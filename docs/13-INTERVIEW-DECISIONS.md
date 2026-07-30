@@ -1,0 +1,30 @@
+# Interview decisions captured
+
+- Local and internet syncing; both devices must be online.
+- Recoverable deletion archive and previous-version history.
+- Two-way/immediate defaults, configurable per folder.
+- Two devices first, extensible later.
+- Code/QR/discovery pairing with code default.
+- Explicit destination choice and recursive subfolders.
+- Glob/path ignores with searchable ignored items.
+- Combined time/storage retention.
+- Open-source public project, GPLv3.
+- LAN plus Tailscale/Headscale-friendly remote transport; native NAT later.
+- Tray-on-close default, startup disabled by default but configurable.
+- Safe cross-platform metadata/symlink behaviour.
+- Optimise near 1 TB and design for more later.
+- Unlimited bandwidth default with limits and metered controls.
+- No account and no telemetry.
+- Polished expandable dashboard; technical MVP then public beta.
+- Previewed non-destructive initial merge.
+- Encrypt/authenticate during transfer; ordinary files at rest.
+- Debounce plus lock/stability detection.
+- Delta chunks for large files and whole-file for small.
+- Important-only notifications.
+- Central configurable local archive; no default archive replication.
+- Rename detection, signed update notification/optional auto install.
+- Logical revisions rather than timestamps.
+- Auto concurrent winner with loser in history, configurable.
+- Ask which copies to retain when removing a folder pair.
+- Visible configurable hidden/system presets.
+- Electron + React + TypeScript + Vite + Tailwind + shadcn Base UI.

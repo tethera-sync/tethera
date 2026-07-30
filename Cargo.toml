@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/sync-core","crates/sync-protocol","crates/sync-crypto","crates/sync-storage","crates/sync-platform","crates/sync-transport","crates/sync-testkit","crates/sync-engine"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
