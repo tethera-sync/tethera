@@ -122,7 +122,7 @@ export function App() {
             <RefreshCwIcon />
           </div>
           <div>
-            <p className="brand-name">FolderSync</p>
+            <p className="brand-name">Tethera</p>
             <p className="brand-caption">Private peer-to-peer sync</p>
           </div>
         </div>
@@ -249,7 +249,7 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
               title={getPairedDevices(snapshot).length === 0 ? "Pair a device first" : "No folders yet"}
               description={getPairedDevices(snapshot).length === 0
                 ? "Folder selection unlocks after a trusted second computer is paired."
-                : "Add your first folder to define what FolderSync should manage."}
+                : "Add your first folder to define what Tethera should manage."}
             />
           ) : (
             <div className="divide-y divide-border">
@@ -300,7 +300,7 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
             <p className="eyebrow">Protected setup order</p>
             <h2>Pair your second computer before choosing folders</h2>
             <p>
-              FolderSync needs a trusted device identity before it can safely browse a destination or create a folder mapping.
+              Tethera needs a trusted device identity before it can safely browse a destination or create a folder mapping.
               No folder can be added while this computer is unpaired.
             </p>
             <div className="pairing-gate-points">
@@ -331,7 +331,7 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
           <div className="large-empty-icon"><FolderIcon /></div>
           <h2>Choose exactly what stays in sync</h2>
           <p>
-            FolderSync never assumes your whole computer should be copied. Use the custom browser to choose one folder on each paired device.
+            Tethera never assumes your whole computer should be copied. Use the custom browser to choose one folder on each paired device.
           </p>
           <AddFolderDialog
             localDevice={localDevice}
@@ -378,7 +378,7 @@ function FolderCard({ folder }: { folder: FolderSummary }) {
 
   async function remove() {
     const confirmed = window.confirm(
-      `Remove “${folder.name}” from FolderSync? Files on both computers will be left untouched.`,
+      `Remove “${folder.name}” from Tethera? Files on both computers will be left untouched.`,
     )
     if (confirmed) await window.folderSync.removeFolder(folder.id)
   }
@@ -597,11 +597,11 @@ function SettingsView({ settings }: { settings: AppSettings }) {
 
   return (
     <div className="page-stack max-w-4xl">
-      <SettingsSection title="Application" description="Choose how FolderSync behaves when the desktop window is closed or the computer starts.">
-        <SettingRow title="Keep syncing in the tray" description="Closing the window hides FolderSync instead of quitting it.">
+      <SettingsSection title="Application" description="Choose how Tethera behaves when the desktop window is closed or the computer starts.">
+        <SettingRow title="Keep syncing in the tray" description="Closing the window hides Tethera instead of quitting it.">
           <Switch aria-label="Keep syncing in the tray" checked={settings.closeToTray} onCheckedChange={(checked: boolean) => update("closeToTray", checked)} />
         </SettingRow>
-        <SettingRow title="Launch after sign-in" description="Start FolderSync when you sign into Windows or Linux.">
+        <SettingRow title="Launch after sign-in" description="Start Tethera when you sign into Windows or Linux.">
           <Switch aria-label="Launch after sign-in" checked={settings.launchAtLogin} onCheckedChange={(checked: boolean) => update("launchAtLogin", checked)} />
         </SettingRow>
         <SettingRow title="Start minimised" description="Open directly into the system tray when launched automatically.">
@@ -716,7 +716,7 @@ function LoadingScreen() {
   return (
     <div className="loading-screen">
       <RefreshCwIcon className="animate-spin" />
-      <p>Loading FolderSync…</p>
+      <p>Loading Tethera…</p>
     </div>
   )
 }
@@ -724,7 +724,7 @@ function LoadingScreen() {
 function viewTitle(view: View, snapshot: AppSnapshot): string {
   if (view === "overview") return snapshot.paused ? "Syncing is paused" : "Your folders at a glance"
   if (view === "folders") return "Synced folders"
-  if (view === "activity") return "What FolderSync has done"
+  if (view === "activity") return "What Tethera has done"
   if (view === "devices") return "Devices and connections"
   if (view === "history") return "Recover earlier versions"
   return "Application preferences"

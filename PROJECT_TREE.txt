@@ -1,4 +1,4 @@
-# FolderSync project tree
+# Tethera project tree
 
 .editorconfig
 .gitignore

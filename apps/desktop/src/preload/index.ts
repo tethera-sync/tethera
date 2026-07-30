@@ -7,13 +7,13 @@ import type {
   ApproveFolderMappingInput,
   BrowseDirectoryInput,
   CreateDirectoryInput,
-  FolderSyncApi,
+  TetheraApi,
   PreviewFolderMappingInput,
   RequestFolderMappingInput,
   RefreshIncomingMappingPreviewInput,
 } from "../shared/contracts"
 
-const api: FolderSyncApi = {
+const api: TetheraApi = {
   getSnapshot: () => ipcRenderer.invoke("app:get-snapshot"),
   pauseAll: () => ipcRenderer.invoke("app:pause-all"),
   resumeAll: () => ipcRenderer.invoke("app:resume-all"),

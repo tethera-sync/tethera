@@ -57,7 +57,7 @@ The initiator chooses both paths and settings, reviews the comparison, then send
 
 Approval creates the same stable mapping ID on both computers. Each side stores its own local path and the opposite path. Send-only and receive-only modes are inverted on the responder so their meaning stays correct locally.
 
-If the receiver changes the destination, FolderSync performs a fresh encrypted comparison before approval. The initiator also recomputes its preview immediately before sending the request, and the receiver recomputes once more at approval time. If either folder changed, approval pauses until the refreshed comparison has been reviewed. Preview data supplied by the renderer is therefore never accepted as authoritative.
+If the receiver changes the destination, Tethera performs a fresh encrypted comparison before approval. The initiator also recomputes its preview immediately before sending the request, and the receiver recomputes once more at approval time. If either folder changed, approval pauses until the refreshed comparison has been reviewed. Preview data supplied by the renderer is therefore never accepted as authoritative.
 
 If the initiator is temporarily unreachable after approval, the receiver stores the approved mapping and retries delivery every five seconds while the peer is online.
 

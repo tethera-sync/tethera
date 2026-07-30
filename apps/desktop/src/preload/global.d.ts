@@ -1,8 +1,8 @@
-import type { FolderSyncApi } from "../shared/contracts"
+import type { TetheraApi } from "../shared/contracts"
 
 declare global {
   interface Window {
-    folderSync: FolderSyncApi
+    folderSync: TetheraApi
   }
 }
 

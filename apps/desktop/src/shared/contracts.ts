@@ -276,7 +276,7 @@ export interface CreateDirectoryInput {
 
 export type AppSettingKey = keyof AppSettings
 
-export interface FolderSyncApi {
+export interface TetheraApi {
   getSnapshot(): Promise<AppSnapshot>
   pauseAll(): Promise<AppSnapshot>
   resumeAll(): Promise<AppSnapshot>

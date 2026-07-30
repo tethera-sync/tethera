@@ -4,7 +4,7 @@ Status: implemented development protocol. It is suitable for local testing but s
 
 ## Purpose
 
-Pair two FolderSync installations without an online account or central server. The result is a pinned peer public key stored on each computer. Pairing authorises identity only; every folder mapping still requires separate approval.
+Pair two Tethera installations without an online account or central server. The result is a pinned peer public key stored on each computer. Pairing authorises identity only; every folder mapping still requires separate approval.
 
 ## Discovery and presence
 
@@ -83,4 +83,4 @@ The pairing socket is not reused for folder browsing or later file transfer. Sli
 - TCP `47655`: direct pairing handshake
 - TCP `47656`: authenticated encrypted trusted-peer RPC
 
-The fixed ports make private-network firewall configuration predictable. FolderSync does not automatically modify host firewall rules, and router port forwarding is not required for LAN use.
+The fixed ports make private-network firewall configuration predictable. Tethera does not automatically modify host firewall rules, and router port forwarding is not required for LAN use.

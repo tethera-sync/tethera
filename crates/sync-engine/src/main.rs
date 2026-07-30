@@ -14,7 +14,7 @@ fn main() {
 
     let version = ProtocolVersion::default();
     println!(
-        "FolderSync engine {} — protocol {version}",
+        "Tethera engine {} — protocol {version}",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -83,7 +83,7 @@ fn handle_line(line: &str, expected_token: &str) -> Value {
         "health" => serde_json::to_value(RpcResponse::success(
             request.id,
             HealthResponse {
-                name: "FolderSync engine",
+                name: "Tethera engine",
                 version: env!("CARGO_PKG_VERSION"),
                 protocol: ProtocolVersion::default().to_string(),
             },

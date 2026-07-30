@@ -1,5 +1,5 @@
 {
-  "name": "foldersync-workspace",
+  "name": "tethera-workspace",
   "private": true,
   "packageManager": "bun@1.3.14",
   "workspaces": [
@@ -7,18 +7,18 @@
     "packages/*"
   ],
   "scripts": {
-    "desktop:dev": "bun run --filter @foldersync/desktop dev",
-    "desktop:build": "bun run --filter @foldersync/desktop build",
-    "desktop:preview": "bun run --filter @foldersync/desktop preview",
-    "desktop:typecheck": "bun run --filter @foldersync/desktop typecheck",
+    "desktop:dev": "bun run --filter @tethera/desktop dev",
+    "desktop:build": "bun run --filter @tethera/desktop build",
+    "desktop:preview": "bun run --filter @tethera/desktop preview",
+    "desktop:typecheck": "bun run --filter @tethera/desktop typecheck",
     "ui:init": "cd apps/desktop && bunx shadcn@latest init --base base",
     "rust:check": "cargo check --workspace",
     "rust:test": "cargo test --workspace",
-    "desktop:setup": "bun run --filter @foldersync/desktop electron:install",
+    "desktop:setup": "bun run --filter @tethera/desktop electron:install",
     "desktop:dev:full": "cargo build -p sync-engine && bun run desktop:setup && bun run desktop:dev",
     "rust:build": "cargo build -p sync-engine",
     "check": "bun run desktop:typecheck && bun run desktop:test && cargo test --workspace",
-    "desktop:test": "bun run --filter @foldersync/desktop test"
+    "desktop:test": "bun run --filter @tethera/desktop test"
   },
   "trustedDependencies": [
     "electron"

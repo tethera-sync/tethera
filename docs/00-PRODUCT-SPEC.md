@@ -2,7 +2,7 @@
 
 ## 1. Vision
 
-FolderSync is a private, local-first desktop application that keeps user-selected folders synchronised between a Linux Mint computer and a Windows 11 computer. It should feel as approachable as a consumer cloud-drive application while retaining the transparency, control and self-host-friendly values expected from open-source software.
+Tethera is a private, local-first desktop application that keeps user-selected folders synchronised between a Linux Mint computer and a Windows 11 computer. It should feel as approachable as a consumer cloud-drive application while retaining the transparency, control and self-host-friendly values expected from open-source software.
 
 The application does not provide cloud storage, does not require an account, does not upload telemetry and does not retain a project-operated copy of user files. Both paired computers must be online for synchronisation to occur.
 

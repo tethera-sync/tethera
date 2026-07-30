@@ -70,7 +70,7 @@ type WireDevice = {
 }
 
 type DiscoveryBeacon = {
-  type: "foldersync-discovery"
+  type: "tethera-discovery"
   protocol: number
   device: WireDevice
   pairingPort: number
@@ -439,7 +439,7 @@ export class PairingService extends EventEmitter {
       } catch {
         throw new Error(
           `Could not connect to ${candidate.address}:${candidate.pairingPort}. ` +
-            `Make sure FolderSync is open on the other computer and allow TCP ${candidate.pairingPort} on private/LAN networks.`,
+            `Make sure Tethera is open on the other computer and allow TCP ${candidate.pairingPort} on private/LAN networks.`,
         )
       }
       const initiatorNonce = randomBytes(32).toString("base64url")
@@ -859,9 +859,9 @@ export class PairingService extends EventEmitter {
       sentAt: Date.now(),
     }
     const beacon: DiscoveryBeacon = {
-      type: "foldersync-discovery",
+      type: "tethera-discovery",
       ...body,
-      signature: this.#sign("foldersync-discovery", body),
+      signature: this.#sign("tethera-discovery", body),
     }
     const payload = Buffer.from(JSON.stringify(beacon), "utf8")
     const targets = discoveryTargets(
@@ -881,7 +881,7 @@ export class PairingService extends EventEmitter {
     let beacon: DiscoveryBeacon
     try {
       beacon = JSON.parse(message.toString("utf8")) as DiscoveryBeacon
-      if (beacon.type !== "foldersync-discovery" || beacon.protocol !== PROTOCOL_VERSION) return
+      if (beacon.type !== "tethera-discovery" || beacon.protocol !== PROTOCOL_VERSION) return
       if (beacon.device.id === this.#identity.id) return
       if (Math.abs(Date.now() - beacon.sentAt) > 60_000) return
       verifyWireDevice(beacon.device)
@@ -893,7 +893,7 @@ export class PairingService extends EventEmitter {
         acceptingPairing: beacon.acceptingPairing,
         sentAt: beacon.sentAt,
       }
-      if (!verifyPayload(beacon.device.publicKey, "foldersync-discovery", body, beacon.signature)) return
+      if (!verifyPayload(beacon.device.publicKey, "tethera-discovery", body, beacon.signature)) return
     } catch {
       return
     }
@@ -1100,11 +1100,11 @@ function publicCandidate(device: DiscoveredRuntime): PairingCandidate {
 }
 
 function canonicalPayload(kind: string, body: unknown): string {
-  return JSON.stringify(["foldersync-pairing-v1", kind, body])
+  return JSON.stringify(["tethera-pairing-v1", kind, body])
 }
 
 function canonicalSessionPayload(kind: string, body: unknown): string {
-  return JSON.stringify(["foldersync-session-auth-v1", kind, body])
+  return JSON.stringify(["tethera-session-auth-v1", kind, body])
 }
 
 function verifyPayload(publicKey: string, kind: string, body: unknown, signature: string): boolean {
@@ -1158,7 +1158,7 @@ function buildTranscriptHash(
   responderNonce: string,
 ): string {
   return createHash("sha256")
-    .update("foldersync-pairing-transcript-v1\0")
+    .update("tethera-pairing-transcript-v1\0")
     .update(sessionId)
     .update("\0")
     .update(initiatorPublicKey)
