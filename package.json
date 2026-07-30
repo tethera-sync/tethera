@@ -15,9 +15,10 @@
     "rust:check": "cargo check --workspace",
     "rust:test": "cargo test --workspace",
     "desktop:setup": "bun run --filter @foldersync/desktop electron:install",
-    "desktop:dev:full": "cargo build -p sync-engine && bun run desktop:dev",
+    "desktop:dev:full": "cargo build -p sync-engine && bun run desktop:setup && bun run desktop:dev",
     "rust:build": "cargo build -p sync-engine",
-    "check": "bun run desktop:typecheck && cargo test --workspace"
+    "check": "bun run desktop:typecheck && bun run desktop:test && cargo test --workspace",
+    "desktop:test": "bun run --filter @foldersync/desktop test"
   },
   "trustedDependencies": [
     "electron"

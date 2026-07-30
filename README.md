@@ -50,6 +50,7 @@ This builds `sync-engine` first. The Electron main process discovers `target/deb
 
 ```bash
 bun run desktop:typecheck
+bun run desktop:test
 cargo test --workspace
 ```
 
@@ -63,3 +64,9 @@ Start with:
 - [`docs/05-SECURITY.md`](docs/05-SECURITY.md)
 - [`docs/07-UX-SPEC.md`](docs/07-UX-SPEC.md)
 - [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md)
+- [`docs/16-PAIRING-PROTOCOL.md`](docs/16-PAIRING-PROTOCOL.md)
+- [`docs/17-SECURE-PEER-SESSION-AND-MAPPING.md`](docs/17-SECURE-PEER-SESSION-AND-MAPPING.md)
+
+### LAN firewall ports
+
+FolderSync LAN discovery uses **UDP 47654**, direct pairing uses **TCP 47655**, and authenticated encrypted peer requests use **TCP 47656**. Allow all three only on trusted/private local networks. The application never modifies firewall rules automatically.

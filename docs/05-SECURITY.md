@@ -59,3 +59,9 @@ Archives are plaintext historical data with owner-only permissions and never pee
 ## Public-beta gates
 
 External pairing/session review, parser fuzzing, path/symlink race tests, update-signature failure tests, dependency scanning, private reporting process and threat-model review on protocol changes.
+
+## Slice 3 implementation note
+
+The current development pairing implementation uses Ed25519 identities in the trusted Electron main process, signed UDP discovery, a signed direct TCP handshake and a user-compared six-digit transcript code. Only public identity metadata is exchanged. The comparison code is derived independently and is not transmitted.
+
+The local identity file is owner-only on Linux. Windows secure-storage integration and migration of pairing/session key handling into the Rust engine remain public-beta gates. The Slice 3 pairing TCP connection must never be reused for file metadata or content because it is not the final encrypted peer transport.

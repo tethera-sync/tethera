@@ -7,9 +7,9 @@ const Dialog = DialogPrimitive.Root
 const DialogTrigger = DialogPrimitive.Trigger
 const DialogClose = DialogPrimitive.Close
 
-type DialogContentProps = Omit<React.ComponentProps<typeof DialogPrimitive.Popup>, "className"> & { className?: string }
+type DialogContentProps = Omit<React.ComponentProps<typeof DialogPrimitive.Popup>, "className"> & { className?: string; showCloseButton?: boolean }
 
-function DialogContent({ className, children, ...props }: DialogContentProps) {
+function DialogContent({ className, children, showCloseButton = true, ...props }: DialogContentProps) {
   return (
     <DialogPrimitive.Portal>
       <DialogPrimitive.Backdrop className="fixed inset-0 z-50 bg-black/55 backdrop-blur-[2px] transition-opacity data-[ending-style]:opacity-0 data-[starting-style]:opacity-0" />
@@ -22,10 +22,12 @@ function DialogContent({ className, children, ...props }: DialogContentProps) {
           {...props}
         >
           {children}
-          <DialogPrimitive.Close className="absolute right-4 top-4 grid size-8 place-items-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/45">
-            <XIcon className="size-4" />
-            <span className="sr-only">Close</span>
-          </DialogPrimitive.Close>
+          {showCloseButton ? (
+            <DialogPrimitive.Close className="absolute right-4 top-4 grid size-8 place-items-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/45">
+              <XIcon className="size-4" />
+              <span className="sr-only">Close</span>
+            </DialogPrimitive.Close>
+          ) : null}
         </DialogPrimitive.Popup>
       </div>
     </DialogPrimitive.Portal>

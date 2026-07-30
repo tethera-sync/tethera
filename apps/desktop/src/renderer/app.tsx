@@ -9,10 +9,13 @@ import {
   ExternalLinkIcon,
   FolderClockIcon,
   FolderIcon,
+  FolderOpenIcon,
   GaugeIcon,
   HardDriveIcon,
   HistoryIcon,
   LaptopIcon,
+  Link2Icon,
+  LockKeyholeIcon,
   MoreHorizontalIcon,
   NetworkIcon,
   PauseIcon,
@@ -29,10 +32,15 @@ import type {
   AppSettings,
   AppSnapshot,
   ConnectionRoute,
+  DeviceSummary,
   FolderSummary,
   OverallStatus,
 } from "@shared/contracts"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
+import { FolderPickerDialog } from "@/components/folder-picker-dialog"
+import { FolderMappingApprovalDialog } from "@/components/folder-mapping-approval-dialog"
+import { PairDeviceDialog } from "@/components/pair-device-dialog"
+import { RevokeDeviceDialog } from "@/components/revoke-device-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
@@ -46,6 +54,13 @@ const emptySnapshot: AppSnapshot = {
   paused: false,
   folders: [],
   devices: [],
+  pairing: {
+    localFingerprint: "Loading…",
+    acceptingPairing: false,
+    discoveredDevices: [],
+    incomingRequests: [],
+  },
+  mappings: { incoming: [], outgoing: [] },
   activity: [],
   settings: {
     closeToTray: true,
@@ -94,8 +109,13 @@ export function App() {
     setSnapshot(snapshot.paused ? await window.folderSync.resumeAll() : await window.folderSync.pauseAll())
   }
 
+  const localDevice = getLocalDevice(snapshot)
+  const pairedDevice = getPairedDevices(snapshot)[0]
+  const pendingMapping = snapshot.mappings.incoming.find((request) => request.status === "pending")
+
   return (
     <div className="app-shell">
+      <FolderMappingApprovalDialog request={pendingMapping} localDevice={localDevice} />
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark" aria-hidden="true">
@@ -149,18 +169,31 @@ export function App() {
           </div>
           <div className="topbar-actions">
             <ConnectionBadge route={snapshot.route} />
-            <Button variant="outline" onClick={togglePause}>
+            <Button variant="outline" onClick={togglePause} disabled={snapshot.folders.length === 0}>
               {snapshot.paused ? <PlayIcon data-icon="inline-start" /> : <PauseIcon data-icon="inline-start" />}
               {snapshot.paused ? "Resume all" : "Pause all"}
             </Button>
-            <AddFolderDialog onAdded={() => setView("folders")} />
+            {pairedDevice ? (
+              <AddFolderDialog
+                localDevice={localDevice}
+                pairedDevice={pairedDevice}
+                onAdded={() => setView("folders")}
+                disabled={pairedDevice.status !== "online"}
+                disabledReason={`${pairedDevice.name} must be online to browse and approve a mapping.`}
+              />
+            ) : (
+              <Button onClick={() => setView("devices")}>
+                <Link2Icon data-icon="inline-start" />
+                Pair device
+              </Button>
+            )}
           </div>
         </header>
 
         <div className="content-scroll">
           {loading ? <LoadingScreen /> : null}
           {!loading && view === "overview" ? <Overview snapshot={snapshot} onNavigate={setView} /> : null}
-          {!loading && view === "folders" ? <FoldersView snapshot={snapshot} /> : null}
+          {!loading && view === "folders" ? <FoldersView snapshot={snapshot} onNavigate={setView} /> : null}
           {!loading && view === "activity" ? <ActivityView activity={snapshot.activity} /> : null}
           {!loading && view === "devices" ? <DevicesView snapshot={snapshot} /> : null}
           {!loading && view === "history" ? <HistoryView /> : null}
@@ -191,7 +224,7 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
         </div>
         <div className="hero-meta">
           <span>{snapshot.folders.length} configured folders</span>
-          <span>{snapshot.devices.length - 1} paired devices</span>
+          <span>{getPairedDevices(snapshot).length} paired devices</span>
         </div>
       </section>
 
@@ -213,8 +246,10 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
           {snapshot.folders.length === 0 ? (
             <CompactEmptyState
               icon={FolderClockIcon}
-              title="No folders yet"
-              description="Add your first folder to define what FolderSync should manage."
+              title={getPairedDevices(snapshot).length === 0 ? "Pair a device first" : "No folders yet"}
+              description={getPairedDevices(snapshot).length === 0
+                ? "Folder selection unlocks after a trusted second computer is paired."
+                : "Add your first folder to define what FolderSync should manage."}
             />
           ) : (
             <div className="divide-y divide-border">
@@ -242,7 +277,10 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
   )
 }
 
-function FoldersView({ snapshot }: { snapshot: AppSnapshot }) {
+function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate: (view: View) => void }) {
+  const localDevice = getLocalDevice(snapshot)
+  const pairedDevice = getPairedDevices(snapshot)[0]
+
   return (
     <div className="page-stack">
       <section className="section-intro">
@@ -250,25 +288,77 @@ function FoldersView({ snapshot }: { snapshot: AppSnapshot }) {
           <h2>Folder mappings</h2>
           <p>Each mapping has independent paths, direction, exclusions, history and bandwidth settings.</p>
         </div>
-        <Badge variant="neutral">{snapshot.folders.length} configured</Badge>
+        <Badge variant={pairedDevice ? "neutral" : "warning"}>
+          {pairedDevice ? `${snapshot.folders.length} configured` : "Pairing required"}
+        </Badge>
       </section>
 
-      {snapshot.folders.length === 0 ? (
+      {!pairedDevice ? (
+        <section className="pairing-gate-card">
+          <div className="pairing-gate-icon"><LockKeyholeIcon /></div>
+          <div className="pairing-gate-copy">
+            <p className="eyebrow">Protected setup order</p>
+            <h2>Pair your second computer before choosing folders</h2>
+            <p>
+              FolderSync needs a trusted device identity before it can safely browse a destination or create a folder mapping.
+              No folder can be added while this computer is unpaired.
+            </p>
+            <div className="pairing-gate-points">
+              <span><ShieldCheckIcon /> Both computers approve the pairing</span>
+              <span><FolderOpenIcon /> Then choose a folder on each computer</span>
+            </div>
+          </div>
+          <Button onClick={() => onNavigate("devices")}>
+            <Link2Icon data-icon="inline-start" />
+            Go to pairing
+          </Button>
+        </section>
+      ) : null}
+
+      {snapshot.mappings.outgoing.length > 0 ? (
+        <section className="mapping-request-list">
+          {snapshot.mappings.outgoing.map((request) => (
+            <div key={request.id} className={`mapping-request-row mapping-request-${request.status}`}>
+              <div><RefreshCwIcon className={request.status === "pending" ? "animate-spin" : undefined} /><span><strong>{request.proposal.name}</strong><small>{request.message ?? pretty(request.status)}</small></span></div>
+              <Badge variant={request.status === "approved" ? "success" : request.status === "rejected" || request.status === "failed" ? "danger" : "info"}>{pretty(request.status)}</Badge>
+            </div>
+          ))}
+        </section>
+      ) : null}
+
+      {snapshot.folders.length === 0 && pairedDevice ? (
         <section className="large-empty-state">
           <div className="large-empty-icon"><FolderIcon /></div>
           <h2>Choose exactly what stays in sync</h2>
           <p>
-            FolderSync never assumes your whole computer should be copied. Add individual folders and choose a destination for each device.
+            FolderSync never assumes your whole computer should be copied. Use the custom browser to choose one folder on each paired device.
           </p>
-          <AddFolderDialog onAdded={() => undefined} />
+          <AddFolderDialog
+            localDevice={localDevice}
+            pairedDevice={pairedDevice}
+            onAdded={() => undefined}
+            disabled={pairedDevice.status !== "online"}
+            disabledReason={`${pairedDevice.name} must be online to browse and approve a mapping.`}
+          />
         </section>
-      ) : (
-        <section className="folder-grid">
-          {snapshot.folders.map((folder) => (
-            <FolderCard key={folder.id} folder={folder} />
-          ))}
-        </section>
-      )}
+      ) : snapshot.folders.length > 0 ? (
+        <>
+          {!pairedDevice ? (
+            <div className="attention-banner">
+              <CircleAlertIcon />
+              <div>
+                <strong>Existing mappings are inactive</strong>
+                <span>These were created before pairing became mandatory. Pair a device before they can be used.</span>
+              </div>
+            </div>
+          ) : null}
+          <section className="folder-grid">
+            {snapshot.folders.map((folder) => (
+              <FolderCard key={folder.id} folder={folder} />
+            ))}
+          </section>
+        </>
+      ) : null}
     </div>
   )
 }
@@ -314,6 +404,8 @@ function FolderCard({ folder }: { folder: FolderSummary }) {
         <div className="path-arrow"><ArrowRightIcon /></div>
         <PathBlock label="Paired computer" path={folder.remotePath} />
       </div>
+
+      {folder.currentAction ? <div className="folder-action-note"><ShieldCheckIcon /><span>{folder.currentAction}</span></div> : null}
 
       <div className="folder-stats">
         <div><span>Files</span><strong>{folder.fileCount?.toLocaleString("en-GB") ?? "Not scanned"}</strong></div>
@@ -389,15 +481,38 @@ function ActivityRow({ event, showDate = false }: { event: ActivityEvent; showDa
 }
 
 function DevicesView({ snapshot }: { snapshot: AppSnapshot }) {
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const localDevice = getLocalDevice(snapshot)
+  const pairedDevices = getPairedDevices(snapshot)
+
   return (
     <div className="page-stack">
       <section className="section-intro">
         <div>
           <h2>Trusted devices</h2>
-          <p>Devices use persistent cryptographic identities. Both sides must approve every pairing.</p>
+          <p>Each computer has a persistent signing identity. Pairing only completes after both people compare and approve the same code.</p>
         </div>
-        <Button disabled title="Pairing is the next implementation milestone"><ComputerIcon data-icon="inline-start" />Pairing next</Button>
+        <div className="flex items-center gap-2">
+          <Badge variant={pairedDevices.length > 0 ? "success" : "warning"}>
+            {pairedDevices.length > 0 ? `${pairedDevices.length} paired` : "Not paired"}
+          </Badge>
+          <PairDeviceDialog snapshot={snapshot} />
+        </div>
       </section>
+
+      {snapshot.pairing.incomingRequests.length > 0 ? (
+        <section className="incoming-pairing-banner">
+          <div><ShieldCheckIcon /><span><strong>Pairing approval needed</strong><small>Open “Start pairing” to compare the code and approve the request.</small></span></div>
+          <PairDeviceDialog snapshot={snapshot} />
+        </section>
+      ) : null}
+
+      {snapshot.mappings.incoming.some((request) => request.status === "pending") ? (
+        <section className="incoming-pairing-banner">
+          <div><FolderOpenIcon /><span><strong>Folder approval needed</strong><small>Review the requested local destination before the mapping is created.</small></span></div>
+          <Badge variant="warning">Action required</Badge>
+        </section>
+      ) : null}
 
       <section className="device-grid">
         {snapshot.devices.map((device) => (
@@ -417,16 +532,42 @@ function DevicesView({ snapshot }: { snapshot: AppSnapshot }) {
               <div><dt>Status</dt><dd>{pretty(device.status)}</dd></div>
               <div><dt>Connection</dt><dd>{prettyRoute(device.route)}</dd></div>
               <div><dt>Address</dt><dd>{device.address ?? "Not connected"}</dd></div>
+              <div><dt>Identity</dt><dd className="device-fingerprint">{device.fingerprint ?? "Loading…"}</dd></div>
             </dl>
+            {device.status !== "this-device" ? <RevokeDeviceDialog device={device} /> : null}
           </article>
         ))}
 
-        <button type="button" className="pair-device-card" disabled>
-          <div className="large-empty-icon"><ComputerIcon /></div>
-          <strong>Pairing is the next milestone</strong>
-          <span>The planned flow supports a one-time code, QR code and local-network approval.</span>
-        </button>
+        <article className="pair-device-card">
+          <div className="large-empty-icon"><Link2Icon /></div>
+          <strong>Pair a second computer</strong>
+          <span>Nearby devices are discovered over your LAN. Both computers compare a one-time code before their identity keys are saved.</span>
+          <div className="pair-device-actions">
+            <PairDeviceDialog snapshot={snapshot} />
+            <Button variant="outline" onClick={() => setPickerOpen(true)}>
+              <FolderOpenIcon data-icon="inline-start" />
+              Preview folder browser
+            </Button>
+          </div>
+        </article>
       </section>
+
+      <section className="setup-order-card">
+        <span>1</span><div><strong>Pair</strong><p>Establish trust between Linux and Windows.</p></div>
+        <ArrowRightIcon />
+        <span>2</span><div><strong>Choose folders</strong><p>Browse a source and destination with the custom picker.</p></div>
+        <ArrowRightIcon />
+        <span>3</span><div><strong>Review and sync</strong><p>Preview the initial merge before any files change.</p></div>
+      </section>
+
+      <FolderPickerDialog
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        device={localDevice}
+        title="Preview the folder browser"
+        description="This preview only browses this computer and does not create a sync mapping."
+        onSelect={() => setPickerOpen(false)}
+      />
     </div>
   )
 }
@@ -591,6 +732,7 @@ function viewTitle(view: View, snapshot: AppSnapshot): string {
 
 function overallHeadline(snapshot: AppSnapshot): string {
   if (snapshot.paused) return "Everything is safely paused"
+  if (getPairedDevices(snapshot).length === 0) return "Pair your second computer first"
   if (snapshot.status === "needs-attention") return "A folder needs your attention"
   if (snapshot.folders.length === 0) return "Ready for your first folder"
   if (snapshot.route === "offline") return "Configured and waiting for a peer"
@@ -599,7 +741,8 @@ function overallHeadline(snapshot: AppSnapshot): string {
 
 function overallDescription(snapshot: AppSnapshot): string {
   if (snapshot.paused) return "Folder changes will remain local until you resume syncing."
-  if (snapshot.folders.length === 0) return "Choose a local folder and the path it should use on your second computer."
+  if (getPairedDevices(snapshot).length === 0) return "Folder selection stays locked until both computers approve a secure pairing."
+  if (snapshot.folders.length === 0) return "Choose one folder on this computer and its destination on the paired device."
   if (snapshot.engineStatus !== "ready") return "Your folder mappings are saved, but live scanning waits for the Rust engine."
   if (snapshot.route === "offline") return "No paired device is currently connected. Your files remain unchanged."
   return "There are no queued transfers or unresolved conflicts."
@@ -630,8 +773,24 @@ function prettyPlatform(platform?: "linux" | "windows" | "unknown"): string {
 
 function statusTone(status: OverallStatus): string {
   if (status === "needs-attention") return "tone-danger"
-  if (status === "paused") return "tone-warning"
+  if (status === "paused" || status === "offline") return "tone-warning"
   return "tone-success"
+}
+
+function getLocalDevice(snapshot: AppSnapshot): DeviceSummary {
+  return snapshot.devices.find((device) => device.status === "this-device") ?? {
+    id: "local-device",
+    name: "This computer",
+    platform: "unknown",
+    status: "this-device",
+    route: "offline",
+  }
+}
+
+function getPairedDevices(snapshot: AppSnapshot): DeviceSummary[] {
+  return snapshot.devices.filter(
+    (device) => device.id !== "local-device" && (device.status === "online" || device.status === "offline"),
+  )
 }
 
 function formatRelative(iso: string): string {

@@ -14,11 +14,18 @@ apps/desktop/electron.vite.config.ts
 apps/desktop/package.json
 apps/desktop/resources/tray.png
 apps/desktop/src/main/engine-supervisor.ts
+apps/desktop/src/main/folder-manifest.ts
 apps/desktop/src/main/index.ts
+apps/desktop/src/main/pairing-service.ts
+apps/desktop/src/main/peer-session-service.ts
 apps/desktop/src/preload/global.d.ts
 apps/desktop/src/preload/index.ts
 apps/desktop/src/renderer/app.tsx
 apps/desktop/src/renderer/components/add-folder-dialog.tsx
+apps/desktop/src/renderer/components/folder-mapping-approval-dialog.tsx
+apps/desktop/src/renderer/components/folder-picker-dialog.tsx
+apps/desktop/src/renderer/components/pair-device-dialog.tsx
+apps/desktop/src/renderer/components/revoke-device-dialog.tsx
 apps/desktop/src/renderer/components/ui/badge.tsx
 apps/desktop/src/renderer/components/ui/button.tsx
 apps/desktop/src/renderer/components/ui/dialog.tsx
@@ -28,6 +35,9 @@ apps/desktop/src/renderer/lib/utils.ts
 apps/desktop/src/renderer/main.tsx
 apps/desktop/src/renderer/styles/globals.css
 apps/desktop/src/shared/contracts.ts
+apps/desktop/tests/folder-manifest.test.ts
+apps/desktop/tests/pairing-service.test.ts
+apps/desktop/tests/peer-session-service.test.ts
 apps/desktop/tsconfig.json
 crates/sync-core/Cargo.toml
 crates/sync-core/src/lib.rs
@@ -61,6 +71,8 @@ docs/12-DECISIONS.md
 docs/13-INTERVIEW-DECISIONS.md
 docs/14-REFERENCES.md
 docs/15-IMPLEMENTATION-STATUS.md
+docs/16-PAIRING-PROTOCOL.md
+docs/17-SECURE-PEER-SESSION-AND-MAPPING.md
 justfile
 package.json
 rust-toolchain.toml

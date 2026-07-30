@@ -1,15 +1,15 @@
 {
   "name": "@foldersync/desktop",
-  "version": "0.0.1",
+  "version": "0.0.6",
   "private": true,
-  "type": "module",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit",
-    "electron:install": "install-electron --no"
+    "electron:install": "install-electron --no",
+    "test": "bun test tests"
   },
   "dependencies": {
     "@base-ui/react": "latest",

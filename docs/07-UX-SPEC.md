@@ -59,3 +59,14 @@ Keyboard operation, visible focus, preserve Base UI semantics, never colour-only
 ## shadcn/Base UI map
 
 Sidebar/navigation, Card/Item, Dialog/Alert Dialog, Sheet, Tabs, Combobox, Field/Input/Select/Switch/Slider, Progress, Tooltip, Toast and Command. Generated code is owned/customised in-repo.
+
+## Pairing prerequisite and folder selection
+
+Folder selection is not available until at least one trusted peer has been paired. Before pairing:
+
+- the top-right primary action is **Pair device**, not **Add folder**;
+- the Folders screen explains the protected setup order;
+- renderer controls cannot open the add-folder flow;
+- the Electron main process rejects direct `folders:add` IPC calls as a second line of defence.
+
+After pairing, adding a mapping uses an in-app browser on both computers rather than a native operating-system dialog. The browser shows only folders, keeps the selected device clearly labelled, supports locations and breadcrumbs, can reveal hidden folders on request, and allows a new destination folder to be created. Remote browsing requires the peer to be online.
