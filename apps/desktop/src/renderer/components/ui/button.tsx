@@ -8,18 +8,19 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        default: "bg-primary text-primary-foreground shadow-sm hover:bg-primary/90",
+        default:
+          "bg-primary text-primary-foreground shadow-[0_1px_2px_rgba(0,0,0,0.25),0_6px_18px_color-mix(in_oklab,var(--primary)_28%,transparent)] hover:bg-primary/90",
         secondary: "bg-secondary text-secondary-foreground hover:bg-secondary/75",
-        outline: "border border-border bg-surface text-foreground shadow-xs hover:bg-accent",
+        outline: "border border-border bg-surface-strong text-foreground shadow-xs hover:border-primary/40 hover:bg-accent",
         ghost: "text-muted-foreground hover:bg-accent hover:text-foreground",
         destructive: "bg-destructive text-white hover:bg-destructive/90",
       },
       size: {
-        default: "h-10 px-4 py-2",
-        sm: "h-8 rounded-md px-3 text-xs",
+        default: "h-9 px-3.5 text-[13px]",
+        sm: "h-8 rounded-lg px-3 text-xs",
         lg: "h-11 px-5",
-        icon: "size-10",
-        "icon-sm": "size-8 rounded-md",
+        icon: "size-9",
+        "icon-sm": "size-8 rounded-lg",
       },
     },
     defaultVariants: { variant: "default", size: "default" },
