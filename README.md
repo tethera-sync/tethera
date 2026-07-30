@@ -1,6 +1,6 @@
-# FolderSync
+# Tethera
 
-FolderSync is a GPLv3 peer-to-peer folder synchronisation application for Linux and Windows. Users choose individual folders, pair trusted computers and transfer files directly over LAN or Tailscale. Files are encrypted in transit and stored normally on the receiving filesystem.
+Tethera is a GPLv3 peer-to-peer folder synchronisation application for Linux and Windows. Users choose individual folders, pair trusted computers and transfer files directly over LAN or Tailscale. Files are encrypted in transit and stored normally on the receiving filesystem.
 
 The repository is an implementation starter, not yet a production-safe sync tool. See [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md) for the exact boundary between working features and planned features.
 
@@ -69,4 +69,4 @@ Start with:
 
 ### LAN firewall ports
 
-FolderSync LAN discovery uses **UDP 47654**, direct pairing uses **TCP 47655**, and authenticated encrypted peer requests use **TCP 47656**. Allow all three only on trusted/private local networks. The application never modifies firewall rules automatically.
+Tethera LAN discovery uses **UDP 47654**, direct pairing uses **TCP 47655**, and authenticated encrypted peer requests use **TCP 47656**. Allow all three only on trusted/private local networks. The application never modifies firewall rules automatically.

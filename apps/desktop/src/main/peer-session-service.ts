@@ -228,7 +228,7 @@ export class PeerSessionService extends EventEmitter {
         Math.abs(Date.now() - first.sentAt) > CLOCK_SKEW_MS ||
         !this.#options.pairing.verifyTrustedSessionPayload(first.deviceId, "session-hello", helloBody, first.signature)
       ) {
-        throw new Error("The connecting computer is not a trusted FolderSync device.")
+        throw new Error("The connecting computer is not a trusted Tethera device.")
       }
       if (this.#recentSessions.has(first.sessionId)) throw new Error("This secure session has already been used.")
       this.#recentSessions.set(first.sessionId, Date.now())
@@ -386,13 +386,13 @@ function importX25519PublicKey(encoded: string): KeyObject {
 
 function buildSessionTranscript(hello: object, welcome: object): Buffer {
   return createHash("sha256")
-    .update(JSON.stringify(["foldersync-secure-session-v1", hello, welcome]))
+    .update(JSON.stringify(["tethera-secure-session-v1", hello, welcome]))
     .digest()
 }
 
 function deriveSessionKey(privateKey: KeyObject, remotePublicKey: string, transcript: Buffer): Buffer {
   const sharedSecret = diffieHellman({ privateKey, publicKey: importX25519PublicKey(remotePublicKey) })
-  return Buffer.from(hkdfSync("sha256", sharedSecret, transcript, Buffer.from("foldersync-peer-rpc-v1"), 32))
+  return Buffer.from(hkdfSync("sha256", sharedSecret, transcript, Buffer.from("tethera-peer-rpc-v1"), 32))
 }
 
 function encryptFrame(

@@ -102,7 +102,7 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
               </div>
               <p>
                 {pairing.acceptingPairing
-                  ? "Nearby FolderSync computers can find this device for five minutes."
+                  ? "Nearby Tethera computers can find this device for five minutes."
                   : "Turn this on from either computer, then select it from the nearby list."}
               </p>
             </div>
@@ -225,7 +225,7 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
                 <ShieldQuestionIcon />
                 <div>
                   <strong>No computers are available yet</strong>
-                  <span>Open FolderSync on the other computer and choose “Allow pairing for 5 minutes”.</span>
+                  <span>Open Tethera on the other computer and choose “Allow pairing for 5 minutes”.</span>
                 </div>
               </div>
             )}

@@ -291,7 +291,7 @@ async function startNetworkServices(): Promise<void> {
     syncPairingSnapshot()
   })
   pairing.on("paired", (device: { id: string; name: string }) => {
-    pushActivity("Device paired", `${device.name} is now a trusted FolderSync device.`, "success")
+    pushActivity("Device paired", `${device.name} is now a trusted Tethera device.`, "success")
     syncPairingSnapshot()
     void persistState()
   })
@@ -299,7 +299,7 @@ async function startNetworkServices(): Promise<void> {
     snapshot.folders = snapshot.folders.map((folder) =>
       folder.remoteDeviceId === device.id ? { ...folder, status: "needs-attention" } : folder,
     )
-    pushActivity("Device trust removed", `${device.name} can no longer access this FolderSync installation.`, "warning")
+    pushActivity("Device trust removed", `${device.name} can no longer access this Tethera installation.`, "warning")
     syncPairingSnapshot()
     void persistState()
   })
@@ -931,7 +931,7 @@ function startEngine(): void {
   })
   const executable = resolveEngineExecutable()
   if (!executable) {
-    engine.markUnavailable("Build the engine with `cargo build -p sync-engine`, then restart FolderSync.")
+    engine.markUnavailable("Build the engine with `cargo build -p sync-engine`, then restart Tethera.")
     return
   }
   engine.start({ command: executable })
@@ -945,7 +945,7 @@ function createWindow(): void {
     minWidth: 960,
     minHeight: 650,
     show: false,
-    title: "FolderSync",
+    title: "Tethera",
     backgroundColor: "#0b0d12",
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
@@ -985,7 +985,7 @@ function createTray(): void {
   const iconPath = path.resolve(__dirname, "../../resources/tray.png")
   const image = existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty()
   tray = new Tray(image.resize({ width: 18, height: 18 }))
-  tray.setToolTip("FolderSync")
+  tray.setToolTip("Tethera")
   tray.on("click", showMainWindow)
   rebuildTrayMenu()
 }
@@ -993,7 +993,7 @@ function createTray(): void {
 function rebuildTrayMenu(): void {
   if (!tray || !snapshot) return
   const template: MenuItemConstructorOptions[] = [
-    { label: "Open FolderSync", click: showMainWindow },
+    { label: "Open Tethera", click: showMainWindow },
     { type: "separator" },
     snapshot.paused
       ? { label: "Resume all", click: () => void setAllPaused(false) }

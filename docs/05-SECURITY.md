@@ -6,7 +6,7 @@ Only paired devices access authorised folder metadata/content; traffic is confid
 
 ## Out of scope
 
-Plain local files are not protected from malware/admins/unlocked theft/applications with legitimate local access. Full-disk encryption remains recommended. FolderSync encrypts in transit, not ordinary live files at rest.
+Plain local files are not protected from malware/admins/unlocked theft/applications with legitimate local access. Full-disk encryption remains recommended. Tethera encrypts in transit, not ordinary live files at rest.
 
 ## Threats and controls
 
