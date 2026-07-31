@@ -81,10 +81,9 @@ mod tests {
 
     #[test]
     fn parses_camel_case_session_token() {
-        let request: RpcRequest = serde_json::from_str(
-            r#"{"id":"1","method":"health","sessionToken":"secret"}"#,
-        )
-        .expect("request should parse");
+        let request: RpcRequest =
+            serde_json::from_str(r#"{"id":"1","method":"health","sessionToken":"secret"}"#)
+                .expect("request should parse");
 
         assert_eq!(request.id, "1");
         assert_eq!(request.method, "health");

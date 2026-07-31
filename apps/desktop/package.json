@@ -2,6 +2,8 @@
   "name": "@tethera/desktop",
   "version": "0.0.6",
   "private": true,
+  "description": "Tethera desktop sync client",
+  "author": "Tethera",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
@@ -9,7 +11,11 @@
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit",
     "electron:install": "install-electron --no",
-    "test": "bun test tests"
+    "test": "bun test tests",
+    "dist": "electron-vite build && electron-builder --config electron-builder.yml",
+    "dist:mac": "electron-vite build && electron-builder --config electron-builder.yml --mac",
+    "dist:win": "electron-vite build && electron-builder --config electron-builder.yml --win",
+    "dist:linux": "electron-vite build && electron-builder --config electron-builder.yml --linux"
   },
   "dependencies": {
     "@base-ui/react": "latest",
@@ -33,6 +39,7 @@
     "@types/react-dom": "latest",
     "@vitejs/plugin-react": "latest",
     "electron": "latest",
+    "electron-builder": "^26.15.3",
     "electron-vite": "latest",
     "tailwindcss": "latest",
     "typescript": "latest",

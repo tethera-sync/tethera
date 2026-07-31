@@ -18,3 +18,5 @@ Thumbs.db
 !.env.example
 *.key
 *.pem
+apps/desktop/resources/engine/*
+!apps/desktop/resources/engine/.gitkeep

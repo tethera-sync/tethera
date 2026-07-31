@@ -52,7 +52,7 @@ pub fn deterministic_conflict_winner<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{deterministic_conflict_winner, DeviceId, RevisionClock};
+    use super::{DeviceId, RevisionClock, deterministic_conflict_winner};
 
     fn revision(device: &str, sequence: u64) -> RevisionClock {
         RevisionClock {

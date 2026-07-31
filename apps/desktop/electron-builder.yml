@@ -1,0 +1,46 @@
+appId: dev.tethera.desktop
+productName: Tethera
+copyright: Copyright © Tethera contributors
+directories:
+  output: dist
+  buildResources: resources
+files:
+  - out/**/*
+  - package.json
+extraResources:
+  - from: resources/engine
+    to: engine
+    filter:
+      - "**/*"
+
+mac:
+  category: public.app-category.utilities
+  icon: resources/icon.png
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+    - target: zip
+      arch: [x64, arm64]
+
+win:
+  icon: resources/icon.png
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: zip
+      arch: [x64]
+
+linux:
+  icon: resources/icon.png
+  category: Utility
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+publish: null

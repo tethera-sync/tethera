@@ -3,7 +3,7 @@
 use std::env;
 use std::io::{self, BufRead, Write};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sync_protocol::{HealthResponse, ProtocolVersion, RpcRequest, RpcResponse};
 
 fn main() {
