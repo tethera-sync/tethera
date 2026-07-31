@@ -1,5 +1,6 @@
 appId: dev.tethera.desktop
 productName: Tethera
+executableName: tethera
 copyright: Copyright © Tethera contributors
 directories:
   output: dist
@@ -19,15 +20,11 @@ mac:
   target:
     - target: dmg
       arch: [x64, arm64]
-    - target: zip
-      arch: [x64, arm64]
 
 win:
   icon: resources/icon.png
   target:
     - target: nsis
-      arch: [x64]
-    - target: zip
       arch: [x64]
 
 linux:
