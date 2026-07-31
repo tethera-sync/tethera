@@ -235,6 +235,12 @@ button {
   height: 17px;
 }
 
+.brand-mark img {
+  width: 20px;
+  height: 20px;
+  object-fit: contain;
+}
+
 .brand-text {
   display: flex;
   min-width: 0;

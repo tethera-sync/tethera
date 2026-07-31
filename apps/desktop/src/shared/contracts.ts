@@ -287,6 +287,7 @@ export interface TetheraApi {
   refreshIncomingMappingPreview(input: RefreshIncomingMappingPreviewInput): Promise<AppSnapshot>
   approveFolderMapping(input: ApproveFolderMappingInput): Promise<AppSnapshot>
   rejectFolderMapping(requestId: string): Promise<AppSnapshot>
+  startInitialSync(folderId: string): Promise<AppSnapshot>
   addFolder(input: AddFolderInput): Promise<AppSnapshot>
   setFolderPaused(folderId: string, paused: boolean): Promise<AppSnapshot>
   removeFolder(folderId: string): Promise<AppSnapshot>

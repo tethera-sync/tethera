@@ -9,7 +9,7 @@ import {
   Tray,
 } from "electron"
 import { execFile } from "node:child_process"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises"
 import os from "node:os"
@@ -40,8 +40,10 @@ import type {
 } from "../shared/contracts"
 import { EngineSupervisor, type EngineState } from "./engine-supervisor"
 import { compareManifests, scanFolder, type FileManifest } from "./folder-manifest"
+import { computeSyncPlan, MAX_TRANSFER_FILE_BYTES, writeFileAtomic } from "./initial-sync"
 import { PairingService } from "./pairing-service"
 import { PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
+import { resolveWithinRoot } from "./path-safety"
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -49,6 +51,7 @@ let isQuitting = false
 let snapshot: AppSnapshot
 let decisionRetryTimer: NodeJS.Timeout | null = null
 const decisionDeliveriesInFlight = new Set<string>()
+const initialSyncInFlight = new Set<string>()
 
 const engine = new EngineSupervisor()
 let pairing: PairingService | null = null
@@ -722,6 +725,96 @@ async function flushPendingMappingDecisions(): Promise<void> {
   }
 }
 
+function updateFolder(folderId: string, patch: Partial<FolderSummary>): void {
+  snapshot.folders = snapshot.folders.map((item) => (item.id === folderId ? { ...item, ...patch } : item))
+}
+
+async function startInitialSync(folderId: string): Promise<AppSnapshot> {
+  if (initialSyncInFlight.has(folderId)) return snapshot
+  const folder = snapshot.folders.find((item) => item.id === folderId)
+  if (!folder) throw new Error("This folder is no longer configured.")
+  if (folder.setupStatus !== "ready-for-initial-sync") throw new Error("This folder has already completed its initial sync.")
+  if (folder.paused || snapshot.paused) throw new Error("Resume this folder before starting the initial sync.")
+  const peer = getPairedDevice(folder.remoteDeviceId)
+  if (!peer) throw new Error("The paired computer for this folder is no longer trusted.")
+  if (peer.status !== "online") throw new Error(`${peer.name} must be online to sync.`)
+
+  initialSyncInFlight.add(folderId)
+  updateFolder(folderId, { status: "syncing", currentAction: "Comparing folders…", progress: 0 })
+  broadcastSnapshot()
+
+  try {
+    const localManifest = await scanFolder(folder.localPath, folder.ignorePatterns)
+    const remoteManifest = await requirePeerSessions().request<FileManifest>(
+      peer.id,
+      { type: "scan-manifest", path: folder.remotePath, ignorePatterns: folder.ignorePatterns },
+      5 * 60_000,
+    )
+
+    const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode)
+    const total = plan.toPull.length
+    let completed = 0
+    let bytesCopied = 0
+    const startedAt = Date.now()
+
+    for (const entry of plan.toPull) {
+      const current = snapshot.folders.find((item) => item.id === folderId)
+      if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
+
+      updateFolder(folderId, {
+        currentAction: `Copying ${entry.path} (${completed + 1}/${total})`,
+        progress: total > 0 ? completed / total : 1,
+      })
+      broadcastSnapshot()
+
+      const result = await requirePeerSessions().request<{ digest: string; size: number; contentBase64: string }>(peer.id, {
+        type: "pull-file",
+        folderId,
+        relativePath: entry.path,
+      })
+      const buffer = Buffer.from(result.contentBase64, "base64")
+      const digest = createHash("sha256").update(buffer).digest("hex")
+      if (digest !== result.digest || buffer.length !== result.size) {
+        plan.skipped.push({ path: entry.path, reason: "The transferred content failed integrity verification." })
+        continue
+      }
+      await writeFileAtomic(folder.localPath, entry.path, buffer)
+      completed += 1
+      bytesCopied += buffer.length
+    }
+
+    const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001)
+    updateFolder(folderId, {
+      setupStatus: "active",
+      status: idleFolderStatus(),
+      progress: 1,
+      bytesPerSecond: Math.round(bytesCopied / elapsedSeconds),
+      fileCount: localManifest.files.length + completed,
+      lastSyncedAt: new Date().toISOString(),
+      currentAction:
+        plan.skipped.length > 0
+          ? `Synced ${completed} file${completed === 1 ? "" : "s"}. ${plan.skipped.length} skipped — see activity log.`
+          : `Synced ${completed} file${completed === 1 ? "" : "s"}.`,
+    })
+    pushActivity(
+      "Initial sync completed",
+      `${folder.name}: copied ${completed} file${completed === 1 ? "" : "s"}${plan.skipped.length > 0 ? `, skipped ${plan.skipped.length}` : ""}.`,
+      plan.skipped.length > 0 ? "warning" : "success",
+      folderId,
+    )
+    for (const skip of plan.skipped.slice(0, 20)) pushActivity(`Skipped ${skip.path}`, skip.reason, "warning", folderId)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "The initial sync failed."
+    updateFolder(folderId, { status: "needs-attention", currentAction: message })
+    pushActivity("Initial sync failed", `${folder.name}: ${message}`, "error", folderId)
+  } finally {
+    initialSyncInFlight.delete(folderId)
+    await persistState()
+    broadcastSnapshot()
+  }
+  return snapshot
+}
+
 async function handlePeerRequest(context: PeerRequestContext, request: PeerRequest): Promise<unknown> {
   if (request.type === "browse-directory") {
     return browseHostDirectory(
@@ -763,6 +856,23 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       showMainWindow()
     }
     return { accepted: true }
+  }
+  if (request.type === "pull-file") {
+    const folderId = typeof request.folderId === "string" ? request.folderId : ""
+    const relativePath = typeof request.relativePath === "string" ? request.relativePath : ""
+    const folder = snapshot.folders.find((item) => item.id === folderId)
+    if (!folder || folder.remoteDeviceId !== context.peerId) {
+      throw new Error("This folder is not shared with the requesting computer.")
+    }
+    if (folder.mode === "receive-only") {
+      throw new Error("This folder is receive-only on this computer and cannot serve files.")
+    }
+    const absolutePath = resolveWithinRoot(folder.localPath, relativePath)
+    const fileStat = await stat(absolutePath)
+    if (!fileStat.isFile()) throw new Error("The requested path is not a file.")
+    if (fileStat.size > MAX_TRANSFER_FILE_BYTES) throw new Error("The requested file exceeds the initial-sync size limit.")
+    const buffer = await readFile(absolutePath)
+    return { digest: createHash("sha256").update(buffer).digest("hex"), size: buffer.length, contentBase64: buffer.toString("base64") }
   }
   if (request.type === "mapping-decision") {
     const proposalId = typeof request.proposalId === "string" ? request.proposalId : ""
@@ -847,6 +957,7 @@ function registerIpc(): void {
   ipcMain.handle("folders:refresh-incoming-preview", (_event, input: RefreshIncomingMappingPreviewInput) => refreshIncomingMappingPreview(input))
   ipcMain.handle("folders:approve-mapping", (_event, input: ApproveFolderMappingInput) => approveFolderMapping(input))
   ipcMain.handle("folders:reject-mapping", (_event, requestId: string) => rejectFolderMapping(requestId))
+  ipcMain.handle("folders:start-initial-sync", (_event, folderId: string) => startInitialSync(folderId))
 
   ipcMain.handle("folders:add", async (_event: Electron.IpcMainInvokeEvent, _input: AddFolderInput) => {
     throw new Error("Folder mappings now require an initial comparison and approval on the other computer.")
@@ -913,6 +1024,12 @@ function registerIpc(): void {
   ipcMain.handle("window:show", () => showMainWindow())
 }
 
+function resolveResourcePath(name: string): string {
+  const packagedPath = path.join(process.resourcesPath, name)
+  if (app.isPackaged && existsSync(packagedPath)) return packagedPath
+  return path.resolve(__dirname, "../../resources", name)
+}
+
 function resolveEngineExecutable(): string | null {
   const override = process.env.FOLDERSYNC_ENGINE_PATH
   if (override && existsSync(override)) return override
@@ -947,6 +1064,7 @@ function createWindow(): void {
     show: false,
     title: "Tethera",
     backgroundColor: "#0b0d12",
+    icon: resolveResourcePath("icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
       contextIsolation: true,
@@ -982,7 +1100,7 @@ function showMainWindow(): void {
 }
 
 function createTray(): void {
-  const iconPath = path.resolve(__dirname, "../../resources/tray.png")
+  const iconPath = resolveResourcePath("tray.png")
   const image = existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty()
   tray = new Tray(image.resize({ width: 18, height: 18 }))
   tray.setToolTip("Tethera")

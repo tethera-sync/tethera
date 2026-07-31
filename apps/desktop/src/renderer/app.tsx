@@ -41,6 +41,7 @@ import type {
   FolderSummary,
   OverallStatus,
 } from "@shared/contracts"
+import tetheraLogo from "@/assets/tethera-logo-flat.png"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { FolderMappingApprovalDialog } from "@/components/folder-mapping-approval-dialog"
@@ -145,7 +146,7 @@ export function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark" aria-hidden="true">
-            <RefreshCwIcon />
+            <img src={tetheraLogo} alt="" />
           </div>
           <div className="brand-text">
             <p className="brand-name">Tethera</p>
@@ -823,6 +824,7 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
 
 function FolderCard({ folder }: { folder: FolderSummary }) {
   const [busy, setBusy] = useState(false)
+  const [syncing, setSyncing] = useState(false)
   const paused = folder.paused || folder.status === "paused"
 
   async function setPaused() {
@@ -839,6 +841,15 @@ function FolderCard({ folder }: { folder: FolderSummary }) {
       `Remove “${folder.name}” from Tethera? Files on both computers will be left untouched.`,
     )
     if (confirmed) await window.folderSync.removeFolder(folder.id)
+  }
+
+  async function startSync() {
+    setSyncing(true)
+    try {
+      await window.folderSync.startInitialSync(folder.id)
+    } finally {
+      setSyncing(false)
+    }
   }
 
   return (
@@ -908,6 +919,12 @@ function FolderCard({ folder }: { folder: FolderSummary }) {
       </div>
 
       <div className="folder-card-footer">
+        {folder.setupStatus === "ready-for-initial-sync" ? (
+          <Button size="sm" onClick={startSync} disabled={syncing || paused || folder.status === "syncing"}>
+            <RefreshCwIcon data-icon="inline-start" />
+            {folder.status === "syncing" ? "Syncing…" : "Start sync"}
+          </Button>
+        ) : null}
         <Button size="sm" variant="outline" onClick={setPaused} disabled={busy}>
           {paused ? <PlayIcon data-icon="inline-start" /> : <PauseIcon data-icon="inline-start" />}
           {paused ? "Resume" : "Pause"}
