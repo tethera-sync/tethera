@@ -24,6 +24,7 @@ const api: TetheraApi = {
   refreshIncomingMappingPreview: (input: RefreshIncomingMappingPreviewInput) => ipcRenderer.invoke("folders:refresh-incoming-preview", input),
   approveFolderMapping: (input: ApproveFolderMappingInput) => ipcRenderer.invoke("folders:approve-mapping", input),
   rejectFolderMapping: (requestId: string) => ipcRenderer.invoke("folders:reject-mapping", requestId),
+  startInitialSync: (folderId: string) => ipcRenderer.invoke("folders:start-initial-sync", folderId),
   addFolder: (input: AddFolderInput) => ipcRenderer.invoke("folders:add", input),
   setFolderPaused: (folderId: string, paused: boolean) => ipcRenderer.invoke("folders:set-paused", folderId, paused),
   removeFolder: (folderId: string) => ipcRenderer.invoke("folders:remove", folderId),
