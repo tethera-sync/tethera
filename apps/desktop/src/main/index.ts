@@ -1024,6 +1024,12 @@ function registerIpc(): void {
   ipcMain.handle("window:show", () => showMainWindow())
 }
 
+function resolveResourcePath(name: string): string {
+  const packagedPath = path.join(process.resourcesPath, name)
+  if (app.isPackaged && existsSync(packagedPath)) return packagedPath
+  return path.resolve(__dirname, "../../resources", name)
+}
+
 function resolveEngineExecutable(): string | null {
   const override = process.env.FOLDERSYNC_ENGINE_PATH
   if (override && existsSync(override)) return override
@@ -1058,6 +1064,7 @@ function createWindow(): void {
     show: false,
     title: "Tethera",
     backgroundColor: "#0b0d12",
+    icon: resolveResourcePath("icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
       contextIsolation: true,
@@ -1093,7 +1100,7 @@ function showMainWindow(): void {
 }
 
 function createTray(): void {
-  const iconPath = path.resolve(__dirname, "../../resources/tray.png")
+  const iconPath = resolveResourcePath("tray.png")
   const image = existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty()
   tray = new Tray(image.resize({ width: 18, height: 18 }))
   tray.setToolTip("Tethera")
