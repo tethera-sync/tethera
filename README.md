@@ -1,25 +1,61 @@
-# Tethera
+<div align="center">
+  <img src="assets/tethera-logo.png" alt="Tethera" width="120" />
 
-Tethera is a GPLv3 peer-to-peer folder synchronisation application for Linux and Windows. Users choose individual folders, pair trusted computers and transfer files directly over LAN or Tailscale. Files are encrypted in transit and stored normally on the receiving filesystem.
+  # Tethera
 
-The repository is an implementation starter, not yet a production-safe sync tool. See [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md) for the exact boundary between working features and planned features.
+  **Private, peer-to-peer folder sync for Linux and Windows — no cloud, no account, no middleman.**
 
-## Stack
+  [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+  [![Status: early development](https://img.shields.io/badge/status-early%20development-orange)](docs/15-IMPLEMENTATION-STATUS.md)
+  [![Bun](https://img.shields.io/badge/runtime-Bun-f472b6)](https://bun.sh)
+  [![Rust](https://img.shields.io/badge/engine-Rust-dea584)](https://www.rust-lang.org)
 
-- Bun workspaces
-- Electron + electron-vite
-- React + TypeScript
-- shadcn-style components using Base UI primitives
-- Tailwind CSS
-- Rust workspace for the sync engine
+</div>
 
-## Prerequisites
+---
 
-- Bun 1.3.14 or newer stable release
-- Rust stable with Cargo
-- Linux Mint or Windows 11 for the initial target platforms
+Tethera keeps folders you choose in sync between two computers you trust — a Linux box and a Windows box, over LAN or [Tailscale](https://tailscale.com) — without uploading anything to a third party. There's no account to create, no server holding a copy of your files, and no telemetry. You pair two machines directly, pick the folders that matter, and Tethera keeps them aligned while both machines are online.
 
-## Install
+It's built for people who want Dropbox-style convenience for a couple of personal machines without trusting a cloud provider with the entire contents of a folder tree.
+
+> **This repository is under active early development.** The pairing, discovery, and secure-session layers work today; actual file transfer and reconciliation are not implemented yet. See [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md) for the precise line between what's real and what's planned — the UI never claims to protect data it isn't protecting yet.
+
+## Why Tethera
+
+- **No cloud in the middle.** Files move directly between your paired devices over LAN or your Tailscale tailnet. Tethera never stores a copy of your data.
+- **Normal files stay normal.** Synced folders remain ordinary directories on disk — no proprietary vault format, no forced app-only access.
+- **Nothing happens silently.** Deletions are archived first, overwrites keep prior versions, and every automatic decision is meant to be recoverable or auditable.
+- **Cross-platform by design.** Linux Mint and Windows 11 are first-class, including differing destination paths, filename rules, and case-sensitivity behavior.
+- **The engine is the source of truth.** A Rust sync engine owns identity, transport, and file safety; the Electron/React UI is a thin, sandboxed client that talks to it over an authenticated local RPC channel.
+
+## How it works
+
+1. **Pair two computers.** Devices discover each other over LAN (or find each other over Tailscale) using a signed presence protocol, then confirm pairing with a comparison code approved on both sides.
+2. **Choose folders to sync.** Point Tethera at a folder on each machine — the source and destination paths don't need to match.
+3. **Tethera keeps them aligned.** Changes propagate directly between paired devices over an encrypted peer session. No relay server ever sees your files.
+
+See [`docs/16-PAIRING-PROTOCOL.md`](docs/16-PAIRING-PROTOCOL.md) and [`docs/17-SECURE-PEER-SESSION-AND-MAPPING.md`](docs/17-SECURE-PEER-SESSION-AND-MAPPING.md) for the protocol details.
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Sync engine | Rust workspace (`crates/`) — identity, transport, protocol, storage, crypto |
+| Desktop shell | Electron + electron-vite |
+| UI | React, TypeScript, Tailwind CSS, shadcn-style components on Base UI |
+| Package management | Bun workspaces |
+
+The Electron main process supervises the Rust `sync-engine` binary as a child process and talks to it over an authenticated stdio RPC session; the renderer never touches Node.js or Electron APIs directly.
+
+## Getting started
+
+### Prerequisites
+
+- [Bun](https://bun.sh) 1.3.14 or newer
+- Rust (stable) with Cargo
+- Linux Mint or Windows 11 (the initial target platforms)
+
+### Install
 
 ```bash
 bun install
@@ -28,25 +64,23 @@ bun run electron:install
 cd ../..
 ```
 
-The explicit Electron install command is useful with Bun's isolated workspace layout and lifecycle-script security.
+The explicit `electron:install` step matters because of how Bun's isolated workspace layout and lifecycle-script security interact with Electron's postinstall.
 
-## Run the UI only
+### Run
 
-The app launches and saves folder configuration even when the Rust binary has not been built:
+UI only — the app launches and saves folder configuration even without a built Rust binary:
 
 ```bash
 bun run desktop:dev
 ```
 
-## Run with the Rust engine
+With the Rust sync engine (builds `sync-engine` first, then launches the app):
 
 ```bash
 bun run desktop:dev:full
 ```
 
-This builds `sync-engine` first. The Electron main process discovers `target/debug/sync-engine`, launches it with an authenticated stdio RPC session and displays its health status in the sidebar.
-
-## Checks
+### Test
 
 ```bash
 bun run desktop:typecheck
@@ -54,19 +88,44 @@ bun run desktop:test
 cargo test --workspace
 ```
 
+Or everything at once:
+
+```bash
+bun run check
+```
+
+## Networking
+
+Tethera needs the following local ports reachable on trusted/private networks only — it never opens or modifies firewall rules automatically:
+
+| Port | Purpose |
+|---|---|
+| UDP 47654 | Signed LAN discovery and presence beacons |
+| TCP 47655 | Direct pairing handshake |
+| TCP 47656 | Authenticated, encrypted peer sessions |
+
 ## Documentation
 
-Start with:
+| Doc | Covers |
+|---|---|
+| [`docs/00-PRODUCT-SPEC.md`](docs/00-PRODUCT-SPEC.md) | Vision, scope, and default policies |
+| [`docs/02-ARCHITECTURE.md`](docs/02-ARCHITECTURE.md) | System architecture |
+| [`docs/03-SYNC-SEMANTICS.md`](docs/03-SYNC-SEMANTICS.md) | Sync, conflict, and recovery semantics |
+| [`docs/05-SECURITY.md`](docs/05-SECURITY.md) | Threat model and security design |
+| [`docs/07-UX-SPEC.md`](docs/07-UX-SPEC.md) | UX specification |
+| [`docs/10-ROADMAP.md`](docs/10-ROADMAP.md) | Roadmap |
+| [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md) | What's implemented vs. planned, right now |
+| [`docs/16-PAIRING-PROTOCOL.md`](docs/16-PAIRING-PROTOCOL.md) | Device pairing protocol |
+| [`docs/17-SECURE-PEER-SESSION-AND-MAPPING.md`](docs/17-SECURE-PEER-SESSION-AND-MAPPING.md) | Encrypted peer sessions and folder mapping |
 
-- [`docs/00-PRODUCT-SPEC.md`](docs/00-PRODUCT-SPEC.md)
-- [`docs/02-ARCHITECTURE.md`](docs/02-ARCHITECTURE.md)
-- [`docs/03-SYNC-SEMANTICS.md`](docs/03-SYNC-SEMANTICS.md)
-- [`docs/05-SECURITY.md`](docs/05-SECURITY.md)
-- [`docs/07-UX-SPEC.md`](docs/07-UX-SPEC.md)
-- [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md)
-- [`docs/16-PAIRING-PROTOCOL.md`](docs/16-PAIRING-PROTOCOL.md)
-- [`docs/17-SECURE-PEER-SESSION-AND-MAPPING.md`](docs/17-SECURE-PEER-SESSION-AND-MAPPING.md)
+## Contributing
 
-### LAN firewall ports
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for coding standards and priorities (data integrity and security come before speed or polish).
 
-Tethera LAN discovery uses **UDP 47654**, direct pairing uses **TCP 47655**, and authenticated encrypted peer requests use **TCP 47656**. Allow all three only on trusted/private local networks. The application never modifies firewall rules automatically.
+## Security
+
+Found a vulnerability? Please see [`SECURITY.md`](SECURITY.md) before opening a public issue — some classes of report (pairing/auth bypass, path escape, RCE, data loss from crafted input) should be reported privately.
+
+## License
+
+Tethera is licensed under the [GNU GPLv3](LICENSE).
