@@ -38,6 +38,9 @@ const api: TetheraApi = {
   rejectPairing: (requestId: string) => ipcRenderer.invoke("pairing:reject", requestId),
   revokeDevice: (deviceId: string) => ipcRenderer.invoke("pairing:revoke", deviceId),
   showWindow: () => ipcRenderer.invoke("window:show"),
+  checkForUpdates: () => ipcRenderer.invoke("updates:check"),
+  downloadUpdate: () => ipcRenderer.invoke("updates:download"),
+  quitAndInstall: () => ipcRenderer.invoke("updates:install"),
   subscribe: (listener: (snapshot: AppSnapshot) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, snapshot: AppSnapshot) => listener(snapshot)
     ipcRenderer.on("app:snapshot", handler)

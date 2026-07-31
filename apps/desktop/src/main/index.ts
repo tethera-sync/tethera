@@ -8,6 +8,7 @@ import {
   shell,
   Tray,
 } from "electron"
+import { autoUpdater } from "electron-updater"
 import { execFile } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
@@ -37,6 +38,7 @@ import type {
   RequestFolderMappingInput,
   RefreshIncomingMappingPreviewInput,
   SyncMode,
+  UpdateState,
 } from "../shared/contracts"
 import { EngineSupervisor, type EngineState } from "./engine-supervisor"
 import { compareManifests, scanFolder, type FileManifest } from "./folder-manifest"
@@ -66,6 +68,7 @@ const emptyPairingState: PairingState = {
 }
 
 const emptyMappingState: MappingState = { incoming: [], outgoing: [] }
+const idleUpdateState: UpdateState = { status: "idle" }
 
 const defaultSettings: AppSettings = {
   closeToTray: true,
@@ -125,6 +128,7 @@ function getInitialSnapshot(): AppSnapshot {
       },
     ],
     settings: defaultSettings,
+    update: idleUpdateState,
   }
 }
 
@@ -158,6 +162,7 @@ async function loadState(): Promise<void> {
         outgoing: parsed.mappings?.outgoing ?? [],
       },
       settings: { ...defaultSettings, ...(parsed.settings ?? {}) },
+      update: idleUpdateState,
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -169,7 +174,7 @@ async function loadState(): Promise<void> {
 }
 
 async function persistState(): Promise<void> {
-  const { pairing: _pairing, ...persistableSnapshot } = snapshot
+  const { pairing: _pairing, update: _update, ...persistableSnapshot } = snapshot
   const persisted = {
     ...persistableSnapshot,
     engineStatus: "unavailable",
@@ -1022,6 +1027,17 @@ function registerIpc(): void {
     return syncPairingSnapshot()
   })
   ipcMain.handle("window:show", () => showMainWindow())
+  ipcMain.handle("updates:check", () => {
+    if (!app.isPackaged) return
+    void autoUpdater.checkForUpdates()
+  })
+  ipcMain.handle("updates:download", () => {
+    void autoUpdater.downloadUpdate()
+  })
+  ipcMain.handle("updates:install", () => {
+    isQuitting = true
+    autoUpdater.quitAndInstall()
+  })
 }
 
 function resolveResourcePath(name: string): string {
@@ -1052,6 +1068,25 @@ function startEngine(): void {
     return
   }
   engine.start({ command: executable })
+}
+
+function setUpdateState(update: UpdateState): void {
+  snapshot.update = update
+  broadcastSnapshot()
+}
+
+function setUpAutoUpdater(): void {
+  autoUpdater.autoDownload = false
+  autoUpdater.autoInstallOnAppQuit = true
+
+  autoUpdater.on("checking-for-update", () => setUpdateState({ status: "checking" }))
+  autoUpdater.on("update-available", (info) => setUpdateState({ status: "available", version: info.version }))
+  autoUpdater.on("update-not-available", () => setUpdateState({ status: "not-available" }))
+  autoUpdater.on("error", (error) => setUpdateState({ status: "error", message: error.message }))
+  autoUpdater.on("download-progress", (progress) =>
+    setUpdateState({ status: "downloading", progressPercent: Math.round(progress.percent) }),
+  )
+  autoUpdater.on("update-downloaded", (info) => setUpdateState({ status: "downloaded", version: info.version }))
 }
 
 function createWindow(): void {
@@ -1117,6 +1152,10 @@ function rebuildTrayMenu(): void {
       ? { label: "Resume all", click: () => void setAllPaused(false) }
       : { label: "Pause all", click: () => void setAllPaused(true) },
     { type: "separator" },
+    snapshot.update.status === "downloaded"
+      ? { label: "Restart to update", click: () => { isQuitting = true; autoUpdater.quitAndInstall() } }
+      : { label: "Check for updates", click: () => void autoUpdater.checkForUpdates(), enabled: app.isPackaged },
+    { type: "separator" },
     { label: "Quit", click: () => { isQuitting = true; app.quit() } },
   ]
   tray.setContextMenu(Menu.buildFromTemplate(template))
@@ -1128,6 +1167,8 @@ app.whenReady().then(async () => {
   createWindow()
   createTray()
   startEngine()
+  setUpAutoUpdater()
+  if (app.isPackaged) void autoUpdater.checkForUpdates()
   try {
     await startNetworkServices()
   } catch (error) {

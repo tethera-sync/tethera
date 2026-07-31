@@ -132,6 +132,22 @@ export interface AppSettings {
   theme: ThemePreference
 }
 
+export type UpdateStatus =
+  | "idle"
+  | "checking"
+  | "available"
+  | "not-available"
+  | "downloading"
+  | "downloaded"
+  | "error"
+
+export interface UpdateState {
+  status: UpdateStatus
+  version?: string
+  progressPercent?: number
+  message?: string
+}
+
 export interface MappingPreviewItem {
   path: string
   category: "local-only" | "remote-only" | "different" | "invalid-name" | "case-collision"
@@ -208,6 +224,7 @@ export interface AppSnapshot {
   mappings: MappingState
   activity: ActivityEvent[]
   settings: AppSettings
+  update: UpdateState
 }
 
 export interface AddFolderInput {
@@ -301,5 +318,8 @@ export interface TetheraApi {
   rejectPairing(requestId: string): Promise<AppSnapshot>
   revokeDevice(deviceId: string): Promise<AppSnapshot>
   showWindow(): Promise<void>
+  checkForUpdates(): Promise<void>
+  downloadUpdate(): Promise<void>
+  quitAndInstall(): Promise<void>
   subscribe(listener: (snapshot: AppSnapshot) => void): () => void
 }

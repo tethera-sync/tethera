@@ -88,17 +88,24 @@ jobs:
             dist_script: dist:mac
             artifact_glob: |
               apps/desktop/dist/*.dmg
+              apps/desktop/dist/*.zip
+              apps/desktop/dist/*.blockmap
+              apps/desktop/dist/latest-mac.yml
           - os: windows-latest
             platform: win
             dist_script: dist:win
             artifact_glob: |
               apps/desktop/dist/*.exe
+              apps/desktop/dist/*.blockmap
+              apps/desktop/dist/latest.yml
           - os: ubuntu-latest
             platform: linux
             dist_script: dist:linux
             artifact_glob: |
               apps/desktop/dist/*.AppImage
               apps/desktop/dist/*.deb
+              apps/desktop/dist/*.blockmap
+              apps/desktop/dist/latest-linux.yml
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout release tag

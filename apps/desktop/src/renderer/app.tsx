@@ -25,6 +25,7 @@ import {
   PauseIcon,
   PlayIcon,
   RefreshCwIcon,
+  DownloadIcon,
   Settings2Icon,
   ShieldCheckIcon,
   SlidersHorizontalIcon,
@@ -40,6 +41,7 @@ import type {
   DeviceSummary,
   FolderSummary,
   OverallStatus,
+  UpdateState,
 } from "@shared/contracts"
 import tetheraLogo from "@/assets/tethera-logo-flat.png"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
@@ -79,6 +81,7 @@ const emptySnapshot: AppSnapshot = {
     pauseOnMetered: true,
     theme: "system",
   },
+  update: { status: "idle" },
 }
 
 type View = "overview" | "folders" | "activity" | "devices" | "history" | "settings"
@@ -251,6 +254,8 @@ export function App() {
             </div>
           </div>
         </header>
+
+        <UpdateBanner update={snapshot.update} />
 
         <div className="content-scroll">
           {loading ? <LoadingScreen /> : null}
@@ -1314,6 +1319,50 @@ function ConnectionPill({ route, paused }: { route: ConnectionRoute; paused: boo
     <StatusPill tone={route === "offline" ? "neutral" : "success"} pulse={route === "connecting"}>
       {prettyRoute(route)}
     </StatusPill>
+  )
+}
+
+function UpdateBanner({ update }: { update: UpdateState }) {
+  if (update.status === "idle" || update.status === "checking" || update.status === "not-available") return null
+
+  if (update.status === "error") {
+    return (
+      <div className="update-banner update-banner-error">
+        <CircleAlertIcon />
+        <span>Update check failed: {update.message ?? "Unknown error."}</span>
+      </div>
+    )
+  }
+
+  if (update.status === "available") {
+    return (
+      <div className="update-banner">
+        <DownloadIcon />
+        <span>Tethera {update.version} is available.</span>
+        <Button size="sm" onClick={() => void window.folderSync.downloadUpdate()}>
+          Download
+        </Button>
+      </div>
+    )
+  }
+
+  if (update.status === "downloading") {
+    return (
+      <div className="update-banner">
+        <DownloadIcon />
+        <span>Downloading update… {update.progressPercent ?? 0}%</span>
+      </div>
+    )
+  }
+
+  return (
+    <div className="update-banner">
+      <CheckCircle2Icon />
+      <span>Tethera {update.version} is ready to install.</span>
+      <Button size="sm" onClick={() => void window.folderSync.quitAndInstall()}>
+        Restart & Update
+      </Button>
+    </div>
   )
 }
 
