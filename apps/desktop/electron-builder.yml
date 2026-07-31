@@ -2,6 +2,7 @@ appId: dev.tethera.desktop
 productName: Tethera
 executableName: tethera
 copyright: Copyright © Tethera contributors
+artifactName: "${productName}-${version}-${arch}.${ext}"
 directories:
   output: dist
   buildResources: resources

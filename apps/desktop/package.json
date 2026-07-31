@@ -4,6 +4,7 @@
   "private": true,
   "description": "Tethera desktop sync client",
   "author": "Tethera <noreply@tdanks.com>",
+  "homepage": "https://github.com/tethera-sync/tethera",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
