@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "description": "Tethera desktop sync client",
-  "author": "Tethera",
+  "author": "Tethera <noreply@tdanks.com>",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
