@@ -30,7 +30,6 @@ import type {
   DirectoryLocation,
   FolderMappingProposal,
   FolderMappingPreview,
-  FolderSetupStatus,
   FolderSummary,
   IncomingMappingRequest,
   MappingState,
@@ -38,12 +37,18 @@ import type {
   PreviewFolderMappingInput,
   RequestFolderMappingInput,
   RefreshIncomingMappingPreviewInput,
-  SyncMode,
   UpdateState,
 } from "../shared/contracts"
 import { EngineSupervisor, type EngineState } from "./engine-supervisor"
 import { compareManifests, scanFolder, type FileManifest } from "./folder-manifest"
 import { computeSyncPlan, MAX_TRANSFER_FILE_BYTES, writeFileAtomic } from "./initial-sync"
+import {
+  folderFromMappingRecord,
+  invertMode,
+  mappingRecordFromFolder,
+  mappingRecordFromProposal,
+  type MappingRecord,
+} from "./mapping-index"
 import { PairingService } from "./pairing-service"
 import { PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
 import { resolveWithinRoot } from "./path-safety"
@@ -512,56 +517,11 @@ function validateMappingInput(input: AddFolderInput): void {
   if (input.name.length > 120) throw new Error("The folder name must be 120 characters or fewer.")
 }
 
-interface MappingRecordDto {
-  id: string
-  name: string
-  initiatorDeviceId: string
-  initiatorDeviceName: string
-  responderDeviceId: string
-  responderDeviceName: string
-  initiatorPath: string
-  responderPath: string
-  mode: SyncMode
-  ignorePatterns: string[]
-  historyDays: number
-  historyMaxBytes: number
-  setupStatus: FolderSetupStatus
-  pendingDelivery: boolean
-  preview: FolderMappingPreview | null
-  createdAt: string
-  updatedAt: string
-}
-
-function mappingRecordFromProposal(
-  proposal: FolderMappingProposal,
-  responderDeviceName: string,
-  setupStatus: FolderSetupStatus,
-): MappingRecordDto {
-  return {
-    id: proposal.id,
-    name: proposal.name,
-    initiatorDeviceId: proposal.initiatorDeviceId,
-    initiatorDeviceName: proposal.initiatorDeviceName,
-    responderDeviceId: proposal.responderDeviceId,
-    responderDeviceName,
-    initiatorPath: proposal.initiatorPath,
-    responderPath: proposal.responderPath,
-    mode: proposal.mode,
-    ignorePatterns: proposal.ignorePatterns,
-    historyDays: proposal.historyDays,
-    historyMaxBytes: proposal.historyMaxBytes,
-    setupStatus,
-    pendingDelivery: false,
-    preview: proposal.preview,
-    createdAt: proposal.createdAt,
-    updatedAt: new Date().toISOString(),
-  }
-}
-
 // Durable copy lives in the Rust/SQLite mapping index; the JSON snapshot above remains the
 // renderer-facing cache. Both writes are best-effort and never block the approval flow — the
-// engine may not be running yet, and the JSON snapshot stays authoritative until it is.
-async function persistMappingToEngine(record: MappingRecordDto): Promise<void> {
+// engine may not be running yet, and the JSON snapshot stays authoritative until reconciliation
+// (see reconcileMappingIndex) confirms the index agrees.
+async function persistMappingToEngine(record: MappingRecord): Promise<void> {
   if (engine.state.status !== "ready") return
   try {
     await engine.request("mapping.upsert", record)
@@ -576,6 +536,68 @@ async function deleteMappingFromEngine(id: string): Promise<void> {
     await engine.request("mapping.delete", { id })
   } catch (error) {
     console.error(`[mapping-index] failed to delete mapping ${id}:`, error instanceof Error ? error.message : error)
+  }
+}
+
+/**
+ * Runs once per engine session, right after the Rust engine reports ready. Reconciles the
+ * durable SQLite mapping index against the in-memory snapshot in both directions: records the
+ * index has but the snapshot doesn't are recovered into `snapshot.folders` (state.json was
+ * lost, predates the index, or this is a fresh install pointed at reused engine data); folders
+ * the snapshot has but the index doesn't (approved while the engine wasn't running yet) are
+ * written through now. Never throws — reconciliation failures are logged and skipped.
+ */
+async function reconcileMappingIndex(): Promise<void> {
+  if (engine.state.status !== "ready") return
+  let records: MappingRecord[]
+  try {
+    records = await engine.request<MappingRecord[]>("mapping.list")
+  } catch (error) {
+    console.error("[mapping-index] failed to list mappings for reconciliation:", error instanceof Error ? error.message : error)
+    return
+  }
+
+  const localDeviceId = getLocalIdentityId()
+  const recordIds = new Set(records.map((record) => record.id))
+  let recovered = 0
+
+  for (const record of records) {
+    if (snapshot.folders.some((folder) => folder.id === record.id)) continue
+    const folder = folderFromMappingRecord(record, localDeviceId)
+    if (!folder) continue
+    snapshot.folders = [...snapshot.folders, folder]
+    recovered += 1
+  }
+  if (recovered > 0) {
+    pushActivity(
+      "Recovered folder mappings",
+      `${recovered} folder mapping${recovered === 1 ? "" : "s"} recovered from the durable mapping index.`,
+      "info",
+    )
+  }
+
+  const localIdentity = pairing?.getLocalSessionIdentity()
+  const timestamp = new Date().toISOString()
+  for (const folder of snapshot.folders) {
+    if (recordIds.has(folder.id)) continue
+    if (folder.setupStatus !== "ready-for-initial-sync" && folder.setupStatus !== "active") continue
+    if (!folder.remoteDeviceId) continue
+    const peer = getPairedDevice(folder.remoteDeviceId)
+    void persistMappingToEngine(
+      mappingRecordFromFolder(
+        folder,
+        folder.remoteDeviceId,
+        localDeviceId,
+        localIdentity?.name ?? "This computer",
+        peer?.name ?? folder.remoteDeviceId,
+        timestamp,
+      ),
+    )
+  }
+
+  if (recovered > 0) {
+    await persistState()
+    broadcastSnapshot()
   }
 }
 
@@ -1016,12 +1038,6 @@ function folderForResponder(proposal: FolderMappingProposal, destinationPath: st
   }
 }
 
-function invertMode(mode: SyncMode): SyncMode {
-  if (mode === "send-only") return "receive-only"
-  if (mode === "receive-only") return "send-only"
-  return "two-way"
-}
-
 function registerIpc(): void {
   ipcMain.handle("app:get-snapshot", () => snapshot)
   ipcMain.handle("app:pause-all", () => setAllPaused(true))
@@ -1134,6 +1150,7 @@ function startEngine(): void {
     snapshot.engineStatus = state.status
     snapshot.engineMessage = state.message
     broadcastSnapshot()
+    if (state.status === "ready") void reconcileMappingIndex()
   })
   const executable = resolveEngineExecutable()
   if (!executable) {

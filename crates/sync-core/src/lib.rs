@@ -1,6 +1,8 @@
 //! Pure synchronisation semantics.
 #![forbid(unsafe_code)]
 
+pub mod manifest;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectionMode {
     TwoWay,

@@ -15,5 +15,8 @@ sync-storage = { path = "../sync-storage" }
 sync-platform = { path = "../sync-platform" }
 sync-transport = { path = "../sync-transport" }
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
