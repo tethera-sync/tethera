@@ -30,6 +30,7 @@ import type {
   DirectoryLocation,
   FolderMappingProposal,
   FolderMappingPreview,
+  FolderSetupStatus,
   FolderSummary,
   IncomingMappingRequest,
   MappingState,
@@ -511,6 +512,73 @@ function validateMappingInput(input: AddFolderInput): void {
   if (input.name.length > 120) throw new Error("The folder name must be 120 characters or fewer.")
 }
 
+interface MappingRecordDto {
+  id: string
+  name: string
+  initiatorDeviceId: string
+  initiatorDeviceName: string
+  responderDeviceId: string
+  responderDeviceName: string
+  initiatorPath: string
+  responderPath: string
+  mode: SyncMode
+  ignorePatterns: string[]
+  historyDays: number
+  historyMaxBytes: number
+  setupStatus: FolderSetupStatus
+  pendingDelivery: boolean
+  preview: FolderMappingPreview | null
+  createdAt: string
+  updatedAt: string
+}
+
+function mappingRecordFromProposal(
+  proposal: FolderMappingProposal,
+  responderDeviceName: string,
+  setupStatus: FolderSetupStatus,
+): MappingRecordDto {
+  return {
+    id: proposal.id,
+    name: proposal.name,
+    initiatorDeviceId: proposal.initiatorDeviceId,
+    initiatorDeviceName: proposal.initiatorDeviceName,
+    responderDeviceId: proposal.responderDeviceId,
+    responderDeviceName,
+    initiatorPath: proposal.initiatorPath,
+    responderPath: proposal.responderPath,
+    mode: proposal.mode,
+    ignorePatterns: proposal.ignorePatterns,
+    historyDays: proposal.historyDays,
+    historyMaxBytes: proposal.historyMaxBytes,
+    setupStatus,
+    pendingDelivery: false,
+    preview: proposal.preview,
+    createdAt: proposal.createdAt,
+    updatedAt: new Date().toISOString(),
+  }
+}
+
+// Durable copy lives in the Rust/SQLite mapping index; the JSON snapshot above remains the
+// renderer-facing cache. Both writes are best-effort and never block the approval flow — the
+// engine may not be running yet, and the JSON snapshot stays authoritative until it is.
+async function persistMappingToEngine(record: MappingRecordDto): Promise<void> {
+  if (engine.state.status !== "ready") return
+  try {
+    await engine.request("mapping.upsert", record)
+  } catch (error) {
+    console.error(`[mapping-index] failed to persist mapping ${record.id}:`, error instanceof Error ? error.message : error)
+  }
+}
+
+async function deleteMappingFromEngine(id: string): Promise<void> {
+  if (engine.state.status !== "ready") return
+  try {
+    await engine.request("mapping.delete", { id })
+  } catch (error) {
+    console.error(`[mapping-index] failed to delete mapping ${id}:`, error instanceof Error ? error.message : error)
+  }
+}
+
 function previewsEqual(left: FolderMappingPreview, right: FolderMappingPreview): boolean {
   const canonical = (preview: FolderMappingPreview) => ({
     ...preview,
@@ -672,6 +740,8 @@ async function approveFolderMapping(input: ApproveFolderMappingInput): Promise<A
       : item,
   )
   pushActivity("Folder mapping approved", `${proposal.name} is configured locally and waiting for the other computer to acknowledge it.`, "success", folder.id)
+  const localIdentity = requirePairingService().getLocalSessionIdentity()
+  void persistMappingToEngine(mappingRecordFromProposal(proposal, localIdentity.name, folder.setupStatus ?? "ready-for-initial-sync"))
   await persistState()
   broadcastSnapshot()
   await deliverMappingDecision(request.id, true)
@@ -892,6 +962,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
         item.id === proposalId ? { ...item, status: "approved", message: `${context.peerName} approved the mapping.` } : item,
       )
       pushActivity("Folder mapping approved", `${outgoing.proposal.name} is now configured on both computers.`, "success", folder.id)
+      void persistMappingToEngine(mappingRecordFromProposal(outgoing.proposal, context.peerName, folder.setupStatus ?? "ready-for-initial-sync"))
     } else {
       snapshot.mappings.outgoing = snapshot.mappings.outgoing.map((item) =>
         item.id === proposalId
@@ -978,13 +1049,15 @@ function registerIpc(): void {
     }),
   )
 
-  ipcMain.handle("folders:remove", async (_event: Electron.IpcMainInvokeEvent, folderId: string) =>
-    mutate(() => {
+  ipcMain.handle("folders:remove", async (_event: Electron.IpcMainInvokeEvent, folderId: string) => {
+    const result = await mutate(() => {
       const folder = snapshot.folders.find((item) => item.id === folderId)
       snapshot.folders = snapshot.folders.filter((item) => item.id !== folderId)
       if (folder) pushActivity("Folder removed", `${folder.name} is no longer managed. Existing files were left untouched.`, "warning")
-    }),
-  )
+    })
+    void deleteMappingFromEngine(folderId)
+    return result
+  })
 
   ipcMain.handle("shell:reveal-path", async (_event: Electron.IpcMainInvokeEvent, targetPath: string) => {
     if (targetPath) await shell.openPath(targetPath)
@@ -1067,7 +1140,7 @@ function startEngine(): void {
     engine.markUnavailable("Build the engine with `cargo build -p sync-engine`, then restart Tethera.")
     return
   }
-  engine.start({ command: executable })
+  engine.start({ command: executable, env: { FOLDERSYNC_DATA_DIR: app.getPath("userData") } })
 }
 
 function setUpdateState(update: UpdateState): void {

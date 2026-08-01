@@ -26,6 +26,7 @@ export interface EngineLaunchOptions {
   command: string
   args?: string[]
   cwd?: string
+  env?: Record<string, string>
 }
 
 export class EngineSupervisor extends EventEmitter {
@@ -52,6 +53,7 @@ export class EngineSupervisor extends EventEmitter {
         cwd: options.cwd,
         env: {
           ...process.env,
+          ...options.env,
           FOLDERSYNC_RPC_SESSION_TOKEN: this.#sessionToken,
         },
         stdio: ["pipe", "pipe", "pipe"],
