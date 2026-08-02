@@ -12,8 +12,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-static WINDOWS_RESERVED_NAME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$").expect("static regex should compile"));
+static WINDOWS_RESERVED_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$")
+        .expect("static regex should compile")
+});
 
 const MAX_SAMPLE_ITEMS: usize = 14;
 
@@ -103,85 +105,55 @@ pub struct CompareOptions {
 /// bytes that would move in each direction, and any Windows-invalid names or case-only
 /// collisions that would block approval.
 #[must_use]
-pub fn compare_manifests(local: &FileManifest, remote: &FileManifest, options: CompareOptions) -> FolderMappingPreview {
-    let local_by_path: HashMap<&str, &FileManifestEntry> =
-        local.files.iter().map(|entry| (entry.path.as_str(), entry)).collect();
-    let remote_by_path: HashMap<&str, &FileManifestEntry> =
-        remote.files.iter().map(|entry| (entry.path.as_str(), entry)).collect();
+pub fn compare_manifests(
+    local: &FileManifest,
+    remote: &FileManifest,
+    options: CompareOptions,
+) -> FolderMappingPreview {
+    let local_by_path: HashMap<&str, &FileManifestEntry> = local
+        .files
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let remote_by_path: HashMap<&str, &FileManifestEntry> = remote
+        .files
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
 
-    let mut paths: Vec<&str> = local_by_path.keys().chain(remote_by_path.keys()).copied().collect();
+    let mut paths: Vec<&str> = local_by_path
+        .keys()
+        .chain(remote_by_path.keys())
+        .copied()
+        .collect();
     paths.sort_unstable();
     paths.dedup();
 
-    let mut identical_files = 0;
-    let mut different_files = 0;
-    let mut local_only_files = 0;
-    let mut remote_only_files = 0;
-    let mut bytes_to_remote: u64 = 0;
-    let mut bytes_to_local: u64 = 0;
-    let mut samples = Vec::new();
-
+    let mut tally = CompareTally::default();
     for relative_path in paths {
         let local_entry = local_by_path.get(relative_path).copied();
         let remote_entry = remote_by_path.get(relative_path).copied();
-
-        match (local_entry, remote_entry) {
-            (Some(local_entry), None) => {
-                local_only_files += 1;
-                if options.mode != SyncMode::ReceiveOnly {
-                    bytes_to_remote += local_entry.size;
-                }
-                add_sample(&mut samples, relative_path, PreviewCategory::LocalOnly, Some(local_entry.size));
-            }
-            (None, Some(remote_entry)) => {
-                remote_only_files += 1;
-                if options.mode != SyncMode::SendOnly {
-                    bytes_to_local += remote_entry.size;
-                }
-                add_sample(&mut samples, relative_path, PreviewCategory::RemoteOnly, Some(remote_entry.size));
-            }
-            (Some(local_entry), Some(remote_entry)) => {
-                let digest_match = matches!((&local_entry.digest, &remote_entry.digest), (Some(l), Some(r)) if l == r);
-                let metadata_match = local_entry.digest.is_none()
-                    && remote_entry.digest.is_none()
-                    && local_entry.size == remote_entry.size
-                    && (local_entry.modified_ms - remote_entry.modified_ms).abs() <= 2_000;
-
-                if digest_match || metadata_match {
-                    identical_files += 1;
-                    continue;
-                }
-
-                different_files += 1;
-                match options.mode {
-                    SyncMode::SendOnly => bytes_to_remote += local_entry.size,
-                    SyncMode::ReceiveOnly => bytes_to_local += remote_entry.size,
-                    SyncMode::TwoWay => {
-                        if local_entry.modified_ms >= remote_entry.modified_ms {
-                            bytes_to_remote += local_entry.size;
-                        } else {
-                            bytes_to_local += remote_entry.size;
-                        }
-                    }
-                }
-                add_sample(
-                    &mut samples,
-                    relative_path,
-                    PreviewCategory::Different,
-                    Some(local_entry.size.max(remote_entry.size)),
-                );
-            }
-            (None, None) => unreachable!("path came from one of the two manifests"),
-        }
+        tally.classify(relative_path, local_entry, remote_entry, options.mode);
     }
 
-    let (mut invalid_windows_names, mut case_collisions) = collect_platform_issues(local, remote, options);
+    let (mut invalid_windows_names, mut case_collisions) =
+        collect_platform_issues(local, remote, options);
 
     for invalid in invalid_windows_names.iter().take(4) {
-        add_sample(&mut samples, invalid, PreviewCategory::InvalidName, None);
+        add_sample(
+            &mut tally.samples,
+            invalid,
+            PreviewCategory::InvalidName,
+            None,
+        );
     }
     for collision in case_collisions.iter().take(4) {
-        add_sample(&mut samples, collision, PreviewCategory::CaseCollision, None);
+        add_sample(
+            &mut tally.samples,
+            collision,
+            PreviewCategory::CaseCollision,
+            None,
+        );
     }
 
     invalid_windows_names.truncate(100);
@@ -190,31 +162,138 @@ pub fn compare_manifests(local: &FileManifest, remote: &FileManifest, options: C
     FolderMappingPreview {
         local_files: local.files.len(),
         remote_files: remote.files.len(),
-        identical_files,
-        different_files,
-        local_only_files,
-        remote_only_files,
+        identical_files: tally.identical_files,
+        different_files: tally.different_files,
+        local_only_files: tally.local_only_files,
+        remote_only_files: tally.remote_only_files,
         ignored_local: local.ignored + local.unreadable,
         ignored_remote: remote.ignored + remote.unreadable,
-        bytes_to_remote,
-        bytes_to_local,
+        bytes_to_remote: tally.bytes_to_remote,
+        bytes_to_local: tally.bytes_to_local,
         invalid_windows_names,
         case_collisions,
         truncated: local.truncated || remote.truncated,
-        samples,
+        samples: tally.samples,
     }
 }
 
-fn add_sample(samples: &mut Vec<MappingPreviewItem>, path: &str, category: PreviewCategory, size: Option<u64>) {
+/// Running totals while walking the union of both manifests' paths.
+#[derive(Default)]
+struct CompareTally {
+    identical_files: usize,
+    different_files: usize,
+    local_only_files: usize,
+    remote_only_files: usize,
+    bytes_to_remote: u64,
+    bytes_to_local: u64,
+    samples: Vec<MappingPreviewItem>,
+}
+
+impl CompareTally {
+    /// Folds one path — present on either side, or both — into the totals.
+    fn classify(
+        &mut self,
+        relative_path: &str,
+        local_entry: Option<&FileManifestEntry>,
+        remote_entry: Option<&FileManifestEntry>,
+        mode: SyncMode,
+    ) {
+        match (local_entry, remote_entry) {
+            (Some(local_entry), None) => {
+                self.local_only_files += 1;
+                if mode != SyncMode::ReceiveOnly {
+                    self.bytes_to_remote += local_entry.size;
+                }
+                add_sample(
+                    &mut self.samples,
+                    relative_path,
+                    PreviewCategory::LocalOnly,
+                    Some(local_entry.size),
+                );
+            }
+            (None, Some(remote_entry)) => {
+                self.remote_only_files += 1;
+                if mode != SyncMode::SendOnly {
+                    self.bytes_to_local += remote_entry.size;
+                }
+                add_sample(
+                    &mut self.samples,
+                    relative_path,
+                    PreviewCategory::RemoteOnly,
+                    Some(remote_entry.size),
+                );
+            }
+            (Some(local_entry), Some(remote_entry)) => {
+                if entries_look_identical(local_entry, remote_entry) {
+                    self.identical_files += 1;
+                    return;
+                }
+
+                self.different_files += 1;
+                match mode {
+                    SyncMode::SendOnly => self.bytes_to_remote += local_entry.size,
+                    SyncMode::ReceiveOnly => self.bytes_to_local += remote_entry.size,
+                    SyncMode::TwoWay => {
+                        if local_entry.modified_ms >= remote_entry.modified_ms {
+                            self.bytes_to_remote += local_entry.size;
+                        } else {
+                            self.bytes_to_local += remote_entry.size;
+                        }
+                    }
+                }
+                add_sample(
+                    &mut self.samples,
+                    relative_path,
+                    PreviewCategory::Different,
+                    Some(local_entry.size.max(remote_entry.size)),
+                );
+            }
+            (None, None) => unreachable!("path came from one of the two manifests"),
+        }
+    }
+}
+
+/// Whether the same path on both sides can be treated as unchanged.
+///
+/// Digests decide it when both sides have one. When neither does — the file was over the
+/// scanner's hashing ceiling — this falls back to size plus a two-second modification-time
+/// window, which absorbs filesystems that store coarser timestamps than others. One side having
+/// a digest and the other not is never "identical": there is nothing to compare.
+fn entries_look_identical(
+    local_entry: &FileManifestEntry,
+    remote_entry: &FileManifestEntry,
+) -> bool {
+    let digest_match = matches!((&local_entry.digest, &remote_entry.digest), (Some(local), Some(remote)) if local == remote);
+    let metadata_match = local_entry.digest.is_none()
+        && remote_entry.digest.is_none()
+        && local_entry.size == remote_entry.size
+        && (local_entry.modified_ms - remote_entry.modified_ms).abs() <= 2_000;
+    digest_match || metadata_match
+}
+
+fn add_sample(
+    samples: &mut Vec<MappingPreviewItem>,
+    path: &str,
+    category: PreviewCategory,
+    size: Option<u64>,
+) {
     if samples.len() < MAX_SAMPLE_ITEMS {
-        samples.push(MappingPreviewItem { path: path.to_owned(), category, size });
+        samples.push(MappingPreviewItem {
+            path: path.to_owned(),
+            category,
+            size,
+        });
     }
 }
 
 /// Collects Windows-invalid filenames and case-only collisions on whichever side would land on
 /// a Windows filesystem, sorted for stable output. Skipped for a side receiving nothing, since
 /// there's nothing that side would ever write to disk.
-fn collect_platform_issues(local: &FileManifest, remote: &FileManifest, options: CompareOptions) -> (Vec<String>, Vec<String>) {
+fn collect_platform_issues(
+    local: &FileManifest,
+    remote: &FileManifest,
+    options: CompareOptions,
+) -> (Vec<String>, Vec<String>) {
     let mut invalid_windows_names = HashSet::new();
     let mut case_collisions = HashSet::new();
 
@@ -267,11 +346,17 @@ pub struct SyncPlan {
 #[must_use]
 pub fn compute_sync_plan(local: &FileManifest, remote: &FileManifest, mode: SyncMode) -> SyncPlan {
     if mode == SyncMode::SendOnly {
-        return SyncPlan { to_pull: Vec::new(), skipped: Vec::new() };
+        return SyncPlan {
+            to_pull: Vec::new(),
+            skipped: Vec::new(),
+        };
     }
 
-    let local_by_path: HashMap<&str, &FileManifestEntry> =
-        local.files.iter().map(|entry| (entry.path.as_str(), entry)).collect();
+    let local_by_path: HashMap<&str, &FileManifestEntry> = local
+        .files
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
     let mut to_pull = Vec::new();
     let mut skipped = Vec::new();
 
@@ -288,12 +373,7 @@ pub fn compute_sync_plan(local: &FileManifest, remote: &FileManifest, mode: Sync
             continue;
         };
 
-        let digest_match = matches!((&local_entry.digest, &remote_entry.digest), (Some(l), Some(r)) if l == r);
-        let metadata_match = local_entry.digest.is_none()
-            && remote_entry.digest.is_none()
-            && local_entry.size == remote_entry.size
-            && (local_entry.modified_ms - remote_entry.modified_ms).abs() <= 2_000;
-        if digest_match || metadata_match {
+        if entries_look_identical(local_entry, remote_entry) {
             continue;
         }
 
@@ -327,9 +407,17 @@ impl IgnoreMatcher {
             .filter(|pattern| !pattern.is_empty() && !pattern.starts_with('#'))
             .map(|pattern| {
                 let directory_only = pattern.ends_with('/');
-                let normalized_pattern = if directory_only { pattern[..pattern.len() - 1].to_owned() } else { pattern };
+                let normalized_pattern = if directory_only {
+                    pattern[..pattern.len() - 1].to_owned()
+                } else {
+                    pattern
+                };
                 let basename_only = !normalized_pattern.contains('/');
-                IgnoreRule { directory_only, basename_only, regex: glob_to_regex(&normalized_pattern) }
+                IgnoreRule {
+                    directory_only,
+                    basename_only,
+                    regex: glob_to_regex(&normalized_pattern),
+                }
             })
             .collect();
         Self { rules }
@@ -343,7 +431,11 @@ impl IgnoreMatcher {
             if rule.directory_only && !is_directory {
                 return false;
             }
-            let subject = if rule.basename_only { basename } else { normalized.as_str() };
+            let subject = if rule.basename_only {
+                basename
+            } else {
+                normalized.as_str()
+            };
             rule.regex.is_match(subject)
         })
     }
@@ -355,7 +447,8 @@ pub fn normalize_relative(relative_path: &str) -> String {
 }
 
 fn strip_leading_dot_slash(path: &str) -> String {
-    path.strip_prefix("./").map_or_else(|| path.to_owned(), ToOwned::to_owned)
+    path.strip_prefix("./")
+        .map_or_else(|| path.to_owned(), ToOwned::to_owned)
 }
 
 fn glob_to_regex(pattern: &str) -> Regex {
@@ -388,7 +481,9 @@ pub fn has_windows_invalid_path(relative_path: &str) -> bool {
         if WINDOWS_RESERVED_NAME.is_match(segment) {
             return true;
         }
-        segment.chars().any(|character| "<>:\"|?*".contains(character) || (character as u32) <= 0x1F)
+        segment
+            .chars()
+            .any(|character| "<>:\"|?*".contains(character) || (character as u32) <= 0x1F)
     })
 }
 
@@ -417,16 +512,27 @@ pub fn find_case_collisions(files: &[FileManifestEntry]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompareOptions, FileManifest, FileManifestEntry, IgnoreMatcher, Platform, SyncMode, compare_manifests,
-        compute_sync_plan, find_case_collisions, has_windows_invalid_path,
+        CompareOptions, FileManifest, FileManifestEntry, IgnoreMatcher, Platform, SyncMode,
+        compare_manifests, compute_sync_plan, find_case_collisions, has_windows_invalid_path,
     };
 
     fn manifest(files: Vec<FileManifestEntry>) -> FileManifest {
-        FileManifest { root_path: "/tmp/test".to_owned(), files, ignored: 0, unreadable: 0, truncated: false }
+        FileManifest {
+            root_path: "/tmp/test".to_owned(),
+            files,
+            ignored: 0,
+            unreadable: 0,
+            truncated: false,
+        }
     }
 
     fn entry(path: &str, size: u64, modified_ms: i64, digest: Option<&str>) -> FileManifestEntry {
-        FileManifestEntry { path: path.to_owned(), size, modified_ms, digest: digest.map(ToOwned::to_owned) }
+        FileManifestEntry {
+            path: path.to_owned(),
+            size,
+            modified_ms,
+            digest: digest.map(ToOwned::to_owned),
+        }
     }
 
     #[test]
@@ -445,7 +551,11 @@ mod tests {
         let preview = compare_manifests(
             &local,
             &remote,
-            CompareOptions { mode: SyncMode::TwoWay, local_platform: Platform::Linux, remote_platform: Platform::Windows },
+            CompareOptions {
+                mode: SyncMode::TwoWay,
+                local_platform: Platform::Linux,
+                remote_platform: Platform::Windows,
+            },
         );
 
         assert_eq!(preview.identical_files, 1);
@@ -461,14 +571,21 @@ mod tests {
         assert!(has_windows_invalid_path("CON.txt"));
         assert!(has_windows_invalid_path("folder/name?.txt"));
         assert_eq!(
-            find_case_collisions(&[entry("Readme.md", 1, 1, None), entry("README.md", 1, 1, None)]),
+            find_case_collisions(&[
+                entry("Readme.md", 1, 1, None),
+                entry("README.md", 1, 1, None)
+            ]),
             vec!["Readme.md ↔ README.md".to_owned()],
         );
     }
 
     #[test]
     fn ignore_matcher_supports_basename_and_recursive_globs() {
-        let matcher = IgnoreMatcher::new(&["node_modules/".to_owned(), "*.tmp".to_owned(), "build/**".to_owned()]);
+        let matcher = IgnoreMatcher::new(&[
+            "node_modules/".to_owned(),
+            "*.tmp".to_owned(),
+            "build/**".to_owned(),
+        ]);
         assert!(matcher.is_ignored("node_modules", true));
         assert!(matcher.is_ignored("cache/file.tmp", false));
         assert!(matcher.is_ignored("build/assets/app.js", false));
