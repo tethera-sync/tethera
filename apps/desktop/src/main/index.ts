@@ -517,35 +517,69 @@ function validateMappingInput(input: AddFolderInput): void {
   if (input.name.length > 120) throw new Error("The folder name must be 120 characters or fewer.")
 }
 
-// Durable copy lives in the Rust/SQLite mapping index; the JSON snapshot above remains the
-// renderer-facing cache. Both writes are best-effort and never block the approval flow — the
-// engine may not be running yet, and the JSON snapshot stays authoritative until reconciliation
-// (see reconcileMappingIndex) confirms the index agrees.
+// The durable copy of a mapping lives in the Rust/SQLite mapping index; the JSON snapshot above
+// stays authoritative and renderer-facing. Index writes are deliberately best-effort and never
+// block pairing or approval: the engine may not be running yet, and a database that will not
+// open must not be able to stop a user from configuring a folder. What they must never do is
+// fail quietly — every failure below is logged *and* raised into the activity feed, so nothing
+// reports a mapping as durably persisted when it isn't.
+
+/** Records an index failure where both the logs and the user-visible diagnostics will show it. */
+function reportMappingIndexFailure(summary: string, error: unknown, folderId?: string): void {
+  const detail = error instanceof Error ? error.message : String(error)
+  console.error(`[mapping-index] ${summary}:`, detail)
+  pushActivity(
+    "Mapping index write failed",
+    `${summary}. The folder is configured on this computer, but it is not saved in the durable mapping index yet: ${detail}`,
+    "warning",
+    folderId,
+  )
+  broadcastSnapshot()
+}
+
+/**
+ * Writes a mapping through to the index. A no-op while the engine is still starting — the
+ * reconciliation pass below writes it as soon as the engine reports ready.
+ */
 async function persistMappingToEngine(record: MappingRecord): Promise<void> {
   if (engine.state.status !== "ready") return
   try {
     await engine.request("mapping.upsert", record)
   } catch (error) {
-    console.error(`[mapping-index] failed to persist mapping ${record.id}:`, error instanceof Error ? error.message : error)
-  }
-}
-
-async function deleteMappingFromEngine(id: string): Promise<void> {
-  if (engine.state.status !== "ready") return
-  try {
-    await engine.request("mapping.delete", { id })
-  } catch (error) {
-    console.error(`[mapping-index] failed to delete mapping ${id}:`, error instanceof Error ? error.message : error)
+    reportMappingIndexFailure(`Could not save "${record.name}" to the mapping index`, error, record.id)
   }
 }
 
 /**
- * Runs once per engine session, right after the Rust engine reports ready. Reconciles the
- * durable SQLite mapping index against the in-memory snapshot in both directions: records the
- * index has but the snapshot doesn't are recovered into `snapshot.folders` (state.json was
- * lost, predates the index, or this is a fresh install pointed at reused engine data); folders
- * the snapshot has but the index doesn't (approved while the engine wasn't running yet) are
- * written through now. Never throws — reconciliation failures are logged and skipped.
+ * Removes a mapping's row from the index. This only ever touches the index record — removing a
+ * folder never deletes, moves or rewrites a single file inside it on either computer.
+ */
+async function deleteMappingFromEngine(id: string, name: string): Promise<void> {
+  if (engine.state.status !== "ready") {
+    // The row outlives the removal until the next reconciliation reports it; see below.
+    console.warn(`[mapping-index] engine not ready, leaving the index row for ${id} to reconcile later`)
+    return
+  }
+  try {
+    await engine.request("mapping.delete", { id })
+  } catch (error) {
+    reportMappingIndexFailure(`Could not remove "${name}" from the mapping index`, error, id)
+  }
+}
+
+/**
+ * Runs once per engine session, right after the Rust engine reports ready.
+ *
+ * This is a one-directional write-through: folders the JSON snapshot has but the index doesn't
+ * (approved while the engine wasn't running yet) are written into the index now. It
+ * deliberately does *not* copy the other way. The index is not yet an authoritative source —
+ * `state.json` is — and a record the snapshot lacks is ambiguous: it can mean the snapshot was
+ * lost, or it can mean the user removed the folder while the engine was down. Recreating the
+ * folder from it would silently resurrect a removed mapping, so those records are only reported
+ * as orphans here and left alone. Making the index authoritative, and reading folders back out
+ * of it, is the next slice's job (see `docs/15-IMPLEMENTATION-STATUS.md`).
+ *
+ * Never throws — reconciliation failures are logged and skipped.
  */
 async function reconcileMappingIndex(): Promise<void> {
   if (engine.state.status !== "ready") return
@@ -553,31 +587,15 @@ async function reconcileMappingIndex(): Promise<void> {
   try {
     records = await engine.request<MappingRecord[]>("mapping.list")
   } catch (error) {
-    console.error("[mapping-index] failed to list mappings for reconciliation:", error instanceof Error ? error.message : error)
+    reportMappingIndexFailure("Could not read the mapping index to reconcile it", error)
     return
   }
 
   const localDeviceId = getLocalIdentityId()
   const recordIds = new Set(records.map((record) => record.id))
-  let recovered = 0
-
-  for (const record of records) {
-    if (snapshot.folders.some((folder) => folder.id === record.id)) continue
-    const folder = folderFromMappingRecord(record, localDeviceId)
-    if (!folder) continue
-    snapshot.folders = [...snapshot.folders, folder]
-    recovered += 1
-  }
-  if (recovered > 0) {
-    pushActivity(
-      "Recovered folder mappings",
-      `${recovered} folder mapping${recovered === 1 ? "" : "s"} recovered from the durable mapping index.`,
-      "info",
-    )
-  }
-
   const localIdentity = pairing?.getLocalSessionIdentity()
   const timestamp = new Date().toISOString()
+
   for (const folder of snapshot.folders) {
     if (recordIds.has(folder.id)) continue
     if (folder.setupStatus !== "ready-for-initial-sync" && folder.setupStatus !== "active") continue
@@ -595,9 +613,18 @@ async function reconcileMappingIndex(): Promise<void> {
     )
   }
 
-  if (recovered > 0) {
-    await persistState()
-    broadcastSnapshot()
+  const orphans = records
+    .filter((record) => !snapshot.folders.some((folder) => folder.id === record.id))
+    // Projecting each record onto this device tells us which local folder it *would* describe,
+    // which is what makes the log line actionable — and skips any record neither side of which
+    // is this machine, which shouldn't exist in a local index but isn't worth reporting.
+    .map((record) => ({ record, folder: folderFromMappingRecord(record, localDeviceId) }))
+    .filter((entry) => entry.folder !== null)
+  if (orphans.length > 0) {
+    console.warn(
+      `[mapping-index] ${orphans.length} index record(s) have no folder in state.json and were left untouched:`,
+      orphans.map((entry) => `${entry.record.id} (${entry.record.name} → ${entry.folder?.localPath})`).join(", "),
+    )
   }
 }
 
@@ -763,7 +790,16 @@ async function approveFolderMapping(input: ApproveFolderMappingInput): Promise<A
   )
   pushActivity("Folder mapping approved", `${proposal.name} is configured locally and waiting for the other computer to acknowledge it.`, "success", folder.id)
   const localIdentity = requirePairingService().getLocalSessionIdentity()
-  void persistMappingToEngine(mappingRecordFromProposal(proposal, localIdentity.name, folder.setupStatus ?? "ready-for-initial-sync"))
+  // This computer is the responder, and the approval hasn't reached the peer yet, so the record
+  // is marked pending until deliverMappingDecision confirms it landed.
+  void persistMappingToEngine(
+    mappingRecordFromProposal(proposal, {
+      responderDeviceName: localIdentity.name,
+      responderPath: destinationPath,
+      setupStatus: folder.setupStatus ?? "ready-for-initial-sync",
+      pendingDelivery: true,
+    }),
+  )
   await persistState()
   broadcastSnapshot()
   await deliverMappingDecision(request.id, true)
@@ -798,6 +834,19 @@ async function deliverMappingDecision(requestId: string, approved: boolean): Pro
       destinationPath: request.selectedDestinationPath,
       reason: approved ? undefined : "The mapping was declined on the other computer.",
     })
+    if (approved) {
+      // The peer has the approval now, so the record is no longer pending delivery. Both
+      // computers end up agreeing: neither holds a pending row for a mapping that is live.
+      const folder = snapshot.folders.find((item) => item.id === request.proposal.id)
+      void persistMappingToEngine(
+        mappingRecordFromProposal(request.proposal, {
+          responderDeviceName: pairing?.getLocalSessionIdentity().name ?? "This computer",
+          responderPath: request.selectedDestinationPath ?? request.proposal.responderPath,
+          setupStatus: folder?.setupStatus ?? "ready-for-initial-sync",
+          pendingDelivery: false,
+        }),
+      )
+    }
     snapshot.mappings.incoming = snapshot.mappings.incoming.filter((item) => item.id !== requestId)
     await persistState()
     broadcastSnapshot()
@@ -984,7 +1033,17 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
         item.id === proposalId ? { ...item, status: "approved", message: `${context.peerName} approved the mapping.` } : item,
       )
       pushActivity("Folder mapping approved", `${outgoing.proposal.name} is now configured on both computers.`, "success", folder.id)
-      void persistMappingToEngine(mappingRecordFromProposal(outgoing.proposal, context.peerName, folder.setupStatus ?? "ready-for-initial-sync"))
+      // This computer is the initiator and has just received the peer's decision, so nothing is
+      // outstanding. `destinationPath` — not the proposal's suggestion — is where the responder
+      // actually approved the mapping into.
+      void persistMappingToEngine(
+        mappingRecordFromProposal(outgoing.proposal, {
+          responderDeviceName: context.peerName,
+          responderPath: destinationPath,
+          setupStatus: folder.setupStatus ?? "ready-for-initial-sync",
+          pendingDelivery: false,
+        }),
+      )
     } else {
       snapshot.mappings.outgoing = snapshot.mappings.outgoing.map((item) =>
         item.id === proposalId
@@ -1066,12 +1125,13 @@ function registerIpc(): void {
   )
 
   ipcMain.handle("folders:remove", async (_event: Electron.IpcMainInvokeEvent, folderId: string) => {
+    const removed = snapshot.folders.find((item) => item.id === folderId)
     const result = await mutate(() => {
-      const folder = snapshot.folders.find((item) => item.id === folderId)
       snapshot.folders = snapshot.folders.filter((item) => item.id !== folderId)
-      if (folder) pushActivity("Folder removed", `${folder.name} is no longer managed. Existing files were left untouched.`, "warning")
+      if (removed) pushActivity("Folder removed", `${removed.name} is no longer managed. Existing files were left untouched.`, "warning")
     })
-    void deleteMappingFromEngine(folderId)
+    // Drops the index row only. No file inside the folder is read, moved or deleted.
+    void deleteMappingFromEngine(folderId, removed?.name ?? folderId)
     return result
   })
 

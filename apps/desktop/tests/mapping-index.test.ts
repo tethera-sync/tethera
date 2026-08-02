@@ -72,8 +72,15 @@ describe("invertMode", () => {
 })
 
 describe("mappingRecordFromProposal", () => {
+  const options = {
+    responderDeviceName: "Windows 11",
+    responderPath: "C:\\Users\\tommy\\Projects",
+    setupStatus: "ready-for-initial-sync",
+    pendingDelivery: false,
+  } as const
+
   test("carries proposal fields into the durable record", () => {
-    const record = mappingRecordFromProposal(proposal(), "Windows 11", "ready-for-initial-sync")
+    const record = mappingRecordFromProposal(proposal(), options)
     expect(record.id).toBe("mapping-1")
     expect(record.initiatorDeviceId).toBe("linux-box")
     expect(record.initiatorDeviceName).toBe("Linux Mint")
@@ -82,6 +89,48 @@ describe("mappingRecordFromProposal", () => {
     expect(record.setupStatus).toBe("ready-for-initial-sync")
     expect(record.pendingDelivery).toBe(false)
     expect(record.preview).toEqual(preview())
+  })
+
+  test("records the destination the responder actually chose, not the proposal's suggestion", () => {
+    // The responder is free to approve into somewhere other than the suggested folder, and the
+    // durable record has to point at the real one.
+    const record = mappingRecordFromProposal(proposal(), {
+      ...options,
+      responderPath: "D:\\Work\\Projects",
+    })
+    expect(record.responderPath).toBe("D:\\Work\\Projects")
+    expect(record.initiatorPath).toBe("/home/tommy/Projects")
+  })
+
+  test("marks the responder's own approval as pending until the peer acknowledges it", () => {
+    // The responder approves first and only learns the peer got it later, so it starts pending.
+    const responderSide = mappingRecordFromProposal(proposal(), { ...options, pendingDelivery: true })
+    expect(responderSide.pendingDelivery).toBe(true)
+
+    // The initiator only ever sees an approval that has already arrived, so it is never pending.
+    const initiatorSide = mappingRecordFromProposal(proposal(), { ...options, pendingDelivery: false })
+    expect(initiatorSide.pendingDelivery).toBe(false)
+
+    // Both computers describe the same mapping under the same id, so re-persisting the
+    // responder's record with delivery confirmed converges on the initiator's view.
+    expect(responderSide.id).toBe(initiatorSide.id)
+    expect({ ...responderSide, pendingDelivery: false, updatedAt: "" }).toEqual({
+      ...initiatorSide,
+      updatedAt: "",
+    })
+  })
+
+  test("keeps createdAt from the proposal and stamps updatedAt at write time", () => {
+    const record = mappingRecordFromProposal(proposal(), { ...options, now: "2026-08-02T09:30:00.000Z" })
+    expect(record.createdAt).toBe("2026-08-01T00:00:00.000Z")
+    expect(record.updatedAt).toBe("2026-08-02T09:30:00.000Z")
+  })
+
+  test("leaves both platforms' path separators alone", () => {
+    const record = mappingRecordFromProposal(proposal(), options)
+    expect(record.initiatorPath).toBe("/home/tommy/Projects")
+    expect(record.responderPath).toBe("C:\\Users\\tommy\\Projects")
+    expect(record.responderPath).not.toContain("/")
   })
 })
 
@@ -126,6 +175,21 @@ describe("folderFromMappingRecord", () => {
 
   test("returns null when the local device isn't a party to the mapping", () => {
     expect(folderFromMappingRecord(record, "some-other-device")).toBeNull()
+  })
+
+  test("carries a Windows path through unchanged on the responder's side", () => {
+    // The responder is the Windows machine here: its own folder must come back as a Windows
+    // path, and the Linux peer's path must survive as the remote one.
+    const result = folderFromMappingRecord(record, "win-box")
+    expect(result?.localPath).toBe("C:\\Users\\tommy\\Projects")
+    expect(result?.localPath).not.toContain("/")
+    expect(result?.remotePath).toBe("/home/tommy/Projects")
+  })
+
+  test("round-trips a UNC path without rewriting separators", () => {
+    const unc: MappingRecord = { ...record, initiatorPath: "\\\\server\\share\\Projects", initiatorDeviceId: "win-box", responderDeviceId: "linux-box", responderPath: "/mnt/data/Projects" }
+    expect(folderFromMappingRecord(unc, "win-box")?.localPath).toBe("\\\\server\\share\\Projects")
+    expect(folderFromMappingRecord(unc, "linux-box")?.localPath).toBe("/mnt/data/Projects")
   })
 })
 

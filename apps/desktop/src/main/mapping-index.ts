@@ -1,5 +1,14 @@
 import type { FolderMappingPreview, FolderMappingProposal, FolderSetupStatus, FolderSummary, SyncMode } from "../shared/contracts"
 
+/**
+ * Shape of the durable mapping index the Rust engine owns, plus the projections between it and
+ * the renderer-facing `FolderSummary`.
+ *
+ * Paths are carried through verbatim in both directions. A Windows `C:\Users\…\Projects` and a
+ * Linux `/home/…/Projects` are both just opaque strings here: nothing normalises separators,
+ * because each side's path only has to stay valid on the machine that produced it.
+ */
+
 /** Mirrors the `MappingRecord` the Rust engine persists to and returns from its `SQLite` mapping index. */
 export interface MappingRecord {
   id: string
@@ -27,11 +36,30 @@ export function invertMode(mode: SyncMode): SyncMode {
   return "two-way"
 }
 
+export interface MappingRecordFromProposalOptions {
+  /** Display name of the device that approved the mapping. */
+  responderDeviceName: string
+  /**
+   * The destination the responder actually chose. The responder may approve into a different
+   * folder than the one the proposal suggested, and the record has to carry the real one — the
+   * proposal's own `responderPath` can be stale by the time either side persists.
+   */
+  responderPath: string
+  setupStatus: FolderSetupStatus
+  /**
+   * `true` while this device has approved the mapping but the peer has not yet acknowledged
+   * it. Only the *responder* is ever in that state: the initiator only learns of an approval
+   * once the peer's decision has already arrived, so it records `false`.
+   */
+  pendingDelivery: boolean
+  /** Overridable for tests; defaults to now. */
+  now?: string
+}
+
 /** Builds the durable record for a freshly approved mapping, from the negotiated proposal. */
 export function mappingRecordFromProposal(
   proposal: FolderMappingProposal,
-  responderDeviceName: string,
-  setupStatus: FolderSetupStatus,
+  options: MappingRecordFromProposalOptions,
 ): MappingRecord {
   return {
     id: proposal.id,
@@ -39,18 +67,18 @@ export function mappingRecordFromProposal(
     initiatorDeviceId: proposal.initiatorDeviceId,
     initiatorDeviceName: proposal.initiatorDeviceName,
     responderDeviceId: proposal.responderDeviceId,
-    responderDeviceName,
+    responderDeviceName: options.responderDeviceName,
     initiatorPath: proposal.initiatorPath,
-    responderPath: proposal.responderPath,
+    responderPath: options.responderPath,
     mode: proposal.mode,
     ignorePatterns: proposal.ignorePatterns,
     historyDays: proposal.historyDays,
     historyMaxBytes: proposal.historyMaxBytes,
-    setupStatus,
-    pendingDelivery: false,
+    setupStatus: options.setupStatus,
+    pendingDelivery: options.pendingDelivery,
     preview: proposal.preview,
     createdAt: proposal.createdAt,
-    updatedAt: new Date().toISOString(),
+    updatedAt: options.now ?? new Date().toISOString(),
   }
 }
 
