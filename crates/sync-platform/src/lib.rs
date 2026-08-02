@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 
+pub mod scan;
+
 /// Joins `relative` onto `root`, rejecting paths that would escape it.
 ///
 /// # Errors

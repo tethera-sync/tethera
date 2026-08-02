@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sync-core = { path = "../sync-core" }
 sync-protocol = { path = "../sync-protocol" }
@@ -13,6 +14,9 @@ sync-crypto = { path = "../sync-crypto" }
 sync-storage = { path = "../sync-storage" }
 sync-platform = { path = "../sync-platform" }
 sync-transport = { path = "../sync-transport" }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
