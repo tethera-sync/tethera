@@ -1,29 +1,51 @@
 # Testing and quality strategy
 
-## Pure and property tests
+## Authoritative mapping store
 
-Test revision ancestry/concurrency, deterministic winner, direction, ignores, retention, merge plans and preconditions. Properties: idempotent replay, partial transfer never changes live path, replacement preserves old content, paths never escape root, both peers pick same winner, and eventual delivery converges.
+The mapping-configuration safety boundary is covered at three levels.
 
-## Integration/E2E
+Rust storage tests exercise:
 
-SQLite migration/recovery, watcher reconciliation, temp-verify-archive-replace, local RPC auth and protocol negotiation. Matrix covers Linux/Linux, Windows/Windows, Linux/Windows, LAN, remote/Tailscale simulation, disconnect at every phase, low space, permissions, sharing interference and name/case collisions.
+- schema v1 to v2 migration, transactional rollback, idempotency and newer-schema refusal;
+- legacy import as one transaction, including zero mappings, duplicates, malformed records, retry and late SQL failure;
+- durable tombstones across reopen, terminal deletion semantics, stale/out-of-order event rejection and same-ID resurrection prevention;
+- exact pending-delivery acknowledgements, duplicate delivery and two authenticated peers converging through active and deletion events;
+- locked/unavailable databases, corrupt stored rows, invalid revisions and invalid participants;
+- opaque round trips for Windows drive paths, UNC paths and Linux paths; and
+- a sentinel proving mapping storage never reads or changes files beneath a configured path.
 
-## Fault injection
+Rust engine/RPC tests exercise authentication before dispatch, unknown-field rejection, structured error codes, migration states, database-unavailable and unsupported-schema health, participant validation, exact acknowledgement matching, active-only reads and the branded data-directory environment fallback.
 
-Crash after planning, during receive, after verify/archive/live rename, around DB commit and before ack. Restart must produce one safe tracked state.
+Desktop tests exercise the one-time `state.json` import and cleanup independently from the database implementation. They cover no file, zero mappings, valid data, malformed and duplicate data, unreadable state, import retry after failure, crash after database commit but before cleanup, verified backups, preservation of unrelated settings, SQLite-only startup reads, tombstone filtering, health warnings and mutation gating.
 
-## Fuzzing
+## Migration and restart integration
 
-Peer frames, paths, ignore parser, chunk maps, migrations where practical and pairing URI.
+The integration gate creates a temporary legacy state, launches the real Rust engine, imports the mappings, restarts the engine, and confirms the import is not duplicated. It then removes a mapping, restarts again, presents an older active event, and verifies the tombstone prevents resurrection. A sentinel beneath a path-shaped fixture must remain byte-for-byte unchanged throughout.
 
-## Model simulation
+No migration or configuration test may scan a mapped directory. Paths in these tests are opaque configuration values.
 
-Random create/edit/delete/rename, concurrent edits, policy changes, partitions, duplicate/reordered messages and restarts. After stability, verify convergence and that displaced content is live or accounted for in history/archive.
+## Required pull-request checks
 
-## UI/performance
+Run from the repository root:
 
-React/Playwright Electron flows, keyboard/accessibility, virtualised large lists and renderer restart. Bench 10k/100k/1m scan, memory per entry, event bursts, hashing/chunking, delta break-even, SQLite queries, renderer memory and direct/relay throughput.
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+bun run desktop:typecheck
+bun run desktop:test
+bun run desktop:build
+bun run check
+```
+
+CI runs the equivalent desktop typecheck/test and Rust format/clippy/test gates on Linux. Cross-platform path preservation is unit-tested without resolving the paths on the host platform.
+
+## Future sync-engine tests
+
+The mapping suite intentionally does not stand in for future file-synchronisation testing. A durable per-file index, scan generations, operation journal, transfer staging, crash recovery and reconciliation will need their own migration, model, fault-injection and cross-platform suites before those features can write user data.
+
+Future file-operation properties remain: partial transfer never changes a live path, replacement preserves displaced content, paths never escape a root, both peers choose the same deterministic result, and eventual authenticated delivery converges.
 
 ## Release gates
 
-No known data-loss bug, crash-phase tests pass, cross-platform E2E passes, signed clean-VM artefacts verify, migrations recover, security checklist complete.
+No known data-loss bug, migration/restart tests pass, unsupported databases fail closed, cross-platform E2E passes, signed clean-VM artefacts verify, and the security checklist is complete. Configuration delivery must remain idempotent and exact-acknowledged; no unavailable database may be represented as an empty mapping set.

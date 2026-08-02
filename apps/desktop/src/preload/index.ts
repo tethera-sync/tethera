@@ -15,6 +15,7 @@ import type {
 
 const api: TetheraApi = {
   getSnapshot: () => ipcRenderer.invoke("app:get-snapshot"),
+  retryMappingStore: () => ipcRenderer.invoke("mapping-store:retry"),
   pauseAll: () => ipcRenderer.invoke("app:pause-all"),
   resumeAll: () => ipcRenderer.invoke("app:resume-all"),
   browseDirectory: (input: BrowseDirectoryInput) => ipcRenderer.invoke("filesystem:browse-directory", input),

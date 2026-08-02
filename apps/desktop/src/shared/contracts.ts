@@ -13,6 +13,13 @@ export type ConnectionRoute =
   | "offline"
 
 export type EngineStatus = "starting" | "ready" | "unavailable" | "error"
+export type MappingStoreStatus =
+  | "loading"
+  | "ready"
+  | "unavailable"
+  | "unsupported-schema"
+  | "migration-required"
+  | "migration-failed"
 export type DeviceStatus = "this-device" | "online" | "offline" | "unpaired"
 export type SyncMode = "two-way" | "send-only" | "receive-only"
 export type ActivityLevel = "info" | "success" | "warning" | "error"
@@ -211,11 +218,23 @@ export interface MappingState {
   outgoing: OutgoingMappingRequest[]
 }
 
+export interface MappingStoreState {
+  status: MappingStoreStatus
+  detail?: string
+  schemaVersion?: number
+  migrationState?: "pending" | "completed" | "failed"
+  journalMode?: string
+  mutationsEnabled: boolean
+  pendingDeliveryCount: number
+  cleanupWarning?: string
+}
+
 export interface AppSnapshot {
   status: OverallStatus
   route: ConnectionRoute
   engineStatus: EngineStatus
   engineMessage?: string
+  mappingStore: MappingStoreState
   peerName?: string
   paused: boolean
   folders: FolderSummary[]
@@ -295,6 +314,7 @@ export type AppSettingKey = keyof AppSettings
 
 export interface TetheraApi {
   getSnapshot(): Promise<AppSnapshot>
+  retryMappingStore(): Promise<AppSnapshot>
   pauseAll(): Promise<AppSnapshot>
   resumeAll(): Promise<AppSnapshot>
   browseDirectory(input: BrowseDirectoryInput): Promise<DirectoryListing>

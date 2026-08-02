@@ -5,15 +5,25 @@ import readline from "node:readline"
 
 export type EngineState =
   | { status: "starting"; message: string }
-  | { status: "ready"; message: string }
+  | { status: "ready"; message: string; mappingStore: MappingStoreHealth }
   | { status: "unavailable"; message: string }
   | { status: "error"; message: string }
+
+export interface MappingStoreHealth {
+  status: "ready" | "not-configured" | "unavailable" | "unsupported-schema" | "migration-failed"
+  detail?: string
+  schemaVersion?: number
+  journalMode?: string
+  migrationState?: "pending" | "completed" | "failed"
+  mutationsEnabled: boolean
+}
 
 type RpcResponse = {
   id: string
   ok: boolean
   result?: unknown
   error?: string
+  errorCode?: string
 }
 
 type PendingRequest = {
@@ -29,9 +39,23 @@ export interface EngineLaunchOptions {
   env?: Record<string, string>
 }
 
+export class EngineRpcError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+  ) {
+    super(message)
+    this.name = "EngineRpcError"
+  }
+}
+
 export class EngineSupervisor extends EventEmitter {
   #child: ChildProcessWithoutNullStreams | null = null
   #sessionToken: string | null = null
+  #launchOptions: EngineLaunchOptions | null = null
+  #generation = 0
+  #restartPromise: Promise<void> | null = null
+  #intentionalStops = new WeakSet<ChildProcessWithoutNullStreams>()
   #pending = new Map<string, PendingRequest>()
   #state: EngineState = {
     status: "unavailable",
@@ -42,14 +66,26 @@ export class EngineSupervisor extends EventEmitter {
     return this.#state
   }
 
+  get generation(): number {
+    return this.#generation
+  }
+
   start(options: EngineLaunchOptions): void {
     if (this.#child) return
+
+    this.#generation += 1
+
+    this.#launchOptions = {
+      ...options,
+      args: options.args ? [...options.args] : undefined,
+      env: options.env ? { ...options.env } : undefined,
+    }
 
     this.#setState({ status: "starting", message: "Starting the Rust sync engine…" })
     this.#sessionToken = randomBytes(32).toString("base64url")
 
     try {
-      this.#child = spawn(options.command, [...(options.args ?? []), "--rpc-stdio"], {
+      const child = spawn(options.command, [...(options.args ?? []), "--rpc-stdio"], {
         cwd: options.cwd,
         env: {
           ...process.env,
@@ -59,6 +95,7 @@ export class EngineSupervisor extends EventEmitter {
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       })
+      this.#child = child
     } catch (error) {
       this.#child = null
       this.#sessionToken = null
@@ -69,36 +106,43 @@ export class EngineSupervisor extends EventEmitter {
       return
     }
 
-    const lines = readline.createInterface({ input: this.#child.stdout })
+    const child = this.#child
+    const lines = readline.createInterface({ input: child.stdout })
     lines.on("line", (line: string) => this.#handleLine(line))
 
-    this.#child.stderr.on("data", (chunk: Buffer) => {
+    child.stderr.on("data", (chunk: Buffer) => {
       const message = chunk.toString("utf8").trim()
       if (message) console.error(`[sync-engine] ${message}`)
     })
 
-    this.#child.once("error", (error: Error) => {
+    child.once("error", (error: Error) => {
+      if (this.#child !== child) return
       this.#setState({ status: "unavailable", message: error.message })
     })
 
-    this.#child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+    child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+      if (this.#child !== child) return
       const message = `Rust engine stopped${code === null ? "" : ` with code ${code}`}${
         signal ? ` (${signal})` : ""
       }.`
       this.#rejectPending(new Error(message))
       this.#child = null
       this.#sessionToken = null
-      this.#setState({ status: "unavailable", message })
+      if (!this.#intentionalStops.has(child)) this.#setState({ status: "unavailable", message })
     })
 
-    void this.request<{ name: string; version: string; protocol: string }>("health")
+    void this.request<{ name: string; version: string; protocol: string; mappingStore?: unknown }>("health")
       .then((health) => {
+        if (this.#child !== child) return
+        const mappingStore = parseMappingStoreHealth(health.mappingStore)
         this.#setState({
           status: "ready",
           message: `${health.name} ${health.version} · protocol ${health.protocol}`,
+          mappingStore,
         })
       })
       .catch((error: Error) => {
+        if (this.#child !== child) return
         this.#setState({ status: "error", message: error.message })
       })
   }
@@ -108,7 +152,7 @@ export class EngineSupervisor extends EventEmitter {
     this.#setState({ status: "unavailable", message })
   }
 
-  async request<T>(method: string, params?: unknown): Promise<T> {
+  async request<T>(method: string, params?: unknown, timeoutMs = 10_000): Promise<T> {
     if (!this.#child || !this.#sessionToken) {
       throw new Error("Rust sync engine is not running.")
     }
@@ -120,7 +164,7 @@ export class EngineSupervisor extends EventEmitter {
       const timeout = setTimeout(() => {
         this.#pending.delete(id)
         reject(new Error(`Rust engine request timed out: ${method}`))
-      }, 5_000)
+      }, timeoutMs)
 
       this.#pending.set(id, {
         resolve: (value) => resolve(value as T),
@@ -133,17 +177,52 @@ export class EngineSupervisor extends EventEmitter {
   }
 
   async stop(): Promise<void> {
-    if (!this.#child) return
+    const child = this.#child
+    if (!child) return
+    this.#intentionalStops.add(child)
 
     try {
       await this.request("shutdown")
     } catch {
-      this.#child.kill()
+      child.kill()
     }
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => {
+          child.kill()
+          resolve()
+        }, 2_000)
+        child.once("exit", () => {
+          clearTimeout(timeout)
+          resolve()
+        })
+      })
+    }
+    if (this.#child === child) {
+      this.#rejectPending(new Error("Rust engine stopped."))
+      this.#child = null
+      this.#sessionToken = null
+    }
+  }
 
-    this.#rejectPending(new Error("Rust engine stopped."))
-    this.#child = null
-    this.#sessionToken = null
+  restart(): Promise<void> {
+    if (this.#restartPromise) return this.#restartPromise
+    const options = this.#launchOptions
+    if (!options) return Promise.reject(new Error("The Rust engine has no launch configuration to retry."))
+    const restart = (async () => {
+      await this.stop()
+      this.start(options)
+    })()
+    this.#restartPromise = restart
+    void restart.then(
+      () => {
+        if (this.#restartPromise === restart) this.#restartPromise = null
+      },
+      () => {
+        if (this.#restartPromise === restart) this.#restartPromise = null
+      },
+    )
+    return restart
   }
 
   #handleLine(line: string): void {
@@ -162,7 +241,7 @@ export class EngineSupervisor extends EventEmitter {
     this.#pending.delete(response.id)
 
     if (response.ok) pending.resolve(response.result)
-    else pending.reject(new Error(response.error ?? "Unknown Rust engine error."))
+    else pending.reject(new EngineRpcError(response.error ?? "Unknown Rust engine error.", response.errorCode ?? "RPC_ERROR"))
   }
 
   #rejectPending(error: Error): void {
@@ -177,4 +256,38 @@ export class EngineSupervisor extends EventEmitter {
     this.#state = state
     this.emit("state", state)
   }
+}
+
+export function parseMappingStoreHealth(value: unknown): MappingStoreHealth {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("The Rust engine is incompatible: health did not include mapping-store status.")
+  }
+  const health = value as Record<string, unknown>
+  const statuses = ["ready", "not-configured", "unavailable", "unsupported-schema", "migration-failed"]
+  const migrationStates = ["pending", "completed", "failed"]
+  if (!statuses.includes(String(health.status)) || typeof health.mutationsEnabled !== "boolean") {
+    throw new Error("The Rust engine returned malformed mapping-store health.")
+  }
+  if (health.detail !== undefined && typeof health.detail !== "string") {
+    throw new Error("The Rust engine returned malformed mapping-store health detail.")
+  }
+  if (
+    health.schemaVersion !== undefined &&
+    (!Number.isSafeInteger(health.schemaVersion) || (health.schemaVersion as number) < 0)
+  ) {
+    throw new Error("The Rust engine returned an invalid mapping schema version.")
+  }
+  if (health.journalMode !== undefined && typeof health.journalMode !== "string") {
+    throw new Error("The Rust engine returned an invalid mapping journal mode.")
+  }
+  if (health.migrationState !== undefined && !migrationStates.includes(String(health.migrationState))) {
+    throw new Error("The Rust engine returned an invalid legacy migration state.")
+  }
+  if (
+    health.status === "ready" &&
+    (health.schemaVersion === undefined || health.migrationState === undefined || health.journalMode === undefined)
+  ) {
+    throw new Error("The Rust engine is incompatible: ready health omitted authoritative mapping metadata.")
+  }
+  return health as unknown as MappingStoreHealth
 }

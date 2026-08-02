@@ -40,6 +40,7 @@ import type {
   ConnectionRoute,
   DeviceSummary,
   FolderSummary,
+  MappingStoreState,
   OverallStatus,
   UpdateState,
 } from "@shared/contracts"
@@ -47,6 +48,7 @@ import tetheraLogo from "@/assets/tethera-logo-flat.png"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { FolderMappingApprovalDialog } from "@/components/folder-mapping-approval-dialog"
+import { MappingStoreBanner } from "@/components/mapping-store-banner"
 import { PairDeviceDialog } from "@/components/pair-device-dialog"
 import { RevokeDeviceDialog } from "@/components/revoke-device-dialog"
 import { Badge } from "@/components/ui/badge"
@@ -63,6 +65,11 @@ const emptySnapshot: AppSnapshot = {
   route: "offline",
   engineStatus: "starting",
   engineMessage: "Connecting…",
+  mappingStore: {
+    status: "loading",
+    mutationsEnabled: false,
+    pendingDeliveryCount: 0,
+  },
   paused: false,
   folders: [],
   devices: [],
@@ -113,6 +120,7 @@ export function App() {
   const [view, setView] = useState<View>("overview")
   const [loading, setLoading] = useState(true)
   const [rail, setRail] = useState(false)
+  const [mappingApprovalOpen, setMappingApprovalOpen] = useState(false)
 
   useEffect(() => {
     void window.folderSync
@@ -141,10 +149,24 @@ export function App() {
   const pendingMapping = snapshot.mappings.incoming.find((request) => request.status === "pending")
   const attentionCount = snapshot.folders.filter((folder) => folder.status === "needs-attention").length
   const pendingApprovals = snapshot.pairing.incomingRequests.length + snapshot.mappings.incoming.filter((request) => request.status === "pending").length
+  const { enabled: mappingMutationsEnabled, reason: mappingMutationReason } = mappingMutationAvailability(
+    snapshot.mappingStore,
+  )
+
+  useEffect(() => {
+    setMappingApprovalOpen(Boolean(pendingMapping))
+  }, [pendingMapping?.id])
 
   return (
     <div className="app-shell" data-rail={rail}>
-      <FolderMappingApprovalDialog request={pendingMapping} localDevice={localDevice} />
+      <FolderMappingApprovalDialog
+        request={pendingMapping}
+        localDevice={localDevice}
+        mutationsEnabled={mappingMutationsEnabled}
+        disabledReason={mappingMutationReason}
+        open={mappingApprovalOpen}
+        onOpenChange={setMappingApprovalOpen}
+      />
 
       <aside className="sidebar">
         <div className="brand">
@@ -224,7 +246,12 @@ export function App() {
           </div>
           <div className="topbar-actions">
             <ConnectionPill route={snapshot.route} paused={snapshot.paused} />
-            <Button variant="outline" onClick={togglePause} disabled={snapshot.folders.length === 0}>
+            <Button
+              variant="outline"
+              onClick={togglePause}
+              disabled={snapshot.folders.length === 0 || !mappingMutationsEnabled}
+              title={!mappingMutationsEnabled ? mappingMutationReason : undefined}
+            >
               {snapshot.paused ? <PlayIcon data-icon="inline-start" /> : <PauseIcon data-icon="inline-start" />}
               {snapshot.paused ? "Resume all" : "Pause all"}
             </Button>
@@ -233,8 +260,12 @@ export function App() {
                 localDevice={localDevice}
                 pairedDevice={pairedDevice}
                 onAdded={() => setView("folders")}
-                disabled={pairedDevice.status !== "online"}
-                disabledReason={`${pairedDevice.name} must be online to browse and approve a mapping.`}
+                disabled={pairedDevice.status !== "online" || !mappingMutationsEnabled}
+                disabledReason={
+                  !mappingMutationsEnabled
+                    ? mappingMutationReason
+                    : `${pairedDevice.name} must be online to browse and approve a mapping.`
+                }
               />
             ) : (
               <Button onClick={() => setView("devices")}>
@@ -255,16 +286,21 @@ export function App() {
           </div>
         </header>
 
-        <UpdateBanner update={snapshot.update} />
+        <div className="main-body">
+          <UpdateBanner update={snapshot.update} />
+          <MappingStoreBanner state={snapshot.mappingStore} />
 
-        <div className="content-scroll">
-          {loading ? <LoadingScreen /> : null}
-          {!loading && view === "overview" ? <Overview snapshot={snapshot} onNavigate={setView} /> : null}
-          {!loading && view === "folders" ? <FoldersView snapshot={snapshot} onNavigate={setView} /> : null}
-          {!loading && view === "activity" ? <ActivityView activity={snapshot.activity} /> : null}
-          {!loading && view === "devices" ? <DevicesView snapshot={snapshot} /> : null}
-          {!loading && view === "history" ? <HistoryView /> : null}
-          {!loading && view === "settings" ? <SettingsView settings={snapshot.settings} /> : null}
+          <div className="content-scroll">
+            {loading ? <LoadingScreen /> : null}
+            {!loading && view === "overview" ? <Overview snapshot={snapshot} onNavigate={setView} /> : null}
+            {!loading && view === "folders" ? <FoldersView snapshot={snapshot} onNavigate={setView} /> : null}
+            {!loading && view === "activity" ? <ActivityView activity={snapshot.activity} /> : null}
+            {!loading && view === "devices" ? (
+              <DevicesView snapshot={snapshot} onReviewMapping={() => setMappingApprovalOpen(true)} />
+            ) : null}
+            {!loading && view === "history" ? <HistoryView /> : null}
+            {!loading && view === "settings" ? <SettingsView snapshot={snapshot} /> : null}
+          </div>
         </div>
       </main>
     </div>
@@ -692,6 +728,9 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
   const [filter, setFilter] = useState<FolderFilter>("all")
   const localDevice = getLocalDevice(snapshot)
   const pairedDevice = getPairedDevices(snapshot)[0]
+  const { enabled: mappingMutationsEnabled, reason: mappingMutationReason } = mappingMutationAvailability(
+    snapshot.mappingStore,
+  )
 
   const folders = useMemo(() => {
     if (filter === "active") return snapshot.folders.filter((folder) => !folder.paused && folder.status !== "paused")
@@ -777,7 +816,15 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
         </section>
       ) : null}
 
-      {snapshot.folders.length === 0 && pairedDevice ? (
+      {snapshot.mappingStore.status === "loading" ? (
+        <section className="card">
+          <CompactEmptyState
+            icon={RefreshCwIcon}
+            title="Loading folder mappings"
+            description="Tethera is reading the authoritative mapping database. No legacy snapshot is being shown while it loads."
+          />
+        </section>
+      ) : snapshot.mappingStore.status !== "ready" ? null : snapshot.folders.length === 0 && pairedDevice ? (
         <section className="large-empty-state">
           <div className="large-empty-icon">
             <FolderIcon />
@@ -791,8 +838,12 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
             localDevice={localDevice}
             pairedDevice={pairedDevice}
             onAdded={() => undefined}
-            disabled={pairedDevice.status !== "online"}
-            disabledReason={`${pairedDevice.name} must be online to browse and approve a mapping.`}
+            disabled={pairedDevice.status !== "online" || !mappingMutationsEnabled}
+            disabledReason={
+              !mappingMutationsEnabled
+                ? mappingMutationReason
+                : `${pairedDevice.name} must be online to browse and approve a mapping.`
+            }
           />
         </section>
       ) : snapshot.folders.length > 0 ? (
@@ -817,7 +868,12 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
           ) : (
             <section className="folder-grid">
               {folders.map((folder) => (
-                <FolderCard key={folder.id} folder={folder} />
+                <FolderCard
+                  key={folder.id}
+                  folder={folder}
+                  mutationsEnabled={mappingMutationsEnabled}
+                  disabledReason={mappingMutationReason}
+                />
               ))}
             </section>
           )}
@@ -827,7 +883,15 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
   )
 }
 
-function FolderCard({ folder }: { folder: FolderSummary }) {
+function FolderCard({
+  folder,
+  mutationsEnabled,
+  disabledReason,
+}: {
+  folder: FolderSummary
+  mutationsEnabled: boolean
+  disabledReason: string
+}) {
   const [busy, setBusy] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const paused = folder.paused || folder.status === "paused"
@@ -925,12 +989,23 @@ function FolderCard({ folder }: { folder: FolderSummary }) {
 
       <div className="folder-card-footer">
         {folder.setupStatus === "ready-for-initial-sync" ? (
-          <Button size="sm" onClick={startSync} disabled={syncing || paused || folder.status === "syncing"}>
+          <Button
+            size="sm"
+            onClick={startSync}
+            disabled={!mutationsEnabled || syncing || paused || folder.status === "syncing"}
+            title={!mutationsEnabled ? disabledReason : undefined}
+          >
             <RefreshCwIcon data-icon="inline-start" />
             {folder.status === "syncing" ? "Syncing…" : "Start sync"}
           </Button>
         ) : null}
-        <Button size="sm" variant="outline" onClick={setPaused} disabled={busy}>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={setPaused}
+          disabled={!mutationsEnabled || busy}
+          title={!mutationsEnabled ? disabledReason : undefined}
+        >
           {paused ? <PlayIcon data-icon="inline-start" /> : <PauseIcon data-icon="inline-start" />}
           {paused ? "Resume" : "Pause"}
         </Button>
@@ -938,7 +1013,15 @@ function FolderCard({ folder }: { folder: FolderSummary }) {
           <SlidersHorizontalIcon data-icon="inline-start" />
           Settings
         </Button>
-        <Button className="ml-auto" size="icon-sm" variant="ghost" aria-label={`Remove ${folder.name}`} onClick={remove}>
+        <Button
+          className="ml-auto"
+          size="icon-sm"
+          variant="ghost"
+          aria-label={`Remove ${folder.name}`}
+          onClick={remove}
+          disabled={!mutationsEnabled}
+          title={!mutationsEnabled ? disabledReason : undefined}
+        >
           <Trash2Icon />
         </Button>
       </div>
@@ -1001,7 +1084,13 @@ function ActivityRow({ event, showDate = false }: { event: ActivityEvent; showDa
 /* Devices                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function DevicesView({ snapshot }: { snapshot: AppSnapshot }) {
+function DevicesView({
+  snapshot,
+  onReviewMapping,
+}: {
+  snapshot: AppSnapshot
+  onReviewMapping(): void
+}) {
   const [pickerOpen, setPickerOpen] = useState(false)
   const localDevice = getLocalDevice(snapshot)
   const pairedDevices = getPairedDevices(snapshot)
@@ -1046,7 +1135,7 @@ function DevicesView({ snapshot }: { snapshot: AppSnapshot }) {
               <small>Review the requested local destination before the mapping is created.</small>
             </span>
           </div>
-          <Badge variant="warning">Action required</Badge>
+          <Button variant="outline" onClick={onReviewMapping}>Review request</Button>
         </section>
       ) : null}
 
@@ -1165,13 +1254,53 @@ function HistoryView() {
   )
 }
 
-function SettingsView({ settings }: { settings: AppSettings }) {
+function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
+  const { settings, mappingStore } = snapshot
   async function update<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
     await window.folderSync.updateSetting(key, value)
   }
 
   return (
     <div className="page-stack max-w-4xl">
+      <SettingsSection
+        title="Mapping database"
+        description="SQLite is the authoritative owner of folder configuration and removal history."
+      >
+        <SettingRow
+          title={mappingStore.status === "ready" ? "Ready" : pretty(mappingStore.status)}
+          description={
+            mappingStore.status === "ready"
+              ? `Schema ${mappingStore.schemaVersion ?? "unknown"} · legacy migration ${mappingStore.migrationState ?? "unknown"} · ${mappingStore.pendingDeliveryCount} pending configuration deliveries.`
+              : mappingStore.detail ?? "Mapping changes stay disabled until the database is available."
+          }
+        >
+          {mappingStore.status === "ready" ? (
+            <StatusPill tone="success"><CheckCircle2Icon className="size-3" /> Ready</StatusPill>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={mappingStore.status === "loading"}
+              onClick={() => void window.folderSync.retryMappingStore()}
+            >
+              <RefreshCwIcon className={mappingStore.status === "loading" ? "animate-spin" : undefined} data-icon="inline-start" />
+              {mappingStore.status === "loading" ? "Restarting…" : "Retry"}
+            </Button>
+          )}
+        </SettingRow>
+        <div className="mapping-diagnostics">
+          <details>
+            <summary>Advanced database details</summary>
+            <dl>
+              <div><dt>Schema version</dt><dd>{mappingStore.schemaVersion ?? "Unavailable"}</dd></div>
+              <div><dt>Migration</dt><dd>{mappingStore.migrationState ?? "Unavailable"}</dd></div>
+              <div><dt>Journal mode</dt><dd>{mappingStore.journalMode ?? "Unavailable"}</dd></div>
+              <div><dt>Mutations</dt><dd>{mappingStore.mutationsEnabled ? "Enabled" : "Disabled"}</dd></div>
+            </dl>
+          </details>
+        </div>
+      </SettingsSection>
+
       <SettingsSection
         title="Application"
         description="Choose how Tethera behaves when the desktop window is closed or the computer starts."
@@ -1420,6 +1549,13 @@ function overallDescription(snapshot: AppSnapshot): string {
 
 function pretty(value: string): string {
   return value.replaceAll("-", " ").replace(/^./, (character) => character.toUpperCase())
+}
+
+function mappingMutationAvailability(state: MappingStoreState): { enabled: boolean; reason: string } {
+  return {
+    enabled: state.status === "ready" && state.mutationsEnabled,
+    reason: state.detail ?? "The mapping database must be ready before configuration can change.",
+  }
 }
 
 function prettyMode(value: FolderSummary["mode"]): string {

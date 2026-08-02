@@ -1,16 +1,19 @@
-import type { FolderMappingPreview, FolderMappingProposal, FolderSetupStatus, FolderSummary, SyncMode } from "../shared/contracts"
+import type {
+  FolderMappingPreview,
+  FolderMappingProposal,
+  FolderSetupStatus,
+  FolderSummary,
+  SyncMode,
+} from "../shared/contracts"
 
 /**
- * Shape of the durable mapping index the Rust engine owns, plus the projections between it and
- * the renderer-facing `FolderSummary`.
+ * Typed mirror of the bounded Rust mapping RPC contract.
  *
- * Paths are carried through verbatim in both directions. A Windows `C:\Users\…\Projects` and a
- * Linux `/home/…/Projects` are both just opaque strings here: nothing normalises separators,
- * because each side's path only has to stay valid on the machine that produced it.
+ * Paths remain opaque strings throughout this module. None of these projections opens,
+ * normalises, scans, creates, moves, or deletes a path.
  */
 
-/** Mirrors the `MappingRecord` the Rust engine persists to and returns from its `SQLite` mapping index. */
-export interface MappingRecord {
+export interface MappingConfiguration {
   id: string
   name: string
   initiatorDeviceId: string
@@ -24,10 +27,79 @@ export interface MappingRecord {
   historyDays: number
   historyMaxBytes: number
   setupStatus: FolderSetupStatus
-  pendingDelivery: boolean
+  paused: boolean
   preview: FolderMappingPreview | null
   createdAt: string
   updatedAt: string
+}
+
+export interface MappingRecord {
+  mapping: MappingConfiguration
+  revision: number
+  eventId: string
+  authorDeviceId: string
+  pendingDelivery: boolean
+}
+
+export interface MappingTombstone {
+  mappingId: string
+  deletionEventId: string
+  deletionRevision: number
+  deletionTimestamp: string
+  deletingDeviceId: string
+  lastKnownUpdateRevision: number
+  tombstoneCreatedAt: string
+  initiatorDeviceId: string
+  responderDeviceId: string
+}
+
+export type MappingEvent =
+  | { kind: "active"; record: MappingRecord }
+  | { kind: "tombstone"; tombstone: MappingTombstone }
+
+export interface MappingDelivery {
+  mappingId: string
+  eventId: string
+  revision: number
+  targetDeviceId: string
+  event: MappingEvent
+  createdAt: string
+}
+
+export interface MappingApplyOutcome {
+  status: "applied" | "duplicate" | "stale" | "tombstoned"
+  mappingId: string
+  eventId: string
+  revision: number
+}
+
+export type MappingAcknowledgement = Pick<MappingApplyOutcome, "mappingId" | "eventId" | "revision">
+
+export interface LegacyMigrationStatus {
+  state: "pending" | "completed" | "failed"
+  sourceFingerprint?: string
+  importedCount: number
+  completedAt?: string
+  lastError?: string
+}
+
+export interface LegacyImportRecord {
+  mapping: MappingConfiguration
+  pendingDeliveryTargetDeviceId: string | null
+}
+
+export interface LegacyImportRequest {
+  sourceFingerprint: string
+  importingDeviceId: string
+  importedAt: string
+  records: LegacyImportRecord[]
+}
+
+export interface LegacyImportOutcome {
+  status: LegacyMigrationStatus
+  importedCount: number
+  tombstonedCount: number
+  alreadyCompleted: boolean
 }
 
 export function invertMode(mode: SyncMode): SyncMode {
@@ -36,31 +108,19 @@ export function invertMode(mode: SyncMode): SyncMode {
   return "two-way"
 }
 
-export interface MappingRecordFromProposalOptions {
-  /** Display name of the device that approved the mapping. */
+export interface MappingConfigurationFromProposalOptions {
   responderDeviceName: string
-  /**
-   * The destination the responder actually chose. The responder may approve into a different
-   * folder than the one the proposal suggested, and the record has to carry the real one — the
-   * proposal's own `responderPath` can be stale by the time either side persists.
-   */
   responderPath: string
   setupStatus: FolderSetupStatus
-  /**
-   * `true` while this device has approved the mapping but the peer has not yet acknowledged
-   * it. Only the *responder* is ever in that state: the initiator only learns of an approval
-   * once the peer's decision has already arrived, so it records `false`.
-   */
-  pendingDelivery: boolean
-  /** Overridable for tests; defaults to now. */
+  paused?: boolean
   now?: string
 }
 
-/** Builds the durable record for a freshly approved mapping, from the negotiated proposal. */
-export function mappingRecordFromProposal(
+/** Builds the configuration that SQLite will wrap in a monotonic active event. */
+export function mappingConfigurationFromProposal(
   proposal: FolderMappingProposal,
-  options: MappingRecordFromProposalOptions,
-): MappingRecord {
+  options: MappingConfigurationFromProposalOptions,
+): MappingConfiguration {
   return {
     id: proposal.id,
     name: proposal.name,
@@ -75,7 +135,7 @@ export function mappingRecordFromProposal(
     historyDays: proposal.historyDays,
     historyMaxBytes: proposal.historyMaxBytes,
     setupStatus: options.setupStatus,
-    pendingDelivery: options.pendingDelivery,
+    paused: options.paused ?? false,
     preview: proposal.preview,
     createdAt: proposal.createdAt,
     updatedAt: options.now ?? new Date().toISOString(),
@@ -83,23 +143,23 @@ export function mappingRecordFromProposal(
 }
 
 /**
- * Synthesises a durable record for a folder that's already configured locally but is missing
- * from the mapping index — for example, it was approved while the Rust engine wasn't running.
- * The original proposal (device names, initial preview) is gone by this point, so this always
- * encodes the local device as the record's "initiator" side. That's safe because the index is
- * a private, per-machine store: nothing outside this device ever reads its initiator/responder
- * fields, so the round trip through `folderFromMappingRecord` on this same device stays
- * self-consistent even if it wasn't the true historical initiator.
+ * Converts one validated legacy folder into a configuration without dereferencing either path.
+ * The old snapshot did not retain participant orientation, so device ids provide a deterministic
+ * ordering that both peers independently derive. Paths and mode are swapped only as a semantic
+ * projection; their bytes are not rewritten.
  */
-export function mappingRecordFromFolder(
+export function mappingConfigurationFromLegacyFolder(
   folder: FolderSummary,
   remoteDeviceId: string,
   localDeviceId: string,
   localDeviceName: string,
   remoteDeviceName: string,
-  timestamp: string,
-): MappingRecord {
-  return {
+  createdAt: string,
+  updatedAt: string,
+  preview: FolderMappingPreview | null = null,
+): MappingConfiguration {
+  const localFirst = localDeviceId.localeCompare(remoteDeviceId) <= 0
+  const localFirstConfiguration: MappingConfiguration = {
     id: folder.id,
     name: folder.name,
     initiatorDeviceId: localDeviceId,
@@ -111,56 +171,45 @@ export function mappingRecordFromFolder(
     mode: folder.mode,
     ignorePatterns: folder.ignorePatterns,
     historyDays: folder.historyDays ?? 30,
-    historyMaxBytes: folder.historyMaxBytes ?? 5 * 1024 ** 3,
+    historyMaxBytes: folder.historyMaxBytes ?? 10 * 1024 ** 3,
     setupStatus: folder.setupStatus ?? "ready-for-initial-sync",
-    pendingDelivery: false,
-    preview: null,
-    createdAt: timestamp,
-    updatedAt: timestamp,
+    paused: folder.paused,
+    preview,
+    createdAt,
+    updatedAt,
+  }
+  if (localFirst) return localFirstConfiguration
+  return {
+    ...localFirstConfiguration,
+    initiatorDeviceId: remoteDeviceId,
+    initiatorDeviceName: remoteDeviceName,
+    responderDeviceId: localDeviceId,
+    responderDeviceName: localDeviceName,
+    initiatorPath: folder.remotePath,
+    responderPath: folder.localPath,
+    mode: invertMode(folder.mode),
   }
 }
 
-/**
- * Reconstructs the `FolderSummary` this device should have configured from a durable mapping
- * record, recovering local state (for example after `state.json` was lost or predates the
- * index) from the engine's `SQLite` copy. Returns `null` if `localDeviceId` isn't a party to
- * the mapping, which should never happen for records this device's engine returns but is
- * checked rather than assumed.
- */
+/** Projects one active authoritative record into the renderer model. */
 export function folderFromMappingRecord(record: MappingRecord, localDeviceId: string): FolderSummary | null {
-  if (record.initiatorDeviceId === localDeviceId) {
-    return {
-      id: record.id,
-      name: record.name,
-      localPath: record.initiatorPath,
-      remotePath: record.responderPath,
-      remoteDeviceId: record.responderDeviceId,
-      status: "offline",
-      setupStatus: record.setupStatus,
-      mode: record.mode,
-      paused: false,
-      ignorePatterns: record.ignorePatterns,
-      historyDays: record.historyDays,
-      historyMaxBytes: record.historyMaxBytes,
-      currentAction: "Recovered from the durable mapping index.",
-    }
+  const mapping = record.mapping
+  const pendingNote = record.pendingDelivery ? "Configuration update is waiting for the paired computer." : undefined
+  const localIsInitiator = mapping.initiatorDeviceId === localDeviceId
+  if (!localIsInitiator && mapping.responderDeviceId !== localDeviceId) return null
+  return {
+    id: mapping.id,
+    name: mapping.name,
+    localPath: localIsInitiator ? mapping.initiatorPath : mapping.responderPath,
+    remotePath: localIsInitiator ? mapping.responderPath : mapping.initiatorPath,
+    remoteDeviceId: localIsInitiator ? mapping.responderDeviceId : mapping.initiatorDeviceId,
+    status: mapping.paused ? "paused" : "offline",
+    setupStatus: mapping.setupStatus,
+    mode: localIsInitiator ? mapping.mode : invertMode(mapping.mode),
+    paused: mapping.paused,
+    ignorePatterns: mapping.ignorePatterns,
+    historyDays: mapping.historyDays,
+    historyMaxBytes: mapping.historyMaxBytes,
+    currentAction: pendingNote,
   }
-  if (record.responderDeviceId === localDeviceId) {
-    return {
-      id: record.id,
-      name: record.name,
-      localPath: record.responderPath,
-      remotePath: record.initiatorPath,
-      remoteDeviceId: record.initiatorDeviceId,
-      status: "offline",
-      setupStatus: record.setupStatus,
-      mode: invertMode(record.mode),
-      paused: false,
-      ignorePatterns: record.ignorePatterns,
-      historyDays: record.historyDays,
-      historyMaxBytes: record.historyMaxBytes,
-      currentAction: "Recovered from the durable mapping index.",
-    }
-  }
-  return null
 }

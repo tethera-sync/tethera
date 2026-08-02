@@ -12,7 +12,7 @@ import { autoUpdater } from "electron-updater"
 import { execFile } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises"
+import { mkdir, readFile, readdir, stat } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { promisify } from "node:util"
@@ -39,16 +39,37 @@ import type {
   RefreshIncomingMappingPreviewInput,
   UpdateState,
 } from "../shared/contracts"
-import { EngineSupervisor, type EngineState } from "./engine-supervisor"
+import {
+  EngineRpcError,
+  EngineSupervisor,
+  type EngineState,
+  type MappingStoreHealth,
+} from "./engine-supervisor"
 import { compareManifests, scanFolder, type FileManifest } from "./folder-manifest"
 import { computeSyncPlan, MAX_TRANSFER_FILE_BYTES, writeFileAtomic } from "./initial-sync"
 import {
   folderFromMappingRecord,
-  invertMode,
-  mappingRecordFromFolder,
-  mappingRecordFromProposal,
+  mappingConfigurationFromProposal,
+  type MappingAcknowledgement,
+  type MappingApplyOutcome,
+  type MappingConfiguration,
+  type MappingDelivery,
+  type MappingEvent,
   type MappingRecord,
 } from "./mapping-index"
+import {
+  initializeMappingAuthority,
+  MappingAuthorityInitializationError,
+} from "./mapping-authority"
+import {
+  readLegacyState,
+  retireLegacyMappingFields,
+  type LegacyStateSource,
+} from "./legacy-mapping-migration"
+import {
+  buildPersistedDesktopState,
+  DesktopStateStore,
+} from "./desktop-state-storage"
 import { PairingService } from "./pairing-service"
 import { PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
 import { resolveWithinRoot } from "./path-safety"
@@ -59,7 +80,13 @@ let isQuitting = false
 let snapshot: AppSnapshot
 let decisionRetryTimer: NodeJS.Timeout | null = null
 const decisionDeliveriesInFlight = new Set<string>()
+const configurationDeliveriesInFlight = new Set<string>()
 const initialSyncInFlight = new Set<string>()
+const mappingRecords = new Map<string, MappingRecord>()
+let legacyStateSource: LegacyStateSource = { kind: "missing", document: {}, modifiedAt: new Date(0).toISOString() }
+let desktopStateStore: DesktopStateStore
+let mappingOwnershipRetired = false
+let mappingAuthorityInitialization: Promise<void> | null = null
 
 const engine = new EngineSupervisor()
 let pairing: PairingService | null = null
@@ -119,6 +146,11 @@ function getInitialSnapshot(): AppSnapshot {
     route: "offline",
     engineStatus: "starting",
     engineMessage: "Checking the Rust sync engine…",
+    mappingStore: {
+      status: "loading",
+      mutationsEnabled: false,
+      pendingDeliveryCount: 0,
+    },
     paused: false,
     folders: [],
     devices: [getLocalDevice()],
@@ -144,23 +176,27 @@ function stateFilePath(): string {
 
 async function loadState(): Promise<void> {
   snapshot = getInitialSnapshot()
+  legacyStateSource = await readLegacyState(stateFilePath())
+  const readable = legacyStateSource.kind !== "unreadable"
+  const loadedDocument = legacyStateSource.kind === "unreadable" ? {} : legacyStateSource.document
+  desktopStateStore = new DesktopStateStore(stateFilePath(), loadedDocument, readable)
+  mappingOwnershipRetired = readable && !Object.hasOwn(loadedDocument, "folders")
 
-  try {
-    const parsed = JSON.parse(await readFile(stateFilePath(), "utf8")) as Partial<AppSnapshot>
+  if (legacyStateSource.kind !== "unreadable") {
+    const parsed = loadedDocument as Partial<AppSnapshot>
     snapshot = {
       ...snapshot,
       ...parsed,
-      folders: (parsed.folders ?? []).map((folder) => ({
-        ...folder,
-        paused: folder.paused ?? false,
-        setupStatus: folder.setupStatus ?? "ready-for-initial-sync",
-        status: folder.paused ? "paused" : folder.status === "needs-attention" ? "needs-attention" : "offline",
-        ignorePatterns: folder.ignorePatterns ?? [],
-        historyDays: folder.historyDays ?? 30,
-        historyMaxBytes: folder.historyMaxBytes ?? 10 * 1024 ** 3,
-      })),
+      // Mapping ownership is never hydrated from this legacy field. It is retained in
+      // `legacyStateSource` only until the one-time SQLite transaction is verified.
+      folders: [],
       engineStatus: "starting",
       engineMessage: "Checking the Rust sync engine…",
+      mappingStore: {
+        status: "loading",
+        mutationsEnabled: false,
+        pendingDeliveryCount: 0,
+      },
       devices: [getLocalDevice()],
       pairing: emptyPairingState,
       mappings: {
@@ -170,25 +206,30 @@ async function loadState(): Promise<void> {
       settings: { ...defaultSettings, ...(parsed.settings ?? {}) },
       update: idleUpdateState,
     }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      console.error("Unable to load persisted app state", error)
-    }
+  } else {
+    pushActivity("Desktop state unavailable", legacyStateSource.detail, "error")
   }
 
   recomputeOverallStatus()
 }
 
 async function persistState(): Promise<void> {
-  const { pairing: _pairing, update: _update, ...persistableSnapshot } = snapshot
-  const persisted = {
-    ...persistableSnapshot,
-    engineStatus: "unavailable",
-    engineMessage: undefined,
-    devices: [],
+  if (!desktopStateStore.writesEnabled) {
+    console.warn("[state] state.json is unreadable; refusing to overwrite it")
+    return
   }
-  await mkdir(path.dirname(stateFilePath()), { recursive: true })
-  await writeFile(stateFilePath(), `${JSON.stringify(persisted, null, 2)}\n`, "utf8")
+  await desktopStateStore.update((current) =>
+    buildPersistedDesktopState(
+      current,
+      {
+        paused: snapshot.paused,
+        mappings: snapshot.mappings,
+        activity: snapshot.activity,
+        settings: snapshot.settings,
+      },
+      mappingOwnershipRetired,
+    ),
+  )
 }
 
 function idleFolderStatus(): FolderSummary["status"] {
@@ -285,6 +326,7 @@ function syncPairingSnapshot(): AppSnapshot {
     return { ...folder, status: "offline" }
   })
   void flushPendingMappingDecisions()
+  void flushPendingConfigurationDeliveries()
   return broadcastSnapshot()
 }
 
@@ -329,7 +371,10 @@ async function startNetworkServices(): Promise<void> {
     broadcastSnapshot()
   })
   await peerSessions.start()
-  decisionRetryTimer = setInterval(() => void flushPendingMappingDecisions(), 5_000)
+  decisionRetryTimer = setInterval(() => {
+    void flushPendingMappingDecisions()
+    void flushPendingConfigurationDeliveries()
+  }, 5_000)
   syncPairingSnapshot()
 }
 
@@ -517,114 +562,264 @@ function validateMappingInput(input: AddFolderInput): void {
   if (input.name.length > 120) throw new Error("The folder name must be 120 characters or fewer.")
 }
 
-// The durable copy of a mapping lives in the Rust/SQLite mapping index; the JSON snapshot above
-// stays authoritative and renderer-facing. Index writes are deliberately best-effort and never
-// block pairing or approval: the engine may not be running yet, and a database that will not
-// open must not be able to stop a user from configuring a folder. What they must never do is
-// fail quietly — every failure below is logged *and* raised into the activity feed, so nothing
-// reports a mapping as durably persisted when it isn't.
-
-/** Records an index failure where both the logs and the user-visible diagnostics will show it. */
-function reportMappingIndexFailure(summary: string, error: unknown, folderId?: string): void {
-  const detail = error instanceof Error ? error.message : String(error)
-  console.error(`[mapping-index] ${summary}:`, detail)
-  pushActivity(
-    "Mapping index write failed",
-    `${summary}. The folder is configured on this computer, but it is not saved in the durable mapping index yet: ${detail}`,
-    "warning",
-    folderId,
-  )
-  broadcastSnapshot()
-}
-
-/**
- * Writes a mapping through to the index. A no-op while the engine is still starting — the
- * reconciliation pass below writes it as soon as the engine reports ready.
- */
-async function persistMappingToEngine(record: MappingRecord): Promise<void> {
-  if (engine.state.status !== "ready") return
-  try {
-    await engine.request("mapping.upsert", record)
-  } catch (error) {
-    reportMappingIndexFailure(`Could not save "${record.name}" to the mapping index`, error, record.id)
+function requireMappingMutations(): void {
+  if (
+    engine.state.status !== "ready" ||
+    snapshot.mappingStore.status !== "ready" ||
+    !snapshot.mappingStore.mutationsEnabled
+  ) {
+    throw new Error(
+      snapshot.mappingStore.detail ??
+        "The authoritative mapping database is not ready. Mapping changes are disabled to protect existing configuration.",
+    )
   }
 }
 
-/**
- * Removes a mapping's row from the index. This only ever touches the index record — removing a
- * folder never deletes, moves or rewrites a single file inside it on either computer.
- */
-async function deleteMappingFromEngine(id: string, name: string): Promise<void> {
-  if (engine.state.status !== "ready") {
-    // The row outlives the removal until the next reconciliation reports it; see below.
-    console.warn(`[mapping-index] engine not ready, leaving the index row for ${id} to reconcile later`)
-    return
-  }
-  try {
-    await engine.request("mapping.delete", { id })
-  } catch (error) {
-    reportMappingIndexFailure(`Could not remove "${name}" from the mapping index`, error, id)
+function mappingStoreStateFromHealth(health: MappingStoreHealth): AppSnapshot["mappingStore"] {
+  const status = mappingStoreStatusFromHealth(health)
+  return {
+    status,
+    detail: health.detail,
+    schemaVersion: health.schemaVersion,
+    migrationState: health.migrationState,
+    journalMode: health.journalMode,
+    mutationsEnabled: status === "ready" && health.mutationsEnabled,
+    pendingDeliveryCount: snapshot.mappingStore.pendingDeliveryCount,
   }
 }
 
-/**
- * Runs once per engine session, right after the Rust engine reports ready.
- *
- * This is a one-directional write-through: folders the JSON snapshot has but the index doesn't
- * (approved while the engine wasn't running yet) are written into the index now. It
- * deliberately does *not* copy the other way. The index is not yet an authoritative source —
- * `state.json` is — and a record the snapshot lacks is ambiguous: it can mean the snapshot was
- * lost, or it can mean the user removed the folder while the engine was down. Recreating the
- * folder from it would silently resurrect a removed mapping, so those records are only reported
- * as orphans here and left alone. Making the index authoritative, and reading folders back out
- * of it, is the next slice's job (see `docs/15-IMPLEMENTATION-STATUS.md`).
- *
- * Never throws — reconciliation failures are logged and skipped.
- */
-async function reconcileMappingIndex(): Promise<void> {
-  if (engine.state.status !== "ready") return
-  let records: MappingRecord[]
-  try {
-    records = await engine.request<MappingRecord[]>("mapping.list")
-  } catch (error) {
-    reportMappingIndexFailure("Could not read the mapping index to reconcile it", error)
-    return
-  }
+function mappingStoreStatusFromHealth(health: MappingStoreHealth): AppSnapshot["mappingStore"]["status"] {
+  if (health.status === "unsupported-schema") return "unsupported-schema"
+  if (health.status === "migration-failed" || health.migrationState === "failed") return "migration-failed"
+  if (health.status !== "ready") return "unavailable"
+  if (health.migrationState !== "completed") return "migration-required"
+  return "ready"
+}
 
+function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
+  mappingRecords.clear()
+  for (const record of records) mappingRecords.set(record.mapping.id, record)
+  const previous = new Map(snapshot.folders.map((folder) => [folder.id, folder]))
   const localDeviceId = getLocalIdentityId()
-  const recordIds = new Set(records.map((record) => record.id))
-  const localIdentity = pairing?.getLocalSessionIdentity()
-  const timestamp = new Date().toISOString()
+  snapshot.folders = records.flatMap((record) => {
+    const projected = folderFromMappingRecord(record, localDeviceId)
+    if (!projected) return []
+    const runtime = previous.get(projected.id)
+    const peerTrusted = projected.remoteDeviceId
+      ? getPairedDevices().some((device) => device.id === projected.remoteDeviceId)
+      : false
+    return [
+      {
+        ...projected,
+        ...(runtime
+          ? {
+              progress: runtime.progress,
+              bytesPerSecond: runtime.bytesPerSecond,
+              fileCount: runtime.fileCount,
+              lastSyncedAt: runtime.lastSyncedAt,
+              currentAction: projected.currentAction ?? runtime.currentAction,
+            }
+          : {}),
+        status:
+          projected.paused || snapshot.paused
+            ? "paused"
+            : peerTrusted
+              ? "offline"
+              : "needs-attention",
+      },
+    ]
+  })
+}
 
-  for (const folder of snapshot.folders) {
-    if (recordIds.has(folder.id)) continue
-    if (folder.setupStatus !== "ready-for-initial-sync" && folder.setupStatus !== "active") continue
-    if (!folder.remoteDeviceId) continue
-    const peer = getPairedDevice(folder.remoteDeviceId)
-    void persistMappingToEngine(
-      mappingRecordFromFolder(
-        folder,
-        folder.remoteDeviceId,
-        localDeviceId,
-        localIdentity?.name ?? "This computer",
-        peer?.name ?? folder.remoteDeviceId,
-        timestamp,
-      ),
-    )
+async function refreshAuthoritativeMappings(): Promise<void> {
+  const [records, pending] = await Promise.all([
+    engine.request<MappingRecord[]>("mapping.list"),
+    engine.request<MappingDelivery[]>("mapping.listPendingDelivery"),
+  ])
+  hydrateAuthoritativeMappings(records)
+  snapshot.mappingStore.pendingDeliveryCount = pending.length
+}
+
+async function initializeAuthoritativeMappings(health: MappingStoreHealth): Promise<void> {
+  if (mappingAuthorityInitialization) return await mappingAuthorityInitialization
+  const generation = engine.generation
+  mappingAuthorityInitialization = (async () => {
+    const reportedState = mappingStoreStateFromHealth(health)
+    snapshot.mappingStore =
+      health.status === "ready"
+        ? { ...reportedState, status: "loading", mutationsEnabled: false }
+        : reportedState
+    broadcastSnapshot()
+    if (health.status !== "ready") return
+
+    try {
+      const identity = requirePairingService().getLocalSessionIdentity()
+      const result = await initializeMappingAuthority({
+        rpc: engine,
+        statePath: stateFilePath(),
+        legacySource: legacyStateSource,
+        localDeviceId: identity.id,
+        localDeviceName: identity.name,
+        remoteDeviceName: (deviceId) => getPairedDevice(deviceId)?.name ?? deviceId,
+        retireLegacyState: async ({ sourceFingerprint, backupFileName, retiredAt }) => {
+          const retired = await desktopStateStore.update((current) =>
+            retireLegacyMappingFields(current, sourceFingerprint, backupFileName, retiredAt),
+          )
+          mappingOwnershipRetired = true
+          return retired
+        },
+      })
+      if (engine.generation !== generation) return
+      if (result.stateDocument) {
+        legacyStateSource = {
+          kind: "readable",
+          document: result.stateDocument,
+          modifiedAt: new Date().toISOString(),
+        }
+        snapshot.mappings = {
+          incoming: snapshot.mappings.incoming.filter(
+            (request) => request.status !== "approved" && request.status !== "approved-awaiting-delivery",
+          ),
+          outgoing: snapshot.mappings.outgoing.filter((request) => request.status !== "approved"),
+        }
+      }
+      hydrateAuthoritativeMappings(result.records)
+      snapshot.mappingStore = {
+        status: "ready",
+        schemaVersion: health.schemaVersion,
+        migrationState: result.migration.state,
+        journalMode: health.journalMode,
+        mutationsEnabled: true,
+        pendingDeliveryCount: result.records.filter((record) => record.pendingDelivery).length,
+        cleanupWarning: result.cleanupWarning,
+      }
+      await refreshAuthoritativeMappings()
+      broadcastSnapshot()
+      void flushPendingConfigurationDeliveries()
+    } catch (error) {
+      if (engine.generation !== generation) return
+      const detail = error instanceof Error ? error.message : "The mapping database could not be initialised."
+      const status =
+        error instanceof EngineRpcError && error.code === "MAPPING_STORE_UNSUPPORTED_SCHEMA"
+          ? "unsupported-schema"
+          : error instanceof MappingAuthorityInitializationError ||
+              (error instanceof EngineRpcError &&
+                ["MAPPING_MIGRATION_FAILED", "MAPPING_STORE_MIGRATION_FAILED"].includes(error.code))
+            ? "migration-failed"
+            : error instanceof EngineRpcError && error.code === "MAPPING_MIGRATION_REQUIRED"
+              ? "migration-required"
+              : "unavailable"
+      snapshot.mappingStore = {
+        ...snapshot.mappingStore,
+        status,
+        detail,
+        mutationsEnabled: false,
+      }
+      console.error("[mapping-index] authoritative store initialisation failed:", detail)
+      pushActivity("Mapping database unavailable", detail, "error")
+      broadcastSnapshot()
+    }
+  })().finally(() => {
+    mappingAuthorityInitialization = null
+    const current = engine.state
+    if (current.status === "ready" && engine.generation !== generation) {
+      void initializeAuthoritativeMappings(current.mappingStore)
+    }
+  })
+  return await mappingAuthorityInitialization
+}
+
+async function upsertAuthoritativeMapping(
+  mapping: MappingConfiguration,
+  targetDeviceId: string | null,
+  expectedRevision: number | null,
+): Promise<MappingRecord> {
+  requireMappingMutations()
+  const record = await engine.request<MappingRecord>("mapping.upsert", {
+    mapping,
+    authorDeviceId: getLocalIdentityId(),
+    deliveryTargetDeviceId: targetDeviceId,
+    expectedRevision,
+    occurredAt: mapping.updatedAt,
+  })
+  await refreshAuthoritativeMappings()
+  return record
+}
+
+async function removeAuthoritativeMapping(record: MappingRecord): Promise<void> {
+  requireMappingMutations()
+  const localDeviceId = getLocalIdentityId()
+  const targetDeviceId = otherParticipant(record.mapping, localDeviceId)
+  await engine.request("mapping.remove", {
+    id: record.mapping.id,
+    deletingDeviceId: localDeviceId,
+    deliveryTargetDeviceId: targetDeviceId,
+    expectedRevision: record.revision,
+    occurredAt: new Date().toISOString(),
+  })
+  await refreshAuthoritativeMappings()
+}
+
+function otherParticipant(mapping: MappingConfiguration, localDeviceId: string): string {
+  if (mapping.initiatorDeviceId === localDeviceId) return mapping.responderDeviceId
+  if (mapping.responderDeviceId === localDeviceId) return mapping.initiatorDeviceId
+  throw new Error("This computer is not a participant in the mapping.")
+}
+
+async function flushPendingConfigurationDeliveries(): Promise<void> {
+  if (!peerSessions || !pairing || snapshot.mappingStore.status !== "ready") return
+  let deliveries: MappingDelivery[]
+  const previousPendingCount = snapshot.mappingStore.pendingDeliveryCount
+  try {
+    deliveries = await engine.request<MappingDelivery[]>("mapping.listPendingDelivery")
+    snapshot.mappingStore.pendingDeliveryCount = deliveries.length
+  } catch (error) {
+    console.warn("[mapping-index] unable to read pending configuration deliveries", error)
+    return
   }
 
-  const orphans = records
-    .filter((record) => !snapshot.folders.some((folder) => folder.id === record.id))
-    // Projecting each record onto this device tells us which local folder it *would* describe,
-    // which is what makes the log line actionable — and skips any record neither side of which
-    // is this machine, which shouldn't exist in a local index but isn't worth reporting.
-    .map((record) => ({ record, folder: folderFromMappingRecord(record, localDeviceId) }))
-    .filter((entry) => entry.folder !== null)
-  if (orphans.length > 0) {
-    console.warn(
-      `[mapping-index] ${orphans.length} index record(s) have no folder in state.json and were left untouched:`,
-      orphans.map((entry) => `${entry.record.id} (${entry.record.name} → ${entry.folder?.localPath})`).join(", "),
-    )
+  let acknowledgedAny = false
+  for (const delivery of deliveries) {
+    const key = `${delivery.eventId}:${delivery.targetDeviceId}`
+    if (configurationDeliveriesInFlight.has(key)) continue
+    const peer = getPairedDevice(delivery.targetDeviceId)
+    if (!peer || peer.status !== "online") continue
+    configurationDeliveriesInFlight.add(key)
+    try {
+      const acknowledgement = await requirePeerSessions().request<MappingAcknowledgement>(peer.id, {
+        type: "mapping-config",
+        event: delivery.event,
+      })
+      if (
+        acknowledgement.mappingId !== delivery.mappingId ||
+        acknowledgement.eventId !== delivery.eventId ||
+        acknowledgement.revision !== delivery.revision
+      ) {
+        throw new Error("The peer acknowledgement did not identify the exact mapping event.")
+      }
+      await engine.request("mapping.acknowledgeDelivery", {
+        ...acknowledgement,
+        authenticatedPeerDeviceId: peer.id,
+        acknowledgedAt: new Date().toISOString(),
+      })
+      if (delivery.event.kind === "active") {
+        snapshot.mappings.incoming = snapshot.mappings.incoming.filter(
+          (request) => request.id !== delivery.mappingId || request.status !== "approved-awaiting-delivery",
+        )
+      }
+      acknowledgedAny = true
+    } catch (error) {
+      console.warn(`[mapping-index] delivery ${delivery.eventId} remains pending`, error)
+    } finally {
+      configurationDeliveriesInFlight.delete(key)
+    }
+  }
+  if (acknowledgedAny) {
+    await refreshAuthoritativeMappings()
+    await persistState()
+    broadcastSnapshot()
+  } else if (previousPendingCount !== snapshot.mappingStore.pendingDeliveryCount) {
+    broadcastSnapshot()
   }
 }
 
@@ -658,6 +853,7 @@ async function previewFolderMapping(input: PreviewFolderMappingInput): Promise<F
 }
 
 async function requestFolderMapping(input: RequestFolderMappingInput): Promise<AppSnapshot> {
+  requireMappingMutations()
   validateMappingInput(input)
   const peer = getPairedDevice(input.remoteDeviceId)
   if (!peer) throw new Error("Pair a trusted computer before requesting a folder mapping.")
@@ -762,6 +958,7 @@ async function refreshIncomingMappingPreview(input: RefreshIncomingMappingPrevie
 }
 
 async function approveFolderMapping(input: ApproveFolderMappingInput): Promise<AppSnapshot> {
+  requireMappingMutations()
   const request = snapshot.mappings.incoming.find((item) => item.id === input.requestId)
   if (!request) throw new Error("The folder mapping request is no longer available.")
   const destinationPath = path.resolve(input.destinationPath)
@@ -781,28 +978,27 @@ async function approveFolderMapping(input: ApproveFolderMappingInput): Promise<A
   }
 
   const proposal = request.proposal
-  const folder = folderForResponder(proposal, destinationPath)
-  snapshot.folders = [...snapshot.folders.filter((item) => item.id !== folder.id), folder]
+  const localIdentity = requirePairingService().getLocalSessionIdentity()
+  const configuration = mappingConfigurationFromProposal(proposal, {
+    responderDeviceName: localIdentity.name,
+    responderPath: destinationPath,
+    setupStatus: "ready-for-initial-sync",
+    now: new Date().toISOString(),
+  })
+  const record = await upsertAuthoritativeMapping(configuration, request.fromDeviceId, null)
+  const projected = folderFromMappingRecord(record, localIdentity.id)
+  if (!projected) throw new Error("The committed mapping does not include this computer.")
+  const folder = { ...projected, fileCount: proposal.preview.remoteFiles }
+  snapshot.folders = snapshot.folders.map((item) => (item.id === folder.id ? { ...item, ...folder } : item))
   snapshot.mappings.incoming = snapshot.mappings.incoming.map((item) =>
     item.id === request.id
       ? { ...item, status: "approved-awaiting-delivery", selectedDestinationPath: destinationPath, message: "Approval is being delivered." }
       : item,
   )
   pushActivity("Folder mapping approved", `${proposal.name} is configured locally and waiting for the other computer to acknowledge it.`, "success", folder.id)
-  const localIdentity = requirePairingService().getLocalSessionIdentity()
-  // This computer is the responder, and the approval hasn't reached the peer yet, so the record
-  // is marked pending until deliverMappingDecision confirms it landed.
-  void persistMappingToEngine(
-    mappingRecordFromProposal(proposal, {
-      responderDeviceName: localIdentity.name,
-      responderPath: destinationPath,
-      setupStatus: folder.setupStatus ?? "ready-for-initial-sync",
-      pendingDelivery: true,
-    }),
-  )
   await persistState()
   broadcastSnapshot()
-  await deliverMappingDecision(request.id, true)
+  void flushPendingConfigurationDeliveries()
   return snapshot
 }
 
@@ -815,11 +1011,11 @@ async function rejectFolderMapping(requestId: string): Promise<AppSnapshot> {
   pushActivity("Folder mapping rejected", `${request.proposal.name} was not added.`, "warning")
   await persistState()
   broadcastSnapshot()
-  await deliverMappingDecision(requestId, false)
+  await deliverMappingDecision(requestId)
   return snapshot
 }
 
-async function deliverMappingDecision(requestId: string, approved: boolean): Promise<void> {
+async function deliverMappingDecision(requestId: string): Promise<void> {
   if (decisionDeliveriesInFlight.has(requestId)) return
   const request = snapshot.mappings.incoming.find((item) => item.id === requestId)
   if (!request) return
@@ -830,23 +1026,9 @@ async function deliverMappingDecision(requestId: string, approved: boolean): Pro
     await requirePeerSessions().request(peer.id, {
       type: "mapping-decision",
       proposalId: request.proposal.id,
-      approved,
-      destinationPath: request.selectedDestinationPath,
-      reason: approved ? undefined : "The mapping was declined on the other computer.",
+      approved: false,
+      reason: "The mapping was declined on the other computer.",
     })
-    if (approved) {
-      // The peer has the approval now, so the record is no longer pending delivery. Both
-      // computers end up agreeing: neither holds a pending row for a mapping that is live.
-      const folder = snapshot.folders.find((item) => item.id === request.proposal.id)
-      void persistMappingToEngine(
-        mappingRecordFromProposal(request.proposal, {
-          responderDeviceName: pairing?.getLocalSessionIdentity().name ?? "This computer",
-          responderPath: request.selectedDestinationPath ?? request.proposal.responderPath,
-          setupStatus: folder?.setupStatus ?? "ready-for-initial-sync",
-          pendingDelivery: false,
-        }),
-      )
-    }
     snapshot.mappings.incoming = snapshot.mappings.incoming.filter((item) => item.id !== requestId)
     await persistState()
     broadcastSnapshot()
@@ -866,8 +1048,7 @@ async function deliverMappingDecision(requestId: string, approved: boolean): Pro
 async function flushPendingMappingDecisions(): Promise<void> {
   if (!peerSessions || !pairing || !snapshot) return
   for (const request of snapshot.mappings.incoming) {
-    if (request.status === "approved-awaiting-delivery") await deliverMappingDecision(request.id, true)
-    else if (request.status === "rejected") await deliverMappingDecision(request.id, false)
+    if (request.status === "rejected") await deliverMappingDecision(request.id)
   }
 }
 
@@ -876,6 +1057,7 @@ function updateFolder(folderId: string, patch: Partial<FolderSummary>): void {
 }
 
 async function startInitialSync(folderId: string): Promise<AppSnapshot> {
+  requireMappingMutations()
   if (initialSyncInFlight.has(folderId)) return snapshot
   const folder = snapshot.folders.find((item) => item.id === folderId)
   if (!folder) throw new Error("This folder is no longer configured.")
@@ -930,13 +1112,21 @@ async function startInitialSync(folderId: string): Promise<AppSnapshot> {
     }
 
     const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001)
+    const currentRecord = mappingRecords.get(folderId)
+    if (!currentRecord) throw new Error("The mapping was removed before its configuration update could commit.")
+    const updatedAt = new Date().toISOString()
+    await upsertAuthoritativeMapping(
+      { ...currentRecord.mapping, setupStatus: "active", updatedAt },
+      otherParticipant(currentRecord.mapping, getLocalIdentityId()),
+      currentRecord.revision,
+    )
     updateFolder(folderId, {
       setupStatus: "active",
       status: idleFolderStatus(),
       progress: 1,
       bytesPerSecond: Math.round(bytesCopied / elapsedSeconds),
       fileCount: localManifest.files.length + completed,
-      lastSyncedAt: new Date().toISOString(),
+      lastSyncedAt: updatedAt,
       currentAction:
         plan.skipped.length > 0
           ? `Synced ${completed} file${completed === 1 ? "" : "s"}. ${plan.skipped.length} skipped — see activity log.`
@@ -949,6 +1139,7 @@ async function startInitialSync(folderId: string): Promise<AppSnapshot> {
       folderId,
     )
     for (const skip of plan.skipped.slice(0, 20)) pushActivity(`Skipped ${skip.path}`, skip.reason, "warning", folderId)
+    void flushPendingConfigurationDeliveries()
   } catch (error) {
     const message = error instanceof Error ? error.message : "The initial sync failed."
     updateFolder(folderId, { status: "needs-attention", currentAction: message })
@@ -1003,6 +1194,50 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     }
     return { accepted: true }
   }
+  if (request.type === "mapping-config") {
+    requireMappingMutations()
+    const event = request.event as MappingEvent | undefined
+    if (!event || (event.kind !== "active" && event.kind !== "tombstone")) {
+      throw new Error("The mapping configuration event is invalid.")
+    }
+    const mappingId = event.kind === "active" ? event.record.mapping.id : event.tombstone.mappingId
+    const previous = mappingRecords.get(mappingId)
+    const outcome = await engine.request<MappingApplyOutcome>("mapping.applyRemote", {
+      event,
+      authenticatedPeerDeviceId: context.peerId,
+      localDeviceId: getLocalIdentityId(),
+    })
+    await refreshAuthoritativeMappings()
+    if (event.kind === "active") {
+      snapshot.mappings.outgoing = snapshot.mappings.outgoing.map((item) =>
+        item.id === outcome.mappingId && item.toDeviceId === context.peerId
+          ? { ...item, status: "approved", message: `${context.peerName} approved the mapping.` }
+          : item,
+      )
+      if (outcome.status === "applied") {
+        pushActivity(
+          "Folder mapping configured",
+          `${event.record.mapping.name} is now configured on both computers.`,
+          "success",
+          outcome.mappingId,
+        )
+      }
+    } else if (outcome.status === "applied") {
+      pushActivity(
+        "Folder mapping removed",
+        `${previous?.mapping.name ?? "A folder mapping"} was removed by ${context.peerName}. Existing files were left untouched.`,
+        "warning",
+        outcome.mappingId,
+      )
+    }
+    await persistState()
+    broadcastSnapshot()
+    return {
+      mappingId: outcome.mappingId,
+      eventId: outcome.eventId,
+      revision: outcome.revision,
+    } satisfies MappingAcknowledgement
+  }
   if (request.type === "pull-file") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const relativePath = typeof request.relativePath === "string" ? request.relativePath : ""
@@ -1026,24 +1261,24 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     if (!outgoing) throw new Error("The original mapping request was not found.")
     const approved = Boolean(request.approved)
     if (approved) {
+      requireMappingMutations()
       const destinationPath = typeof request.destinationPath === "string" ? request.destinationPath : outgoing.proposal.responderPath
-      const folder = folderForInitiator(outgoing.proposal, destinationPath)
-      snapshot.folders = [...snapshot.folders.filter((item) => item.id !== folder.id), folder]
+      if (!mappingRecords.has(proposalId)) {
+        await upsertAuthoritativeMapping(
+          mappingConfigurationFromProposal(outgoing.proposal, {
+            responderDeviceName: context.peerName,
+            responderPath: destinationPath,
+            setupStatus: "ready-for-initial-sync",
+            now: new Date().toISOString(),
+          }),
+          null,
+          null,
+        )
+      }
       snapshot.mappings.outgoing = snapshot.mappings.outgoing.map((item) =>
         item.id === proposalId ? { ...item, status: "approved", message: `${context.peerName} approved the mapping.` } : item,
       )
-      pushActivity("Folder mapping approved", `${outgoing.proposal.name} is now configured on both computers.`, "success", folder.id)
-      // This computer is the initiator and has just received the peer's decision, so nothing is
-      // outstanding. `destinationPath` — not the proposal's suggestion — is where the responder
-      // actually approved the mapping into.
-      void persistMappingToEngine(
-        mappingRecordFromProposal(outgoing.proposal, {
-          responderDeviceName: context.peerName,
-          responderPath: destinationPath,
-          setupStatus: folder.setupStatus ?? "ready-for-initial-sync",
-          pendingDelivery: false,
-        }),
-      )
+      pushActivity("Folder mapping approved", `${outgoing.proposal.name} is now configured on both computers.`, "success", proposalId)
     } else {
       snapshot.mappings.outgoing = snapshot.mappings.outgoing.map((item) =>
         item.id === proposalId
@@ -1059,46 +1294,19 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
   throw new Error("This secure peer request is not supported.")
 }
 
-function folderForInitiator(proposal: FolderMappingProposal, destinationPath: string): FolderSummary {
-  return {
-    id: proposal.id,
-    name: proposal.name,
-    localPath: proposal.initiatorPath,
-    remotePath: destinationPath,
-    remoteDeviceId: proposal.responderDeviceId,
-    status: snapshot.paused ? "paused" : "offline",
-    setupStatus: "ready-for-initial-sync",
-    mode: proposal.mode,
-    paused: false,
-    ignorePatterns: proposal.ignorePatterns,
-    historyDays: proposal.historyDays,
-    historyMaxBytes: proposal.historyMaxBytes,
-    fileCount: proposal.preview.localFiles,
-    currentAction: "Initial merge approved; file transfer is not enabled yet.",
-  }
-}
-
-function folderForResponder(proposal: FolderMappingProposal, destinationPath: string): FolderSummary {
-  return {
-    id: proposal.id,
-    name: proposal.name,
-    localPath: destinationPath,
-    remotePath: proposal.initiatorPath,
-    remoteDeviceId: proposal.initiatorDeviceId,
-    status: snapshot.paused ? "paused" : "offline",
-    setupStatus: "ready-for-initial-sync",
-    mode: invertMode(proposal.mode),
-    paused: false,
-    ignorePatterns: proposal.ignorePatterns,
-    historyDays: proposal.historyDays,
-    historyMaxBytes: proposal.historyMaxBytes,
-    fileCount: proposal.preview.remoteFiles,
-    currentAction: "Initial merge approved; file transfer is not enabled yet.",
-  }
-}
-
 function registerIpc(): void {
   ipcMain.handle("app:get-snapshot", () => snapshot)
+  ipcMain.handle("mapping-store:retry", async () => {
+    snapshot.mappingStore = {
+      ...snapshot.mappingStore,
+      status: "loading",
+      detail: undefined,
+      mutationsEnabled: false,
+    }
+    broadcastSnapshot()
+    await engine.restart()
+    return snapshot
+  })
   ipcMain.handle("app:pause-all", () => setAllPaused(true))
   ipcMain.handle("app:resume-all", () => setAllPaused(false))
   ipcMain.handle("filesystem:browse-directory", (_event, input: BrowseDirectoryInput) => browseDirectory(input))
@@ -1114,25 +1322,45 @@ function registerIpc(): void {
     throw new Error("Folder mappings now require an initial comparison and approval on the other computer.")
   })
 
-  ipcMain.handle("folders:set-paused", async (_event: Electron.IpcMainInvokeEvent, folderId: string, paused: boolean) =>
-    mutate(() => {
-      snapshot.folders = snapshot.folders.map((folder) =>
-        folder.id === folderId ? { ...folder, status: paused || snapshot.paused ? "paused" : idleFolderStatus(), paused } : folder,
-      )
-      const folder = snapshot.folders.find((item) => item.id === folderId)
-      if (folder) pushActivity(paused ? "Folder paused" : "Folder resumed", `${folder.name} was ${paused ? "paused" : "resumed"}.`, paused ? "warning" : "success", folderId)
-    }),
-  )
+  ipcMain.handle("folders:set-paused", async (_event: Electron.IpcMainInvokeEvent, folderId: string, paused: boolean) => {
+    requireMappingMutations()
+    const record = mappingRecords.get(folderId)
+    if (!record) throw new Error("The mapping no longer exists in the authoritative database.")
+    const targetDeviceId = otherParticipant(record.mapping, getLocalIdentityId())
+    await upsertAuthoritativeMapping(
+      { ...record.mapping, paused, updatedAt: new Date().toISOString() },
+      targetDeviceId,
+      record.revision,
+    )
+    pushActivity(
+      paused ? "Folder paused" : "Folder resumed",
+      `${record.mapping.name} was ${paused ? "paused" : "resumed"}.`,
+      paused ? "warning" : "success",
+      folderId,
+    )
+    await persistState()
+    broadcastSnapshot()
+    void flushPendingConfigurationDeliveries()
+    return snapshot
+  })
 
   ipcMain.handle("folders:remove", async (_event: Electron.IpcMainInvokeEvent, folderId: string) => {
-    const removed = snapshot.folders.find((item) => item.id === folderId)
-    const result = await mutate(() => {
-      snapshot.folders = snapshot.folders.filter((item) => item.id !== folderId)
-      if (removed) pushActivity("Folder removed", `${removed.name} is no longer managed. Existing files were left untouched.`, "warning")
-    })
-    // Drops the index row only. No file inside the folder is read, moved or deleted.
-    void deleteMappingFromEngine(folderId, removed?.name ?? folderId)
-    return result
+    requireMappingMutations()
+    const record = mappingRecords.get(folderId)
+    if (!record) throw new Error("The mapping no longer exists in the authoritative database.")
+    // This commits a configuration tombstone only. No path in the mapping is dereferenced and no
+    // file inside either mapped directory is read, moved, rewritten, or deleted.
+    await removeAuthoritativeMapping(record)
+    pushActivity(
+      "Folder removed",
+      `${record.mapping.name} is no longer managed. Existing files were left untouched.`,
+      "warning",
+      folderId,
+    )
+    await persistState()
+    broadcastSnapshot()
+    void flushPendingConfigurationDeliveries()
+    return snapshot
   })
 
   ipcMain.handle("shell:reveal-path", async (_event: Electron.IpcMainInvokeEvent, targetPath: string) => {
@@ -1209,15 +1437,29 @@ function startEngine(): void {
   engine.on("state", (state: EngineState) => {
     snapshot.engineStatus = state.status
     snapshot.engineMessage = state.message
+    if (state.status === "starting") {
+      snapshot.mappingStore = {
+        ...snapshot.mappingStore,
+        status: "loading",
+        mutationsEnabled: false,
+      }
+    } else if (state.status !== "ready") {
+      snapshot.mappingStore = {
+        ...snapshot.mappingStore,
+        status: "unavailable",
+        detail: state.message,
+        mutationsEnabled: false,
+      }
+    }
     broadcastSnapshot()
-    if (state.status === "ready") void reconcileMappingIndex()
+    if (state.status === "ready") void initializeAuthoritativeMappings(state.mappingStore)
   })
   const executable = resolveEngineExecutable()
   if (!executable) {
     engine.markUnavailable("Build the engine with `cargo build -p sync-engine`, then restart Tethera.")
     return
   }
-  engine.start({ command: executable, env: { FOLDERSYNC_DATA_DIR: app.getPath("userData") } })
+  engine.start({ command: executable, env: { TETHERA_DATA_DIR: app.getPath("userData") } })
 }
 
 function setUpdateState(update: UpdateState): void {
@@ -1316,7 +1558,6 @@ app.whenReady().then(async () => {
   registerIpc()
   createWindow()
   createTray()
-  startEngine()
   setUpAutoUpdater()
   if (app.isPackaged) void autoUpdater.checkForUpdates()
   try {
@@ -1325,6 +1566,7 @@ app.whenReady().then(async () => {
     pushActivity("Network services unavailable", error instanceof Error ? error.message : "Unable to start LAN services.", "error")
     broadcastSnapshot()
   }
+  startEngine()
   app.on("activate", showMainWindow)
 })
 

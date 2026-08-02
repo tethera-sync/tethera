@@ -23,7 +23,7 @@ impl std::fmt::Display for ProtocolVersion {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RpcRequest {
     pub id: String,
     pub method: String,
@@ -33,6 +33,7 @@ pub struct RpcRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RpcResponse<T>
 where
     T: Serialize,
@@ -43,6 +44,8 @@ where
     pub result: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 impl<T> RpcResponse<T>
@@ -55,15 +58,25 @@ where
             ok: true,
             result: Some(result),
             error: None,
+            error_code: None,
         }
     }
 
     pub fn error(id: String, error: impl Into<String>) -> Self {
+        Self::error_with_code(id, "RPC_ERROR", error)
+    }
+
+    pub fn error_with_code(
+        id: String,
+        error_code: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             id,
             ok: false,
             result: None,
             error: Some(error.into()),
+            error_code: Some(error_code.into()),
         }
     }
 }
@@ -74,9 +87,8 @@ pub struct HealthResponse {
     pub name: &'static str,
     pub version: &'static str,
     pub protocol: String,
-    /// Whether durable mapping persistence is actually working this session. The desktop shell
-    /// writes mappings best-effort, so this is how it learns that those writes are going
-    /// nowhere instead of assuming they landed.
+    /// Whether the authoritative mapping database is usable in this session. The desktop uses
+    /// this state to gate reads and mutations instead of treating an unavailable store as empty.
     pub mapping_store: MappingStoreHealth,
 }
 
@@ -84,9 +96,8 @@ pub struct HealthResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MappingStoreHealth {
-    /// `ready` — open and writable. `not-configured` — no data directory was supplied, so
-    /// nothing is being persisted. `unavailable` — a directory was supplied but the database
-    /// could not be opened, and mapping writes are being dropped.
+    /// `ready` — open, writable and imported. Other values identify an explicit unavailable,
+    /// unsupported-schema or migration state; mapping reads and mutations then fail closed.
     pub status: &'static str,
     /// Why the store is unusable, when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,6 +108,12 @@ pub struct MappingStoreHealth {
     /// Journal mode actually in force — `wal` for a healthy on-disk database.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub journal_mode: Option<String>,
+    /// One-time `state.json` import state. Mapping reads and mutations remain disabled until this
+    /// says `completed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_state: Option<String>,
+    /// Whether mapping writes can safely commit in this engine session.
+    pub mutations_enabled: bool,
 }
 
 impl MappingStoreHealth {
@@ -107,13 +124,15 @@ impl MappingStoreHealth {
             detail: Some(detail.into()),
             schema_version: None,
             journal_mode: None,
+            migration_state: None,
+            mutations_enabled: false,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolVersion, RpcRequest};
+    use super::{ProtocolVersion, RpcRequest, RpcResponse};
 
     #[test]
     fn parses_camel_case_session_token() {
@@ -129,5 +148,18 @@ mod tests {
     #[test]
     fn protocol_version_has_stable_display() {
         assert_eq!(ProtocolVersion::default().to_string(), "0.1");
+    }
+
+    #[test]
+    fn structured_errors_use_the_camel_case_wire_contract() {
+        let value = serde_json::to_value(RpcResponse::<serde_json::Value>::error_with_code(
+            "1".to_owned(),
+            "MAPPING_NOT_FOUND",
+            "missing",
+        ))
+        .expect("serialise response");
+
+        assert_eq!(value["errorCode"], "MAPPING_NOT_FOUND");
+        assert!(value.get("error_code").is_none());
     }
 }

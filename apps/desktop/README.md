@@ -20,7 +20,7 @@ bun run desktop:dev:full
 
 ## Implemented
 
-- Persistent local settings, activity and approved folder-mapping records
+- Persistent local settings and activity, with approved folder mappings owned authoritatively by Rust/SQLite
 - Custom local and encrypted remote folder browser
 - Global and per-folder pause/resume
 - Close-to-tray lifecycle and launch/appearance settings
@@ -33,14 +33,20 @@ bun run desktop:dev:full
 - Recursive initial folder comparison with ignore rules
 - Three-stage mapping wizard and mandatory approval on the receiving computer
 - Recomparison when the receiving computer changes its destination folder
+- Transactional one-time migration of legacy `state.json` mappings into SQLite
+- Durable mapping tombstones and authenticated, exact-acknowledged configuration delivery
+- Mapping-store loading, degraded, unsupported-schema and migration-failure UI
 
-Actual file transfer, replacement and deletion remain deliberately disabled. Approved mappings enter `ready-for-initial-sync` state until the Rust reconciliation and transfer slice is implemented.
+`state.json` continues to hold unrelated desktop preferences and temporary proposal UI state, but it is not a mapping read source or a second writable mapping store. The engine prefers `TETHERA_DATA_DIR`; the deprecated `FOLDERSYNC_DATA_DIR` is accepted only as a logged compatibility fallback. Electron continues to pass its established `userData` location so existing databases remain discoverable.
+
+The existing explicitly initiated development initial pull can copy bounded remote-only files and skips differing files. This PR does not expand that path. Continuous two-way reconciliation, filesystem watchers, deletion propagation, production transfer and history remain unimplemented.
 
 ## Checks
 
 ```bash
 bun run desktop:typecheck
 bun run desktop:test
+bun run desktop:build
 ```
 
 ## Component workflow

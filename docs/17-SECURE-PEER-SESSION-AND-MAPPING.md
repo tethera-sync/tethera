@@ -1,10 +1,10 @@
-# Secure Peer Session and Folder Mapping — Slice 4
+# Secure Peer Session and Folder Mapping
 
 Status: implemented development protocol. It is designed for LAN testing and still requires independent security review before public release.
 
 ## Purpose
 
-Slice 4 adds the first post-pairing data channel. It allows trusted computers to browse folder names, compare selected folders and approve a shared mapping without sending any file contents or modifying either folder.
+The post-pairing channel lets trusted computers browse destinations, compare selected folders, approve a shared mapping and reconcile mapping-configuration events. Configuration messages do not inspect or modify either mapped folder.
 
 ## Authenticated encrypted session
 
@@ -27,7 +27,9 @@ The server currently accepts only bounded typed operations:
 - list directories and standard locations;
 - build a read-only file manifest for an explicitly selected folder;
 - submit a folder-mapping proposal;
-- deliver an approval or rejection for a known proposal.
+- deliver an approval or rejection for a known proposal;
+- deliver a versioned active mapping event or durable mapping tombstone; and
+- serve a bounded file for the existing explicitly started development initial pull.
 
 Remote browsing returns folder names, paths, link/directory type and hidden status. It does not return file names or file contents. Creating a folder from the remote browser is disabled; the receiving user may choose or create a different local destination during approval.
 
@@ -55,15 +57,25 @@ The initiator chooses both paths and settings, reviews the comparison, then send
 - change the local destination with the custom folder browser;
 - approve or reject.
 
-Approval creates the same stable mapping ID on both computers. Each side stores its own local path and the opposite path. Send-only and receive-only modes are inverted on the responder so their meaning stays correct locally.
+Approval creates the same stable mapping ID on both computers. SQLite commits the responder's configuration before it is presented as durable, then the active event remains in the delivery outbox until the initiator acknowledges its exact mapping ID, event ID and revision. Each side stores its own local path and the opposite path. Send-only and receive-only modes are inverted on the responder so their meaning stays correct locally.
 
 If the receiver changes the destination, Tethera performs a fresh encrypted comparison before approval. The initiator also recomputes its preview immediately before sending the request, and the receiver recomputes once more at approval time. If either folder changed, approval pauses until the refreshed comparison has been reviewed. Preview data supplied by the renderer is therefore never accepted as authoritative.
 
-If the initiator is temporarily unreachable after approval, the receiver stores the approved mapping and retries delivery every five seconds while the peer is online.
+If the initiator is temporarily unreachable after approval, the receiver retains the active event in SQLite and retries while the peer is online. Duplicate delivery is idempotent.
+
+## Configuration reconciliation and removal
+
+Active mapping records and tombstones use the authenticated peer identity established above. The Rust engine accepts an event only when the authenticated peer and local device are the two mapping participants. It rejects unknown fields and invalid revisions before changing storage.
+
+Ordering uses monotonic revisions with deterministic event IDs; timestamps are diagnostic metadata, not the sole ordering input. A newer event defeats an older active event, and a tombstoned mapping ID is terminal. Re-adding the same folder pair creates a new mapping ID instead of reviving deletion evidence.
+
+Removing a mapping commits its durable tombstone and pending peer delivery in one SQLite transaction. The peer must acknowledge the exact deletion event before the outbox entry is cleared. Disconnects and stale acknowledgements leave it pending. Tombstones survive restart and are not automatically pruned.
 
 ## Data-safety boundary
 
-Slice 4 does not copy, replace, rename or delete files. Approved mappings are marked `ready-for-initial-sync` and display that transfer is not enabled yet. This prevents the interface from implying that real synchronisation has begun.
+Mapping migration, configuration delivery and removal never scan, copy, replace, rename, move or delete a user file. Removing a mapping changes configuration only and leaves both folders untouched.
+
+The repository separately retains its pre-existing, explicitly initiated development initial pull for bounded remote-only files. That path is not part of configuration reconciliation and is not expanded by the authoritative-mapping work. It still skips files that differ on both sides and is not continuous two-way synchronisation.
 
 ## Firewall ports
 

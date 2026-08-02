@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -12,7 +13,10 @@ use sync_core::manifest::{
 };
 use sync_platform::scan::scan_folder;
 use sync_protocol::{HealthResponse, MappingStoreHealth, ProtocolVersion, RpcRequest, RpcResponse};
-use sync_storage::mapping::{MappingRecord, MappingStore, check_identifier};
+use sync_storage::mapping::{
+    LegacyImportRequest, LegacyMigrationState, MappingConfiguration, MappingEvent, MappingStore,
+    MappingStoreError, check_identifier,
+};
 
 /// Longest path `manifest.scan` will accept, so a malformed request cannot hand the walker an
 /// unbounded string.
@@ -79,82 +83,165 @@ fn run_stdio_rpc() {
     }
 }
 
-/// The mapping index, or the reason there isn't one.
-///
-/// Persistence is deliberately optional: a database that will not open must not stop the engine
-/// from serving `health` or from running a scan, and must not stop the desktop shell from
-/// pairing or approving a mapping. What it must not do is fail silently — the reason is kept
-/// here and reported through `health` so the shell can say persistence is off rather than
-/// letting the user believe an approval was durably recorded.
+const TETHERA_DATA_DIR: &str = "TETHERA_DATA_DIR";
+const LEGACY_DATA_DIR: &str = "FOLDERSYNC_DATA_DIR";
+
+/// The authoritative mapping database, or a typed reason why it cannot be used.
 enum MappingStoreSlot {
     Ready(Box<MappingStore>),
-    /// No `FOLDERSYNC_DATA_DIR`; nothing is being persisted this session.
     NotConfigured,
-    /// A data directory was supplied but the database could not be opened.
-    Unavailable(String),
+    Unavailable {
+        status: &'static str,
+        detail: String,
+        schema_version: Option<i64>,
+    },
+}
+
+struct DataDirectorySelection {
+    path: Option<PathBuf>,
+    used_legacy_name: bool,
+}
+
+fn select_data_directory(
+    tethera: Option<OsString>,
+    legacy: Option<OsString>,
+) -> DataDirectorySelection {
+    let usable = |value: OsString| {
+        if value.to_string_lossy().trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        }
+    };
+    if let Some(path) = tethera.and_then(usable) {
+        return DataDirectorySelection {
+            path: Some(path),
+            used_legacy_name: false,
+        };
+    }
+    if let Some(path) = legacy.and_then(usable) {
+        return DataDirectorySelection {
+            path: Some(path),
+            used_legacy_name: true,
+        };
+    }
+    DataDirectorySelection {
+        path: None,
+        used_legacy_name: false,
+    }
+}
+
+struct RpcFailure {
+    code: &'static str,
+    message: String,
 }
 
 impl MappingStoreSlot {
-    /// Opens the mapping index under `FOLDERSYNC_DATA_DIR`, if the desktop shell provided one.
     fn open() -> Self {
-        let Ok(data_dir) = env::var("FOLDERSYNC_DATA_DIR") else {
+        let selection =
+            select_data_directory(env::var_os(TETHERA_DATA_DIR), env::var_os(LEGACY_DATA_DIR));
+        let Some(data_dir) = selection.path else {
             return Self::NotConfigured;
         };
-        if data_dir.trim().is_empty() {
-            return Self::NotConfigured;
+        if selection.used_legacy_name {
+            eprintln!(
+                "{LEGACY_DATA_DIR} is deprecated; set {TETHERA_DATA_DIR} instead. The existing data directory is still being used."
+            );
         }
-        let db_path = PathBuf::from(data_dir).join("mappings.sqlite3");
+        let db_path = data_dir.join("mappings.sqlite3");
         match MappingStore::open(&db_path) {
             Ok(store) => Self::Ready(Box::new(store)),
-            Err(error) => Self::Unavailable(format!(
-                "Failed to open the mapping index at {}: {error}",
-                db_path.display()
-            )),
+            Err(MappingStoreError::UnsupportedSchemaVersion { found }) => Self::Unavailable {
+                status: "unsupported-schema",
+                detail: format!(
+                    "The mapping database uses schema version {found}, newer than this Tethera build supports. Upgrade Tethera before changing mappings."
+                ),
+                schema_version: Some(found),
+            },
+            Err(MappingStoreError::SchemaMigration(detail)) => Self::Unavailable {
+                status: "migration-failed",
+                detail: format!("The mapping database schema migration did not commit: {detail}"),
+                schema_version: None,
+            },
+            Err(error) => Self::Unavailable {
+                status: "unavailable",
+                detail: format!("Failed to open the authoritative mapping database: {error}"),
+                schema_version: None,
+            },
         }
     }
 
-    /// The store, or the message to hand back to a caller that needs one.
-    fn store(&self) -> Result<&MappingStore, String> {
+    fn store(&self) -> Result<&MappingStore, RpcFailure> {
         match self {
             Self::Ready(store) => Ok(store),
-            Self::NotConfigured => Err(
-                "The mapping index is unavailable: no FOLDERSYNC_DATA_DIR was supplied, so nothing is being persisted."
-                    .to_owned(),
-            ),
-            Self::Unavailable(detail) => {
-                Err(format!("The mapping index is unavailable: {detail}"))
-            }
+            Self::NotConfigured => Err(RpcFailure {
+                code: "MAPPING_STORE_NOT_CONFIGURED",
+                message: format!(
+                    "The mapping database is unavailable: no {TETHERA_DATA_DIR} was supplied."
+                ),
+            }),
+            Self::Unavailable { status, detail, .. } => Err(RpcFailure {
+                code: match *status {
+                    "unsupported-schema" => "MAPPING_STORE_UNSUPPORTED_SCHEMA",
+                    "migration-failed" => "MAPPING_STORE_MIGRATION_FAILED",
+                    _ => "MAPPING_STORE_UNAVAILABLE",
+                },
+                message: detail.clone(),
+            }),
         }
     }
 
-    /// A line for stderr at startup when persistence is not working, or `None` when it is.
     fn startup_warning(&self) -> Option<String> {
         match self {
             Self::Ready(_) => None,
-            Self::NotConfigured => Some(
-                "FOLDERSYNC_DATA_DIR is not set: folder mappings will not be persisted this session."
-                    .to_owned(),
-            ),
-            Self::Unavailable(detail) => {
-                Some(format!("{detail} — folder mappings will not be persisted this session."))
-            }
+            Self::NotConfigured => Some(format!(
+                "{TETHERA_DATA_DIR} is not set: the authoritative mapping database is unavailable and mapping mutations are disabled."
+            )),
+            Self::Unavailable { detail, .. } => Some(format!(
+                "{detail} Mapping mutations are disabled; no mapping is being treated as deleted or empty."
+            )),
         }
     }
 
     fn health(&self) -> MappingStoreHealth {
         match self {
-            Self::Ready(store) => MappingStoreHealth {
-                status: "ready",
-                detail: None,
-                schema_version: store.schema_version().ok(),
-                journal_mode: Some(store.journal_mode().to_owned()),
+            Self::Ready(store) => match store.legacy_migration_status() {
+                Ok(migration) => MappingStoreHealth {
+                    status: "ready",
+                    detail: migration.last_error,
+                    schema_version: store.schema_version().ok(),
+                    journal_mode: Some(store.journal_mode().to_owned()),
+                    migration_state: Some(
+                        match migration.state {
+                            LegacyMigrationState::Pending => "pending",
+                            LegacyMigrationState::Completed => "completed",
+                            LegacyMigrationState::Failed => "failed",
+                        }
+                        .to_owned(),
+                    ),
+                    mutations_enabled: migration.state == LegacyMigrationState::Completed,
+                },
+                Err(error) => MappingStoreHealth {
+                    status: "unavailable",
+                    detail: Some(format!("Mapping-store metadata is unreadable: {error}")),
+                    schema_version: store.schema_version().ok(),
+                    journal_mode: Some(store.journal_mode().to_owned()),
+                    migration_state: Some("failed".to_owned()),
+                    mutations_enabled: false,
+                },
             },
             Self::NotConfigured => MappingStoreHealth::unusable(
                 "not-configured",
-                "No FOLDERSYNC_DATA_DIR was supplied, so mappings are not being persisted.",
+                format!("No {TETHERA_DATA_DIR} was supplied."),
             ),
-            Self::Unavailable(detail) => {
-                MappingStoreHealth::unusable("unavailable", detail.clone())
+            Self::Unavailable {
+                status,
+                detail,
+                schema_version,
+            } => {
+                let mut health = MappingStoreHealth::unusable(status, detail.clone());
+                health.schema_version = *schema_version;
+                health
             }
         }
     }
@@ -176,14 +263,16 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
             return json!({
                 "id": "unknown",
                 "ok": false,
+                "errorCode": "INVALID_REQUEST",
                 "error": format!("Invalid request: {error}")
             });
         }
     };
 
     if request.session_token != expected_token {
-        return serde_json::to_value(RpcResponse::<Value>::error(
+        return serde_json::to_value(RpcResponse::<Value>::error_with_code(
             request.id,
+            "AUTHENTICATION_FAILED",
             "Invalid RPC session token.",
         ))
         .expect("serialising an RPC error should not fail");
@@ -211,12 +300,22 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
         "mapping.listPendingDelivery" => {
             handle_mapping_list_pending_delivery(request, mapping_store)
         }
-        "mapping.delete" => handle_mapping_delete(request, mapping_store),
+        "mapping.remove" => handle_mapping_remove(request, mapping_store),
+        "mapping.applyRemote" => handle_mapping_apply_remote(request, mapping_store),
+        "mapping.acknowledgeDelivery" => {
+            handle_mapping_acknowledge_delivery(request, mapping_store)
+        }
+        "mapping.getMigrationStatus" => handle_mapping_get_migration_status(request, mapping_store),
+        "mapping.importLegacy" => handle_mapping_import_legacy(request, mapping_store),
+        "mapping.recordMigrationFailure" => {
+            handle_mapping_record_migration_failure(request, mapping_store)
+        }
         "manifest.scan" => handle_manifest_scan(request),
         "manifest.compare" => handle_manifest_compare(request),
         "plan.build" => handle_plan_build(request),
-        other => serde_json::to_value(RpcResponse::<Value>::error(
+        other => serde_json::to_value(RpcResponse::<Value>::error_with_code(
             request.id,
+            "METHOD_NOT_FOUND",
             format!("Unknown method: {other}"),
         ))
         .expect("serialising an RPC error should not fail"),
@@ -235,8 +334,55 @@ fn success_response(id: String, result: impl serde::Serialize) -> Value {
 }
 
 fn error_response(id: String, message: impl Into<String>) -> Value {
-    serde_json::to_value(RpcResponse::<Value>::error(id, message))
+    error_response_with_code(id, "RPC_ERROR", message)
+}
+
+fn error_response_with_code(
+    id: String,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> Value {
+    serde_json::to_value(RpcResponse::<Value>::error_with_code(id, code, message))
         .expect("serialising an RPC error response should not fail")
+}
+
+fn rpc_failure_response(id: String, failure: RpcFailure) -> Value {
+    error_response_with_code(id, failure.code, failure.message)
+}
+
+fn store_error_response(id: String, context: &str, error: &MappingStoreError) -> Value {
+    error_response_with_code(id, mapping_error_code(error), format!("{context}: {error}"))
+}
+
+fn mapping_error_code(error: &MappingStoreError) -> &'static str {
+    match error {
+        MappingStoreError::Database(_) => "MAPPING_STORE_UNAVAILABLE",
+        MappingStoreError::Serialisation(_)
+        | MappingStoreError::CorruptRecord { .. }
+        | MappingStoreError::CorruptMetadata { .. } => "MAPPING_STORE_CORRUPT",
+        MappingStoreError::UnsupportedSchemaVersion { .. } => "MAPPING_STORE_UNSUPPORTED_SCHEMA",
+        MappingStoreError::SchemaMigration(_) => "MAPPING_STORE_MIGRATION_FAILED",
+        MappingStoreError::MigrationRequired => "MAPPING_MIGRATION_REQUIRED",
+        MappingStoreError::MigrationFailed(_) => "MAPPING_MIGRATION_FAILED",
+        MappingStoreError::LegacyImportAlreadyCompleted => "LEGACY_IMPORT_ALREADY_COMPLETED",
+        MappingStoreError::DuplicateMappingId(_) => "LEGACY_IMPORT_DUPLICATE_ID",
+        MappingStoreError::Tombstoned(_) => "MAPPING_TOMBSTONED",
+        MappingStoreError::NotFound(_) => "MAPPING_NOT_FOUND",
+        MappingStoreError::StaleRevision { .. } => "MAPPING_STALE_REVISION",
+        MappingStoreError::InvalidParticipant(_) => "MAPPING_INVALID_PARTICIPANT",
+        MappingStoreError::AcknowledgementMismatch => "MAPPING_ACK_MISMATCH",
+        MappingStoreError::ConflictingEvent { .. } => "MAPPING_EVENT_CONFLICT",
+        MappingStoreError::Invalid(_) => "INVALID_PARAMS",
+    }
+}
+
+fn require_no_params(params: Option<&Value>, method: &str) -> Result<(), String> {
+    if params.is_some() {
+        return Err(format!(
+            "Invalid params for {method}: no params are accepted"
+        ));
+    }
+    Ok(())
 }
 
 /// Pulls a validated mapping id out of a request's params.
@@ -247,52 +393,63 @@ fn mapping_id(params: Option<Value>, method: &str) -> Result<String, String> {
     Ok(params.id)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingUpsertParams {
+    mapping: MappingConfiguration,
+    author_device_id: String,
+    delivery_target_device_id: Option<String>,
+    expected_revision: Option<i64>,
+    occurred_at: String,
+}
+
 fn handle_mapping_upsert(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: MappingUpsertParams = match parse_params(request.params, "mapping.upsert") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
     let store = match mapping_store.store() {
         Ok(store) => store,
-        Err(message) => return error_response(request.id, message),
+        Err(failure) => return rpc_failure_response(request.id, failure),
     };
-    let record: MappingRecord = match parse_params(request.params, "mapping.upsert") {
-        Ok(record) => record,
-        Err(message) => return error_response(request.id, message),
-    };
-    match store.upsert(&record) {
-        Ok(()) => success_response(request.id, record),
-        Err(store_error) => error_response(
-            request.id,
-            format!("Failed to store mapping: {store_error}"),
-        ),
+    match store.upsert_local(
+        &params.mapping,
+        &params.author_device_id,
+        params.delivery_target_device_id.as_deref(),
+        params.expected_revision,
+        &params.occurred_at,
+    ) {
+        Ok(record) => success_response(request.id, record),
+        Err(error) => store_error_response(request.id, "Failed to store mapping", &error),
     }
 }
 
 fn handle_mapping_get(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
-    let store = match mapping_store.store() {
-        Ok(store) => store,
-        Err(message) => return error_response(request.id, message),
-    };
     let id = match mapping_id(request.params, "mapping.get") {
         Ok(id) => id,
-        Err(message) => return error_response(request.id, message),
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
     };
     match store.get(&id) {
         Ok(record) => success_response(request.id, record),
-        Err(store_error) => {
-            error_response(request.id, format!("Failed to read mapping: {store_error}"))
-        }
+        Err(error) => store_error_response(request.id, "Failed to read mapping", &error),
     }
 }
 
 fn handle_mapping_list(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    if let Err(message) = require_no_params(request.params.as_ref(), "mapping.list") {
+        return error_response_with_code(request.id, "INVALID_PARAMS", message);
+    }
     let store = match mapping_store.store() {
         Ok(store) => store,
-        Err(message) => return error_response(request.id, message),
+        Err(failure) => return rpc_failure_response(request.id, failure),
     };
     match store.list() {
         Ok(records) => success_response(request.id, records),
-        Err(store_error) => error_response(
-            request.id,
-            format!("Failed to list mappings: {store_error}"),
-        ),
+        Err(error) => store_error_response(request.id, "Failed to list mappings", &error),
     }
 }
 
@@ -300,35 +457,199 @@ fn handle_mapping_list_pending_delivery(
     request: RpcRequest,
     mapping_store: &MappingStoreSlot,
 ) -> Value {
+    if let Err(message) = require_no_params(request.params.as_ref(), "mapping.listPendingDelivery")
+    {
+        return error_response_with_code(request.id, "INVALID_PARAMS", message);
+    }
     let store = match mapping_store.store() {
         Ok(store) => store,
-        Err(message) => return error_response(request.id, message),
+        Err(failure) => return rpc_failure_response(request.id, failure),
     };
     match store.list_pending_delivery() {
-        Ok(records) => success_response(request.id, records),
-        Err(store_error) => error_response(
-            request.id,
-            format!("Failed to list pending mappings: {store_error}"),
-        ),
+        Ok(deliveries) => success_response(request.id, deliveries),
+        Err(error) => store_error_response(request.id, "Failed to list pending mappings", &error),
     }
 }
 
-fn handle_mapping_delete(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingRemoveParams {
+    id: String,
+    deleting_device_id: String,
+    delivery_target_device_id: Option<String>,
+    expected_revision: i64,
+    occurred_at: String,
+}
+
+fn handle_mapping_remove(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: MappingRemoveParams = match parse_params(request.params, "mapping.remove") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
     let store = match mapping_store.store() {
         Ok(store) => store,
-        Err(message) => return error_response(request.id, message),
+        Err(failure) => return rpc_failure_response(request.id, failure),
     };
-    let id = match mapping_id(request.params, "mapping.delete") {
-        Ok(id) => id,
-        Err(message) => return error_response(request.id, message),
+    match store.remove_local(
+        &params.id,
+        &params.deleting_device_id,
+        params.delivery_target_device_id.as_deref(),
+        params.expected_revision,
+        &params.occurred_at,
+    ) {
+        Ok(tombstone) => success_response(request.id, tombstone),
+        Err(error) => store_error_response(request.id, "Failed to remove mapping", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingApplyRemoteParams {
+    event: MappingEvent,
+    authenticated_peer_device_id: String,
+    local_device_id: String,
+}
+
+fn handle_mapping_apply_remote(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: MappingApplyRemoteParams = match parse_params(request.params, "mapping.applyRemote")
+    {
+        Ok(params) => params,
+        Err(message) => {
+            return error_response_with_code(request.id, "INVALID_PARAMS", message);
+        }
     };
-    // Removes only this index row. Nothing under the mapped folder is touched.
-    match store.delete(&id) {
-        Ok(deleted) => success_response(request.id, json!({ "deleted": deleted })),
-        Err(store_error) => error_response(
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.apply_remote(
+        &params.event,
+        &params.authenticated_peer_device_id,
+        &params.local_device_id,
+    ) {
+        Ok(outcome) => success_response(request.id, outcome),
+        Err(error) => {
+            store_error_response(request.id, "Failed to apply peer mapping event", &error)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingAcknowledgeParams {
+    mapping_id: String,
+    event_id: String,
+    revision: i64,
+    authenticated_peer_device_id: String,
+    acknowledged_at: String,
+}
+
+fn handle_mapping_acknowledge_delivery(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: MappingAcknowledgeParams =
+        match parse_params(request.params, "mapping.acknowledgeDelivery") {
+            Ok(params) => params,
+            Err(message) => {
+                return error_response_with_code(request.id, "INVALID_PARAMS", message);
+            }
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.acknowledge_delivery(
+        &params.mapping_id,
+        &params.event_id,
+        params.revision,
+        &params.authenticated_peer_device_id,
+        &params.acknowledged_at,
+    ) {
+        Ok(outcome) => success_response(request.id, outcome),
+        Err(error) => {
+            store_error_response(request.id, "Failed to acknowledge mapping delivery", &error)
+        }
+    }
+}
+
+fn handle_mapping_get_migration_status(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    if let Err(message) = require_no_params(request.params.as_ref(), "mapping.getMigrationStatus") {
+        return error_response_with_code(request.id, "INVALID_PARAMS", message);
+    }
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.legacy_migration_status() {
+        Ok(status) => success_response(request.id, status),
+        Err(error) => store_error_response(request.id, "Failed to read migration status", &error),
+    }
+}
+
+fn handle_mapping_import_legacy(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: LegacyImportRequest = match parse_params(request.params, "mapping.importLegacy") {
+        Ok(params) => params,
+        Err(message) => {
+            if let Ok(store) = mapping_store.store() {
+                let _ = store.record_legacy_import_failure(&message);
+            }
+            return error_response_with_code(request.id, "INVALID_PARAMS", message);
+        }
+    };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.import_legacy(&params) {
+        Ok(outcome) => success_response(request.id, outcome),
+        Err(error) => {
+            store_error_response(request.id, "Legacy mapping import did not commit", &error)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MappingMigrationFailureParams {
+    detail: String,
+}
+
+fn handle_mapping_record_migration_failure(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: MappingMigrationFailureParams =
+        match parse_params(request.params, "mapping.recordMigrationFailure") {
+            Ok(params) => params,
+            Err(message) => {
+                return error_response_with_code(request.id, "INVALID_PARAMS", message);
+            }
+        };
+    if params.detail.trim().is_empty() {
+        return error_response_with_code(
             request.id,
-            format!("Failed to delete mapping: {store_error}"),
-        ),
+            "INVALID_PARAMS",
+            "migration failure detail must not be empty",
+        );
+    }
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.record_legacy_import_failure(&params.detail) {
+        Ok(()) => match store.legacy_migration_status() {
+            Ok(status) => success_response(request.id, status),
+            Err(error) => {
+                store_error_response(request.id, "Failed to read migration status", &error)
+            }
+        },
+        Err(error) => {
+            store_error_response(request.id, "Failed to record migration failure", &error)
+        }
     }
 }
 
@@ -420,41 +741,64 @@ fn handle_plan_build(request: RpcRequest) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{MappingStoreSlot, handle_line};
-    use sync_storage::mapping::{MappingStore, SCHEMA_VERSION};
+    use std::ffi::OsString;
+
+    use super::{MappingStoreSlot, handle_line, mapping_error_code, select_data_directory};
+    use sync_storage::mapping::{
+        LegacyImportRequest, MappingStore, MappingStoreError, SCHEMA_VERSION,
+    };
 
     /// A slot backed by a real in-memory database.
     fn ready_store() -> MappingStoreSlot {
-        MappingStoreSlot::Ready(Box::new(
-            MappingStore::open_in_memory().expect("open in-memory store"),
-        ))
+        let store = MappingStore::open_in_memory().expect("open in-memory store");
+        store
+            .import_legacy(&LegacyImportRequest {
+                source_fingerprint: "0".repeat(64),
+                importing_device_id: "linux-box".to_owned(),
+                imported_at: "2026-08-01T00:00:00Z".to_owned(),
+                records: Vec::new(),
+            })
+            .expect("complete empty legacy import");
+        MappingStoreSlot::Ready(Box::new(store))
     }
 
     fn sample_mapping_json() -> &'static str {
         r#"{
-            "id": "mapping-1",
-            "name": "Projects",
-            "initiatorDeviceId": "linux-box",
-            "initiatorDeviceName": "Linux Mint",
-            "responderDeviceId": "win-box",
-            "responderDeviceName": "Windows 11",
-            "initiatorPath": "/home/tommy/Projects",
-            "responderPath": "C:\\Users\\tommy\\Projects",
-            "mode": "two-way",
-            "ignorePatterns": ["node_modules/"],
-            "historyDays": 30,
-            "historyMaxBytes": 5000000000,
-            "setupStatus": "pending-approval",
-            "pendingDelivery": false,
-            "preview": null,
-            "createdAt": "2026-08-01T00:00:00Z",
-            "updatedAt": "2026-08-01T00:00:00Z"
+            "mapping": {
+                "id": "mapping-1",
+                "name": "Projects",
+                "initiatorDeviceId": "linux-box",
+                "initiatorDeviceName": "Linux Mint",
+                "responderDeviceId": "win-box",
+                "responderDeviceName": "Windows 11",
+                "initiatorPath": "/home/tommy/Projects",
+                "responderPath": "C:\\Users\\tommy\\Projects",
+                "mode": "two-way",
+                "ignorePatterns": ["node_modules/"],
+                "historyDays": 30,
+                "historyMaxBytes": 5000000000,
+                "setupStatus": "pending-approval",
+                "paused": false,
+                "preview": null,
+                "createdAt": "2026-08-01T00:00:00Z",
+                "updatedAt": "2026-08-01T00:00:00Z"
+            },
+            "authorDeviceId": "linux-box",
+            "deliveryTargetDeviceId": null,
+            "expectedRevision": null,
+            "occurredAt": "2026-08-01T00:00:00Z"
         }"#
     }
 
     /// Builds a request line with the given method and raw JSON params.
     fn request(method: &str, params: &str) -> String {
         format!(r#"{{"id":"1","method":"{method}","sessionToken":"correct","params":{params}}}"#)
+    }
+
+    fn remove_mapping_json(id: &str, expected_revision: i64) -> String {
+        format!(
+            r#"{{"id":"{id}","deletingDeviceId":"linux-box","deliveryTargetDeviceId":null,"expectedRevision":{expected_revision},"occurredAt":"2026-08-01T00:01:00Z"}}"#
+        )
     }
 
     #[test]
@@ -468,6 +812,17 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_event_has_a_stable_structured_error_code() {
+        assert_eq!(
+            mapping_error_code(&MappingStoreError::ConflictingEvent {
+                mapping_id: "mapping-1".to_owned(),
+                event_id: "active:mapping-1:1:linux-box".to_owned(),
+            }),
+            "MAPPING_EVENT_CONFLICT"
+        );
+    }
+
+    #[test]
     fn every_mapping_method_requires_the_session_token() {
         let store = ready_store();
         for method in [
@@ -475,7 +830,12 @@ mod tests {
             "mapping.get",
             "mapping.list",
             "mapping.listPendingDelivery",
-            "mapping.delete",
+            "mapping.remove",
+            "mapping.applyRemote",
+            "mapping.acknowledgeDelivery",
+            "mapping.getMigrationStatus",
+            "mapping.importLegacy",
+            "mapping.recordMigrationFailure",
             "manifest.scan",
             "manifest.compare",
             "plan.build",
@@ -538,6 +898,11 @@ mod tests {
         );
         // In-memory databases report `memory`; an on-disk one reports `wal`.
         assert_eq!(response["result"]["mappingStore"]["journalMode"], "memory");
+        assert_eq!(
+            response["result"]["mappingStore"]["migrationState"],
+            "completed"
+        );
+        assert_eq!(response["result"]["mappingStore"]["mutationsEnabled"], true);
     }
 
     #[test]
@@ -559,7 +924,11 @@ mod tests {
 
     #[test]
     fn health_admits_when_the_database_could_not_be_opened() {
-        let slot = MappingStoreSlot::Unavailable("disk is on fire".to_owned());
+        let slot = MappingStoreSlot::Unavailable {
+            status: "unavailable",
+            detail: "disk is on fire".to_owned(),
+            schema_version: None,
+        };
         let response = handle_line(
             r#"{"id":"1","method":"health","sessionToken":"correct"}"#,
             "correct",
@@ -573,6 +942,32 @@ mod tests {
                 .contains("disk is on fire")
         );
         assert!(response["result"]["mappingStore"]["schemaVersion"].is_null());
+    }
+
+    #[test]
+    fn health_distinguishes_a_newer_unsupported_database() {
+        let slot = MappingStoreSlot::Unavailable {
+            status: "unsupported-schema",
+            detail: "upgrade Tethera before changing mappings".to_owned(),
+            schema_version: Some(SCHEMA_VERSION + 1),
+        };
+        let response = handle_line(
+            r#"{"id":"1","method":"health","sessionToken":"correct"}"#,
+            "correct",
+            &slot,
+        );
+        assert_eq!(
+            response["result"]["mappingStore"]["status"],
+            "unsupported-schema"
+        );
+        assert_eq!(
+            response["result"]["mappingStore"]["schemaVersion"],
+            SCHEMA_VERSION + 1
+        );
+        assert_eq!(
+            response["result"]["mappingStore"]["mutationsEnabled"],
+            false
+        );
     }
 
     #[test]
@@ -612,17 +1007,14 @@ mod tests {
 
         let response = handle_line(
             &request(
-                "mapping.delete",
+                "mapping.get",
                 r#"{"id":"x'; DROP TABLE folder_mappings; --"}"#,
             ),
             "correct",
             &store,
         );
         assert_eq!(response["ok"], true);
-        assert_eq!(
-            response["result"]["deleted"], false,
-            "no row has that literal id"
-        );
+        assert!(response["result"].is_null(), "no row has that literal id");
 
         let listed = handle_line(
             r#"{"id":"2","method":"mapping.list","sessionToken":"correct"}"#,
@@ -638,16 +1030,59 @@ mod tests {
 
     #[test]
     fn mapping_methods_report_an_unavailable_store() {
-        for method in [
-            "mapping.list",
-            "mapping.listPendingDelivery",
-            "mapping.get",
-            "mapping.delete",
-            "mapping.upsert",
-        ] {
-            let line = format!(
-                r#"{{"id":"1","method":"{method}","sessionToken":"correct","params":{{"id":"mapping-1"}}}}"#
-            );
+        let cases = [
+            (
+                "mapping.list",
+                r#"{"id":"1","method":"mapping.list","sessionToken":"correct"}"#.to_owned(),
+            ),
+            (
+                "mapping.listPendingDelivery",
+                r#"{"id":"1","method":"mapping.listPendingDelivery","sessionToken":"correct"}"#
+                    .to_owned(),
+            ),
+            (
+                "mapping.get",
+                request("mapping.get", r#"{"id":"mapping-1"}"#),
+            ),
+            (
+                "mapping.remove",
+                request("mapping.remove", &remove_mapping_json("mapping-1", 1)),
+            ),
+            (
+                "mapping.upsert",
+                request("mapping.upsert", sample_mapping_json()),
+            ),
+            (
+                "mapping.acknowledgeDelivery",
+                request(
+                    "mapping.acknowledgeDelivery",
+                    r#"{"mappingId":"mapping-1","eventId":"event-1","revision":1,"authenticatedPeerDeviceId":"win-box","acknowledgedAt":"2026-08-01T00:02:00Z"}"#,
+                ),
+            ),
+            (
+                "mapping.getMigrationStatus",
+                r#"{"id":"1","method":"mapping.getMigrationStatus","sessionToken":"correct"}"#
+                    .to_owned(),
+            ),
+            (
+                "mapping.importLegacy",
+                request(
+                    "mapping.importLegacy",
+                    &format!(
+                        r#"{{"sourceFingerprint":"{}","importingDeviceId":"linux-box","importedAt":"2026-08-01T00:00:00Z","records":[]}}"#,
+                        "0".repeat(64)
+                    ),
+                ),
+            ),
+            (
+                "mapping.recordMigrationFailure",
+                request(
+                    "mapping.recordMigrationFailure",
+                    r#"{"detail":"state.json is unreadable"}"#,
+                ),
+            ),
+        ];
+        for (method, line) in cases {
             let response = handle_line(&line, "correct", &MappingStoreSlot::NotConfigured);
             assert_eq!(
                 response["ok"], false,
@@ -673,7 +1108,8 @@ mod tests {
             &store,
         );
         assert_eq!(response["ok"], true);
-        assert_eq!(response["result"]["id"], "mapping-1");
+        assert_eq!(response["result"]["mapping"]["id"], "mapping-1");
+        assert_eq!(response["result"]["revision"], 1);
 
         let response = handle_line(
             &request("mapping.get", r#"{"id":"mapping-1"}"#),
@@ -681,8 +1117,11 @@ mod tests {
             &store,
         );
         assert_eq!(response["ok"], true);
-        assert_eq!(response["result"]["id"], "mapping-1");
-        assert_eq!(response["result"]["setupStatus"], "pending-approval");
+        assert_eq!(response["result"]["mapping"]["id"], "mapping-1");
+        assert_eq!(
+            response["result"]["mapping"]["setupStatus"],
+            "pending-approval"
+        );
     }
 
     #[test]
@@ -699,9 +1138,12 @@ mod tests {
             "correct",
             &store,
         );
-        assert_eq!(response["result"]["initiatorPath"], "/home/tommy/Projects");
         assert_eq!(
-            response["result"]["responderPath"], "C:\\Users\\tommy\\Projects",
+            response["result"]["mapping"]["initiatorPath"],
+            "/home/tommy/Projects"
+        );
+        assert_eq!(
+            response["result"]["mapping"]["responderPath"], "C:\\Users\\tommy\\Projects",
             "a Windows path must survive the round trip with its backslashes"
         );
     }
@@ -718,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_list_and_delete_round_trip() {
+    fn mapping_list_and_remove_round_trip() {
         let store = ready_store();
         handle_line(
             &request("mapping.upsert", sample_mapping_json()),
@@ -733,12 +1175,14 @@ mod tests {
         );
         assert_eq!(list_response["result"].as_array().expect("array").len(), 1);
 
-        let delete_response = handle_line(
-            &request("mapping.delete", r#"{"id":"mapping-1"}"#),
+        let remove_response = handle_line(
+            &request("mapping.remove", &remove_mapping_json("mapping-1", 1)),
             "correct",
             &store,
         );
-        assert_eq!(delete_response["result"]["deleted"], true);
+        assert_eq!(remove_response["ok"], true);
+        assert_eq!(remove_response["result"]["mappingId"], "mapping-1");
+        assert_eq!(remove_response["result"]["deletionRevision"], 2);
 
         let list_after_delete = handle_line(
             r#"{"id":"4","method":"mapping.list","sessionToken":"correct"}"#,
@@ -749,17 +1193,29 @@ mod tests {
             list_after_delete["result"].as_array().expect("array").len(),
             0
         );
+        let get_after_remove = handle_line(
+            &request("mapping.get", r#"{"id":"mapping-1"}"#),
+            "correct",
+            &store,
+        );
+        assert!(get_after_remove["result"].is_null());
+        let resurrection = handle_line(
+            &request("mapping.upsert", sample_mapping_json()),
+            "correct",
+            &store,
+        );
+        assert_eq!(resurrection["errorCode"], "MAPPING_TOMBSTONED");
     }
 
     #[test]
-    fn deleting_a_missing_mapping_succeeds_and_reports_that_nothing_was_removed() {
+    fn removing_a_missing_mapping_is_a_structured_error() {
         let response = handle_line(
-            &request("mapping.delete", r#"{"id":"never-existed"}"#),
+            &request("mapping.remove", &remove_mapping_json("never-existed", 1)),
             "correct",
             &ready_store(),
         );
-        assert_eq!(response["ok"], true);
-        assert_eq!(response["result"]["deleted"], false);
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["errorCode"], "MAPPING_NOT_FOUND");
     }
 
     #[test]
@@ -773,7 +1229,10 @@ mod tests {
 
         let pending = sample_mapping_json()
             .replace("mapping-1", "mapping-2")
-            .replace(r#""pendingDelivery": false"#, r#""pendingDelivery": true"#);
+            .replace(
+                r#""deliveryTargetDeviceId": null"#,
+                r#""deliveryTargetDeviceId": "win-box""#,
+            );
         handle_line(&request("mapping.upsert", &pending), "correct", &store);
 
         let response = handle_line(
@@ -783,7 +1242,195 @@ mod tests {
         );
         let records = response["result"].as_array().expect("array");
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0]["id"], "mapping-2");
+        assert_eq!(records[0]["mappingId"], "mapping-2");
+        assert_eq!(records[0]["targetDeviceId"], "win-box");
+    }
+
+    #[test]
+    fn pending_delivery_requires_the_exact_authenticated_acknowledgement() {
+        let store = ready_store();
+        let pending = sample_mapping_json().replace(
+            r#""deliveryTargetDeviceId": null"#,
+            r#""deliveryTargetDeviceId": "win-box""#,
+        );
+        let created = handle_line(&request("mapping.upsert", &pending), "correct", &store);
+        let event_id = created["result"]["eventId"].as_str().expect("event id");
+
+        let stale = format!(
+            r#"{{"mappingId":"mapping-1","eventId":{event_id},"revision":2,"authenticatedPeerDeviceId":"win-box","acknowledgedAt":"2026-08-01T00:02:00Z"}}"#,
+            event_id = serde_json::to_string(event_id).expect("event id json")
+        );
+        let response = handle_line(
+            &request("mapping.acknowledgeDelivery", &stale),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["errorCode"], "MAPPING_ACK_MISMATCH");
+
+        let exact = format!(
+            r#"{{"mappingId":"mapping-1","eventId":{event_id},"revision":1,"authenticatedPeerDeviceId":"win-box","acknowledgedAt":"2026-08-01T00:02:00Z"}}"#,
+            event_id = serde_json::to_string(event_id).expect("event id json")
+        );
+        let response = handle_line(
+            &request("mapping.acknowledgeDelivery", &exact),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["result"]["status"], "acknowledged");
+        let duplicate = handle_line(
+            &request("mapping.acknowledgeDelivery", &exact),
+            "correct",
+            &store,
+        );
+        assert_eq!(duplicate["result"]["status"], "already-acknowledged");
+        let pending_after = handle_line(
+            r#"{"id":"3","method":"mapping.listPendingDelivery","sessionToken":"correct"}"#,
+            "correct",
+            &store,
+        );
+        assert_eq!(pending_after["result"].as_array().expect("array").len(), 0);
+    }
+
+    #[test]
+    fn remote_events_require_the_authenticated_mapping_participant() {
+        let sender = ready_store();
+        let created = handle_line(
+            &request("mapping.upsert", sample_mapping_json()),
+            "correct",
+            &sender,
+        );
+        let event = serde_json::json!({
+            "kind": "active",
+            "record": created["result"].clone(),
+        });
+        let receiver = ready_store();
+        let invalid = serde_json::json!({
+            "event": event,
+            "authenticatedPeerDeviceId": "mallory",
+            "localDeviceId": "win-box",
+        });
+        let response = handle_line(
+            &request("mapping.applyRemote", &invalid.to_string()),
+            "correct",
+            &receiver,
+        );
+        assert_eq!(response["errorCode"], "MAPPING_INVALID_PARTICIPANT");
+
+        let valid = serde_json::json!({
+            "event": event,
+            "authenticatedPeerDeviceId": "linux-box",
+            "localDeviceId": "win-box",
+        });
+        let response = handle_line(
+            &request("mapping.applyRemote", &valid.to_string()),
+            "correct",
+            &receiver,
+        );
+        assert_eq!(response["result"]["status"], "applied");
+        let duplicate = handle_line(
+            &request("mapping.applyRemote", &valid.to_string()),
+            "correct",
+            &receiver,
+        );
+        assert_eq!(duplicate["result"]["status"], "duplicate");
+    }
+
+    #[test]
+    fn migration_status_and_failure_are_explicit_until_import_commits() {
+        let store = MappingStoreSlot::Ready(Box::new(
+            MappingStore::open_in_memory().expect("open pending store"),
+        ));
+        let status = handle_line(
+            r#"{"id":"1","method":"mapping.getMigrationStatus","sessionToken":"correct"}"#,
+            "correct",
+            &store,
+        );
+        assert_eq!(status["result"]["state"], "pending");
+        let list = handle_line(
+            r#"{"id":"2","method":"mapping.list","sessionToken":"correct"}"#,
+            "correct",
+            &store,
+        );
+        assert_eq!(list["errorCode"], "MAPPING_MIGRATION_REQUIRED");
+
+        let failed = handle_line(
+            &request(
+                "mapping.recordMigrationFailure",
+                r#"{"detail":"legacy record is malformed"}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(failed["result"]["state"], "failed");
+
+        let import = format!(
+            r#"{{"sourceFingerprint":"{}","importingDeviceId":"linux-box","importedAt":"2026-08-01T00:00:00Z","records":[]}}"#,
+            "a".repeat(64)
+        );
+        let imported = handle_line(&request("mapping.importLegacy", &import), "correct", &store);
+        assert_eq!(imported["result"]["status"]["state"], "completed");
+        let list = handle_line(
+            r#"{"id":"3","method":"mapping.list","sessionToken":"correct"}"#,
+            "correct",
+            &store,
+        );
+        assert_eq!(list["ok"], true);
+        assert_eq!(list["result"].as_array().expect("array").len(), 0);
+    }
+
+    #[test]
+    fn unknown_fields_and_invalid_revisions_are_rejected() {
+        let store = ready_store();
+        let mut params: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("mapping json");
+        params["unexpected"] = serde_json::json!(true);
+        let response = handle_line(
+            &request("mapping.upsert", &params.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["errorCode"], "INVALID_PARAMS");
+
+        params.as_object_mut().expect("object").remove("unexpected");
+        params["expectedRevision"] = serde_json::json!(0);
+        let response = handle_line(
+            &request("mapping.upsert", &params.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["errorCode"], "INVALID_PARAMS");
+
+        params["expectedRevision"] = serde_json::Value::Null;
+        params["mapping"]["preview"] = serde_json::json!({
+            "localFiles": 0,
+            "remoteFiles": 0,
+            "identicalFiles": 0,
+            "differentFiles": 0,
+            "localOnlyFiles": 0,
+            "remoteOnlyFiles": 0,
+            "ignoredLocal": 0,
+            "ignoredRemote": 0,
+            "bytesToRemote": 0,
+            "bytesToLocal": 0,
+            "invalidWindowsNames": [],
+            "caseCollisions": [],
+            "truncated": false,
+            "samples": [],
+            "unexpected": true
+        });
+        let response = handle_line(
+            &request("mapping.upsert", &params.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["errorCode"], "INVALID_PARAMS");
+
+        let response = handle_line(
+            r#"{"id":"1","method":"mapping.list","sessionToken":"correct","unexpected":true}"#,
+            "correct",
+            &store,
+        );
+        assert_eq!(response["errorCode"], "INVALID_REQUEST");
     }
 
     #[test]
@@ -840,28 +1487,34 @@ mod tests {
     #[test]
     fn mapping_id_methods_reject_blank_and_malformed_ids() {
         let store = ready_store();
-        for method in ["mapping.get", "mapping.delete"] {
-            for params in [
-                r#"{"id":""}"#,
-                r#"{"id":"   "}"#,
-                r#"{"id":123}"#,
-                r"{}",
-                r#"{"identifier":"mapping-1"}"#,
-                r#"{"id":"mapping-1","extra":"unexpected"}"#,
-            ] {
-                let response = handle_line(&request(method, params), "correct", &store);
-                assert_eq!(
-                    response["ok"], false,
-                    "{method} should reject params {params}"
-                );
-            }
+        for params in [
+            r#"{"id":""}"#,
+            r#"{"id":"   "}"#,
+            r#"{"id":123}"#,
+            r"{}",
+            r#"{"identifier":"mapping-1"}"#,
+            r#"{"id":"mapping-1","extra":"unexpected"}"#,
+        ] {
+            let response = handle_line(&request("mapping.get", params), "correct", &store);
+            assert_eq!(
+                response["ok"], false,
+                "mapping.get should reject params {params}"
+            );
         }
     }
 
     #[test]
     fn mapping_methods_require_params_when_they_take_them() {
         let store = ready_store();
-        for method in ["mapping.get", "mapping.delete", "mapping.upsert"] {
+        for method in [
+            "mapping.get",
+            "mapping.remove",
+            "mapping.upsert",
+            "mapping.applyRemote",
+            "mapping.acknowledgeDelivery",
+            "mapping.importLegacy",
+            "mapping.recordMigrationFailure",
+        ] {
             let line = format!(r#"{{"id":"1","method":"{method}","sessionToken":"correct"}}"#);
             let response = handle_line(&line, "correct", &store);
             assert_eq!(response["ok"], false, "{method} should require params");
@@ -1005,6 +1658,16 @@ mod tests {
         let first = MappingStoreSlot::Ready(Box::new(
             MappingStore::open(&path).expect("open first session"),
         ));
+        if let MappingStoreSlot::Ready(store) = &first {
+            store
+                .import_legacy(&LegacyImportRequest {
+                    source_fingerprint: "0".repeat(64),
+                    importing_device_id: "linux-box".to_owned(),
+                    imported_at: "2026-08-01T00:00:00Z".to_owned(),
+                    records: Vec::new(),
+                })
+                .expect("complete import before writing mappings");
+        }
         handle_line(
             &request("mapping.upsert", sample_mapping_json()),
             "correct",
@@ -1021,6 +1684,29 @@ mod tests {
             "correct",
             &second,
         );
-        assert_eq!(response["result"]["id"], "mapping-1");
+        assert_eq!(response["result"]["mapping"]["id"], "mapping-1");
+    }
+
+    #[test]
+    fn tethera_data_dir_takes_precedence_over_the_deprecated_name() {
+        let selection = select_data_directory(
+            Some(OsString::from("/new/tethera")),
+            Some(OsString::from("/old/foldersync")),
+        );
+        assert_eq!(
+            selection.path.expect("selected"),
+            std::path::Path::new("/new/tethera")
+        );
+        assert!(!selection.used_legacy_name);
+    }
+
+    #[test]
+    fn deprecated_data_dir_is_a_compatible_fallback() {
+        let selection = select_data_directory(None, Some(OsString::from("/old/foldersync")));
+        assert_eq!(
+            selection.path.expect("selected"),
+            std::path::Path::new("/old/foldersync")
+        );
+        assert!(selection.used_legacy_name);
     }
 }

@@ -23,9 +23,17 @@ import {
 export function FolderMappingApprovalDialog({
   request,
   localDevice,
+  mutationsEnabled,
+  disabledReason,
+  open,
+  onOpenChange,
 }: {
   request?: IncomingMappingRequest
   localDevice: DeviceSummary
+  mutationsEnabled: boolean
+  disabledReason: string
+  open: boolean
+  onOpenChange(open: boolean): void
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
   const [destinationPath, setDestinationPath] = useState("")
@@ -83,7 +91,7 @@ export function FolderMappingApprovalDialog({
 
   return (
     <>
-      <Dialog open>
+      <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="mapping-approval-dialog" showCloseButton={false}>
           <DialogHeader>
             <div className="mapping-approval-heading">
@@ -131,16 +139,21 @@ export function FolderMappingApprovalDialog({
           {blockingWarnings > 0 ? (
             <div className="mapping-warning danger"><FileWarningIcon /><div><strong>Approval blocked</strong><span>Rename {blockingWarnings} Windows-invalid or case-colliding paths first.</span></div></div>
           ) : (
-            <div className="approval-safety"><CheckCircle2Icon /><span>Approval creates matching records on both computers. File transfer remains disabled until the next sync-engine slice.</span></div>
+            <div className="approval-safety"><CheckCircle2Icon /><span>Approval only commits configuration. No file is touched until you explicitly start the existing initial sync.</span></div>
           )}
 
+          {!mutationsEnabled ? <p className="mapping-error">{disabledReason}</p> : null}
           {request.message ? <p className="approval-status-note">{request.message}</p> : null}
 
           {error ? <p className="mapping-error">{error}</p> : null}
 
           <DialogFooter>
             <Button variant="outline" disabled={busy} onClick={() => void reject()}><XIcon data-icon="inline-start" />Reject</Button>
-            <Button disabled={busy || !destinationPath || blockingWarnings > 0} onClick={() => void approve()}>
+            <Button
+              disabled={!mutationsEnabled || busy || !destinationPath || blockingWarnings > 0}
+              title={!mutationsEnabled ? disabledReason : undefined}
+              onClick={() => void approve()}
+            >
               <ShieldCheckIcon data-icon="inline-start" />{busy ? "Comparing…" : "Approve mapping"}
             </Button>
           </DialogFooter>

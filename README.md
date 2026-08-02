@@ -18,7 +18,7 @@ Tethera keeps folders you choose in sync between two computers you trust — a L
 
 It's built for people who want Dropbox-style convenience for a couple of personal machines without trusting a cloud provider with the entire contents of a folder tree.
 
-> **This repository is under active early development.** The pairing, discovery, and secure-session layers work today; actual file transfer and reconciliation are not implemented yet. See [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md) for the precise line between what's real and what's planned — the UI never claims to protect data it isn't protecting yet.
+> **This repository is under active early development.** Pairing, authenticated peer sessions, and authoritative mapping configuration work today. A deliberately limited Electron-side initial pull exists for development, but continuous two-way reconciliation and production engine-owned transfer are not implemented. See [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md) for the exact boundary.
 
 ## Why Tethera
 
@@ -26,7 +26,7 @@ It's built for people who want Dropbox-style convenience for a couple of persona
 - **Normal files stay normal.** Synced folders remain ordinary directories on disk — no proprietary vault format, no forced app-only access.
 - **Nothing happens silently.** Deletions are archived first, overwrites keep prior versions, and every automatic decision is meant to be recoverable or auditable.
 - **Cross-platform by design.** Linux Mint and Windows 11 are first-class, including differing destination paths, filename rules, and case-sensitivity behavior.
-- **The engine is the source of truth.** A Rust sync engine owns identity, transport, and file safety; the Electron/React UI is a thin, sandboxed client that talks to it over an authenticated local RPC channel.
+- **The mapping index is the source of truth.** The Rust engine owns folder-mapping configuration, revisions, tombstones, and pending peer delivery in SQLite. The sandboxed renderer can reach it only through preload, Electron main, and authenticated local RPC.
 
 ## How it works
 
@@ -46,6 +46,8 @@ See [`docs/16-PAIRING-PROTOCOL.md`](docs/16-PAIRING-PROTOCOL.md) and [`docs/17-S
 | Package management | Bun workspaces |
 
 The Electron main process supervises the Rust `sync-engine` binary as a child process and talks to it over an authenticated stdio RPC session; the renderer never touches Node.js or Electron APIs directly.
+
+Mapping data lives at `TETHERA_DATA_DIR/mappings.sqlite3`; the desktop passes its existing Electron `userData` directory so upgrades do not strand the PR #4 database. `FOLDERSYNC_DATA_DIR` remains a deprecated fallback for compatibility, and is ignored when `TETHERA_DATA_DIR` is present.
 
 ## Getting started
 
@@ -68,7 +70,7 @@ The explicit `electron:install` step matters because of how Bun's isolated works
 
 ### Run
 
-UI only — the app launches and saves folder configuration even without a built Rust binary:
+UI only — the app launches without a built Rust binary, but mapping reads and mutations remain explicitly unavailable because SQLite cannot be reached:
 
 ```bash
 bun run desktop:dev
