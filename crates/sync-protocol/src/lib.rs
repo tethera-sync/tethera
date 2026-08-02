@@ -69,10 +69,46 @@ where
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub name: &'static str,
     pub version: &'static str,
     pub protocol: String,
+    /// Whether durable mapping persistence is actually working this session. The desktop shell
+    /// writes mappings best-effort, so this is how it learns that those writes are going
+    /// nowhere instead of assuming they landed.
+    pub mapping_store: MappingStoreHealth,
+}
+
+/// Reported state of the engine's `SQLite` mapping index.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingStoreHealth {
+    /// `ready` — open and writable. `not-configured` — no data directory was supplied, so
+    /// nothing is being persisted. `unavailable` — a directory was supplied but the database
+    /// could not be opened, and mapping writes are being dropped.
+    pub status: &'static str,
+    /// Why the store is unusable, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Schema version of the open database.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<i64>,
+    /// Journal mode actually in force — `wal` for a healthy on-disk database.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_mode: Option<String>,
+}
+
+impl MappingStoreHealth {
+    #[must_use]
+    pub fn unusable(status: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            status,
+            detail: Some(detail.into()),
+            schema_version: None,
+            journal_mode: None,
+        }
+    }
 }
 
 #[cfg(test)]
