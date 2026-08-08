@@ -1,6 +1,7 @@
 //! `SQLite`, journal and archive interfaces.
 #![forbid(unsafe_code)]
 
+pub mod file_sync;
 pub mod mapping;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

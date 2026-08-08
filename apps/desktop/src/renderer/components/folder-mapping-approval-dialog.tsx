@@ -139,7 +139,7 @@ export function FolderMappingApprovalDialog({
           {blockingWarnings > 0 ? (
             <div className="mapping-warning danger"><FileWarningIcon /><div><strong>Approval blocked</strong><span>Rename {blockingWarnings} Windows-invalid or case-colliding paths first.</span></div></div>
           ) : (
-            <div className="approval-safety"><CheckCircle2Icon /><span>Approval only commits configuration. No file is touched until you explicitly start the existing initial sync.</span></div>
+            <div className="approval-safety"><CheckCircle2Icon /><span>Approval only commits configuration. One computer must then start the initial merge; Tethera coordinates both directions without overwriting same-path differences.</span></div>
           )}
 
           {!mutationsEnabled ? <p className="mapping-error">{disabledReason}</p> : null}

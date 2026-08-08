@@ -36,10 +36,14 @@ bun run desktop:dev:full
 - Transactional one-time migration of legacy `state.json` mappings into SQLite
 - Durable mapping tombstones and authenticated, exact-acknowledged configuration delivery
 - Mapping-store loading, degraded, unsupported-schema and migration-failure UI
+- One-click, direction-aware initial merge coordinated across both computers
+- Bounded encrypted file chunks with full SHA-256 verification and atomic no-replace commits
+- Automatic watcher-backed reconciliation with peer change notifications and a five-minute safety scan
+- Durable Rust/SQLite file baselines, retry operations, and non-destructive conflicts
 
 `state.json` continues to hold unrelated desktop preferences and temporary proposal UI state, but it is not a mapping read source or a second writable mapping store. The engine prefers `TETHERA_DATA_DIR`; the deprecated `FOLDERSYNC_DATA_DIR` is accepted only as a logged compatibility fallback. Electron continues to pass its established `userData` location so existing databases remain discoverable.
 
-The existing explicitly initiated development initial pull can copy bounded remote-only files and skips differing files. This PR does not expand that path. Continuous two-way reconciliation, filesystem watchers, deletion propagation, production transfer and history remain unimplemented.
+The explicitly initiated initial merge copies files that are missing on the receiving side, coordinates the inverse pass when the mapping direction allows it, and supports files larger than one peer-session frame. Once active, both computers watch their approved local root; the non-coordinator sends an authenticated change notification and a deterministic coordinator scans both roots. A five-minute full verification is the missed-event safety net. A change transfers only when the other copy still matches the last verified common digest, and the displaced version is hard-linked into a reserved recovery area before replacement. Simultaneous edits, one-sided deletions, and unbased legacy state are persisted and surfaced without choosing a winner. Deletion/rename propagation, recovery browsing/retention, production engine-owned networking, conflict resolution, content-defined chunks, and mid-file resume remain unimplemented.
 
 ## Checks
 

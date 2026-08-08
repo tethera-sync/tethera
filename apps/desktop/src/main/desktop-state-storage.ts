@@ -9,6 +9,14 @@ export interface PersistedDesktopProjection {
   mappings: MappingState
   activity: ActivityEvent[]
   settings: AppSettings
+  initialSyncOutcomes?: Record<string, PersistedInitialSyncOutcome>
+}
+
+export interface PersistedInitialSyncOutcome {
+  completedAt: string
+  copiedFiles: number
+  fileCount: number
+  conflicts: Array<{ path: string; reason: string }>
 }
 
 const TRANSIENT_STATE_FIELDS = [
@@ -36,6 +44,7 @@ export function buildPersistedDesktopState(
     activity: projection.activity,
     settings: projection.settings,
   }
+  if (projection.initialSyncOutcomes) persisted.initialSyncOutcomes = projection.initialSyncOutcomes
   for (const field of TRANSIENT_STATE_FIELDS) delete persisted[field]
   if (mappingOwnershipRetired) delete persisted.folders
   return persisted

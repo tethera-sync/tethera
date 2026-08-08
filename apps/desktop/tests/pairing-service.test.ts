@@ -49,4 +49,9 @@ describe("pairing identity helpers", () => {
     const second = pairingTestHelpers.buildTranscriptHash("session-1", initiator, otherResponder, "a", "b")
     expect(first).not.toBe(second)
   })
+
+  test("rejects pairing messages from an incompatible protocol", () => {
+    expect(() => pairingTestHelpers.assertPairingProtocol(2)).toThrow("protocol 3")
+    expect(() => pairingTestHelpers.assertPairingProtocol(3)).not.toThrow()
+  })
 })

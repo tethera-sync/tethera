@@ -6,18 +6,20 @@ Rust workspace, Electron/React shell, Base UI shadcn, Linux/Windows CI, lint/tes
 ## M1 Local index
 Recursive scan, ignore engine, watcher plus reconciliation, SQLite migrations, stable reads and hashing.
 
-Delivered mapping-configuration foundation:
+Delivered local-index foundation:
 
-- SQLite schema v2 is authoritative for folder mappings.
+- SQLite schema v3 is authoritative for folder mappings and verified file-sync state.
 - Versioned active events, terminal tombstones, exact pending-delivery acknowledgements, and one-time `state.json` migration are implemented.
 - Mapping-store health and fail-closed renderer states are implemented.
+- SQLite schema v3 stores per-file verified baselines, retryable operations, and conflicts.
+- Native recursive watchers plus a periodic safety scan drive continuous reconciliation.
 
-Still outstanding in M1: a durable per-file index, scan generations, production stable reads at scale, watcher/reconciliation scheduling, and moving the live desktop preview path onto the Rust scanner.
+Still outstanding in M1: scan generations/paging, incremental hashing at scale, and moving the live desktop scanner onto a single Rust implementation.
 
 ## M2 LAN technical MVP
 Identity/pairing, LAN discovery, encrypted mutual session, folder mapping, previewed initial merge, whole-file transfer, atomic journalled commit, two-way sync, history/archive.
 
-Pairing, authenticated Electron peer sessions, mapping approval, and mapping-configuration reconciliation are implemented. Engine-owned transfer, journalled file commits, continuous two-way sync, and history/archive are not.
+Pairing, authenticated Electron peer sessions, mapping approval, mapping-configuration reconciliation, a coordinated additive initial merge, and safe continuous file updates are implemented. Transfers are chunked and verified; replacements require the destination's last observed digest and use an atomic verified commit. Engine-owned networking, resumable chunks, deletion/rename propagation, and history/archive are not.
 
 ## M3 Correctness hardening
 Logical revisions, concurrent conflicts, rename, open files, cross-platform incompatibilities, history restore, retention, one-way modes, removal workflow, property/fault tests.
@@ -36,4 +38,4 @@ More devices, native NAT/relay, optional self-hosted rendezvous, other OSes, at-
 
 ## Recommended next pull request
 
-PR #6 should move read-only manifest generation and initial comparison behind the existing authenticated engine boundary, with a durable-scan design that removes the preliminary scanner’s in-memory/size ceilings. It should remain a read-only slice: no transfers, watcher, file reconciliation, deletion propagation, or user-file mutation until the per-file index and operation journal have explicit migrations and crash tests.
+The next milestone should add version history and an explicit conflict-resolution flow, preserving displaced copies before any user chooses a winner. Deletion and rename propagation should remain disabled until that recovery layer is proven crash-safe.

@@ -31,7 +31,7 @@ const DISCOVERY_STALE_MS = 9_000
 const PAIRING_WINDOW_MS = 5 * 60_000
 const HANDSHAKE_TIMEOUT_MS = 5 * 60_000
 const MAX_PENDING_INCOMING = 5
-const PROTOCOL_VERSION = 1
+const PROTOCOL_VERSION = 3
 
 type Platform = "linux" | "windows" | "unknown"
 
@@ -458,6 +458,7 @@ export class PairingService extends EventEmitter {
       connection.write(request)
 
       const challenge = await connection.read(HANDSHAKE_TIMEOUT_MS)
+      assertPairingProtocol(challenge.protocol)
       if (challenge.type === "pair-error" || challenge.type === "pair-rejected") {
         throw new Error(challenge.reason)
       }
@@ -521,6 +522,7 @@ export class PairingService extends EventEmitter {
       this.emit("change")
 
       const response = await connection.read(HANDSHAKE_TIMEOUT_MS)
+      assertPairingProtocol(response.protocol)
       if (response.type === "pair-rejected" || response.type === "pair-error") {
         session.status = "rejected"
         session.message = response.reason
@@ -576,6 +578,7 @@ export class PairingService extends EventEmitter {
         connection.write({ type: "pair-error", protocol: PROTOCOL_VERSION, reason: "Expected a pairing request." })
         return
       }
+      assertPairingProtocol(first.protocol)
       if (!this.#isAcceptingPairing()) {
         connection.write({ type: "pair-rejected", protocol: PROTOCOL_VERSION, sessionId: first.sessionId, reason: "This computer is not currently accepting pairing requests." })
         return
@@ -654,6 +657,7 @@ export class PairingService extends EventEmitter {
 
       const confirm = await connection.read(HANDSHAKE_TIMEOUT_MS)
       if (confirm.type !== "pair-confirm") throw new Error("The other computer did not confirm the comparison code.")
+      assertPairingProtocol(confirm.protocol)
       if (
         confirm.sessionId !== first.sessionId ||
         confirm.requestId !== generatedRequestId ||
@@ -1158,7 +1162,9 @@ function buildTranscriptHash(
   responderNonce: string,
 ): string {
   return createHash("sha256")
-    .update("tethera-pairing-transcript-v1\0")
+    .update("tethera-pairing-transcript\0")
+    .update(PROTOCOL_VERSION.toString())
+    .update("\0")
     .update(sessionId)
     .update("\0")
     .update(initiatorPublicKey)
@@ -1169,6 +1175,12 @@ function buildTranscriptHash(
     .update("\0")
     .update(responderNonce)
     .digest("hex")
+}
+
+function assertPairingProtocol(protocol: number): void {
+  if (protocol !== PROTOCOL_VERSION) {
+    throw new Error(`This computer requires Tethera pairing protocol ${PROTOCOL_VERSION}.`)
+  }
 }
 
 function comparisonCode(transcriptHash: string): string {
@@ -1217,6 +1229,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: 
 }
 
 export const pairingTestHelpers = {
+  assertPairingProtocol,
   buildTranscriptHash,
   comparisonCode,
   deviceId,

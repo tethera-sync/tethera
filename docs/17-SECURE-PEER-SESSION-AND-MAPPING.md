@@ -29,7 +29,10 @@ The server currently accepts only bounded typed operations:
 - submit a folder-mapping proposal;
 - deliver an approval or rejection for a known proposal;
 - deliver a versioned active mapping event or durable mapping tombstone; and
-- serve a bounded file for the existing explicitly started development initial pull.
+- coordinate the inverse pass of an explicitly started initial merge; and
+- describe and serve approved mapping-relative files in bounded encrypted chunks.
+
+Pairing/discovery and peer-session protocols are version 3. Older applications are filtered during discovery or rejected during negotiation because they do not implement the same coordinated continuous-sync request set.
 
 Remote browsing returns folder names, paths, link/directory type and hidden status. It does not return file names or file contents. Creating a folder from the remote browser is disabled; the receiving user may choose or create a different local destination during approval.
 
@@ -41,7 +44,7 @@ Before approval, each computer scans its selected folder with the same ignore ru
 - Larger files use size and close timestamp equality for the preview only.
 - The preview is capped at 10,000 files per side.
 - It reports local-only, remote-only, identical and different paths.
-- It estimates transfer direction and size from the selected sync mode.
+- It estimates additive transfer direction and size from the selected sync mode; same-path differences are excluded because this slice leaves them untouched.
 - It detects Windows-invalid names and case-only collisions and blocks approval until they are resolved.
 - Symlinks are skipped.
 
@@ -63,6 +66,22 @@ If the receiver changes the destination, Tethera performs a fresh encrypted comp
 
 If the initiator is temporarily unreachable after approval, the receiver retains the active event in SQLite and retries while the peer is online. Duplicate delivery is idempotent.
 
+## Coordinated initial merge
+
+After approval, either user may start the initial merge. The lower participant device id coordinates deterministically, forwarding the command when it was clicked on the other computer. It obtains and heartbeats a short-lived mapping-scoped lease from the peer before any full scan or file read; file operations are serialized, and pause/removal is rejected on both computers until the lease is released or expires. The coordinator performs its allowed pull first, then asks the authenticated peer to run the inverse pull. Send-only and receive-only modes are already inverted in the peer's local mapping, so the two passes honor the selected direction without a separate upload endpoint. A fresh two-sided full-integrity scan must show no remaining transferable one-sided files before activation; if either folder changed, Tethera leaves copied files in place and asks the user to retry. Completion is reported only after the peer acknowledges the exact active mapping event.
+
+The transfer scan hashes every file, including files above the preview hashing ceiling. A scan that exceeds 10,000 files or encounters unreadable items fails instead of presenting an incomplete merge as complete. Files missing at a destination are transferred in 512 KiB requests. The source returns a full SHA-256 descriptor and serves each range only while size and modification time remain stable. The destination verifies the complete size and digest, fsyncs a sibling staging file, rejects symlink escapes, and atomically links the completed file into place only if the destination still does not exist.
+
+Same-path differences are never overwritten in this milestone. They remain unchanged on both computers and are persisted as structured outcomes for restart-safe folder status as well as activity. No deletion or rename is propagated. If the connection closes, an incomplete staging file is removed; power-loss residue uses a reserved staging name that manifest scans never synchronize. Retry re-scans both sides and treats previously committed files as already identical.
+
+## Continuous reconciliation
+
+After activation, only the deterministic lower device ID coordinates reconciliation. Both participants watch their approved root; native directory notifications trigger a debounced local cycle or an authenticated notification to the coordinator. A five-minute full verification catches missed events. The authenticated peer accepts full scans and file operations only for the exact active, unpaused mapping and its elected coordinator. Ignore rules and reserved staging names are enforced on file reads.
+
+Both full SHA-256 manifests are reconciled in Rust against a durable common baseline. A new file or a file changed on only one computer becomes a durable directional operation when the mapping mode permits it. Existing destinations are committed only while they still match the expected baseline digest; before replacement, the displaced inode is hard-linked into a content-addressed `.tethera-recovery` directory and fsynced. Recovery paths are excluded from scans. Successful writes update the baseline on both computers. Failed operations retain bounded diagnostics and attempt counts for restart/reconnect retry.
+
+The first scan marks a mapping observed but never guesses about one-sided legacy files. Simultaneous edits, one-sided deletions, blocked-direction changes, and unbased divergent paths become durable conflicts. The UI reports their paths and states explicitly. Tethera does not pick a newest timestamp, delete either copy, or claim that history exists.
+
 ## Configuration reconciliation and removal
 
 Active mapping records and tombstones use the authenticated peer identity established above. The Rust engine accepts an event only when the authenticated peer and local device are the two mapping participants. It rejects unknown fields and invalid revisions before changing storage.
@@ -75,7 +94,7 @@ Removing a mapping commits its durable tombstone and pending peer delivery in on
 
 Mapping migration, configuration delivery and removal never scan, copy, replace, rename, move or delete a user file. Removing a mapping changes configuration only and leaves both folders untouched.
 
-The repository separately retains its pre-existing, explicitly initiated development initial pull for bounded remote-only files. That path is not part of configuration reconciliation and is not expanded by the authoritative-mapping work. It still skips files that differ on both sides and is not continuous two-way synchronisation.
+File scanning, watch scheduling, and encrypted chunk transport remain Electron-owned; Rust owns the durable reconciliation decision and file-sync metadata. There is no deletion/rename propagation, conflict winner, recovery browser/retention policy, mid-file resume, or bandwidth scheduler.
 
 ## Firewall ports
 

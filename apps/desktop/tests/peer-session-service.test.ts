@@ -26,4 +26,10 @@ describe("secure peer-session crypto", () => {
     expect(peerSessionTestHelpers.decryptFrame(key, "session", "request", frame)).toEqual({ type: "ping" })
     expect(() => peerSessionTestHelpers.decryptFrame(key, "session", "response", frame)).toThrow()
   })
+
+  test("bounds and validates peer error responses", () => {
+    expect(peerSessionTestHelpers.parsePeerResponse({ ok: false, error: "retry" })).toEqual({ ok: false, error: "retry" })
+    expect(() => peerSessionTestHelpers.parsePeerResponse({ ok: false, error: "x".repeat(513) })).toThrow("invalid")
+    expect(() => peerSessionTestHelpers.parsePeerResponse({ ok: "yes", result: true })).toThrow("invalid")
+  })
 })

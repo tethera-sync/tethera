@@ -931,7 +931,7 @@ function FolderCard({
           <div className="flex items-center gap-2">
             <h3 className="truncate">{folder.name}</h3>
             <StatusPill tone={statusTone(folder.status)} pulse={folder.status === "syncing"}>
-              {pretty(folder.status)}
+              {folderStatusLabel(folder)}
             </StatusPill>
           </div>
           <p className="mt-1 truncate text-[11px] text-muted-foreground">{prettyMode(folder.mode)}</p>
@@ -966,8 +966,8 @@ function FolderCard({
       ) : null}
 
       {folder.currentAction && folder.progress === undefined ? (
-        <div className="folder-action-note">
-          <ShieldCheckIcon />
+        <div className="folder-action-note" role={folder.status === "needs-attention" ? "alert" : undefined}>
+          {folder.status === "needs-attention" ? <CircleAlertIcon /> : <ShieldCheckIcon />}
           <span>{folder.currentAction}</span>
         </div>
       ) : null}
@@ -996,7 +996,7 @@ function FolderCard({
             title={!mutationsEnabled ? disabledReason : undefined}
           >
             <RefreshCwIcon data-icon="inline-start" />
-            {folder.status === "syncing" ? "Syncing…" : "Start sync"}
+            {folder.status === "syncing" ? "Merging…" : "Start initial merge"}
           </Button>
         ) : null}
         <Button
@@ -1532,9 +1532,11 @@ function viewTitle(view: View, snapshot: AppSnapshot): string {
 function overallHeadline(snapshot: AppSnapshot): string {
   if (snapshot.paused) return "Everything is safely paused"
   if (getPairedDevices(snapshot).length === 0) return "Pair your second computer first"
+  if (snapshot.folders.some((folder) => folder.setupStatus === "ready-for-initial-sync")) return "Ready for the initial merge"
   if (snapshot.status === "needs-attention") return "A folder needs your attention"
+  if (snapshot.status === "syncing") return "Synchronizing folder changes"
   if (snapshot.folders.length === 0) return "Ready for your first folder"
-  if (snapshot.route === "offline") return "Configured and waiting for a peer"
+  if (snapshot.status === "offline") return "Configured and waiting for a peer"
   return "Everything is up to date"
 }
 
@@ -1544,7 +1546,18 @@ function overallDescription(snapshot: AppSnapshot): string {
   if (snapshot.folders.length === 0) return "Choose one folder on this computer and its destination on the paired device."
   if (snapshot.engineStatus !== "ready") return "Your folder mappings are saved, but live scanning waits for the Rust engine."
   if (snapshot.route === "offline") return "No paired device is currently connected. Your files remain unchanged."
-  return "There are no queued transfers or unresolved conflicts."
+  if (snapshot.folders.some((folder) => folder.setupStatus === "ready-for-initial-sync")) {
+    return "Start the merge on either computer to copy missing files safely in the configured direction."
+  }
+  if (snapshot.status === "syncing") return "Tethera is verifying and transferring changed files over the secure peer connection."
+  if (snapshot.status === "needs-attention") return "Review the affected folder. Tethera leaves ambiguous versions and deletions untouched."
+  return "Tethera is watching each active folder and will synchronize safe changes automatically."
+}
+
+function folderStatusLabel(folder: FolderSummary): string {
+  if (folder.status === "up-to-date" && folder.setupStatus === "active") return "Up to date"
+  if (folder.status === "needs-attention" && folder.setupStatus === "ready-for-initial-sync") return "Ready for initial merge"
+  return pretty(folder.status)
 }
 
 function pretty(value: string): string {

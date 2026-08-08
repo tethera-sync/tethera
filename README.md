@@ -18,7 +18,7 @@ Tethera keeps folders you choose in sync between two computers you trust — a L
 
 It's built for people who want Dropbox-style convenience for a couple of personal machines without trusting a cloud provider with the entire contents of a folder tree.
 
-> **This repository is under active early development.** Pairing, authenticated peer sessions, and authoritative mapping configuration work today. A deliberately limited Electron-side initial pull exists for development, but continuous two-way reconciliation and production engine-owned transfer are not implemented. See [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md) for the exact boundary.
+> **This repository is under active early development.** Pairing, authenticated peer sessions, approved folder mappings, a safe initial merge, and automatic post-merge file synchronization work today. Changes are detected continuously, transferred in verified chunks, and retried from durable Rust/SQLite state. Deletion/rename propagation, conflict resolution/history, resumable chunks, and engine-owned network transfer are not implemented. See [`docs/15-IMPLEMENTATION-STATUS.md`](docs/15-IMPLEMENTATION-STATUS.md) for the exact boundary.
 
 ## Why Tethera
 

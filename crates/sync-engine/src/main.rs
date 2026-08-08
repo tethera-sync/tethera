@@ -13,6 +13,7 @@ use sync_core::manifest::{
 };
 use sync_platform::scan::scan_folder;
 use sync_protocol::{HealthResponse, MappingStoreHealth, ProtocolVersion, RpcRequest, RpcResponse};
+use sync_storage::file_sync::ReconcileRequest;
 use sync_storage::mapping::{
     LegacyImportRequest, LegacyMigrationState, MappingConfiguration, MappingEvent, MappingStore,
     MappingStoreError, check_identifier,
@@ -310,6 +311,11 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
         "mapping.recordMigrationFailure" => {
             handle_mapping_record_migration_failure(request, mapping_store)
         }
+        "fileSync.reconcile" => handle_file_sync_reconcile(request, mapping_store),
+        "fileSync.getState" => handle_file_sync_get_state(request, mapping_store),
+        "fileSync.complete" => handle_file_sync_complete(request, mapping_store),
+        "fileSync.applyVerified" => handle_file_sync_apply_verified(request, mapping_store),
+        "fileSync.fail" => handle_file_sync_fail(request, mapping_store),
         "manifest.scan" => handle_manifest_scan(request),
         "manifest.compare" => handle_manifest_compare(request),
         "plan.build" => handle_plan_build(request),
@@ -653,6 +659,126 @@ fn handle_mapping_record_migration_failure(
     }
 }
 
+fn handle_file_sync_reconcile(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ReconcileRequest = match parse_params(request.params, "fileSync.reconcile") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.reconcile_files(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(request.id, "Failed to reconcile file state", &error),
+    }
+}
+
+fn handle_file_sync_get_state(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let id = match mapping_id(request.params, "fileSync.getState") {
+        Ok(id) => id,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.file_sync_state(&id) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(request.id, "Failed to read file sync state", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FileSyncCompleteParams {
+    operation_id: i64,
+    digest: String,
+    size: i64,
+    verified_at: String,
+}
+
+fn handle_file_sync_complete(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: FileSyncCompleteParams = match parse_params(request.params, "fileSync.complete") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.complete_file_operation(
+        params.operation_id,
+        &params.digest,
+        params.size,
+        &params.verified_at,
+    ) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(request.id, "Failed to complete file operation", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FileSyncApplyVerifiedParams {
+    mapping_id: String,
+    path: String,
+    digest: String,
+    size: i64,
+    verified_at: String,
+}
+
+fn handle_file_sync_apply_verified(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: FileSyncApplyVerifiedParams =
+        match parse_params(request.params, "fileSync.applyVerified") {
+            Ok(params) => params,
+            Err(message) => {
+                return error_response_with_code(request.id, "INVALID_PARAMS", message);
+            }
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.apply_verified_file(
+        &params.mapping_id,
+        &params.path,
+        &params.digest,
+        params.size,
+        &params.verified_at,
+    ) {
+        Ok(state) => success_response(request.id, state),
+        Err(error) => store_error_response(request.id, "Failed to record verified file", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FileSyncFailParams {
+    operation_id: i64,
+    detail: String,
+    failed_at: String,
+}
+
+fn handle_file_sync_fail(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: FileSyncFailParams = match parse_params(request.params, "fileSync.fail") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.fail_file_operation(params.operation_id, &params.detail, &params.failed_at) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to record file operation failure",
+            &error,
+        ),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ManifestScanParams {
@@ -836,6 +962,11 @@ mod tests {
             "mapping.getMigrationStatus",
             "mapping.importLegacy",
             "mapping.recordMigrationFailure",
+            "fileSync.reconcile",
+            "fileSync.getState",
+            "fileSync.complete",
+            "fileSync.applyVerified",
+            "fileSync.fail",
             "manifest.scan",
             "manifest.compare",
             "plan.build",
@@ -1122,6 +1253,39 @@ mod tests {
             response["result"]["mapping"]["setupStatus"],
             "pending-approval"
         );
+    }
+
+    #[test]
+    fn file_sync_rpc_initializes_and_reads_durable_state() {
+        let store = ready_store();
+        let mut upsert: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("mapping json");
+        upsert["mapping"]["setupStatus"] = serde_json::json!("active");
+        let response = handle_line(
+            &request("mapping.upsert", &upsert.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["ok"], true);
+
+        let response = handle_line(
+            &request(
+                "fileSync.reconcile",
+                r#"{"mappingId":"mapping-1","local":[],"remote":[],"mode":"two-way","observedAt":"2026-08-01T00:01:00Z","queueOperations":true}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["initialized"], true);
+
+        let response = handle_line(
+            &request("fileSync.getState", r#"{"id":"mapping-1"}"#),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["result"]["initialized"], true);
+        assert_eq!(response["result"]["operations"], serde_json::json!([]));
     }
 
     #[test]
