@@ -36,6 +36,32 @@ describe("desktop state persistence", () => {
     expect(afterImport.folders).toBeUndefined()
   })
 
+  test("persists structured initial-merge conflicts independently of mapping ownership", () => {
+    const state = buildPersistedDesktopState(
+      {},
+      {
+        ...projection(),
+        initialSyncOutcomes: {
+          "folder-1": {
+            completedAt: "2026-08-08T10:00:00.000Z",
+            copiedFiles: 2,
+            fileCount: 4,
+            conflicts: [{ path: "notes.txt", reason: "Different content was left untouched." }],
+          },
+        },
+      },
+      true,
+    )
+    expect(state.initialSyncOutcomes).toEqual({
+      "folder-1": {
+        completedAt: "2026-08-08T10:00:00.000Z",
+        copiedFiles: 2,
+        fileCount: 4,
+        conflicts: [{ path: "notes.txt", reason: "Different content was left untouched." }],
+      },
+    })
+  })
+
   test("serializes concurrent writes and builds each document from the last commit", async () => {
     const writes: Record<string, unknown>[] = []
     let releaseFirst: (() => void) | undefined

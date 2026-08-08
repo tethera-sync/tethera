@@ -277,7 +277,7 @@ function MappingPreviewView({ preview, localName, remoteName }: { preview: Folde
       <div className="preview-summary-grid">
         <PreviewMetric label={`Only on ${localName}`} value={preview.localOnlyFiles} detail={formatBytes(preview.bytesToRemote)} />
         <PreviewMetric label={`Only on ${remoteName}`} value={preview.remoteOnlyFiles} detail={formatBytes(preview.bytesToLocal)} />
-        <PreviewMetric label="Different at same path" value={preview.differentFiles} detail="Newest copy wins; other copy enters history" />
+        <PreviewMetric label="Different at same path" value={preview.differentFiles} detail="Left untouched and reported for review" />
         <PreviewMetric label="Already identical" value={preview.identicalFiles} detail="No transfer needed" />
       </div>
 
@@ -304,7 +304,7 @@ function MappingPreviewView({ preview, localName, remoteName }: { preview: Folde
           </div>
         )}
       </div>
-      <p className="preview-safety-note">No files are copied, replaced or deleted in this slice. The other computer must approve this exact mapping first.</p>
+      <p className="preview-safety-note">This preview is read-only. After approval, the initial merge copies missing files in the allowed direction; it never replaces or deletes an existing path.</p>
     </div>
   )
 }

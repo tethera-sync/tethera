@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Schema version this build reads and writes. Version 1 is intentionally left unchanged below.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 200;
@@ -616,7 +616,7 @@ fn check_fingerprint(value: &str) -> Result<(), MappingStoreError> {
 
 #[derive(Debug)]
 pub struct MappingStore {
-    connection: Connection,
+    pub(crate) connection: Connection,
     journal_mode: String,
 }
 
@@ -723,7 +723,64 @@ impl MappingStore {
 
         if current < 2 {
             self.migrate_v1_to_v2()?;
+            current = 2;
         }
+        if current < 3 {
+            self.migrate_v2_to_v3()?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v2_to_v3(&self) -> Result<(), MappingStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE file_sync_mapping_state (
+                mapping_id TEXT PRIMARY KEY REFERENCES folder_mappings(id) ON DELETE CASCADE,
+                initialized_at TEXT NOT NULL
+            );
+            CREATE TABLE file_sync_baselines (
+                mapping_id TEXT NOT NULL REFERENCES folder_mappings(id) ON DELETE CASCADE,
+                relative_path TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                verified_at TEXT NOT NULL,
+                PRIMARY KEY (mapping_id, relative_path)
+            );
+            CREATE TABLE file_sync_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mapping_id TEXT NOT NULL REFERENCES folder_mappings(id) ON DELETE CASCADE,
+                relative_path TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('pull-remote', 'push-local')),
+                source_digest TEXT NOT NULL,
+                source_size INTEGER NOT NULL CHECK (source_size >= 0),
+                expected_destination_digest TEXT,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'failed')),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (mapping_id, relative_path, direction)
+            );
+            CREATE INDEX file_sync_operations_pending
+                ON file_sync_operations (mapping_id, status, updated_at, id);
+            CREATE TABLE file_sync_conflicts (
+                mapping_id TEXT NOT NULL REFERENCES folder_mappings(id) ON DELETE CASCADE,
+                relative_path TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN (
+                    'unbased-divergence', 'simultaneous-modification',
+                    'deletion-not-propagated', 'direction-blocked'
+                )),
+                local_digest TEXT,
+                remote_digest TEXT,
+                detected_at TEXT NOT NULL,
+                PRIMARY KEY (mapping_id, relative_path)
+            );
+            CREATE INDEX file_sync_conflicts_by_mapping
+                ON file_sync_conflicts (mapping_id, detected_at, relative_path);
+            PRAGMA user_version = 3;",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1236,6 +1293,12 @@ impl MappingStore {
         write_tombstone(&transaction, &tombstone)?;
         transaction.execute("DELETE FROM folder_mappings WHERE id = ?1", params![id])?;
         if let Some(target) = delivery_target_device_id {
+            transaction.execute(
+                "DELETE FROM mapping_delivery_outbox
+                 WHERE mapping_id = ?1 AND target_device_id = ?2
+                   AND event_kind = 'active' AND acknowledged_at IS NULL",
+                params![id, target],
+            )?;
             insert_delivery(
                 &transaction,
                 &MappingEvent::Tombstone {
@@ -1523,7 +1586,7 @@ impl MappingStore {
         })
     }
 
-    fn ensure_import_completed(&self) -> Result<(), MappingStoreError> {
+    pub(crate) fn ensure_import_completed(&self) -> Result<(), MappingStoreError> {
         let status = self.legacy_migration_status()?;
         match status.state {
             LegacyMigrationState::Completed => Ok(()),
@@ -2236,7 +2299,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_schema_v1_to_v2_without_losing_paths() {
+    fn migrates_schema_v1_to_current_without_losing_paths() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("mappings.sqlite3");
         let mut mapping = sample("legacy-1");
@@ -2245,7 +2308,7 @@ mod tests {
         seed_v1(&path, &[mapping]);
 
         let store = MappingStore::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         let revision: (i64, String, bool) = store
             .connection
             .query_row(
@@ -2265,7 +2328,7 @@ mod tests {
         seed_v1(&path, &[sample("mapping-1")]);
         drop(MappingStore::open(&path).expect("first migration"));
         let reopened = MappingStore::open(&path).expect("second migration");
-        assert_eq!(reopened.schema_version().expect("version"), 2);
+        assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
         assert!(
             super::revision_from(&reopened.connection, "mapping-1")
                 .expect("revision")
@@ -2729,6 +2792,26 @@ mod tests {
                 .status,
             AcknowledgeStatus::AlreadyAcknowledged
         );
+    }
+
+    #[test]
+    fn tombstone_supersedes_an_unacknowledged_active_delivery() {
+        let store = ready_store();
+        let active = create_local(&store, "mapping-1");
+        assert_eq!(store.list_pending_delivery().expect("active").len(), 1);
+
+        store
+            .remove_local(
+                "mapping-1",
+                "linux-box",
+                Some("win-box"),
+                active.revision,
+                LATER,
+            )
+            .expect("remove");
+        let pending = store.list_pending_delivery().expect("tombstone only");
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending[0].event, MappingEvent::Tombstone { .. }));
     }
 
     #[test]

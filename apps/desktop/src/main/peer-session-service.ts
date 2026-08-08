@@ -15,7 +15,8 @@ import net, { type Server, type Socket } from "node:net"
 import type { PairingService } from "./pairing-service"
 
 const DEFAULT_SESSION_PORT = 47_656
-const PROTOCOL_VERSION = 1
+// Version 3 adds durable continuous-reconciliation and verified replacement requests.
+const PROTOCOL_VERSION = 3
 const CONNECT_TIMEOUT_MS = 10_000
 const REQUEST_TIMEOUT_MS = 45_000
 const CLOCK_SKEW_MS = 2 * 60_000
@@ -196,7 +197,7 @@ export class PeerSessionService extends EventEmitter {
       if (responseFrame.type !== "secure-frame" || responseFrame.requestId !== requestId) {
         throw new Error("The peer returned an invalid encrypted response.")
       }
-      const response = decryptFrame<PeerResponse>(key, sessionId, "response", responseFrame)
+      const response = parsePeerResponse(decryptFrame<unknown>(key, sessionId, "response", responseFrame))
       if (!response.ok) throw new Error(response.error)
       return response.result as T
     } finally {
@@ -273,7 +274,7 @@ export class PeerSessionService extends EventEmitter {
       try {
         response = { ok: true, result: await this.#options.onRequest(context, request) }
       } catch (error) {
-        response = { ok: false, error: error instanceof Error ? error.message : "The peer request failed." }
+        response = { ok: false, error: boundedPeerError(error, "The peer request failed.") }
       }
       connection.write(encryptFrame(key, first.sessionId, frame.requestId, "response", response))
     } catch (error) {
@@ -281,7 +282,7 @@ export class PeerSessionService extends EventEmitter {
         connection.write({
           type: "session-error",
           protocol: PROTOCOL_VERSION,
-          reason: error instanceof Error ? error.message : "The secure peer session failed.",
+          reason: boundedPeerError(error, "The secure peer session failed."),
         })
       } catch {
         // The connection may already be closed.
@@ -297,6 +298,29 @@ export class PeerSessionService extends EventEmitter {
       if (seenAt < cutoff) this.#recentSessions.delete(sessionId)
     }
   }
+}
+
+function boundedPeerError(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : fallback
+  const bounded = message
+    .replaceAll("\0", "")
+    .replace(/[A-Za-z]:\\[^\r\n]*/g, "[local path]")
+    .replace(/\/(?:[^/\s]+\/)*[^/\s]*/g, "[local path]")
+    .slice(0, 512)
+    .trim()
+  return bounded || fallback
+}
+
+function parsePeerResponse(value: unknown): PeerResponse {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The peer returned an invalid response.")
+  }
+  const response = value as { ok?: unknown; result?: unknown; error?: unknown }
+  if (response.ok === true) return { ok: true, result: response.result }
+  if (response.ok === false && typeof response.error === "string" && response.error.length <= 512) {
+    return { ok: false, error: response.error.replaceAll("\0", "") }
+  }
+  throw new Error("The peer returned an invalid response.")
 }
 
 class JsonLineConnection {
@@ -468,4 +492,5 @@ export const peerSessionTestHelpers = {
   deriveSessionKey,
   encryptFrame,
   exportX25519PublicKey,
+  parsePeerResponse,
 }

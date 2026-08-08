@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test"
+import { mkdir, mkdtemp, rm, truncate, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import type { FileManifest } from "../src/main/folder-manifest"
-import { folderManifestTestHelpers } from "../src/main/folder-manifest"
+import { folderManifestTestHelpers, isManifestPathIgnored, scanFolder } from "../src/main/folder-manifest"
 
 function manifest(files: FileManifest["files"]): FileManifest {
   return { rootPath: "/tmp/test", files, ignored: 0, unreadable: 0, truncated: false }
@@ -26,7 +29,7 @@ describe("folder mapping comparison", () => {
     expect(preview.localOnlyFiles).toBe(1)
     expect(preview.remoteOnlyFiles).toBe(1)
     expect(preview.differentFiles).toBe(1)
-    expect(preview.bytesToRemote).toBe(18)
+    expect(preview.bytesToRemote).toBe(10)
     expect(preview.bytesToLocal).toBe(20)
   })
 
@@ -47,5 +50,49 @@ describe("folder mapping comparison", () => {
     expect(matcher("cache/file.tmp", false)).toBe(true)
     expect(matcher("build/assets/app.js", false)).toBe(true)
     expect(matcher("src/app.ts", false)).toBe(false)
+    expect(isManifestPathIgnored("node_modules/pkg/secret.js", ["node_modules/"])).toBe(true)
+    expect(isManifestPathIgnored("src/app.ts", ["node_modules/"])).toBe(false)
+  })
+
+  test("full-integrity scans hash files above the preview hashing ceiling", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-test-"))
+    try {
+      const largeFile = path.join(root, "large.bin")
+      await writeFile(largeFile, "")
+      await truncate(largeFile, 16 * 1024 * 1024 + 1)
+      const previewManifest = await scanFolder(root, [])
+      const transferManifest = await scanFolder(root, [], { hashAllFiles: true })
+      expect(previewManifest.files[0]?.digest).toBeUndefined()
+      expect(transferManifest.files[0]?.digest).toMatch(/^[a-f0-9]{64}$/)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("never includes crash-residue staging files in a manifest", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-stage-test-"))
+    try {
+      await writeFile(path.join(root, ".report.tethera-tmp-0123456789abcdef0123456789abcdef"), "partial")
+      await writeFile(path.join(root, "report.txt"), "complete")
+      const result = await scanFolder(root, [], { hashAllFiles: true })
+      expect(result.files.map((entry) => entry.path)).toEqual(["report.txt"])
+      expect(result.ignored).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("never synchronizes reserved replacement recovery copies", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-recovery-test-"))
+    try {
+      await mkdir(path.join(root, ".tethera-recovery"))
+      await writeFile(path.join(root, ".tethera-recovery", `${"a".repeat(64)}.backup`), "old version")
+      await writeFile(path.join(root, "report.txt"), "current version")
+      const result = await scanFolder(root, [], { hashAllFiles: true })
+      expect(result.files.map((entry) => entry.path)).toEqual(["report.txt"])
+      expect(result.ignored).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

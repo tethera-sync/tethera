@@ -7,19 +7,25 @@ This document separates implemented behaviour from planned behaviour so the prod
 - Electron/React desktop shell with a narrow context-isolated preload bridge, tray lifecycle, preferences, local activity and mapping-management UI.
 - Persistent Ed25519 device identity, signed LAN presence, two-sided pairing and pinned trusted peers.
 - Short-lived authenticated encrypted peer requests using ephemeral X25519, HKDF, AES-256-GCM and the paired Ed25519 identity.
-- Custom local and trusted-peer folder selection, mapping proposal/approval and a limited development initial comparison.
-- An existing, explicitly initiated initial pull for remote-only files up to its documented development limit. It predates the authoritative-mapping work; this pull request neither expands its scanner nor adds a new file operation.
+- Custom local and trusted-peer folder selection, mapping proposal/approval and a bounded development initial comparison.
+- An explicitly initiated, direction-aware additive initial merge coordinated across both computers. Missing files transfer in 512 KiB encrypted requests with a full SHA-256 check and an atomic no-replace destination commit. Same-path differences are left untouched and surfaced.
+- Automatic post-merge reconciliation. Both participants debounce native directory watches, the non-coordinator reports changes over the authenticated peer session, a five-minute full scan covers missed/coalesced notifications, and one deterministic mapping participant coordinates each cycle.
+- Rust/SQLite verified-file baselines, durable retry operations, and explicit non-destructive conflicts. Only a one-sided change from a common digest may replace an existing file.
 
 ## Authoritative Rust/SQLite mapping index
 
 SQLite is the sole authoritative store for approved folder-mapping configuration. The desktop starts its stable device identity, opens the authenticated Rust RPC session, completes or verifies the legacy import, and then obtains active mappings through `mapping.list`. It never silently falls back to `state.json`.
 
-Schema version 2 keeps the original version-1 migration unchanged and adds:
+Schema version 3 keeps the original migrations and adds:
 
 - `mapping_revisions` for the current active event metadata;
 - `mapping_tombstones` for durable deletion evidence;
 - `mapping_delivery_outbox` for exact peer delivery and acknowledgement; and
 - `mapping_legacy_import` for durable one-time import status.
+- `file_sync_mapping_state` for the first verified observation boundary;
+- `file_sync_baselines` for common SHA-256 file versions;
+- `file_sync_operations` for retryable pull/push work; and
+- `file_sync_conflicts` for simultaneous changes, one-sided deletion, direction mismatch, or unbased state.
 
 Each migration step and each mapping mutation is transactional. A startup write probe distinguishes a genuinely writable store from a WAL database that can be opened for reads while another writer holds it. A newer schema is refused without modification.
 
@@ -61,28 +67,32 @@ Renderer access remains `renderer -> preload -> Electron main -> authenticated R
 - `mapping.upsert` and `mapping.remove`;
 - `mapping.applyRemote` and `mapping.acknowledgeDelivery`; and
 - `mapping.getMigrationStatus`, `mapping.importLegacy` and `mapping.recordMigrationFailure`.
+- `fileSync.reconcile`, `fileSync.getState`, `fileSync.complete`, `fileSync.applyVerified` and `fileSync.fail`.
 
 The RPC exposes no SQL, no arbitrary file operation and no identity private key.
 
-## Preliminary scanner and existing initial pull
+## Initial merge and continuous synchronization
 
-The preliminary Rust scanner, comparison and no-write plan remain unchanged and are not wired into the authoritative configuration migration. It still has its documented development ceilings and no durable per-file index.
+The preliminary Rust scanner, comparison and no-write plan are not wired into the live desktop transfer path. They still have documented development ceilings, use BLAKE3 rather than the desktop transfer path's SHA-256, and have no durable per-file index. Their opaque digest values must not be mixed with the desktop manifest contract.
 
-The Electron main process still owns the older limited initial comparison and explicit initial pull. Differing files are skipped rather than reconciled. This is an existing boundary, not a production sync engine, and was not expanded by this pull request.
+The Electron main process owns the initial merge. One user action runs a full-integrity local pull, asks the authenticated peer to run the inverse pull, and performs a fresh two-sided convergence scan before activation. A deterministic device-id coordinator prevents simultaneous starts from deadlocking. Completion is reported only after the peer acknowledges the exact active mapping event. Each source file is hashed before transfer, read in bounded chunks only while its size and modification time remain stable, re-hashed at the destination, staged beside its destination, fsynced, and atomically linked into place without replacing a path that appeared after planning. Full-integrity scans are restricted to the approved mapping and its exact ignore rules. Truncated or unreadable scans fail closed. Differing files remain unchanged on both computers and their structured outcomes survive restart.
+
+After activation, the lower participant device ID is the deterministic coordinator. Both participants watch their local tree; a non-coordinator change sends a bounded authenticated notification that queues the coordinator, while a five-minute full two-sided scan covers missed events. Full SHA-256 observations go to the Rust engine, which compares them with the last verified common baseline. A new path or one-sided modification permitted by the mapping mode becomes durable work. Both devices record the new baseline only after the destination verifies and atomically commits the exact source digest. A disconnect or restart leaves retry state in SQLite; a commit whose acknowledgement was lost converges on the next identical scan.
+
+Existing destinations are replaced only if their digest still matches the planner's expected destination digest. Before replacement, the old inode is hard-linked into a content-addressed `.tethera-recovery` area on the same filesystem and fsynced; this also retains an edit made through an already-open old file handle. Recovery paths are reserved and never enter manifests. New destinations use an atomic no-replace link. The first observation of a legacy/imported active mapping never assumes a one-sided file is new. Simultaneous modifications, one- or two-sided deletions, direction-blocked changes, and paths without a verified baseline become durable conflicts; files are not deleted and the folder/activity UI identifies affected paths.
 
 ## Clearly not implemented
 
-- Durable per-file rows or scan generations.
-- Production or expanded scanning, filesystem watchers, continuous reconciliation or file-operation plans.
-- Engine-owned file transfer, chunking, resume, atomic journalled commits or bandwidth scheduling.
-- File deletion or rename propagation, history/archive, restore or conflict winner selection.
+- Scan generations, incremental hashing, paging beyond 10,000 files, or production-scale performance work.
+- Engine-owned filesystem watching/network transfer, resumable/content-defined chunking, archive-backed replacement, or bandwidth scheduling.
+- File deletion or rename propagation, recovery browsing/retention, restore, or conflict winner selection.
 - NAT traversal, cloud services, accounts or telemetry.
-- Changes to the preliminary scanner's limits.
+- Removal of the 10,000-file manifest ceiling.
 - Code-signed/notarised release builds.
 
 ## Recommended next pull request
 
-PR #6 should introduce a migration-ready durable per-file manifest design and move read-only manifest generation behind the authenticated engine boundary. Keep that slice read-only until scan generations and the operation journal have explicit crash/restart tests; do not combine it with transfers, watcher scheduling, deletion propagation or conflict resolution.
+The next milestone should add version history and an explicit conflict-resolution flow. It must archive every displaced version, expose both copies to the user, and prove restore/restart safety before deletion or rename propagation is enabled.
 
 ## LAN ports
 

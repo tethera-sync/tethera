@@ -1,8 +1,8 @@
-import { createReadStream } from "node:fs"
 import { createHash } from "node:crypto"
-import { opendir, stat } from "node:fs/promises"
+import { lstat, open, opendir, realpath, stat } from "node:fs/promises"
 import path from "node:path"
 import type { FolderMappingPreview, MappingPreviewItem, SyncMode } from "../shared/contracts"
+import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 
 const MAX_MANIFEST_FILES = 10_000
 const MAX_HASH_FILE_BYTES = 16 * 1024 * 1024
@@ -29,10 +29,20 @@ export interface CompareManifestOptions {
   remotePlatform: "linux" | "windows" | "unknown"
 }
 
-export async function scanFolder(rootPath: string, ignorePatterns: string[]): Promise<FileManifest> {
+export interface ScanFolderOptions {
+  /** Hash every file for a transfer decision; preview scans retain the bounded fast path. */
+  hashAllFiles?: boolean
+}
+
+export async function scanFolder(
+  rootPath: string,
+  ignorePatterns: string[],
+  options: ScanFolderOptions = {},
+): Promise<FileManifest> {
   const root = path.resolve(rootPath)
   const rootStat = await stat(root)
   if (!rootStat.isDirectory()) throw new Error("The selected path is not a folder.")
+  const canonicalRoot = await realpath(root)
 
   const matcher = createIgnoreMatcher(ignorePatterns)
   const files: FileManifestEntry[] = []
@@ -42,10 +52,17 @@ export async function scanFolder(rootPath: string, ignorePatterns: string[]): Pr
 
   async function visit(directoryPath: string, relativeDirectory: string): Promise<void> {
     if (truncated) return
-    let directory
+    let directory: Awaited<ReturnType<typeof opendir>> | undefined
     try {
       directory = await opendir(directoryPath)
+      const canonicalDirectory = await realpath(directoryPath)
+      if (!isCanonicalPathInside(canonicalRoot, canonicalDirectory)) {
+        await directory.close()
+        unreadable += 1
+        return
+      }
     } catch {
+      await directory?.close().catch(() => undefined)
       unreadable += 1
       return
     }
@@ -53,6 +70,10 @@ export async function scanFolder(rootPath: string, ignorePatterns: string[]): Pr
     for await (const entry of directory) {
       if (truncated) break
       const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name))
+      if (isTetheraStagingPath(relativePath)) {
+        ignored += 1
+        continue
+      }
       if (matcher(relativePath, entry.isDirectory())) {
         ignored += 1
         continue
@@ -72,13 +93,7 @@ export async function scanFolder(rootPath: string, ignorePatterns: string[]): Pr
         break
       }
       try {
-        const metadata = await stat(absolutePath)
-        files.push({
-          path: relativePath,
-          size: metadata.size,
-          modifiedMs: metadata.mtimeMs,
-          digest: metadata.size <= MAX_HASH_FILE_BYTES ? await hashFile(absolutePath) : undefined,
-        })
+        files.push(await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true))
       } catch {
         unreadable += 1
       }
@@ -135,10 +150,8 @@ export function compareManifests(
     }
 
     differentFiles += 1
-    if (options.mode === "send-only") bytesToRemote += localEntry.size
-    else if (options.mode === "receive-only") bytesToLocal += remoteEntry.size
-    else if (localEntry.modifiedMs >= remoteEntry.modifiedMs) bytesToRemote += localEntry.size
-    else bytesToLocal += remoteEntry.size
+    // The initial merge is additive-only. Same-path differences are surfaced and left untouched
+    // until durable revisions and history exist, so they must not inflate transfer estimates.
     addSample(samples, { path: relativePath, category: "different", size: Math.max(localEntry.size, remoteEntry.size) })
   }
 
@@ -206,6 +219,18 @@ function createIgnoreMatcher(patterns: string[]): (relativePath: string, directo
   }
 }
 
+/** Applies manifest ignore rules to a direct file request, including ignored parent folders. */
+export function isManifestPathIgnored(relativePath: string, patterns: string[]): boolean {
+  const normalized = normalizeRelative(relativePath)
+  const matcher = createIgnoreMatcher(patterns)
+  if (matcher(normalized, false)) return true
+  const segments = normalized.split("/")
+  for (let index = 1; index < segments.length; index += 1) {
+    if (matcher(segments.slice(0, index).join("/"), true)) return true
+  }
+  return false
+}
+
 function globToRegExp(pattern: string): RegExp {
   let source = ""
   for (let index = 0; index < pattern.length; index += 1) {
@@ -221,15 +246,50 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`^${source}$`, "i")
 }
 
-async function hashFile(filePath: string): Promise<string> {
-  const hash = createHash("sha256")
-  await new Promise<void>((resolve, reject) => {
-    const stream = createReadStream(filePath)
-    stream.on("data", (chunk) => hash.update(chunk))
-    stream.once("error", reject)
-    stream.once("end", resolve)
-  })
-  return hash.digest("hex")
+async function inspectManifestFile(
+  rootPath: string,
+  canonicalRoot: string,
+  relativePath: string,
+  hashAllFiles: boolean,
+): Promise<FileManifestEntry> {
+  const absolutePath = resolveWithinRoot(rootPath, relativePath)
+  const entry = await lstat(absolutePath)
+  if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("The manifest path is not a regular file.")
+  const canonicalFile = await realpath(absolutePath)
+  if (!isCanonicalPathInside(canonicalRoot, canonicalFile)) throw new Error("The manifest file escapes the folder root.")
+
+  const handle = await open(absolutePath, "r")
+  try {
+    const initial = await handle.stat()
+    if (!initial.isFile() || initial.dev !== entry.dev || initial.ino !== entry.ino) {
+      throw new Error("The manifest file changed while it was opened.")
+    }
+    let digest: string | undefined
+    if (hashAllFiles || initial.size <= MAX_HASH_FILE_BYTES) {
+      const hash = createHash("sha256")
+      const buffer = Buffer.allocUnsafe(512 * 1024)
+      let offset = 0
+      while (offset < initial.size) {
+        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, initial.size - offset), offset)
+        if (bytesRead === 0) throw new Error("The manifest file changed while it was read.")
+        hash.update(buffer.subarray(0, bytesRead))
+        offset += bytesRead
+      }
+      digest = hash.digest("hex")
+    }
+    const after = await handle.stat()
+    if (initial.size !== after.size || initial.mtimeMs !== after.mtimeMs) {
+      throw new Error("The manifest file changed while it was read.")
+    }
+    return { path: relativePath, size: initial.size, modifiedMs: initial.mtimeMs, digest }
+  } finally {
+    await handle.close()
+  }
+}
+
+function isCanonicalPathInside(canonicalRoot: string, canonicalCandidate: string): boolean {
+  const relative = path.relative(canonicalRoot, canonicalCandidate)
+  return !relative.startsWith("..") && !path.isAbsolute(relative)
 }
 
 function hasWindowsInvalidPath(relativePath: string): boolean {

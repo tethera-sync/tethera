@@ -18,6 +18,10 @@ Rust engine/RPC tests exercise authentication before dispatch, unknown-field rej
 
 Desktop tests exercise the one-time `state.json` import and cleanup independently from the database implementation. They cover no file, zero mappings, valid data, malformed and duplicate data, unreadable state, import retry after failure, crash after database commit but before cleanup, verified backups, preservation of unrelated settings, SQLite-only startup reads, tombstone filtering, health warnings and mutation gating.
 
+Initial-merge tests cover direction-aware additive planning, fresh-scan convergence gating, large-file eligibility, strict two-pass completion ordering, durable conflict outcome projection, bounded source reads, source mutation detection, full-file SHA-256 verification, incomplete-staging cleanup, atomic no-replace commits, and source/destination symlink escape rejection. Full-integrity manifest tests prove files above the preview hashing ceiling receive digests and crash-residue staging names are never synchronized.
+
+Continuous-sync tests cover watcher delivery, full-digest observation conversion, one-way mode inversion, compare-and-replace destination checks, first-observation fail-safe behavior, verified-baseline advancement, durable retry state, simultaneous modifications, one-sided deletions, unbased divergence, and cascade cleanup when a mapping is removed.
+
 ## Migration and restart integration
 
 The integration gate creates a temporary legacy state, launches the real Rust engine, imports the mappings, restarts the engine, and confirms the import is not duplicated. It then removes a mapping, restarts again, presents an older active event, and verifies the tombstone prevents resurrection. A sentinel beneath a path-shaped fixture must remain byte-for-byte unchanged throughout.
@@ -42,9 +46,9 @@ CI runs the equivalent desktop typecheck/test and Rust format/clippy/test gates 
 
 ## Future sync-engine tests
 
-The mapping suite intentionally does not stand in for future file-synchronisation testing. A durable per-file index, scan generations, operation journal, transfer staging, crash recovery and reconciliation will need their own migration, model, fault-injection and cross-platform suites before those features can write user data.
+The file-sync suite covers its schema migration, deterministic planner, durable operations/conflicts, restart reads, and safe transfer staging. Scan generations, power-loss fault injection, large-scale/cross-platform stress, resumable chunks, archive recovery, and deletion propagation still require dedicated suites before those features are enabled.
 
-Future file-operation properties remain: partial transfer never changes a live path, replacement preserves displaced content, paths never escape a root, both peers choose the same deterministic result, and eventual authenticated delivery converges.
+Future file-operation properties remain: journal recovery after process/power failure, displaced-version recovery across a power loss, deterministic user-directed conflict resolution, and convergence under repeated transport interruption. The additive initial merge already enforces that partial transfer never creates a live path and paths never escape an approved root.
 
 ## Release gates
 
