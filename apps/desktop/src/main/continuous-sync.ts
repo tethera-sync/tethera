@@ -54,6 +54,12 @@ export interface FileSyncState {
   baselineCount: number
   operations: FileSyncOperation[]
   conflicts: FileSyncConflict[]
+  recoveryIssues: Array<{
+    id: string
+    path: string
+    state: "recovery-required" | "integrity-failed"
+    lastError?: string
+  }>
 }
 
 export interface ReconcileFilesRequest {
@@ -78,13 +84,25 @@ export function observedFiles(manifest: FileManifest): ObservedFile[] {
 
 export function conflictSummary(conflicts: FileSyncConflict[]): string {
   if (conflicts.length === 0) return "Watching for changes."
-  const simultaneous = conflicts.filter((conflict) => conflict.kind === "simultaneous-modification").length
-  const deletions = conflicts.filter((conflict) => conflict.kind === "deletion-not-propagated").length
-  const unbased = conflicts.filter((conflict) => conflict.kind === "unbased-divergence").length
+  let simultaneous = 0
+  let deletions = 0
+  let unbased = 0
+  let directionBlocked = 0
+  for (const conflict of conflicts) {
+    if (conflict.kind === "simultaneous-modification") simultaneous += 1
+    else if (conflict.kind === "deletion-not-propagated") deletions += 1
+    else if (conflict.kind === "unbased-divergence") unbased += 1
+    else if (conflict.kind === "direction-blocked") directionBlocked += 1
+    else {
+      const exhaustiveKind: never = conflict.kind
+      throw new Error(`Unknown sync conflict kind: ${exhaustiveKind}`)
+    }
+  }
   const details = [
     simultaneous > 0 ? `${simultaneous} edited on both computers` : "",
     deletions > 0 ? `${deletions} deleted on one computer` : "",
     unbased > 0 ? `${unbased} without a verified baseline` : "",
+    directionBlocked > 0 ? `${directionBlocked} changed against the one-way direction` : "",
   ].filter(Boolean)
   return `${conflicts.length} conflict${conflicts.length === 1 ? " needs" : "s need"} attention${details.length > 0 ? ` (${details.join(", ")})` : ""}; neither copy was changed.`
 }

@@ -31,9 +31,12 @@ describe("continuous sync helpers", () => {
     const conflicts: FileSyncConflict[] = [
       { mappingId: "m", path: "a", kind: "simultaneous-modification", detectedAt: "now" },
       { mappingId: "m", path: "b", kind: "deletion-not-propagated", detectedAt: "now" },
+      { mappingId: "m", path: "c", kind: "direction-blocked", localDigest: "a".repeat(64), detectedAt: "now" },
     ]
-    expect(conflictSummary(conflicts)).toContain("edited on both computers")
-    expect(conflictSummary(conflicts)).toContain("neither copy was changed")
+    const summary = conflictSummary(conflicts)
+    expect(summary).toContain("edited on both computers")
+    expect(summary).toContain("changed against the one-way direction")
+    expect(summary).toContain("neither copy was changed")
   })
 })
 

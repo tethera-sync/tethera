@@ -38,4 +38,4 @@ More devices, native NAT/relay, optional self-hosted rendezvous, other OSes, at-
 
 ## Recommended next pull request
 
-The next milestone should add version history and an explicit conflict-resolution flow, preserving displaced copies before any user chooses a winner. Deletion and rename propagation should remain disabled until that recovery layer is proven crash-safe.
+The next milestone should add an explicit archive-backed conflict-resolution flow, using the implemented replacement journal and restore primitive whenever a user chooses a winner. Deletion and rename propagation should remain disabled until that recovery flow is exposed and proven safe end to end.

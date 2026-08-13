@@ -73,10 +73,11 @@ describe("folder mapping comparison", () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-stage-test-"))
     try {
       await writeFile(path.join(root, ".report.tethera-tmp-0123456789abcdef0123456789abcdef"), "partial")
+      await writeFile(path.join(root, ".report.tethera-displaced-0123456789abcdef0123456789abcdef"), "old")
       await writeFile(path.join(root, "report.txt"), "complete")
       const result = await scanFolder(root, [], { hashAllFiles: true })
       expect(result.files.map((entry) => entry.path)).toEqual(["report.txt"])
-      expect(result.ignored).toBe(1)
+      expect(result.ignored).toBe(2)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

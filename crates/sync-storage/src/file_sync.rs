@@ -8,6 +8,10 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::mapping::{MappingStore, MappingStoreError, check_identifier};
+use crate::version_archive::{
+    ReplacementRecoveryIssue, mark_completed, recovery_issues_for_mapping,
+    require_installed_sync_entry,
+};
 
 const MAX_FILES: usize = 10_000;
 const MAX_PATH_LENGTH: usize = 4_096;
@@ -129,6 +133,7 @@ pub struct ReconcileResult {
     pub verified_count: usize,
     pub operations: Vec<SyncOperation>,
     pub conflicts: Vec<SyncConflict>,
+    pub recovery_issues: Vec<ReplacementRecoveryIssue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -139,6 +144,7 @@ pub struct FileSyncState {
     pub baseline_count: i64,
     pub operations: Vec<SyncOperation>,
     pub conflicts: Vec<SyncConflict>,
+    pub recovery_issues: Vec<ReplacementRecoveryIssue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -214,6 +220,7 @@ impl MappingStore {
                 verified_count: plan.verified_count,
                 operations: state.operations,
                 conflicts: state.conflicts,
+                recovery_issues: state.recovery_issues,
             })
     }
 
@@ -237,12 +244,14 @@ impl MappingStore {
         )?;
         let operations = read_operations(&self.connection, mapping_id)?;
         let conflicts = read_conflicts(&self.connection, mapping_id)?;
+        let recovery_issues = recovery_issues_for_mapping(&self.connection, mapping_id)?;
         Ok(FileSyncState {
             mapping_id: mapping_id.to_owned(),
             initialized,
             baseline_count,
             operations,
             conflicts,
+            recovery_issues,
         })
     }
 
@@ -257,6 +266,7 @@ impl MappingStore {
         digest: &str,
         size: i64,
         verified_at: &str,
+        replacement_journal_id: Option<&str>,
     ) -> Result<FileSyncMutationAck, MappingStoreError> {
         validate_digest(digest)?;
         validate_size(size)?;
@@ -270,6 +280,8 @@ impl MappingStore {
                 "completed file metadata did not match the durable operation".to_owned(),
             ));
         }
+        let installed_entry =
+            installed_replacement_entry(&transaction, &operation, replacement_journal_id)?;
         upsert_baseline(
             &transaction,
             &operation.mapping_id,
@@ -282,6 +294,9 @@ impl MappingStore {
             "DELETE FROM file_sync_operations WHERE id = ?1",
             params![operation_id],
         )?;
+        if let Some(entry_id) = installed_entry {
+            mark_completed(&transaction, &entry_id, verified_at)?;
+        }
         transaction.execute(
             "DELETE FROM file_sync_conflicts WHERE mapping_id = ?1 AND relative_path = ?2",
             params![operation.mapping_id, operation.path],
@@ -304,6 +319,7 @@ impl MappingStore {
         digest: &str,
         size: i64,
         verified_at: &str,
+        replacement_journal_id: Option<&str>,
     ) -> Result<FileSyncState, MappingStoreError> {
         self.ensure_import_completed()?;
         check_identifier("mappingId", mapping_id)?;
@@ -314,11 +330,24 @@ impl MappingStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         require_active_mapping(&transaction, mapping_id)?;
+        let operation = read_operations(&transaction, mapping_id)?
+            .into_iter()
+            .find(|operation| operation.path == path && operation.source_digest == digest);
+        let installed_entry = operation
+            .as_ref()
+            .map(|operation| {
+                installed_replacement_entry(&transaction, operation, replacement_journal_id)
+            })
+            .transpose()?
+            .flatten();
         upsert_baseline(&transaction, mapping_id, path, digest, size, verified_at)?;
         transaction.execute(
             "DELETE FROM file_sync_operations WHERE mapping_id = ?1 AND relative_path = ?2",
             params![mapping_id, path],
         )?;
+        if let Some(entry_id) = installed_entry {
+            mark_completed(&transaction, &entry_id, verified_at)?;
+        }
         transaction.execute(
             "DELETE FROM file_sync_conflicts WHERE mapping_id = ?1 AND relative_path = ?2",
             params![mapping_id, path],
@@ -463,6 +492,12 @@ fn plan_one_sided(
     }
     let allowed = (is_local && mode != "receive-only") || (!is_local && mode != "send-only");
     if !allowed {
+        plan.conflicts.push(PlannedConflict {
+            path: path.to_owned(),
+            kind: ConflictKind::DirectionBlocked,
+            local_digest: is_local.then(|| file.digest.clone()),
+            remote_digest: (!is_local).then(|| file.digest.clone()),
+        });
         return;
     }
     plan.operations.push(PlannedOperation {
@@ -718,7 +753,7 @@ fn validate_reconcile_request(request: &ReconcileRequest) -> Result<(), MappingS
     Ok(())
 }
 
-fn validate_path(path: &str) -> Result<(), MappingStoreError> {
+pub(crate) fn validate_path(path: &str) -> Result<(), MappingStoreError> {
     if path.is_empty() || path.len() > MAX_PATH_LENGTH || path.contains('\0') {
         return Err(MappingStoreError::Invalid(
             "relative file paths must be non-empty, NUL-free, and at most 4096 bytes".to_owned(),
@@ -738,7 +773,7 @@ fn validate_path(path: &str) -> Result<(), MappingStoreError> {
     Ok(())
 }
 
-fn validate_digest(digest: &str) -> Result<(), MappingStoreError> {
+pub(crate) fn validate_digest(digest: &str) -> Result<(), MappingStoreError> {
     if digest.len() != 64
         || !digest
             .bytes()
@@ -751,7 +786,7 @@ fn validate_digest(digest: &str) -> Result<(), MappingStoreError> {
     Ok(())
 }
 
-fn validate_size(size: i64) -> Result<(), MappingStoreError> {
+pub(crate) fn validate_size(size: i64) -> Result<(), MappingStoreError> {
     if size < 0 {
         return Err(MappingStoreError::Invalid(
             "file size must not be negative".to_owned(),
@@ -760,7 +795,7 @@ fn validate_size(size: i64) -> Result<(), MappingStoreError> {
     Ok(())
 }
 
-fn validate_timestamp(field: &str, value: &str) -> Result<(), MappingStoreError> {
+pub(crate) fn validate_timestamp(field: &str, value: &str) -> Result<(), MappingStoreError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|error| {
         MappingStoreError::Invalid(format!("{field} must be an RFC 3339 timestamp: {error}"))
     })?;
@@ -816,7 +851,7 @@ fn read_baselines(
         .map_err(Into::into)
 }
 
-fn upsert_baseline(
+pub(crate) fn upsert_baseline(
     transaction: &Transaction<'_>,
     mapping_id: &str,
     path: &str,
@@ -834,6 +869,25 @@ fn upsert_baseline(
         params![mapping_id, path, digest, size, verified_at],
     )?;
     Ok(())
+}
+
+fn installed_replacement_entry(
+    transaction: &Transaction<'_>,
+    operation: &SyncOperation,
+    entry_id: Option<&str>,
+) -> Result<Option<String>, MappingStoreError> {
+    if operation.direction != SyncDirection::PullRemote
+        || operation.expected_destination_digest.is_none()
+    {
+        return Ok(None);
+    }
+    let id =
+        require_installed_sync_entry(transaction, entry_id, operation.id)?.ok_or_else(|| {
+            MappingStoreError::Invalid(
+                "a replacing operation requires an installed archive journal".to_owned(),
+            )
+        })?;
+    Ok(Some(id))
 }
 
 fn operation_by_id(
@@ -1045,6 +1099,94 @@ mod tests {
     }
 
     #[test]
+    fn a_new_file_on_the_non_authoritative_side_is_a_durable_direction_conflict() {
+        for (mode, local, remote, expected_local_digest, expected_remote_digest) in [
+            (
+                "receive-only",
+                vec![file("seed.txt", 'a'), file("destination-only.txt", 'b')],
+                vec![file("seed.txt", 'a')],
+                Some("b".repeat(64)),
+                None,
+            ),
+            (
+                "send-only",
+                vec![file("seed.txt", 'a')],
+                vec![file("seed.txt", 'a'), file("destination-only.txt", 'c')],
+                None,
+                Some("c".repeat(64)),
+            ),
+        ] {
+            let store = active_store();
+            reconcile(
+                &store,
+                vec![file("seed.txt", 'a')],
+                vec![file("seed.txt", 'a')],
+            );
+
+            let result = store
+                .reconcile_files(&ReconcileRequest {
+                    mapping_id: "mapping-1".to_owned(),
+                    local,
+                    remote,
+                    mode: mode.to_owned(),
+                    observed_at: NOW.to_owned(),
+                    queue_operations: true,
+                })
+                .expect("reconcile non-authoritative one-way addition");
+
+            assert!(result.operations.is_empty());
+            assert_eq!(result.conflicts.len(), 1);
+            assert_eq!(result.conflicts[0].kind, ConflictKind::DirectionBlocked);
+            assert_eq!(result.conflicts[0].local_digest, expected_local_digest);
+            assert_eq!(result.conflicts[0].remote_digest, expected_remote_digest);
+
+            let durable = store.file_sync_state("mapping-1").expect("durable state");
+            assert_eq!(durable.conflicts, result.conflicts);
+        }
+    }
+
+    #[test]
+    fn a_new_file_on_the_authoritative_side_still_queues_one_way_transfer() {
+        for (mode, local, remote, expected_direction) in [
+            (
+                "send-only",
+                vec![file("seed.txt", 'a'), file("source.txt", 'b')],
+                vec![file("seed.txt", 'a')],
+                SyncDirection::PushLocal,
+            ),
+            (
+                "receive-only",
+                vec![file("seed.txt", 'a')],
+                vec![file("seed.txt", 'a'), file("source.txt", 'b')],
+                SyncDirection::PullRemote,
+            ),
+        ] {
+            let store = active_store();
+            reconcile(
+                &store,
+                vec![file("seed.txt", 'a')],
+                vec![file("seed.txt", 'a')],
+            );
+
+            let result = store
+                .reconcile_files(&ReconcileRequest {
+                    mapping_id: "mapping-1".to_owned(),
+                    local,
+                    remote,
+                    mode: mode.to_owned(),
+                    observed_at: NOW.to_owned(),
+                    queue_operations: true,
+                })
+                .expect("reconcile authoritative one-way addition");
+
+            assert!(result.conflicts.is_empty());
+            assert_eq!(result.operations.len(), 1);
+            assert_eq!(result.operations[0].direction, expected_direction);
+            assert_eq!(result.operations[0].path, "source.txt");
+        }
+    }
+
+    #[test]
     fn unchanged_reconciliation_preserves_retry_and_conflict_metadata() {
         let store = active_store();
         reconcile(
@@ -1163,8 +1305,10 @@ mod tests {
             vec![file("notes.txt", 'b')],
             vec![file("notes.txt", 'a')],
         );
+        let operation = &plan.operations[0];
+        assert_eq!(operation.direction, SyncDirection::PushLocal);
         let acknowledgement = store
-            .complete_file_operation(plan.operations[0].id, &"b".repeat(64), 4, NOW)
+            .complete_file_operation(operation.id, &"b".repeat(64), 4, NOW, None)
             .expect("complete");
         assert_eq!(acknowledgement.mapping_id, "mapping-1");
         let state = store.file_sync_state("mapping-1").expect("state");

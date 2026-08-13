@@ -49,6 +49,8 @@ Unknown request-envelope fields and unknown fields in every mapping params/confi
 | `mapping.applyRemote` | Apply one bounded event from the authenticated peer after participant validation. |
 | `mapping.acknowledgeDelivery` | Clear exactly one matching event/revision/target; stale acknowledgements fail. |
 
+Replacement safety adds authenticated `archive.prepareReplacement`, `archive.markArchived`, `archive.markInstalled`, `archive.listIncomplete`, `archive.listVersions`, `archive.get`, `archive.recordIssue`, `archive.recordObjectIssue`, `archive.recover`, `archive.prepareRestore`, and `archive.completeRestore`. These methods validate journal identities and lifecycle transitions; they do not accept arbitrary archive paths or file bytes. `archive.recordObjectIssue` durably marks a previously published object `missing` or `corrupt` after filesystem verification fails. `fileSync.complete` and `fileSync.applyVerified` require the receiving device's installed replacement journal before completing a destructive pull.
+
 No mapping method accepts SQL or dereferences a mapping path. No private key or user-file content is returned.
 
 ## Ordering and delivery

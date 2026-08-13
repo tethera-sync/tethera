@@ -18,6 +18,9 @@ use sync_storage::mapping::{
     LegacyImportRequest, LegacyMigrationState, MappingConfiguration, MappingEvent, MappingStore,
     MappingStoreError, check_identifier,
 };
+use sync_storage::version_archive::{
+    ArchiveObjectState, PrepareReplacementRequest, PrepareRestoreRequest,
+};
 
 /// Longest path `manifest.scan` will accept, so a malformed request cannot hand the walker an
 /// unbounded string.
@@ -316,6 +319,17 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
         "fileSync.complete" => handle_file_sync_complete(request, mapping_store),
         "fileSync.applyVerified" => handle_file_sync_apply_verified(request, mapping_store),
         "fileSync.fail" => handle_file_sync_fail(request, mapping_store),
+        "archive.prepareReplacement" => handle_archive_prepare_replacement(request, mapping_store),
+        "archive.markArchived" => handle_archive_mark_archived(request, mapping_store),
+        "archive.markInstalled" => handle_archive_mark_installed(request, mapping_store),
+        "archive.listIncomplete" => handle_archive_list_incomplete(request, mapping_store),
+        "archive.listVersions" => handle_archive_list_versions(request, mapping_store),
+        "archive.get" => handle_archive_get(request, mapping_store),
+        "archive.recordIssue" => handle_archive_record_issue(request, mapping_store),
+        "archive.recordObjectIssue" => handle_archive_record_object_issue(request, mapping_store),
+        "archive.recover" => handle_archive_recover(request, mapping_store),
+        "archive.prepareRestore" => handle_archive_prepare_restore(request, mapping_store),
+        "archive.completeRestore" => handle_archive_complete_restore(request, mapping_store),
         "manifest.scan" => handle_manifest_scan(request),
         "manifest.compare" => handle_manifest_compare(request),
         "plan.build" => handle_plan_build(request),
@@ -696,6 +710,7 @@ struct FileSyncCompleteParams {
     digest: String,
     size: i64,
     verified_at: String,
+    replacement_journal_id: Option<String>,
 }
 
 fn handle_file_sync_complete(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
@@ -712,6 +727,7 @@ fn handle_file_sync_complete(request: RpcRequest, mapping_store: &MappingStoreSl
         &params.digest,
         params.size,
         &params.verified_at,
+        params.replacement_journal_id.as_deref(),
     ) {
         Ok(result) => success_response(request.id, result),
         Err(error) => store_error_response(request.id, "Failed to complete file operation", &error),
@@ -726,6 +742,7 @@ struct FileSyncApplyVerifiedParams {
     digest: String,
     size: i64,
     verified_at: String,
+    replacement_journal_id: Option<String>,
 }
 
 fn handle_file_sync_apply_verified(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
@@ -746,6 +763,7 @@ fn handle_file_sync_apply_verified(request: RpcRequest, mapping_store: &MappingS
         &params.digest,
         params.size,
         &params.verified_at,
+        params.replacement_journal_id.as_deref(),
     ) {
         Ok(state) => success_response(request.id, state),
         Err(error) => store_error_response(request.id, "Failed to record verified file", &error),
@@ -774,6 +792,290 @@ fn handle_file_sync_fail(request: RpcRequest, mapping_store: &MappingStoreSlot) 
         Err(error) => store_error_response(
             request.id,
             "Failed to record file operation failure",
+            &error,
+        ),
+    }
+}
+
+fn archive_store<'a>(
+    request_id: &str,
+    mapping_store: &'a MappingStoreSlot,
+) -> Result<&'a MappingStore, Value> {
+    mapping_store
+        .store()
+        .map_err(|failure| rpc_failure_response(request_id.to_owned(), failure))
+}
+
+fn handle_archive_prepare_replacement(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: PrepareReplacementRequest =
+        match parse_params(request.params, "archive.prepareReplacement") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.prepare_replacement(&params) {
+        Ok(entry) => success_response(request.id, entry),
+        Err(error) => {
+            store_error_response(request.id, "Failed to prepare replacement archive", &error)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveMarkArchivedParams {
+    entry_id: String,
+    archive_digest: String,
+    archive_size: i64,
+    object_key: String,
+    archived_at: String,
+}
+
+fn handle_archive_mark_archived(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchiveMarkArchivedParams =
+        match parse_params(request.params, "archive.markArchived") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.mark_replacement_archived(
+        &params.entry_id,
+        &params.archive_digest,
+        params.archive_size,
+        &params.object_key,
+        &params.archived_at,
+    ) {
+        Ok(entry) => success_response(request.id, entry),
+        Err(error) => store_error_response(request.id, "Failed to record archived content", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveEntryTimeParams {
+    entry_id: String,
+    occurred_at: String,
+}
+
+fn handle_archive_mark_installed(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchiveEntryTimeParams = match parse_params(request.params, "archive.markInstalled")
+    {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.mark_replacement_installed(&params.entry_id, &params.occurred_at) {
+        Ok(entry) => success_response(request.id, entry),
+        Err(error) => {
+            store_error_response(request.id, "Failed to record installed replacement", &error)
+        }
+    }
+}
+
+fn handle_archive_list_incomplete(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    if let Err(message) = require_no_params(request.params.as_ref(), "archive.listIncomplete") {
+        return error_response_with_code(request.id, "INVALID_PARAMS", message);
+    }
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.incomplete_replacements() {
+        Ok(entries) => success_response(request.id, entries),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to read replacement recovery journal",
+            &error,
+        ),
+    }
+}
+
+fn handle_archive_list_versions(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let id = match mapping_id(request.params, "archive.listVersions") {
+        Ok(id) => id,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.archived_versions(&id) {
+        Ok(entries) => success_response(request.id, entries),
+        Err(error) => store_error_response(request.id, "Failed to list archived versions", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveEntryParams {
+    entry_id: String,
+}
+
+fn handle_archive_get(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchiveEntryParams = match parse_params(request.params, "archive.get") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.replacement_entry(&params.entry_id) {
+        Ok(entry) => success_response(request.id, entry),
+        Err(error) => store_error_response(request.id, "Failed to read archived version", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveIssueParams {
+    entry_id: String,
+    integrity_failure: bool,
+    detail: String,
+    occurred_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveObjectIssueParams {
+    entry_id: String,
+    state: ArchiveObjectState,
+    detail: String,
+    occurred_at: String,
+}
+
+fn handle_archive_record_object_issue(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: ArchiveObjectIssueParams =
+        match parse_params(request.params, "archive.recordObjectIssue") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.record_archive_object_issue(
+        &params.entry_id,
+        params.state,
+        &params.detail,
+        &params.occurred_at,
+    ) {
+        Ok(entry) => success_response(request.id, entry),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to record archive object integrity issue",
+            &error,
+        ),
+    }
+}
+
+fn handle_archive_record_issue(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchiveIssueParams = match parse_params(request.params, "archive.recordIssue") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.record_replacement_issue(
+        &params.entry_id,
+        params.integrity_failure,
+        &params.detail,
+        &params.occurred_at,
+    ) {
+        Ok(entry) => success_response(request.id, entry),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to record replacement recovery issue",
+            &error,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveRecoverParams {
+    entry_id: String,
+    live_digest: Option<String>,
+    archive_available: bool,
+    recovered_at: String,
+}
+
+fn handle_archive_recover(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchiveRecoverParams = match parse_params(request.params, "archive.recover") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.recover_replacement(
+        &params.entry_id,
+        params.live_digest.as_deref(),
+        params.archive_available,
+        &params.recovered_at,
+    ) {
+        Ok(entry) => success_response(request.id, entry),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to reconcile replacement recovery",
+            &error,
+        ),
+    }
+}
+
+fn handle_archive_prepare_restore(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: PrepareRestoreRequest = match parse_params(request.params, "archive.prepareRestore")
+    {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.prepare_restore(&params) {
+        Ok(entry) => success_response(request.id, entry),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to prepare archived-version restore",
+            &error,
+        ),
+    }
+}
+
+fn handle_archive_complete_restore(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchiveEntryTimeParams =
+        match parse_params(request.params, "archive.completeRestore") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.complete_restore(&params.entry_id, &params.occurred_at) {
+        Ok(entry) => success_response(request.id, entry),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to complete archived-version restore",
             &error,
         ),
     }
@@ -967,6 +1269,17 @@ mod tests {
             "fileSync.complete",
             "fileSync.applyVerified",
             "fileSync.fail",
+            "archive.prepareReplacement",
+            "archive.markArchived",
+            "archive.markInstalled",
+            "archive.listIncomplete",
+            "archive.listVersions",
+            "archive.get",
+            "archive.recordIssue",
+            "archive.recordObjectIssue",
+            "archive.recover",
+            "archive.prepareRestore",
+            "archive.completeRestore",
             "manifest.scan",
             "manifest.compare",
             "plan.build",

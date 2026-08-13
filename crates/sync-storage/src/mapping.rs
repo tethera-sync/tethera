@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Schema version this build reads and writes. Version 1 is intentionally left unchanged below.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 200;
@@ -576,7 +576,7 @@ fn check_text(field: &str, value: &str, max_length: usize) -> Result<(), Mapping
     Ok(())
 }
 
-fn check_path(field: &str, value: &str) -> Result<(), MappingStoreError> {
+pub(crate) fn check_path(field: &str, value: &str) -> Result<(), MappingStoreError> {
     check_text(field, value, MAX_PATH_LENGTH)
 }
 
@@ -727,7 +727,69 @@ impl MappingStore {
         }
         if current < 3 {
             self.migrate_v2_to_v3()?;
+            current = 3;
         }
+        if current < 4 {
+            self.migrate_v3_to_v4()?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v3_to_v4(&self) -> Result<(), MappingStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE archive_objects (
+                digest TEXT PRIMARY KEY,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                object_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK (state IN ('available', 'missing', 'corrupt')),
+                created_at TEXT NOT NULL,
+                verified_at TEXT NOT NULL,
+                last_error TEXT
+            );
+            CREATE TABLE file_replacement_journal (
+                id TEXT PRIMARY KEY,
+                mapping_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                sync_operation_id INTEGER,
+                kind TEXT NOT NULL CHECK (kind IN ('sync', 'restore')),
+                old_digest TEXT,
+                old_size INTEGER CHECK (old_size IS NULL OR old_size >= 0),
+                replacement_digest TEXT NOT NULL,
+                replacement_size INTEGER NOT NULL CHECK (replacement_size >= 0),
+                archive_digest TEXT,
+                archive_object_key TEXT,
+                restored_from_journal_id TEXT,
+                state TEXT NOT NULL CHECK (state IN (
+                    'planned', 'archived', 'installed', 'completed', 'aborted',
+                    'recovery-required', 'integrity-failed'
+                )),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                last_error TEXT,
+                local_root TEXT NOT NULL,
+                CHECK ((old_digest IS NULL) = (old_size IS NULL)),
+                CHECK ((archive_digest IS NULL) = (archive_object_key IS NULL))
+            );
+            CREATE INDEX file_replacement_journal_history
+                ON file_replacement_journal (mapping_id, created_at DESC, id DESC)
+                WHERE archive_digest IS NOT NULL;
+            CREATE INDEX file_replacement_journal_incomplete
+                ON file_replacement_journal (created_at, id)
+                WHERE state IN (
+                    'planned', 'archived', 'installed', 'recovery-required', 'integrity-failed'
+                );
+            CREATE INDEX file_replacement_journal_recovery_issues
+                ON file_replacement_journal (mapping_id, updated_at, id)
+                WHERE state IN ('recovery-required', 'integrity-failed');
+            CREATE UNIQUE INDEX file_replacement_journal_active_path
+                ON file_replacement_journal (mapping_id, relative_path)
+                WHERE state IN ('planned', 'archived', 'installed', 'recovery-required', 'integrity-failed');
+            PRAGMA user_version = 4;",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2334,6 +2396,46 @@ mod tests {
                 .expect("revision")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn migrates_schema_v3_to_v4_without_rewriting_existing_mapping_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("mappings.sqlite3");
+        seed_v1(&path, &[sample("existing-v3-mapping")]);
+        drop(MappingStore::open(&path).expect("create representative current schema"));
+
+        let connection = rusqlite::Connection::open(&path).expect("open representative v3");
+        connection
+            .execute_batch(
+                "DROP TABLE file_replacement_journal;
+                 DROP TABLE archive_objects;
+                 PRAGMA user_version = 3;",
+            )
+            .expect("downgrade representative schema to v3");
+        drop(connection);
+
+        let reopened = MappingStore::open(&path).expect("migrate v3 to v4");
+        assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
+        let mapping_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM folder_mappings WHERE id = 'existing-v3-mapping'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mapping count");
+        let journal_table_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'file_replacement_journal'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("journal table count");
+        assert_eq!(mapping_count, 1);
+        assert_eq!(journal_table_count, 1);
     }
 
     #[test]

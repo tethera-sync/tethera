@@ -16,7 +16,7 @@ This document separates implemented behaviour from planned behaviour so the prod
 
 SQLite is the sole authoritative store for approved folder-mapping configuration. The desktop starts its stable device identity, opens the authenticated Rust RPC session, completes or verifies the legacy import, and then obtains active mappings through `mapping.list`. It never silently falls back to `state.json`.
 
-Schema version 3 keeps the original migrations and adds:
+Schema version 4 keeps the original migrations and adds:
 
 - `mapping_revisions` for the current active event metadata;
 - `mapping_tombstones` for durable deletion evidence;
@@ -26,6 +26,8 @@ Schema version 3 keeps the original migrations and adds:
 - `file_sync_baselines` for common SHA-256 file versions;
 - `file_sync_operations` for retryable pull/push work; and
 - `file_sync_conflicts` for simultaneous changes, one-sided deletion, direction mismatch, or unbased state.
+- `archive_objects` for verified content-addressed archive metadata; and
+- `file_replacement_journal` for restart-safe replacement and restore lifecycle state.
 
 Each migration step and each mapping mutation is transactional. A startup write probe distinguishes a genuinely writable store from a WAL database that can be opened for reads while another writer holds it. A newer schema is refused without modification.
 
@@ -79,20 +81,24 @@ The Electron main process owns the initial merge. One user action runs a full-in
 
 After activation, the lower participant device ID is the deterministic coordinator. Both participants watch their local tree; a non-coordinator change sends a bounded authenticated notification that queues the coordinator, while a five-minute full two-sided scan covers missed events. Full SHA-256 observations go to the Rust engine, which compares them with the last verified common baseline. A new path or one-sided modification permitted by the mapping mode becomes durable work. Both devices record the new baseline only after the destination verifies and atomically commits the exact source digest. A disconnect or restart leaves retry state in SQLite; a commit whose acknowledgement was lost converges on the next identical scan.
 
-Existing destinations are replaced only if their digest still matches the planner's expected destination digest. Before replacement, the old inode is hard-linked into a content-addressed `.tethera-recovery` area on the same filesystem and fsynced; this also retains an edit made through an already-open old file handle. Recovery paths are reserved and never enter manifests. New destinations use an atomic no-replace link. The first observation of a legacy/imported active mapping never assumes a one-sided file is new. Simultaneous modifications, one- or two-sided deletions, direction-blocked changes, and paths without a verified baseline become durable conflicts; files are not deleted and the folder/activity UI identifies affected paths.
+Existing destinations are replaced only if their digest still matches the planner's expected destination digest. The new file is staged and verified beside the destination. The exact destination entry is then moved to a reserved same-directory displaced path, copied into `userData/version-archive/objects/sha256/<prefix>/<digest>`, fsynced, re-hashed, and recorded as `archived` in SQLite before the new file is installed with an atomic no-replace link. A path created concurrently in the installation or rollback window is never overwritten. Sync completion and the journal's `completed` transition commit together. Deterministic archive staging can be verified and published after restart, and every journal entry is bound to the canonical local root that created it. The reserved displaced inode is retained and ignored by scans because POSIX permits late writes through an already-open handle; a future retention policy may remove it only under an explicit safety rule. The external content-addressed object remains the authoritative archived version. New destinations use the same atomic no-replace link.
+
+Startup processes incomplete replacement rows before watchers resume. An unchanged old live digest aborts work safely; the exact planned replacement plus a verified archive rolls forward; missing/corrupt archive content becomes `integrity-failed`; every ambiguous observation becomes `recovery-required`. Restore uses the same pipeline and archives a current live file before replacing it. A minimal Electron API exposes the engine-backed restore primitive, while the History screen remains a placeholder.
+
+The first observation of a legacy/imported active mapping never assumes a one-sided file is new. Simultaneous modifications, one- or two-sided deletions, direction-blocked changes, and paths without a verified baseline become durable conflicts; files are not deleted and the folder/activity UI identifies affected paths.
 
 ## Clearly not implemented
 
 - Scan generations, incremental hashing, paging beyond 10,000 files, or production-scale performance work.
-- Engine-owned filesystem watching/network transfer, resumable/content-defined chunking, archive-backed replacement, or bandwidth scheduling.
-- File deletion or rename propagation, recovery browsing/retention, restore, or conflict winner selection.
+- Engine-owned filesystem watching/network transfer, resumable/content-defined chunking, or bandwidth scheduling.
+- File deletion or rename propagation, archive browsing/retention, or conflict winner selection.
 - NAT traversal, cloud services, accounts or telemetry.
 - Removal of the 10,000-file manifest ceiling.
 - Code-signed/notarised release builds.
 
 ## Recommended next pull request
 
-The next milestone should add version history and an explicit conflict-resolution flow. It must archive every displaced version, expose both copies to the user, and prove restore/restart safety before deletion or rename propagation is enabled.
+The next milestone should add an explicit archive-backed conflict-resolution flow so the user can inspect both copies and select a result without bypassing the replacement journal. Deletion and rename propagation should remain disabled until that flow is proven safe.
 
 ## LAN ports
 

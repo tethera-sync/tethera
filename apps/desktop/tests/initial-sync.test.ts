@@ -7,12 +7,12 @@ import type { FileManifest } from "../src/main/folder-manifest"
 import {
   assessInitialMergeConvergence,
   computeSyncPlan,
-  replacementRecoveryPath,
   runCoordinatedInitialMerge,
   writeFileAtomic,
   writeFileChunksAtomic,
 } from "../src/main/initial-sync"
 import { isTetheraStagingPath, resolveWithinRoot } from "../src/main/path-safety"
+import { archiveObjectPath } from "../src/main/version-archive"
 
 function manifest(files: FileManifest["files"]): FileManifest {
   return { rootPath: "/tmp/test", files, ignored: 0, unreadable: 0, truncated: false }
@@ -211,6 +211,7 @@ describe("writeFileChunksAtomic", () => {
 
   test("replaces only the destination version recorded by reconciliation", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-chunk-test-"))
+    const archiveRoot = await mkdtemp(path.join(tmpdir(), "tethera-archive-test-"))
     const original = Buffer.from("verified original")
     const replacement = Buffer.from("safe replacement")
     const originalDigest = createHash("sha256").update(original).digest("hex")
@@ -225,19 +226,26 @@ describe("writeFileChunksAtomic", () => {
         async function* () { yield replacement }(),
         {
           expectedDestinationDigest: originalDigest,
-          recoveryPath: replacementRecoveryPath("notes.txt", originalDigest),
+          expectedDestinationSize: original.length,
+          replacement: {
+            journalId: "replacement-1",
+            archiveRoot,
+            markArchived: async () => undefined,
+            markInstalled: async () => undefined,
+          },
         },
       )
       expect(await readFile(path.join(root, "notes.txt"))).toEqual(replacement)
-      const recoveryPath = replacementRecoveryPath("notes.txt", originalDigest)
-      expect(await readFile(path.join(root, recoveryPath))).toEqual(original)
+      expect(await readFile(archiveObjectPath(archiveRoot, `sha256/${originalDigest.slice(0, 2)}/${originalDigest}`))).toEqual(original)
     } finally {
       await rm(root, { recursive: true, force: true })
+      await rm(archiveRoot, { recursive: true, force: true })
     }
   })
 
   test("preserves a destination changed after reconciliation", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-chunk-test-"))
+    const archiveRoot = await mkdtemp(path.join(tmpdir(), "tethera-archive-test-"))
     const staleDigest = createHash("sha256").update("old baseline").digest("hex")
     const replacement = Buffer.from("remote replacement")
     const replacementDigest = createHash("sha256").update(replacement).digest("hex")
@@ -251,12 +259,19 @@ describe("writeFileChunksAtomic", () => {
         async function* () { yield replacement }(),
         {
           expectedDestinationDigest: staleDigest,
-          recoveryPath: replacementRecoveryPath("notes.txt", staleDigest),
+          expectedDestinationSize: 12,
+          replacement: {
+            journalId: "replacement-2",
+            archiveRoot,
+            markArchived: async () => undefined,
+            markInstalled: async () => undefined,
+          },
         },
       )).rejects.toThrow("local copy was preserved")
       expect(await readFile(path.join(root, "notes.txt"), "utf8")).toBe("new local edit")
     } finally {
       await rm(root, { recursive: true, force: true })
+      await rm(archiveRoot, { recursive: true, force: true })
     }
   })
 })
