@@ -13,6 +13,7 @@ target/
 !.vscode/extensions.json
 .DS_Store
 Thumbs.db
+t3code-*/
 .env
 .env.*
 !.env.example
