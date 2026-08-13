@@ -2020,11 +2020,6 @@ textarea.field-control { height: auto; padding-block: 10px; line-height: 1.55; }
 
 .folder-picker-entry:hover { background: var(--accent); }
 
-.folder-picker-entry-selected {
-  border-color: color-mix(in oklab, var(--primary) 26%, var(--border));
-  background: color-mix(in oklab, var(--primary) 11%, transparent);
-}
-
 .folder-entry-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 8px; background: var(--secondary); color: var(--primary); }
 .folder-entry-icon svg { width: 15px; height: 15px; }
 .folder-picker-entry strong { display: block; overflow: hidden; font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }

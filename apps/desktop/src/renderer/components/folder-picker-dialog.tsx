@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ChangeEvent } from "react"
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react"
 import {
   ArrowLeftIcon,
   ChevronRightIcon,
@@ -52,36 +52,49 @@ export function FolderPickerDialog({
   onSelect,
 }: FolderPickerDialogProps) {
   const [listing, setListing] = useState<DirectoryListing | null>(null)
-  const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [query, setQuery] = useState("")
   const [includeHidden, setIncludeHidden] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [creatingFolder, setCreatingFolder] = useState(false)
   const [newFolderName, setNewFolderName] = useState("")
+  const requestGenerationRef = useRef(0)
+  const createInFlightRef = useRef(false)
+  const folderListRef = useRef<HTMLDivElement>(null)
+  const lastBrowseRequestRef = useRef<{ path?: string; includeHidden: boolean }>({ includeHidden: false })
 
-  async function loadDirectory(targetPath?: string, hidden = includeHidden) {
+  async function loadDirectory(targetPath?: string, hidden = includeHidden, focusAfterLoad = false) {
+    const requestGeneration = ++requestGenerationRef.current
+    lastBrowseRequestRef.current = { path: targetPath, includeHidden: hidden }
     setLoading(true)
     setError(null)
-    setSelectedPath(null)
     try {
       const next = await window.folderSync.browseDirectory({
         deviceId: device.id,
         path: targetPath,
         includeHidden: hidden,
       })
+      if (requestGeneration !== requestGenerationRef.current) return
       setListing(next)
+      if (focusAfterLoad) focusFolderList(requestGeneration)
     } catch (caught) {
+      if (requestGeneration !== requestGenerationRef.current) return
       setError(caught instanceof Error ? caught.message : "Unable to open this folder.")
+      focusFolderList(requestGeneration)
     } finally {
-      setLoading(false)
+      if (requestGeneration === requestGenerationRef.current) setLoading(false)
     }
+  }
+
+  function focusFolderList(requestGeneration: number): void {
+    requestAnimationFrame(() => {
+      if (requestGeneration === requestGenerationRef.current) folderListRef.current?.focus()
+    })
   }
 
   useEffect(() => {
     if (!open) return
     setListing(null)
-    setSelectedPath(null)
     setQuery("")
     setError(null)
     setCreatingFolder(false)
@@ -89,6 +102,9 @@ export function FolderPickerDialog({
     void loadDirectory(initialPath, includeHidden)
     // Loading is intentionally reset whenever the dialog is opened for a device/path.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => {
+      requestGenerationRef.current += 1
+    }
   }, [open, device.id, initialPath])
 
   const visibleEntries = useMemo(() => {
@@ -109,7 +125,9 @@ export function FolderPickerDialog({
   }
 
   async function createFolder() {
-    if (!listing || !newFolderName.trim()) return
+    if (!listing || !newFolderName.trim() || createInFlightRef.current) return
+    createInFlightRef.current = true
+    const requestGeneration = ++requestGenerationRef.current
     setLoading(true)
     setError(null)
     try {
@@ -118,25 +136,26 @@ export function FolderPickerDialog({
         parentPath: listing.currentPath,
         name: newFolderName.trim(),
       })
-      setListing(next)
+      if (requestGeneration !== requestGenerationRef.current) return
       const created = next.entries.find((entry) => entry.name === newFolderName.trim())
-      setSelectedPath(created?.path ?? null)
+      setListing(next)
       setNewFolderName("")
       setCreatingFolder(false)
+      if (created) await loadDirectory(created.path, includeHidden, true)
     } catch (caught) {
+      if (requestGeneration !== requestGenerationRef.current) return
       setError(caught instanceof Error ? caught.message : "Unable to create the folder.")
     } finally {
-      setLoading(false)
+      createInFlightRef.current = false
+      if (requestGeneration === requestGenerationRef.current) setLoading(false)
     }
   }
 
   function chooseFolder() {
-    if (!listing) return
-    onSelect(selectedPath ?? listing.currentPath)
+    if (!listing || loading) return
+    onSelect(listing.currentPath)
     onOpenChange(false)
   }
-
-  const selectedLabel = selectedPath ? "Choose selected folder" : "Choose this folder"
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -167,7 +186,8 @@ export function FolderPickerDialog({
                     key={location.id}
                     type="button"
                     className={cn("folder-location", active && "folder-location-active")}
-                    onClick={() => void loadDirectory(location.path)}
+                    disabled={loading}
+                    onClick={() => void loadDirectory(location.path, includeHidden, true)}
                   >
                     <Icon />
                     <span title={location.path}>{location.label}</span>
@@ -184,7 +204,7 @@ export function FolderPickerDialog({
                 size="icon"
                 aria-label="Go to parent folder"
                 disabled={!listing?.parentPath || loading}
-                onClick={() => void loadDirectory(listing?.parentPath ?? undefined)}
+                    onClick={() => void loadDirectory(listing?.parentPath ?? undefined, includeHidden, true)}
               >
                 <ArrowLeftIcon />
               </Button>
@@ -193,7 +213,7 @@ export function FolderPickerDialog({
                 {breadcrumbs.map((crumb, index) => (
                   <div key={crumb.path} className="folder-breadcrumb-segment">
                     {index > 0 ? <ChevronRightIcon /> : null}
-                    <button type="button" title={crumb.path} onClick={() => void loadDirectory(crumb.path)}>
+                    <button type="button" title={crumb.path} disabled={loading} onClick={() => void loadDirectory(crumb.path, includeHidden, true)}>
                       {crumb.label}
                     </button>
                   </div>
@@ -238,6 +258,7 @@ export function FolderPickerDialog({
                 <input
                   autoFocus
                   className="field-control"
+                  disabled={loading}
                   value={newFolderName}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => setNewFolderName(event.target.value)}
                   placeholder="New folder name"
@@ -255,7 +276,23 @@ export function FolderPickerDialog({
               </div>
             ) : null}
 
-            <div className="folder-picker-list" role="listbox" aria-label="Folders">
+            <span className="sr-only" role="status" aria-live="polite">
+              {loading
+                ? "Opening folder…"
+                : error
+                  ? `Could not open folder. ${error}`
+                  : listing
+                    ? `Opened ${breadcrumbs.at(-1)?.label ?? "folder"}.`
+                    : ""}
+            </span>
+            <div
+              ref={folderListRef}
+              className="folder-picker-list"
+              role="navigation"
+              aria-label="Folders"
+              aria-busy={loading}
+              tabIndex={-1}
+            >
               {loading && !listing ? (
                 <div className="folder-picker-message">
                   <RefreshCwIcon className="animate-spin" />
@@ -267,11 +304,16 @@ export function FolderPickerDialog({
                 <div className="folder-picker-error">
                   <strong>Couldn’t open this location</strong>
                   <span>{error}</span>
-                  {listing ? (
-                    <Button variant="outline" size="sm" onClick={() => void loadDirectory(listing.currentPath)}>
-                      Try again
-                    </Button>
-                  ) : null}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const request = lastBrowseRequestRef.current
+                      void loadDirectory(request.path, request.includeHidden, true)
+                    }}
+                  >
+                    Try again
+                  </Button>
                 </div>
               ) : null}
 
@@ -288,14 +330,9 @@ export function FolderPickerDialog({
                     <button
                       key={entry.path}
                       type="button"
-                      role="option"
-                      aria-selected={selectedPath === entry.path}
-                      className={cn("folder-picker-entry", selectedPath === entry.path && "folder-picker-entry-selected")}
-                      onClick={() => setSelectedPath(entry.path)}
-                      onDoubleClick={() => void loadDirectory(entry.path)}
-                      onKeyDown={(event: { key: string }) => {
-                        if (event.key === "Enter") void loadDirectory(entry.path)
-                      }}
+                      className="folder-picker-entry"
+                      disabled={loading}
+                      onClick={() => void loadDirectory(entry.path, includeHidden, true)}
                     >
                       <div className="folder-entry-icon">
                         <FolderIcon />
@@ -315,8 +352,8 @@ export function FolderPickerDialog({
         <div className="folder-picker-selection">
           <FolderOpenIcon />
           <div>
-            <span>{selectedPath ? "Selected folder" : "Current folder"}</span>
-            <code title={selectedPath ?? listing?.currentPath}>{selectedPath ?? listing?.currentPath ?? "Loading…"}</code>
+            <span>Current folder</span>
+            <code title={listing?.currentPath}>{listing?.currentPath ?? "Loading…"}</code>
           </div>
         </div>
 
@@ -324,8 +361,8 @@ export function FolderPickerDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button disabled={!listing || Boolean(error)} onClick={chooseFolder}>
-            {selectedLabel}
+          <Button disabled={!listing || Boolean(error) || loading} onClick={chooseFolder}>
+            Choose this folder
           </Button>
         </DialogFooter>
       </DialogContent>

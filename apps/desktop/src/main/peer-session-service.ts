@@ -19,8 +19,11 @@ const DEFAULT_SESSION_PORT = 47_656
 const PROTOCOL_VERSION = 3
 const CONNECT_TIMEOUT_MS = 10_000
 const REQUEST_TIMEOUT_MS = 45_000
+const RESPONSE_FLUSH_TIMEOUT_MS = 15_000
 const CLOCK_SKEW_MS = 2 * 60_000
 const MAX_LINE_BYTES = 16 * 1024 * 1024
+const MAX_AUTHENTICATED_SESSIONS = 16
+const MAX_AUTHENTICATED_SESSIONS_PER_PEER = 4
 
 type SessionHello = {
   type: "session-hello"
@@ -72,10 +75,14 @@ export interface PeerRequestContext {
   peerId: string
   peerName: string
   remoteAddress: string
+  requestId: string
 }
 
 export interface PeerSessionServiceOptions {
-  pairing: PairingService
+  pairing: Pick<
+    PairingService,
+    "getLocalSessionIdentity" | "getTrustedSessionPeer" | "signSessionPayload" | "verifyTrustedSessionPayload"
+  >
   onRequest: (context: PeerRequestContext, request: PeerRequest) => Promise<unknown>
   port?: number
 }
@@ -86,6 +93,8 @@ export class PeerSessionService extends EventEmitter {
   #port = 0
   #stopped = false
   #recentSessions = new Map<string, number>()
+  #authenticatedSessions = 0
+  #authenticatedSessionsByPeer = new Map<string, number>()
 
   constructor(options: PeerSessionServiceOptions) {
     super()
@@ -111,6 +120,10 @@ export class PeerSessionService extends EventEmitter {
         resolve()
       })
     })
+  }
+
+  get port(): number {
+    return this.#port
   }
 
   async stop(): Promise<void> {
@@ -207,12 +220,17 @@ export class PeerSessionService extends EventEmitter {
 
   async #handleIncoming(socket: Socket): Promise<void> {
     const connection = new JsonLineConnection(socket)
+    let sessionId: string | undefined
+    let requestId: string | undefined
+    let peerIdForLog: string | undefined
+    let authenticatedPeerId: string | undefined
     try {
       const first = await connection.read(CONNECT_TIMEOUT_MS)
       if (first.type !== "session-hello") {
-        connection.write({ type: "session-error", protocol: PROTOCOL_VERSION, reason: "Expected a secure-session hello." })
+        await connection.end({ type: "session-error", protocol: PROTOCOL_VERSION, reason: "Expected a secure-session hello." })
         return
       }
+      sessionId = safeCorrelationId(first.sessionId)
       const local = this.#options.pairing.getLocalSessionIdentity()
       const helloBody = {
         protocol: first.protocol,
@@ -237,6 +255,9 @@ export class PeerSessionService extends EventEmitter {
 
       const peer = this.#options.pairing.getTrustedSessionPeer(first.deviceId)
       if (!peer) throw new Error("The connecting computer is no longer trusted.")
+      peerIdForLog = safePeerId(peer.id)
+      this.#beginAuthenticatedSession(peer.id)
+      authenticatedPeerId = peer.id
       const ephemeral = generateKeyPairSync("x25519")
       const responderNonce = randomBytes(32).toString("base64url")
       const welcomeBody = {
@@ -263,33 +284,74 @@ export class PeerSessionService extends EventEmitter {
       )
       const frame = await connection.read(REQUEST_TIMEOUT_MS)
       if (frame.type !== "secure-frame") throw new Error("Expected an encrypted peer request.")
+      requestId = safeCorrelationId(frame.requestId)
       const request = decryptFrame<PeerRequest>(key, first.sessionId, "request", frame)
       const context: PeerRequestContext = {
         peerId: peer.id,
         peerName: peer.name,
         remoteAddress: normalizeRemoteAddress(socket.remoteAddress),
+        requestId,
       }
 
       let response: PeerResponse
       try {
         response = { ok: true, result: await this.#options.onRequest(context, request) }
       } catch (error) {
-        response = { ok: false, error: boundedPeerError(error, "The peer request failed.") }
+        const detail = boundedPeerError(error, "The peer request failed.")
+        console.warn("[peer-session] peer request failed", {
+          operation: safeOperationName(request.type),
+          peerId: context.peerId,
+          requestId: context.requestId,
+          error: safeErrorDiagnostic(error),
+        })
+        response = { ok: false, error: detail }
       }
-      connection.write(encryptFrame(key, first.sessionId, frame.requestId, "response", response))
+      await connection.end(encryptFrame(key, first.sessionId, frame.requestId, "response", response))
     } catch (error) {
+      const detail = boundedPeerError(error, "The secure peer session failed.")
+      console.warn("[peer-session] secure session failed", {
+        sessionId,
+        requestId,
+        peerId: peerIdForLog,
+        error: safeErrorDiagnostic(error),
+      })
       try {
-        connection.write({
+        await connection.end({
           type: "session-error",
           protocol: PROTOCOL_VERSION,
-          reason: boundedPeerError(error, "The secure peer session failed."),
+          reason: detail,
         })
-      } catch {
-        // The connection may already be closed.
+      } catch (sendError) {
+        console.warn("[peer-session] unable to flush terminal response", {
+          sessionId,
+          requestId,
+          peerId: peerIdForLog,
+          error: safeErrorDiagnostic(sendError),
+        })
       }
     } finally {
+      if (authenticatedPeerId) this.#endAuthenticatedSession(authenticatedPeerId)
       connection.close()
     }
+  }
+
+  #beginAuthenticatedSession(peerId: string): void {
+    const peerSessions = this.#authenticatedSessionsByPeer.get(peerId) ?? 0
+    if (
+      this.#authenticatedSessions >= MAX_AUTHENTICATED_SESSIONS ||
+      peerSessions >= MAX_AUTHENTICATED_SESSIONS_PER_PEER
+    ) {
+      throw peerSessionError("This computer is already handling its maximum number of secure sessions.", "PEER_SESSION_CAPACITY")
+    }
+    this.#authenticatedSessions += 1
+    this.#authenticatedSessionsByPeer.set(peerId, peerSessions + 1)
+  }
+
+  #endAuthenticatedSession(peerId: string): void {
+    const peerSessions = this.#authenticatedSessionsByPeer.get(peerId) ?? 0
+    this.#authenticatedSessions = Math.max(0, this.#authenticatedSessions - 1)
+    if (peerSessions <= 1) this.#authenticatedSessionsByPeer.delete(peerId)
+    else this.#authenticatedSessionsByPeer.set(peerId, peerSessions - 1)
   }
 
   #pruneRecentSessions(): void {
@@ -309,6 +371,32 @@ function boundedPeerError(error: unknown, fallback: string): string {
     .slice(0, 512)
     .trim()
   return bounded || fallback
+}
+
+function safeOperationName(value: unknown): string {
+  if (typeof value !== "string") return "unknown"
+  return value.replace(/[^a-z0-9-]/gi, "").slice(0, 64) || "unknown"
+}
+
+function safeCorrelationId(value: unknown): string {
+  return typeof value === "string" && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(value)
+    ? value
+    : "invalid"
+}
+
+function safePeerId(value: unknown): string {
+  return typeof value === "string" && /^[a-f0-9]{32}$/i.test(value) ? value : "invalid"
+}
+
+function safeErrorDiagnostic(error: unknown): { name: string; code?: string } {
+  if (!(error instanceof Error)) return { name: "UnknownError" }
+  const candidateCode = (error as NodeJS.ErrnoException).code
+  return {
+    name: error.name.replace(/[^a-z0-9]/gi, "").slice(0, 64) || "Error",
+    ...(typeof candidateCode === "string" && /^[A-Z0-9_]{1,32}$/.test(candidateCode)
+      ? { code: candidateCode }
+      : {}),
+  }
 }
 
 function parsePeerResponse(value: unknown): PeerResponse {
@@ -340,7 +428,32 @@ class JsonLineConnection {
 
   write(message: WireMessage): void {
     if (this.#socket.destroyed) throw new Error("The secure peer connection is closed.")
-    this.#socket.write(`${JSON.stringify(message)}\n`)
+    this.#socket.write(serializeWireMessage(message))
+  }
+
+  async end(message: WireMessage): Promise<void> {
+    if (this.#socket.destroyed || this.#socket.writableEnded) {
+      throw peerSessionError("The secure peer connection is closed.", "PEER_CONNECTION_CLOSED")
+    }
+    const serialized = serializeWireMessage(message)
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      const finish = (error?: Error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        this.#socket.off("error", onError)
+        if (error) reject(error)
+        else resolve()
+      }
+      const onError = (error: Error) => finish(error)
+      const timeout = setTimeout(
+        () => finish(peerSessionError("The secure peer response timed out.", "PEER_RESPONSE_FLUSH_TIMEOUT")),
+        RESPONSE_FLUSH_TIMEOUT_MS,
+      )
+      this.#socket.once("error", onError)
+      this.#socket.end(serialized, () => finish())
+    })
   }
 
   async read(timeoutMs: number): Promise<WireMessage> {
@@ -398,6 +511,18 @@ class JsonLineConnection {
     this.#closedError = error
     for (const waiter of this.#waiters.splice(0)) waiter.reject(error)
   }
+}
+
+function serializeWireMessage(message: WireMessage): string {
+  const serialized = `${JSON.stringify(message)}\n`
+  if (Buffer.byteLength(serialized, "utf8") > MAX_LINE_BYTES) {
+    throw peerSessionError("The peer message exceeded the safe size limit.", "PEER_MESSAGE_TOO_LARGE")
+  }
+  return serialized
+}
+
+function peerSessionError(message: string, code: string): Error {
+  return Object.assign(new Error(message), { code })
 }
 
 function exportX25519PublicKey(key: KeyObject): string {
