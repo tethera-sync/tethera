@@ -12,9 +12,10 @@ import { autoUpdater } from "electron-updater"
 import { execFile } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
-import { mkdir, readdir, stat } from "node:fs/promises"
+import { mkdir, readdir, realpath, stat } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 import { promisify } from "node:util"
 import type {
   AddFolderInput,
@@ -51,7 +52,6 @@ import {
   computeSyncPlan,
   type InitialSyncPassResult,
   runCoordinatedInitialMerge,
-  replacementRecoveryPath,
   type SyncSkip,
   writeFileChunksAtomic,
 } from "./initial-sync"
@@ -97,10 +97,24 @@ import {
   type FileSyncState,
   type ReconcileFilesResult,
 } from "./continuous-sync"
+import {
+  recoverStagedArchiveObject,
+  removePublishedArchiveStage,
+  inspectReplacementRecovery,
+  VERSION_ARCHIVE_DIRECTORY,
+  type ReplacementJournalEntry,
+} from "./version-archive"
+import { restoreArchivedVersion } from "./archive-restore"
 
 interface TransferChunkResponse {
   offset: number
   contentBase64: string
+}
+
+interface PlannedFileResult {
+  bytes: number
+  replacementJournalId?: string
+  completedDuringRecovery?: boolean
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -113,6 +127,7 @@ const configurationDeliveriesInFlight = new Set<string>()
 const initialSyncInFlight = new Set<string>()
 const initialSyncCompletions = new Map<string, { promise: Promise<void>; resolve: () => void }>()
 const initialSyncForwarded = new Set<string>()
+const archiveRestoreInFlight = new Set<string>()
 const peerFileOperationsInFlight = new Set<string>()
 const initialSyncPeerLeases = new Map<string, { peerId: string; expiresAt: number }>()
 const continuousSyncInFlight = new Set<string>()
@@ -239,6 +254,10 @@ function getInitialSnapshot(): AppSnapshot {
 
 function stateFilePath(): string {
   return path.join(app.getPath("userData"), "state.json")
+}
+
+function versionArchiveObjectRoot(): string {
+  return path.join(app.getPath("userData"), VERSION_ARCHIVE_DIRECTORY, "objects")
 }
 
 async function loadState(): Promise<void> {
@@ -494,7 +513,7 @@ async function startNetworkServices(): Promise<void> {
 }
 
 async function setAllPaused(paused: boolean): Promise<AppSnapshot> {
-  if (paused && (initialSyncInFlight.size > 0 || initialSyncForwarded.size > 0 || hasAnyInitialSyncPeerLease() || continuousSyncInFlight.size > 0)) {
+  if (paused && (initialSyncInFlight.size > 0 || initialSyncForwarded.size > 0 || archiveRestoreInFlight.size > 0 || hasAnyInitialSyncPeerLease() || continuousSyncInFlight.size > 0)) {
     throw new Error("Wait for active file transfers to finish before pausing all folders.")
   }
   const next = await mutate(() => {
@@ -822,6 +841,8 @@ async function initializeAuthoritativeMappings(health: MappingStoreHealth): Prom
         }
       }
       hydrateAuthoritativeMappings(result.records)
+      await refreshAuthoritativeMappings()
+      await recoverIncompleteReplacements()
       snapshot.mappingStore = {
         status: "ready",
         schemaVersion: health.schemaVersion,
@@ -831,7 +852,6 @@ async function initializeAuthoritativeMappings(health: MappingStoreHealth): Prom
         pendingDeliveryCount: result.records.filter((record) => record.pendingDelivery).length,
         cleanupWarning: result.cleanupWarning,
       }
-      await refreshAuthoritativeMappings()
       await Promise.all(snapshot.folders.map((folder) => refreshContinuousSyncState(folder.id)))
       await refreshContinuousSyncMonitors()
       for (const folder of snapshot.folders) scheduleContinuousSync(folder.id)
@@ -1238,15 +1258,18 @@ function applyFileSyncStateToFolder(folderId: string, state: FileSyncState, sync
   if (!folder) return
   const peer = getPairedDevice(folder.remoteDeviceId)
   const hasConflicts = state.conflicts.length > 0
+  const hasRecoveryIssues = state.recoveryIssues.length > 0
   updateFolder(folderId, {
     status: folder.paused || snapshot.paused
       ? "paused"
-      : hasConflicts
+      : hasConflicts || hasRecoveryIssues
         ? "needs-attention"
         : peer?.status === "online"
           ? "up-to-date"
           : "offline",
-    currentAction: hasConflicts
+    currentAction: hasRecoveryIssues
+      ? state.recoveryIssues[0]?.lastError ?? `${state.recoveryIssues.length} file replacement${state.recoveryIssues.length === 1 ? " requires" : "s require"} recovery.`
+      : hasConflicts
       ? conflictSummary(state.conflicts)
       : state.operations.length > 0
         ? `${state.operations.length} change${state.operations.length === 1 ? " is" : "s are"} waiting to retry.`
@@ -1426,6 +1449,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
   continuousSyncInFlight.add(folderId)
   updateFolder(folderId, { status: "syncing", progress: 0, bytesPerSecond: 0, currentAction: `Checking for changes with ${peer.name}…` })
   broadcastSnapshot()
+  let reconciledState: ReconcileFilesResult | undefined
   try {
     const observedAt = new Date().toISOString()
     const [localManifest, remoteManifest] = await Promise.all([
@@ -1446,6 +1470,12 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       observedAt,
       queueOperations: true,
     }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
+    reconciledState = result
+    if (result.conflicts.length > 0) {
+      applyFileSyncStateToFolder(folderId, result)
+      recordContinuousConflicts(folder, result.conflicts)
+      broadcastSnapshot()
+    }
     await requirePeerSessions().request(peer.id, {
       type: "continuous-sync-observe",
       folderId,
@@ -1485,13 +1515,23 @@ async function flushContinuousSync(folderId: string): Promise<void> {
           if (!entry || entry.digest !== operation.sourceDigest || entry.size !== operation.sourceSize) {
             throw new Error(`${operation.path} changed after reconciliation; it will be retried.`)
           }
-          await pullPlannedFile(folder, peer, entry, reportProgress, operation.expectedDestinationDigest)
-          await engine.request("fileSync.complete", {
-            operationId: operation.id,
-            digest: operation.sourceDigest,
-            size: operation.sourceSize,
-            verifiedAt: new Date().toISOString(),
-          })
+          const transfer = await pullPlannedFile(
+            folder,
+            peer,
+            entry,
+            reportProgress,
+            operation.expectedDestinationDigest,
+            operation.id,
+          )
+          if (!transfer.completedDuringRecovery) {
+            await engine.request("fileSync.complete", {
+              operationId: operation.id,
+              digest: operation.sourceDigest,
+              size: operation.sourceSize,
+              verifiedAt: new Date().toISOString(),
+              replacementJournalId: transfer.replacementJournalId,
+            })
+          }
           await requirePeerSessions().request(peer.id, {
             type: "continuous-sync-verified",
             folderId,
@@ -1545,12 +1585,41 @@ async function flushContinuousSync(folderId: string): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Continuous synchronization failed."
     const online = getPairedDevice(folder.remoteDeviceId)?.status === "online"
-    updateFolder(folderId, {
-      status: online ? "needs-attention" : "offline",
-      progress: undefined,
-      bytesPerSecond: undefined,
-      currentAction: online ? `${message} Tethera will retry.` : "Waiting for the paired computer to reconnect.",
-    })
+    const durableConflicts = reconciledState?.conflicts ?? []
+    const latestState = durableConflicts.length > 0
+      ? await engine.request<FileSyncState>("fileSync.getState", { id: folderId }).catch((stateError) => {
+          console.warn(`[continuous-sync] unable to refresh durable conflict state for ${folderId}`, stateError)
+          return undefined
+        })
+      : undefined
+    if (latestState) {
+      recordContinuousConflicts(folder, latestState.conflicts)
+      if (latestState.conflicts.length > 0) {
+        applyFileSyncStateToFolder(folderId, latestState)
+      } else {
+        updateFolder(folderId, {
+          status: online ? "needs-attention" : "offline",
+          progress: undefined,
+          bytesPerSecond: undefined,
+          currentAction: online ? `${message} Tethera will retry.` : "Waiting for the paired computer to reconnect.",
+          fileCount: latestState.baselineCount,
+        })
+      }
+    } else if (durableConflicts.length > 0) {
+      updateFolder(folderId, {
+        status: "needs-attention",
+        progress: undefined,
+        bytesPerSecond: undefined,
+        currentAction: conflictSummary(durableConflicts),
+      })
+    } else {
+      updateFolder(folderId, {
+        status: online ? "needs-attention" : "offline",
+        progress: undefined,
+        bytesPerSecond: undefined,
+        currentAction: online ? `${message} Tethera will retry.` : "Waiting for the paired computer to reconnect.",
+      })
+    }
     if (continuousLastErrors.get(folderId) !== message) {
       pushActivity("Folder sync interrupted", `${folder.name}: ${message}`, "error", folderId)
       continuousLastErrors.set(folderId, message)
@@ -1636,13 +1705,44 @@ async function pullPlannedFile(
   entry: FileManifest["files"][number],
   onProgress: (fileBytes: number) => void,
   expectedDestinationDigest?: string,
-): Promise<number> {
+  syncOperationId?: number,
+): Promise<PlannedFileResult> {
   const descriptor = await requirePeerSessions().request<TransferFileDescriptor>(peer.id, {
     type: "pull-file-descriptor",
     folderId: folder.id,
     relativePath: entry.path,
   }, 5 * 60_000)
   validateTransferDescriptor(entry, descriptor)
+
+  let journal: ReplacementJournalEntry | undefined
+  let expectedDestinationSize: number | undefined
+  if (expectedDestinationDigest !== undefined) {
+    const current = await describeTransferFile(folder.localPath, entry.path)
+    if (current.digest !== expectedDestinationDigest) {
+      throw new Error("The destination changed after reconciliation; its local copy was preserved.")
+    }
+    expectedDestinationSize = current.size
+    const journalId = randomUUID()
+    const localRoot = await realpath(folder.localPath)
+    const request = {
+      id: journalId,
+      mappingId: folder.id,
+      path: entry.path,
+      syncOperationId,
+      oldDigest: current.digest,
+      oldSize: current.size,
+      replacementDigest: descriptor.digest,
+      replacementSize: descriptor.size,
+      localRoot,
+      createdAt: new Date().toISOString(),
+    }
+    try {
+      journal = await engine.request<ReplacementJournalEntry>("archive.prepareReplacement", request)
+    } catch {
+      journal = await engine.request<ReplacementJournalEntry>("archive.get", { entryId: journalId })
+    }
+  }
+  const journalId = journal?.id
 
   async function* chunks(): AsyncGenerator<Buffer> {
     let offset = 0
@@ -1667,21 +1767,156 @@ async function pullPlannedFile(
     }
   }
 
-  await writeFileChunksAtomic(
-    folder.localPath,
-    entry.path,
-    descriptor.size,
-    descriptor.digest,
-    chunks(),
-    {
-      onChunk: onProgress,
-      expectedDestinationDigest,
-      recoveryPath: expectedDestinationDigest
-        ? replacementRecoveryPath(entry.path, expectedDestinationDigest)
-        : undefined,
-    },
+  try {
+    await writeFileChunksAtomic(
+      folder.localPath,
+      entry.path,
+      descriptor.size,
+      descriptor.digest,
+      chunks(),
+      {
+        onChunk: onProgress,
+        expectedDestinationDigest,
+        expectedDestinationSize,
+        replacement: journalId
+          ? {
+              journalId,
+              archiveRoot: versionArchiveObjectRoot(),
+              markArchived: async (archive) => {
+                await engine.request<ReplacementJournalEntry>("archive.markArchived", {
+                  entryId: journalId,
+                  archiveDigest: archive.digest,
+                  archiveSize: archive.size,
+                  objectKey: archive.objectKey,
+                  archivedAt: new Date().toISOString(),
+                })
+              },
+              markInstalled: async () => {
+                await engine.request<ReplacementJournalEntry>("archive.markInstalled", {
+                  entryId: journalId,
+                  occurredAt: new Date().toISOString(),
+                })
+              },
+            }
+          : undefined,
+      },
+    )
+  } catch (error) {
+    if (journal) {
+      const recovered = await reconcileReplacementAfterFailure(folder, journal)
+      if (recovered.state === "completed") {
+        return { bytes: descriptor.size, replacementJournalId: recovered.id, completedDuringRecovery: true }
+      }
+    }
+    throw error
+  }
+  return { bytes: descriptor.size, replacementJournalId: journalId }
+}
+
+async function refreshRecoverableArchiveMetadata(
+  entry: ReplacementJournalEntry,
+): Promise<ReplacementJournalEntry> {
+  if (entry.oldDigest == null || entry.oldSize == null || entry.archiveObjectKey) return entry
+  const recovered = await recoverStagedArchiveObject(
+    versionArchiveObjectRoot(),
+    entry.id,
+    entry.oldDigest,
+    entry.oldSize,
   )
-  return descriptor.size
+  if (!recovered) return entry
+  const updated = await engine.request<ReplacementJournalEntry>("archive.markArchived", {
+    entryId: entry.id,
+    archiveDigest: recovered.digest,
+    archiveSize: recovered.size,
+    objectKey: recovered.objectKey,
+    archivedAt: new Date().toISOString(),
+  })
+  await removePublishedArchiveStage(versionArchiveObjectRoot(), entry.id, entry.oldDigest)
+  return updated
+}
+
+async function reconcileReplacementAfterFailure(
+  folder: FolderSummary,
+  initialEntry: ReplacementJournalEntry,
+  refreshEntry = true,
+): Promise<ReplacementJournalEntry> {
+  const durable = refreshEntry
+    ? await engine.request<ReplacementJournalEntry>("archive.get", { entryId: initialEntry.id })
+    : initialEntry
+  const entry = await refreshRecoverableArchiveMetadata(durable)
+  try {
+    if (await realpath(folder.localPath) !== entry.localRoot) {
+      throw new Error("The replacement journal belongs to a different configured folder root.")
+    }
+    const inspection = await inspectReplacementRecovery(
+      folder.localPath,
+      versionArchiveObjectRoot(),
+      entry,
+    )
+    return await engine.request<ReplacementJournalEntry>("archive.recover", {
+      entryId: entry.id,
+      liveDigest: inspection.liveDigest,
+      archiveAvailable: inspection.archiveAvailable,
+      recoveredAt: new Date().toISOString(),
+    })
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Replacement recovery could not determine a safe state."
+    await engine.request("archive.recordIssue", {
+      entryId: entry.id,
+      integrityFailure: false,
+      detail,
+      occurredAt: new Date().toISOString(),
+    }).catch((recordError) => console.error(
+      `[archive] unable to persist recovery failure for ${entry.id} (${entry.mappingId}:${entry.path})`,
+      recordError,
+    ))
+    throw error
+  }
+}
+
+async function recoverIncompleteReplacements(): Promise<void> {
+  const entries = await engine.request<ReplacementJournalEntry[]>("archive.listIncomplete")
+  const foldersById = new Map(snapshot.folders.map((folder) => [folder.id, folder]))
+  for (const initialEntry of entries) {
+    const folder = foldersById.get(initialEntry.mappingId)
+    if (!folder) {
+      const detail = "The archived replacement belongs to a mapping that is no longer active; automatic recovery was stopped."
+      await engine.request("archive.recordIssue", {
+        entryId: initialEntry.id,
+        integrityFailure: false,
+        detail,
+        occurredAt: new Date().toISOString(),
+      })
+      pushActivity("File replacement needs recovery", `${initialEntry.path}: ${detail}`, "error", initialEntry.mappingId)
+      continue
+    }
+    try {
+      const recovered = await reconcileReplacementAfterFailure(folder, initialEntry, false)
+      if (recovered.state === "recovery-required" || recovered.state === "integrity-failed") {
+        updateFolder(folder.id, {
+          status: "needs-attention",
+          currentAction: recovered.lastError ?? `Recovery is required for ${recovered.path}.`,
+        })
+        pushActivity(
+          recovered.state === "integrity-failed" ? "Archived version failed integrity check" : "File replacement needs recovery",
+          `${folder.name}: ${recovered.path}. ${recovered.lastError ?? "No file was overwritten."}`,
+          "error",
+          folder.id,
+        )
+      } else if (recovered.state === "completed" || recovered.state === "aborted") {
+        pushActivity(
+          recovered.state === "completed" ? "File replacement recovered" : "Interrupted replacement cancelled safely",
+          `${folder.name}: ${recovered.path} (${recovered.id}).`,
+          "info",
+          folder.id,
+        )
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Replacement recovery failed."
+      updateFolder(folder.id, { status: "needs-attention", currentAction: detail })
+      pushActivity("File replacement recovery stopped", `${folder.name}: ${detail}`, "error", folder.id)
+    }
+  }
 }
 
 async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): Promise<InitialSyncPassResult> {
@@ -1738,7 +1973,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
     const current = snapshot.folders.find((item) => item.id === folder.id)
     if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
     reportProgress(entry.path, 0, true)
-    const bytes = await pullPlannedFile(folder, peer, entry, (fileBytes) => reportProgress(entry.path, fileBytes))
+    const { bytes } = await pullPlannedFile(folder, peer, entry, (fileBytes) => reportProgress(entry.path, fileBytes))
     copiedFiles += 1
     copiedBytes += bytes
     reportProgress(entry.path, 0, true)
@@ -2232,14 +2467,17 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
           modifiedMs: 0,
           digest: operation.digest,
         }
-        await pullPlannedFile(folder, peer, entry, () => undefined, operation.expectedDestinationDigest)
-        const state = await engine.request<FileSyncState>("fileSync.applyVerified", {
-          mappingId: operation.folderId,
-          path: operation.path,
-          digest: operation.digest,
-          size: operation.size,
-          verifiedAt: new Date().toISOString(),
-        })
+        const transfer = await pullPlannedFile(folder, peer, entry, () => undefined, operation.expectedDestinationDigest)
+        const state = transfer.completedDuringRecovery
+          ? await engine.request<FileSyncState>("fileSync.getState", { id: operation.folderId })
+          : await engine.request<FileSyncState>("fileSync.applyVerified", {
+              mappingId: operation.folderId,
+              path: operation.path,
+              digest: operation.digest,
+              size: operation.size,
+              verifiedAt: new Date().toISOString(),
+              replacementJournalId: transfer.replacementJournalId,
+            })
         applyFileSyncStateToFolder(operation.folderId, state, new Date().toISOString())
         broadcastSnapshot()
         return { applied: true }
@@ -2307,7 +2545,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       hasInitialSyncPeerLease(mappingId) &&
       !isCoordinatorCompletion
     const localOperationBlocksEvent =
-      (initialSyncInFlight.has(mappingId) || initialSyncForwarded.has(mappingId) || continuousSyncInFlight.has(mappingId)) &&
+      (initialSyncInFlight.has(mappingId) || initialSyncForwarded.has(mappingId) || archiveRestoreInFlight.has(mappingId) || continuousSyncInFlight.has(mappingId)) &&
       !isCoordinatorCompletion
     if (localOperationBlocksEvent || peerLeaseBlocksEvent) {
       throw new Error("Wait for the initial merge to finish before changing or removing this mapping.")
@@ -2500,6 +2738,9 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
 function registerIpc(): void {
   ipcMain.handle("app:get-snapshot", () => snapshot)
   ipcMain.handle("mapping-store:retry", async () => {
+    if (archiveRestoreInFlight.size > 0) {
+      throw new Error("Wait for the archived-version restore to finish before restarting storage.")
+    }
     snapshot.mappingStore = {
       ...snapshot.mappingStore,
       status: "loading",
@@ -2509,6 +2750,32 @@ function registerIpc(): void {
     broadcastSnapshot()
     await engine.restart()
     return snapshot
+  })
+  ipcMain.handle("archive:restore", async (event, entryId: string) => {
+    requireTrustedMainRenderer(event)
+    requireMappingMutations()
+    if (typeof entryId !== "string" || !entryId) throw new Error("Choose an archived version to restore.")
+    const source = await engine.request<ReplacementJournalEntry>("archive.get", { entryId })
+    const folder = snapshot.folders.find((candidate) => candidate.id === source.mappingId)
+    if (!folder) throw new Error("The archived version's folder mapping is no longer active.")
+    if (continuousSyncInFlight.has(folder.id) || initialSyncInFlight.has(folder.id) || archiveRestoreInFlight.has(folder.id)) {
+      throw new Error("Wait for the current folder operation to finish before restoring a version.")
+    }
+    archiveRestoreInFlight.add(folder.id)
+    try {
+      const restored = await withContinuousSyncBlocked(folder.id, () =>
+        restoreArchivedVersion(engine, folder.localPath, versionArchiveObjectRoot(), entryId),
+      )
+      updateFolder(folder.id, {
+        status: "needs-attention",
+        currentAction: `${restored.path} was restored safely and will be reconciled with the paired computer.`,
+      })
+      pushActivity("Archived version restored", `${folder.name}: restored ${restored.path}.`, "success", folder.id)
+      scheduleContinuousSync(folder.id)
+      return broadcastSnapshot()
+    } finally {
+      archiveRestoreInFlight.delete(folder.id)
+    }
   })
   ipcMain.handle("app:pause-all", () => setAllPaused(true))
   ipcMain.handle("app:resume-all", () => setAllPaused(false))
@@ -2529,7 +2796,7 @@ function registerIpc(): void {
     requireMappingMutations()
     const release = blockContinuousSync(folderId)
     try {
-      if (paused && (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId))) {
+      if (paused && (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId))) {
         throw new Error("Wait for the active file transfer to finish before pausing this folder.")
       }
       const record = mappingRecords.get(folderId)
@@ -2559,7 +2826,7 @@ function registerIpc(): void {
     requireMappingMutations()
     const release = blockContinuousSync(folderId)
     try {
-      if (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId)) {
+      if (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId)) {
         throw new Error("Wait for the active file transfer to finish before removing this folder.")
       }
       const record = mappingRecords.get(folderId)
@@ -2636,6 +2903,29 @@ function registerIpc(): void {
     isQuitting = true
     autoUpdater.quitAndInstall()
   })
+}
+
+function requireTrustedMainRenderer(event: Electron.IpcMainInvokeEvent): void {
+  if (
+    !mainWindow ||
+    event.sender !== mainWindow.webContents ||
+    event.senderFrame !== mainWindow.webContents.mainFrame ||
+    !isTrustedRendererUrl(event.senderFrame.url)
+  ) {
+    throw new Error("Archived versions can only be restored from Tethera's main window.")
+  }
+}
+
+function isTrustedRendererUrl(url: string): boolean {
+  const developmentUrl = process.env.ELECTRON_RENDERER_URL
+  if (developmentUrl) {
+    try {
+      return new URL(url).origin === new URL(developmentUrl).origin
+    } catch {
+      return false
+    }
+  }
+  return url === pathToFileURL(path.join(__dirname, "../renderer/index.html")).href
 }
 
 function resolveResourcePath(name: string): string {
@@ -2723,8 +3013,7 @@ function createWindow(): void {
   })
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }))
   mainWindow.webContents.on("will-navigate", (event: Electron.Event, url: string) => {
-    const isDevServer = process.env.ELECTRON_RENDERER_URL && url.startsWith(process.env.ELECTRON_RENDERER_URL)
-    if (!isDevServer && !url.startsWith("file:")) event.preventDefault()
+    if (!isTrustedRendererUrl(url)) event.preventDefault()
   })
   if (process.env.ELECTRON_RENDERER_URL) void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
   else void mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"))

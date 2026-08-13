@@ -3,6 +3,7 @@
 
 pub mod file_sync;
 pub mod mapping;
+pub mod version_archive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationPhase {

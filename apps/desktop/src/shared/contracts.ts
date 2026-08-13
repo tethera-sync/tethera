@@ -315,6 +315,7 @@ export type AppSettingKey = keyof AppSettings
 export interface TetheraApi {
   getSnapshot(): Promise<AppSnapshot>
   retryMappingStore(): Promise<AppSnapshot>
+  restoreArchivedVersion(entryId: string): Promise<AppSnapshot>
   pauseAll(): Promise<AppSnapshot>
   resumeAll(): Promise<AppSnapshot>
   browseDirectory(input: BrowseDirectoryInput): Promise<DirectoryListing>

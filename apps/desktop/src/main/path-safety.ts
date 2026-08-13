@@ -1,6 +1,6 @@
 import path from "node:path"
 
-const TETHERA_STAGING_SUFFIX = /\.tethera-tmp-[a-f0-9]{32}(?:$|[\\/])/
+const TETHERA_STAGING_SUFFIX = /\.tethera-(?:tmp|displaced)-[a-f0-9]{32}(?:$|[\\/])/
 const TETHERA_RECOVERY_ROOT = /(?:^|[\\/])\.tethera-recovery(?:$|[\\/])/
 
 /** Staging and recovery names are reserved internal namespaces and never synchronize. */
