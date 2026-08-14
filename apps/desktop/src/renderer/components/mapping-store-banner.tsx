@@ -24,7 +24,7 @@ export function MappingStoreBanner({ state }: { state: MappingStoreState }) {
 
   if (state.status === "loading") {
     return (
-      <div className="mapping-store-banner mapping-store-banner-loading" role="status">
+      <div className="mapping-store-banner [display:flex] [min-height:48px] [flex:0_0_auto] [align-items:center] [gap:11px] [margin:10px_24px_0] [padding:11px_13px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_24%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--primary)_7%,_var(--surface))] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--primary)] [&>div]:[min-width:0] [&>div]:[flex:1] [&_strong]:[display:block] [&_span]:[display:block] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:650] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10.5px] [&_span]:[line-height:1.4] mapping-store-banner-loading [color:var(--muted-foreground)]" role="status">
         <RefreshCwIcon className="animate-spin" />
         <div><strong>Loading folder configuration</strong><span>Reading the authoritative mapping database…</span></div>
       </div>
@@ -33,7 +33,7 @@ export function MappingStoreBanner({ state }: { state: MappingStoreState }) {
 
   if (state.status === "ready") {
     return (
-      <div className="mapping-store-banner" role="status">
+      <div className="mapping-store-banner [display:flex] [min-height:48px] [flex:0_0_auto] [align-items:center] [gap:11px] [margin:10px_24px_0] [padding:11px_13px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_24%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--primary)_7%,_var(--surface))] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--primary)] [&>div]:[min-width:0] [&>div]:[flex:1] [&_strong]:[display:block] [&_span]:[display:block] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:650] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10.5px] [&_span]:[line-height:1.4]" role="status">
         <ShieldCheckIcon />
         <div>
           <strong>{state.pendingDeliveryCount > 0 ? "Configuration delivery pending" : "Mapping database ready"}</strong>
@@ -47,7 +47,7 @@ export function MappingStoreBanner({ state }: { state: MappingStoreState }) {
   }
 
   return (
-    <div className="mapping-store-banner mapping-store-banner-warning" role="alert">
+    <div className="mapping-store-banner [display:flex] [min-height:48px] [flex:0_0_auto] [align-items:center] [gap:11px] [margin:10px_24px_0] [padding:11px_13px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_24%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--primary)_7%,_var(--surface))] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--primary)] [&>div]:[min-width:0] [&>div]:[flex:1] [&_strong]:[display:block] [&_span]:[display:block] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:650] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10.5px] [&_span]:[line-height:1.4] mapping-store-banner-warning [border-color:color-mix(in_oklab,_var(--warning)_38%,_var(--border))] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [&>svg]:[color:var(--warning)]" role="alert">
       <CircleAlertIcon />
       <div>
         <strong>{warningTitle(state.status)}</strong>

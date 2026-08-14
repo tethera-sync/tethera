@@ -159,10 +159,10 @@ export function FolderPickerDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="folder-picker-dialog">
+      <DialogContent className="folder-picker-dialog [width:min(980px,_calc(100vw_-_36px))] [max-width:min(980px,_calc(100vw_-_36px))] [padding:20px]">
         <DialogHeader>
-          <div className="folder-picker-title-row">
-            <div className="folder-picker-device-icon">
+          <div className="folder-picker-title-row [display:flex] [align-items:flex-start] [gap:12px]">
+            <div className="folder-picker-device-icon [display:grid] [width:38px] [height:38px] [flex:0_0_auto] [place-items:center] [border-radius:11px] [background:color-mix(in_oklab,_var(--primary)_12%,_var(--surface-strong))] [color:var(--primary)] [&_svg]:[width:18px] [&_svg]:[height:18px]">
               {device.id === "local-device" ? <MonitorIcon /> : <ComputerIcon />}
             </div>
             <div>
@@ -174,10 +174,10 @@ export function FolderPickerDialog({
           </div>
         </DialogHeader>
 
-        <div className="folder-picker-shell">
-          <aside className="folder-picker-sidebar" aria-label="Folder locations">
-            <p className="folder-picker-section-label">Locations</p>
-            <div className="folder-location-list">
+        <div className="folder-picker-shell [display:grid] [grid-template-columns:178px_minmax(0,_1fr)] [height:min(520px,_calc(100vh_-_245px))] [min-height:390px] [overflow:hidden] [margin-top:18px] [border:1px_solid_var(--border)] [border-radius:14px] [background:var(--surface-sunken)] max-[760px]:[grid-template-columns:1fr]">
+          <aside className="folder-picker-sidebar [overflow-y:auto] [border-right:1px_solid_var(--border)] [background:color-mix(in_oklab,_var(--surface)_60%,_transparent)] [padding:13px_10px] max-[760px]:[display:none]" aria-label="Folder locations">
+            <p className="folder-picker-section-label [margin:0_8px_8px] [color:var(--muted-foreground)] [font-size:9px] [font-weight:700] [letter-spacing:0.1em] [text-transform:uppercase]">Locations</p>
+            <div className="folder-location-list [display:grid] [gap:2px]">
               {(listing?.locations ?? []).map((location) => {
                 const Icon = locationIcon(location)
                 const active = listing?.currentPath === location.path
@@ -185,7 +185,7 @@ export function FolderPickerDialog({
                   <button
                     key={location.id}
                     type="button"
-                    className={cn("folder-location", active && "folder-location-active")}
+                    className={cn("folder-location [display:flex] [width:100%] [height:34px] [align-items:center] [gap:9px] [border:0] [border-radius:8px] [background:transparent] [padding:0_9px] [color:var(--muted-foreground)] [font-size:11.5px] [text-align:left] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:15px] [&_svg]:[height:15px] [&_svg]:[flex:0_0_auto] [&_span]:[overflow:hidden] [&_span]:[text-overflow:ellipsis] [&_span]:[white-space:nowrap]", active && "folder-location-active [background:color-mix(in_oklab,_var(--primary)_13%,_transparent)] [color:var(--primary)]")}
                     disabled={loading}
                     onClick={() => void loadDirectory(location.path, includeHidden, true)}
                   >
@@ -197,8 +197,8 @@ export function FolderPickerDialog({
             </div>
           </aside>
 
-          <section className="folder-picker-main">
-            <div className="folder-picker-toolbar">
+          <section className="folder-picker-main [display:grid] [min-width:0] [min-height:0] [grid-template-rows:auto_auto_auto_minmax(0,_1fr)]">
+            <div className="folder-picker-toolbar [display:flex] [min-width:0] [align-items:center] [gap:6px] [border-bottom:1px_solid_var(--border)] [padding:8px_10px] [background:var(--surface)]">
               <Button
                 variant="ghost"
                 size="icon"
@@ -209,9 +209,9 @@ export function FolderPickerDialog({
                 <ArrowLeftIcon />
               </Button>
 
-              <div className="folder-breadcrumbs" aria-label="Current folder path">
+              <div className="folder-breadcrumbs [display:flex] [min-width:0] [flex:1] [align-items:center] [overflow-x:auto] [scrollbar-width:none] [&::-webkit-scrollbar]:[display:none]" aria-label="Current folder path">
                 {breadcrumbs.map((crumb, index) => (
-                  <div key={crumb.path} className="folder-breadcrumb-segment">
+                  <div key={crumb.path} className="folder-breadcrumb-segment [display:flex] [flex:0_0_auto] [align-items:center] [&>svg]:[width:13px] [&>svg]:[height:13px] [&>svg]:[color:var(--muted-foreground)] [&_button]:[max-width:150px] [&_button]:[overflow:hidden] [&_button]:[border:0] [&_button]:[border-radius:6px] [&_button]:[background:transparent] [&_button]:[padding:5px_7px] [&_button]:[font-size:11px] [&_button]:[font-weight:550] [&_button]:[text-overflow:ellipsis] [&_button]:[white-space:nowrap] [&_button:hover]:[background:var(--accent)]">
                     {index > 0 ? <ChevronRightIcon /> : null}
                     <button type="button" title={crumb.path} disabled={loading} onClick={() => void loadDirectory(crumb.path, includeHidden, true)}>
                       {crumb.label}
@@ -231,8 +231,8 @@ export function FolderPickerDialog({
               </Button>
             </div>
 
-            <div className="folder-picker-actions">
-              <label className="folder-search">
+            <div className="folder-picker-actions [display:flex] [align-items:center] [gap:8px] [border-bottom:1px_solid_var(--border)] [padding:9px_11px] [background:color-mix(in_oklab,_var(--surface)_45%,_transparent)] max-[760px]:[flex-wrap:wrap]">
+              <label className="folder-search [display:flex] [min-width:180px] [flex:1] [align-items:center] [gap:8px] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [padding:0_10px] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[color:var(--muted-foreground)] [&_input]:[width:100%] [&_input]:[height:32px] [&_input]:[border:0] [&_input]:[outline:0] [&_input]:[background:transparent] [&_input]:[font-size:11.5px] [&_input]:[color:var(--foreground)] max-[760px]:[min-width:100%]">
                 <SearchIcon />
                 <input
                   value={query}
@@ -253,11 +253,11 @@ export function FolderPickerDialog({
             </div>
 
             {creatingFolder ? (
-              <div className="new-folder-row">
+              <div className="new-folder-row [display:flex] [align-items:center] [gap:8px] [border-bottom:1px_solid_var(--border)] [background:color-mix(in_oklab,_var(--primary)_6%,_var(--surface))] [padding:8px_11px] [&>svg]:[width:16px] [&>svg]:[height:16px] [&>svg]:[color:var(--primary)] [&_.field-control]:[height:33px]">
                 <FolderPlusIcon />
                 <input
                   autoFocus
-                  className="field-control"
+                  className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55]"
                   disabled={loading}
                   value={newFolderName}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => setNewFolderName(event.target.value)}
@@ -287,21 +287,21 @@ export function FolderPickerDialog({
             </span>
             <div
               ref={folderListRef}
-              className="folder-picker-list"
+              className="folder-picker-list [min-height:0] [overflow-y:auto] [padding:7px]"
               role="navigation"
               aria-label="Folders"
               aria-busy={loading}
               tabIndex={-1}
             >
               {loading && !listing ? (
-                <div className="folder-picker-message">
+                <div className="folder-picker-message [display:flex] [min-height:190px] [flex-direction:column] [align-items:center] [justify-content:center] [gap:7px] [padding:24px] [color:var(--muted-foreground)] [text-align:center] [&>svg]:[width:23px] [&>svg]:[height:23px] [&_strong]:[color:var(--foreground)] [&_strong]:[font-size:12px] [&_span]:[max-width:54ch] [&_span]:[font-size:11px] [&_span]:[line-height:1.45]">
                   <RefreshCwIcon className="animate-spin" />
                   <span>Opening folder…</span>
                 </div>
               ) : null}
 
               {!loading && error ? (
-                <div className="folder-picker-error">
+                <div className="folder-picker-error [display:flex] [min-height:190px] [flex-direction:column] [align-items:center] [justify-content:center] [gap:7px] [padding:24px] [color:var(--muted-foreground)] [text-align:center] [&>svg]:[width:23px] [&>svg]:[height:23px] [&_strong]:[color:var(--foreground)] [&_strong]:[font-size:12px] [&_span]:[max-width:54ch] [&_span]:[font-size:11px] [&_span]:[line-height:1.45]">
                   <strong>Couldn’t open this location</strong>
                   <span>{error}</span>
                   <Button
@@ -318,7 +318,7 @@ export function FolderPickerDialog({
               ) : null}
 
               {!loading && !error && visibleEntries.length === 0 ? (
-                <div className="folder-picker-message">
+                <div className="folder-picker-message [display:flex] [min-height:190px] [flex-direction:column] [align-items:center] [justify-content:center] [gap:7px] [padding:24px] [color:var(--muted-foreground)] [text-align:center] [&>svg]:[width:23px] [&>svg]:[height:23px] [&_strong]:[color:var(--foreground)] [&_strong]:[font-size:12px] [&_span]:[max-width:54ch] [&_span]:[font-size:11px] [&_span]:[line-height:1.45]">
                   <FolderOpenIcon />
                   <strong>{query ? "No matching folders" : "This folder has no subfolders"}</strong>
                   <span>{query ? "Try a different search." : listing?.readOnly ? "You can choose the current folder." : "You can choose the current folder or create a new one."}</span>
@@ -330,11 +330,11 @@ export function FolderPickerDialog({
                     <button
                       key={entry.path}
                       type="button"
-                      className="folder-picker-entry"
+                      className="folder-picker-entry [display:grid] [width:100%] [grid-template-columns:auto_minmax(0,_1fr)_auto] [align-items:center] [gap:10px] [border:1px_solid_transparent] [border-radius:10px] [background:transparent] [padding:8px_9px] [text-align:left] [&:hover]:[background:var(--accent)] [&_strong]:[display:block] [&_strong]:[overflow:hidden] [&_strong]:[font-size:11.5px] [&_strong]:[text-overflow:ellipsis] [&_strong]:[white-space:nowrap] [&_span]:[display:block] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9.5px] [&>svg]:[width:14px] [&>svg]:[height:14px] [&>svg]:[color:var(--muted-foreground)]"
                       disabled={loading}
                       onClick={() => void loadDirectory(entry.path, includeHidden, true)}
                     >
-                      <div className="folder-entry-icon">
+                      <div className="folder-entry-icon [display:grid] [width:30px] [height:30px] [place-items:center] [border-radius:8px] [background:var(--secondary)] [color:var(--primary)] [&_svg]:[width:15px] [&_svg]:[height:15px]">
                         <FolderIcon />
                       </div>
                       <div>
@@ -349,7 +349,7 @@ export function FolderPickerDialog({
           </section>
         </div>
 
-        <div className="folder-picker-selection">
+        <div className="folder-picker-selection [display:flex] [min-width:0] [align-items:center] [gap:10px] [margin-top:12px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface-sunken)] [padding:9px_11px] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--primary)] [&>div]:[min-width:0] [&_span]:[display:block] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9px] [&_span]:[text-transform:uppercase] [&_span]:[letter-spacing:0.07em] [&_code]:[display:block] [&_code]:[overflow:hidden] [&_code]:[margin-top:2px] [&_code]:[font-size:10.5px] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap]">
           <FolderOpenIcon />
           <div>
             <span>Current folder</span>

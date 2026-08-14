@@ -92,10 +92,10 @@ export function FolderMappingApprovalDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="mapping-approval-dialog" showCloseButton={false}>
+        <DialogContent className="mapping-approval-dialog [max-width:720px]" showCloseButton={false}>
           <DialogHeader>
-            <div className="mapping-approval-heading">
-              <div className="mapping-approval-icon"><ShieldCheckIcon /></div>
+            <div className="mapping-approval-heading [display:flex] [align-items:flex-start] [gap:12px]">
+              <div className="mapping-approval-icon [display:grid] [place-items:center] [width:42px] [height:42px] [flex:0_0_auto] [border:1px_solid_color-mix(in_oklab,_var(--primary)_33%,_var(--border))] [border-radius:12px] [background:color-mix(in_oklab,_var(--primary)_10%,_var(--surface))] [color:var(--primary)] [&_svg]:[width:20px] [&_svg]:[height:20px]"><ShieldCheckIcon /></div>
               <div>
                 <DialogTitle>Approve folder access</DialogTitle>
                 <DialogDescription>
@@ -105,31 +105,31 @@ export function FolderMappingApprovalDialog({
             </div>
           </DialogHeader>
 
-          <div className="approval-device-row">
+          <div className="approval-device-row [display:grid] [grid-template-columns:1fr_auto_1fr] [align-items:center] [gap:12px] [margin-top:20px] [&>div]:[display:flex] [&>div]:[align-items:center] [&>div]:[gap:9px] [&>div]:[border:1px_solid_var(--border)] [&>div]:[border-radius:10px] [&>div]:[padding:10px_12px] [&>div]:[background:var(--surface)] [&>div:last-child]:[justify-content:flex-end] [&_svg]:[width:18px] [&_svg]:[color:var(--primary)] [&_span]:[display:grid] [&_small]:[color:var(--muted-foreground)] [&_small]:[font-size:9px] [&_strong]:[font-size:11px]">
             <div><ComputerIcon /><span><small>From</small><strong>{request.fromDeviceName}</strong></span></div>
             <span>→</span>
             <div><ComputerIcon /><span><small>To</small><strong>{localDevice.name}</strong></span></div>
           </div>
 
-          <div className="approval-paths">
+          <div className="approval-paths [display:grid] [gap:10px] [margin-top:14px] [&>div]:[display:grid] [&>div]:[gap:5px] [&>div>span]:[color:var(--muted-foreground)] [&>div>span]:[font-size:9.5px] [&_code]:[min-width:0] [&_code]:[overflow:hidden] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap] [&_code]:[border:1px_solid_var(--border)] [&_code]:[border-radius:8px] [&_code]:[background:var(--surface-sunken)] [&_code]:[padding:9px_10px] [&_code]:[font-size:10px]">
             <div><span>Folder on {request.fromDeviceName}</span><code title={proposal.initiatorPath}>{proposal.initiatorPath}</code></div>
             <div>
               <span>Folder on this computer</span>
-              <div className="approval-destination-row">
+              <div className="approval-destination-row [display:flex] [gap:8px] [&_code]:[flex:1]">
                 <code title={destinationPath}>{destinationPath}</code>
                 <Button variant="outline" size="sm" disabled={busy} onClick={() => setPickerOpen(true)}><FolderOpenIcon data-icon="inline-start" />Change</Button>
               </div>
             </div>
           </div>
 
-          <div className="approval-summary-grid">
+          <div className="approval-summary-grid [display:grid] [grid-template-columns:repeat(4,_minmax(0,_1fr))] [gap:8px] [margin-top:14px] [&>div]:[display:grid] [&>div]:[gap:2px] [&>div]:[border:1px_solid_var(--border)] [&>div]:[border-radius:9px] [&>div]:[padding:9px_10px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9px] [&_strong]:[overflow:hidden] [&_strong]:[text-overflow:ellipsis] [&_strong]:[font-size:10.5px] max-[760px]:[grid-template-columns:repeat(2,_minmax(0,_1fr))]">
             <div><span>Sync direction</span><strong>{prettyMode(proposal.mode)}</strong></div>
             <div><span>Ignore rules</span><strong>{proposal.ignorePatterns.length}</strong></div>
             <div><span>Version history</span><strong>{proposal.historyDays} days</strong></div>
             <div><span>Storage cap</span><strong>{formatBytes(proposal.historyMaxBytes)}</strong></div>
           </div>
 
-          <div className="approval-preview-line">
+          <div className="approval-preview-line [display:grid] [grid-template-columns:repeat(4,_1fr)] [gap:1px] [overflow:hidden] [margin-top:10px] [border:1px_solid_var(--border)] [border-radius:9px] [background:var(--border)] [&>div]:[display:grid] [&>div]:[gap:2px] [&>div]:[background:var(--surface)] [&>div]:[padding:9px_10px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:8.5px] [&_strong]:[font-size:13px] [&_strong]:[font-variant-numeric:tabular-nums] max-[760px]:[grid-template-columns:repeat(2,_minmax(0,_1fr))]">
             <div><span>Only on their computer</span><strong>{proposal.preview.localOnlyFiles}</strong></div>
             <div><span>Only on this computer</span><strong>{proposal.preview.remoteOnlyFiles}</strong></div>
             <div><span>Different versions</span><strong>{proposal.preview.differentFiles}</strong></div>
@@ -137,15 +137,15 @@ export function FolderMappingApprovalDialog({
           </div>
 
           {blockingWarnings > 0 ? (
-            <div className="mapping-warning danger"><FileWarningIcon /><div><strong>Approval blocked</strong><span>Rename {blockingWarnings} Windows-invalid or case-colliding paths first.</span></div></div>
+            <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&.danger]:[border-color:color-mix(in_oklab,_var(--danger)_36%,_var(--border))] [&.danger]:[background:color-mix(in_oklab,_var(--danger)_9%,_var(--surface))] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&.danger>svg]:[color:var(--danger)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5] danger"><FileWarningIcon /><div><strong>Approval blocked</strong><span>Rename {blockingWarnings} Windows-invalid or case-colliding paths first.</span></div></div>
           ) : (
-            <div className="approval-safety"><CheckCircle2Icon /><span>Approval only commits configuration. One computer must then start the initial merge; Tethera coordinates both directions without overwriting same-path differences.</span></div>
+            <div className="approval-safety [display:flex] [align-items:flex-start] [gap:8px] [margin-top:12px] [color:var(--muted-foreground)] [font-size:10px] [line-height:1.5] [&_svg]:[width:15px] [&_svg]:[height:15px] [&_svg]:[flex:0_0_auto] [&_svg]:[color:var(--success)]"><CheckCircle2Icon /><span>Approval only commits configuration. One computer must then start the initial merge; Tethera coordinates both directions without overwriting same-path differences.</span></div>
           )}
 
-          {!mutationsEnabled ? <p className="mapping-error">{disabledReason}</p> : null}
-          {request.message ? <p className="approval-status-note">{request.message}</p> : null}
+          {!mutationsEnabled ? <p className="mapping-error [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_34%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_10%,_var(--surface))] [padding:10px_12px] [color:var(--destructive)] [font-size:12px]">{disabledReason}</p> : null}
+          {request.message ? <p className="approval-status-note [margin:0] [border:1px_solid_var(--border)] [border-radius:10px] [background:color-mix(in_oklab,_var(--surface-sunken)_80%,_transparent)] [padding:10px_12px] [color:var(--muted-foreground)] [font-size:11.5px] [line-height:1.45]">{request.message}</p> : null}
 
-          {error ? <p className="mapping-error">{error}</p> : null}
+          {error ? <p className="mapping-error [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_34%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_10%,_var(--surface))] [padding:10px_12px] [color:var(--destructive)] [font-size:12px]">{error}</p> : null}
 
           <DialogFooter>
             <Button variant="outline" disabled={busy} onClick={() => void reject()}><XIcon data-icon="inline-start" />Reject</Button>

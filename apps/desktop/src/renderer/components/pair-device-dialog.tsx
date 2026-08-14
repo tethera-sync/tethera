@@ -71,10 +71,10 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
         <Link2Icon data-icon="inline-start" />
         Start pairing
       </DialogTrigger>
-      <DialogContent className="pairing-dialog">
+      <DialogContent className="pairing-dialog [width:min(760px,_calc(100vw_-_32px))] [max-width:760px] [max-height:min(860px,_calc(100vh_-_32px))] [overflow-y:auto]">
         <DialogHeader>
-          <div className="pairing-dialog-heading">
-            <div className="pairing-dialog-icon"><ShieldCheckIcon /></div>
+          <div className="pairing-dialog-heading [display:flex] [align-items:flex-start] [gap:12px]">
+            <div className="pairing-dialog-icon [display:grid] [width:40px] [height:40px] [flex:0_0_auto] [place-items:center] [border:1px_solid_color-mix(in_oklab,_var(--primary)_26%,_var(--border))] [border-radius:12px] [background:color-mix(in_oklab,_var(--primary)_11%,_var(--surface-strong))] [color:var(--primary)] [&_svg]:[width:20px] [&_svg]:[height:20px]"><ShieldCheckIcon /></div>
             <div>
               <DialogTitle>Pair another computer</DialogTitle>
               <DialogDescription>
@@ -84,7 +84,7 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
           </div>
         </DialogHeader>
 
-        <div className="pairing-security-note">
+        <div className="pairing-security-note [display:flex] [align-items:center] [gap:11px] [margin-top:18px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface-sunken)] [padding:10px_12px] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[color:var(--primary)] [&_span]:[display:block] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9px] [&_span]:[text-transform:uppercase] [&_span]:[letter-spacing:0.08em] [&_code]:[display:block] [&_code]:[margin-top:2px] [&_code]:[font-size:10.5px] [&_code]:[letter-spacing:0.04em]">
           <FingerprintIcon />
           <div>
             <span>This computer’s identity</span>
@@ -92,11 +92,11 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
           </div>
         </div>
 
-        <section className={cn("pairing-visibility-card", pairing.acceptingPairing && "pairing-visibility-active")}>
-          <div className="pairing-visibility-copy">
-            <div className="pairing-radio-icon"><RadioIcon /></div>
+        <section className={cn("pairing-visibility-card [display:flex] [align-items:center] [justify-content:space-between] [gap:18px] [margin-top:14px] [border:1px_solid_var(--border)] [border-radius:13px] [background:var(--surface)] [padding:14px] max-[760px]:[align-items:stretch] max-[760px]:[flex-direction:column] max-[760px]:[&>button]:[width:100%]", pairing.acceptingPairing && "pairing-visibility-active [border-color:color-mix(in_oklab,_var(--success)_38%,_var(--border))] [background:color-mix(in_oklab,_var(--success)_7%,_var(--surface))]")}>
+          <div className="pairing-visibility-copy [display:flex] [min-width:0] [align-items:flex-start] [gap:11px] [&_p]:[margin-top:4px] [&_p]:[max-width:54ch] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:10.5px] [&_p]:[line-height:1.45]">
+            <div className="pairing-radio-icon [display:grid] [width:34px] [height:34px] [flex:0_0_auto] [place-items:center] [border-radius:10px] [background:var(--secondary)] [color:var(--primary)] [&_svg]:[width:17px] [&_svg]:[height:17px]"><RadioIcon /></div>
             <div>
-              <div className="pairing-visibility-title">
+              <div className="pairing-visibility-title [display:flex] [align-items:center] [gap:8px] [&_strong]:[font-size:12px]">
                 <strong>{pairing.acceptingPairing ? "Visible for pairing" : "Not accepting pairing requests"}</strong>
                 {pairing.acceptingPairing ? <Badge variant="success">{remaining ?? "5:00"}</Badge> : null}
               </div>
@@ -118,23 +118,23 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
         </section>
 
         {pairing.incomingRequests.length > 0 ? (
-          <section className="pairing-section">
-            <div className="pairing-section-heading">
+          <section className="pairing-section [margin-top:18px]">
+            <div className="pairing-section-heading [display:flex] [align-items:center] [justify-content:space-between] [gap:14px] [margin-bottom:9px] [&_h3]:[font-size:12.5px] [&_h3]:[font-weight:640] [&_p]:[margin-top:3px] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:10px]">
               <div><h3>Incoming request</h3><p>Only approve when both screens show the same code.</p></div>
               <Badge variant="info">Action required</Badge>
             </div>
-            <div className="pairing-request-list">
+            <div className="pairing-request-list [display:grid] [gap:9px]">
               {pairing.incomingRequests.map((request) => (
-                <article className="pairing-request-card" key={request.id}>
+                <article className="pairing-request-card [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:13px]" key={request.id}>
                   <DeviceIdentity candidate={request.device} />
                   <ComparisonCode code={request.comparisonCode} />
                   {request.status === "waiting-for-peer" ? (
-                    <div className="pairing-waiting-row">
+                    <div className="pairing-waiting-row [display:flex] [align-items:center] [justify-content:center] [gap:8px] [margin-top:12px] [color:var(--muted-foreground)] [font-size:10.5px] [&_svg]:[width:15px] [&_svg]:[height:15px]">
                       <LoaderCircleIcon className="animate-spin" />
                       <span>Waiting for {request.device.name} to confirm the code…</span>
                     </div>
                   ) : (
-                    <div className="pairing-request-actions">
+                    <div className="pairing-request-actions [display:flex] [justify-content:flex-end] [gap:8px] [margin-top:12px]">
                       <Button
                         variant="outline"
                         disabled={busyAction === `reject:${request.id}`}
@@ -158,19 +158,19 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
         ) : null}
 
         {outgoing ? (
-          <section className="pairing-section">
-            <div className="pairing-section-heading">
+          <section className="pairing-section [margin-top:18px]">
+            <div className="pairing-section-heading [display:flex] [align-items:center] [justify-content:space-between] [gap:14px] [margin-bottom:9px] [&_h3]:[font-size:12.5px] [&_h3]:[font-weight:640] [&_p]:[margin-top:3px] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:10px]">
               <div><h3>Pairing with {outgoing.device.name}</h3><p>{outgoing.message ?? pairingStatusDescription(outgoing.status)}</p></div>
               <PairingStatusBadge status={outgoing.status} />
             </div>
-            <article className="outgoing-pairing-card">
+            <article className="outgoing-pairing-card [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:13px]">
               <DeviceIdentity candidate={outgoing.device} />
               {outgoing.comparisonCode ? <ComparisonCode code={outgoing.comparisonCode} /> : null}
               {outgoing.status === "connecting" ? (
-                <div className="pairing-waiting-row"><LoaderCircleIcon className="animate-spin" /><span>Opening a direct LAN connection…</span></div>
+                <div className="pairing-waiting-row [display:flex] [align-items:center] [justify-content:center] [gap:8px] [margin-top:12px] [color:var(--muted-foreground)] [font-size:10.5px] [&_svg]:[width:15px] [&_svg]:[height:15px]"><LoaderCircleIcon className="animate-spin" /><span>Opening a direct LAN connection…</span></div>
               ) : null}
               {outgoing.status === "confirm-code" ? (
-                <div className="pairing-request-actions">
+                <div className="pairing-request-actions [display:flex] [justify-content:flex-end] [gap:8px] [margin-top:12px]">
                   <Button variant="outline" onClick={() => run("cancel", () => window.folderSync.cancelPairing(outgoing.id))}>Cancel</Button>
                   <Button onClick={() => run("confirm", () => window.folderSync.confirmPairing(outgoing.id))}>
                     <ShieldCheckIcon data-icon="inline-start" />
@@ -179,10 +179,10 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
                 </div>
               ) : null}
               {outgoing.status === "waiting-for-approval" || outgoing.status === "waiting-for-peer" ? (
-                <div className="pairing-waiting-row"><LoaderCircleIcon className="animate-spin" /><span>{outgoing.message}</span></div>
+                <div className="pairing-waiting-row [display:flex] [align-items:center] [justify-content:center] [gap:8px] [margin-top:12px] [color:var(--muted-foreground)] [font-size:10.5px] [&_svg]:[width:15px] [&_svg]:[height:15px]"><LoaderCircleIcon className="animate-spin" /><span>{outgoing.message}</span></div>
               ) : null}
               {terminalOutgoing ? (
-                <div className="pairing-request-actions">
+                <div className="pairing-request-actions [display:flex] [justify-content:flex-end] [gap:8px] [margin-top:12px]">
                   <Button variant="outline" onClick={() => run("dismiss", () => window.folderSync.cancelPairing(outgoing.id))}>
                     {outgoing.status === "paired" ? "Done" : "Close"}
                   </Button>
@@ -191,8 +191,8 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
             </article>
           </section>
         ) : (
-          <section className="pairing-section">
-            <div className="pairing-section-heading">
+          <section className="pairing-section [margin-top:18px]">
+            <div className="pairing-section-heading [display:flex] [align-items:center] [justify-content:space-between] [gap:14px] [margin-bottom:9px] [&_h3]:[font-size:12.5px] [&_h3]:[font-weight:640] [&_p]:[margin-top:3px] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:10px]">
               <div><h3>Nearby computers</h3><p>Only devices currently allowing pairing appear here.</p></div>
               <Button
                 variant="ghost"
@@ -206,9 +206,9 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
             </div>
 
             {pairing.discoveredDevices.length > 0 ? (
-              <div className="nearby-device-list">
+              <div className="nearby-device-list [display:grid] [gap:9px]">
                 {pairing.discoveredDevices.map((candidate) => (
-                  <article className="nearby-device-card" key={candidate.id}>
+                  <article className="nearby-device-card [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:13px] [display:flex] [align-items:center] [justify-content:space-between] [gap:14px] max-[760px]:[align-items:stretch] max-[760px]:[flex-direction:column] max-[760px]:[&>button]:[width:100%]" key={candidate.id}>
                     <DeviceIdentity candidate={candidate} />
                     <Button
                       disabled={Boolean(busyAction)}
@@ -221,7 +221,7 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
                 ))}
               </div>
             ) : (
-              <div className="pairing-empty-state">
+              <div className="pairing-empty-state [display:flex] [min-height:104px] [align-items:center] [justify-content:center] [gap:12px] [border:1px_dashed_var(--border)] [border-radius:var(--radius-tile)] [background:color-mix(in_oklab,_var(--surface-sunken)_70%,_transparent)] [padding:18px] [text-align:left] [&>svg]:[width:24px] [&>svg]:[height:24px] [&>svg]:[color:var(--muted-foreground)] [&_strong]:[display:block] [&_strong]:[font-size:11.5px] [&_span]:[display:block] [&_span]:[max-width:56ch] [&_span]:[margin-top:3px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.45]">
                 <ShieldQuestionIcon />
                 <div>
                   <strong>No computers are available yet</strong>
@@ -232,7 +232,7 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
           </section>
         )}
 
-        {error ? <div className="pairing-error"><XCircleIcon /><span>{error}</span></div> : null}
+        {error ? <div className="pairing-error [display:flex] [align-items:flex-start] [gap:8px] [margin-top:12px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_35%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_9%,_var(--surface))] [padding:9px_11px] [color:var(--destructive)] [font-size:10.5px] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex:0_0_auto]"><XCircleIcon /><span>{error}</span></div> : null}
 
         <DialogFooter>
           <Button variant="outline" onClick={() => setOpen(false)}>Close</Button>
@@ -244,8 +244,8 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
 
 function DeviceIdentity({ candidate }: { candidate: PairingCandidate }) {
   return (
-    <div className="pairing-device-identity">
-      <div className="pairing-device-icon">
+    <div className="pairing-device-identity [display:flex] [min-width:0] [align-items:center] [gap:11px] [&>div:last-child]:[min-width:0] [&_strong]:[display:block] [&_strong]:[overflow:hidden] [&_strong]:[font-size:12px] [&_strong]:[text-overflow:ellipsis] [&_strong]:[white-space:nowrap] [&_span]:[display:block] [&_span]:[overflow:hidden] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9.5px] [&_span]:[text-overflow:ellipsis] [&_span]:[white-space:nowrap] [&_code]:[display:block] [&_code]:[overflow:hidden] [&_code]:[margin-top:4px] [&_code]:[color:var(--muted-foreground)] [&_code]:[font-size:8.5px] [&_code]:[letter-spacing:0.035em] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap]">
+      <div className="pairing-device-icon [display:grid] [width:38px] [height:38px] [flex:0_0_auto] [place-items:center] [border-radius:11px] [background:var(--secondary)] [color:var(--primary)] [&_svg]:[width:18px] [&_svg]:[height:18px]">
         {candidate.platform === "windows" ? <ComputerIcon /> : <LaptopIcon />}
       </div>
       <div>
@@ -259,7 +259,7 @@ function DeviceIdentity({ candidate }: { candidate: PairingCandidate }) {
 
 function ComparisonCode({ code }: { code: string }) {
   return (
-    <div className="comparison-code-block">
+    <div className="comparison-code-block [display:grid] [place-items:center] [margin-top:13px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_24%,_var(--border))] [border-radius:var(--radius-tile)] [background:color-mix(in_oklab,_var(--primary)_8%,_var(--surface-sunken))] [padding:15px] [text-align:center] [&>div]:[display:flex] [&>div]:[align-items:center] [&>div]:[gap:6px] [&>div]:[color:var(--muted-foreground)] [&>div]:[font-size:9px] [&>div]:[text-transform:uppercase] [&>div]:[letter-spacing:0.07em] [&>div_svg]:[width:14px] [&>div_svg]:[height:14px] [&>div_svg]:[color:var(--primary)] [&_strong]:[margin-top:7px] [&_strong]:[font-size:28px] [&_strong]:[font-variant-numeric:tabular-nums] [&_strong]:[letter-spacing:0.16em] [&_p]:[margin-top:5px] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:9.5px] max-[760px]:[&_strong]:[font-size:23px]">
       <div><ShieldCheckIcon /><span>Comparison code</span></div>
       <strong>{code}</strong>
       <p>Never approve if the code differs on either computer.</p>

@@ -158,7 +158,7 @@ export function App() {
   }, [pendingMapping?.id])
 
   return (
-    <div className="app-shell" data-rail={rail}>
+    <div className="app-shell [display:grid] [grid-template-columns:244px_minmax(0,_1fr)] [height:100vh] [background:radial-gradient(1100px_520px_at_12%_-12%,_var(--shell-glow),_transparent_70%),_radial-gradient(900px_480px_at_100%_4%,_color-mix(in_oklab,_var(--chart-2)_6%,_transparent),_transparent_65%),_var(--background)] [transition:grid-template-columns_220ms_cubic-bezier(0.32,_0.72,_0,_1)] [&[data-rail='true']]:[grid-template-columns:76px_minmax(0,_1fr)] [&[data-rail='true']_.rail-toggle_svg]:[transform:rotate(180deg)] [&[data-rail='true']_.brand-text]:[display:none] [&[data-rail='true']_.nav-group-label]:[display:none] [&[data-rail='true']_.nav-item>span:first-of-type]:[display:none] [&[data-rail='true']_.theme-switcher>span]:[display:none] [&[data-rail='true']_.device-chip>div:last-child]:[display:none] [&[data-rail='true']_.brand]:[justify-content:center] [&[data-rail='true']_.brand]:[padding:0] [&[data-rail='true']_.sidebar]:[align-items:stretch] [&[data-rail='true']_.sidebar]:[padding-inline:10px] [&[data-rail='true']_.nav-item]:[justify-content:center] [&[data-rail='true']_.nav-item]:[padding:0] [&[data-rail='true']_.nav-count]:[position:absolute] [&[data-rail='true']_.nav-count]:[top:3px] [&[data-rail='true']_.nav-count]:[right:3px] [&[data-rail='true']_.nav-count]:[min-width:0] [&[data-rail='true']_.nav-count]:[padding:2px_4px] [&[data-rail='true']_.nav-count]:[font-size:8px] [&[data-rail='true']_.theme-options]:[grid-template-columns:1fr] [&[data-rail='true']_.device-chip]:[justify-content:center] [&[data-rail='true']_.device-chip]:[padding-inline:0] max-[900px]:[grid-template-columns:76px_minmax(0,_1fr)]" data-rail={rail}>
       <FolderMappingApprovalDialog
         request={pendingMapping}
         localDevice={localDevice}
@@ -168,18 +168,18 @@ export function App() {
         onOpenChange={setMappingApprovalOpen}
       />
 
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark" aria-hidden="true">
-            <img src={tetheraLogo} alt="" />
+      <aside className="sidebar [display:flex] [min-height:0] [flex-direction:column] [gap:18px] [border-right:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [background:color-mix(in_oklab,_var(--surface)_55%,_transparent)] [padding:16px_12px_14px]">
+        <div className="brand [display:flex] [align-items:center] [gap:10px] [padding:4px_4px_0]">
+          <div className="brand-mark grid size-[34px] shrink-0 place-items-center" aria-hidden="true">
+            <img className="h-auto w-[30px] max-w-none translate-y-[6px] object-contain" src={tetheraLogo} alt="" />
           </div>
-          <div className="brand-text">
-            <p className="brand-name">Tethera</p>
-            <span className="brand-tag">P2P</span>
+          <div className="brand-text [display:flex] [min-width:0] [flex:1] [align-items:center] [gap:7px]">
+            <p className="brand-name [margin:0] [font-size:15px] [font-weight:680] [letter-spacing:-0.025em]">Tethera</p>
+            <span className="brand-tag [border-radius:5px] [background:color-mix(in_oklab,_var(--primary)_18%,_transparent)] [padding:2px_5px] [color:var(--primary)] [font-size:8.5px] [font-weight:700] [letter-spacing:0.08em] [text-transform:uppercase]">P2P</span>
           </div>
           <button
             type="button"
-            className="rail-toggle"
+            className="rail-toggle [display:grid] [width:26px] [height:26px] [flex:0_0_auto] [place-items:center] [border:0] [border-radius:7px] [background:transparent] [color:var(--muted-foreground)] [transition:140ms_ease] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:15px] [&_svg]:[height:15px] [&_svg]:[transition:transform_220ms_cubic-bezier(0.32,_0.72,_0,_1)]"
             onClick={() => setRail((previous) => !previous)}
             aria-label={rail ? "Expand sidebar" : "Collapse sidebar"}
             aria-pressed={rail}
@@ -188,11 +188,11 @@ export function App() {
           </button>
         </div>
 
-        <div className="nav-scroll">
+        <div className="nav-scroll [display:flex] [min-height:0] [flex:1] [flex-direction:column] [gap:14px] [overflow-y:auto] [scrollbar-width:none] [&::-webkit-scrollbar]:[display:none]">
           {navGroups.map((group) => (
             <nav key={group.label} aria-label={group.label}>
-              <p className="nav-group-label">{group.label}</p>
-              <div className="nav-list">
+              <p className="nav-group-label [margin:0_0_6px_10px] [color:var(--muted-foreground)] [font-size:9px] [font-weight:700] [letter-spacing:0.12em] [text-transform:uppercase] [opacity:0.75]">{group.label}</p>
+              <div className="nav-list [display:grid] [gap:2px]">
                 {group.items.map((item) => {
                   const Icon = item.icon
                   const active = view === item.id
@@ -200,7 +200,7 @@ export function App() {
                     <button
                       key={item.id}
                       type="button"
-                      className={cn("nav-item", active && "nav-item-active")}
+                      className={cn("nav-item [position:relative] [display:flex] [width:100%] [height:38px] [align-items:center] [gap:10px] [border:0] [border-radius:10px] [background:transparent] [padding:0_10px] [color:var(--muted-foreground)] [font-size:12.5px] [font-weight:550] [text-align:left] [transition:background_140ms_ease,_color_140ms_ease] [&:hover]:[background:color-mix(in_oklab,_var(--accent)_70%,_transparent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex:0_0_auto] [&>span:first-of-type]:[overflow:hidden] [&>span:first-of-type]:[flex:1] [&>span:first-of-type]:[text-overflow:ellipsis] [&>span:first-of-type]:[white-space:nowrap]", active && "nav-item-active [background:linear-gradient(_100deg,_color-mix(in_oklab,_var(--primary)_16%,_transparent),_color-mix(in_oklab,_var(--primary)_6%,_transparent)_)] [color:var(--foreground)] [box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--primary)_20%,_transparent)] [&::before]:[content:''] [&::before]:[position:absolute] [&::before]:[top:50%] [&::before]:[left:-12px] [&::before]:[width:3px] [&::before]:[height:18px] [&::before]:[transform:translateY(-50%)] [&::before]:[border-radius:0_3px_3px_0] [&::before]:[background:var(--primary)] [&_svg]:[color:var(--primary)]")}
                       onClick={() => setView(item.id)}
                       aria-current={active ? "page" : undefined}
                       title={rail ? item.label : undefined}
@@ -208,13 +208,13 @@ export function App() {
                       <Icon />
                       <span>{item.label}</span>
                       {item.id === "activity" && snapshot.activity.length > 0 ? (
-                        <span className="nav-count">{Math.min(snapshot.activity.length, 99)}</span>
+                        <span className="nav-count [min-width:19px] [border-radius:999px] [background:color-mix(in_oklab,_var(--primary)_20%,_transparent)] [padding:2px_6px] [color:var(--primary)] [font-size:9.5px] [font-weight:700] [text-align:center]">{Math.min(snapshot.activity.length, 99)}</span>
                       ) : null}
                       {item.id === "folders" && attentionCount > 0 ? (
-                        <span className="nav-dot" role="img" aria-label={`${attentionCount} folders need attention`} />
+                        <span className="nav-dot [width:6px] [height:6px] [border-radius:999px] [background:var(--warning)] [box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--warning)_22%,_transparent)]" role="img" aria-label={`${attentionCount} folders need attention`} />
                       ) : null}
                       {item.id === "devices" && pendingApprovals > 0 ? (
-                        <span className="nav-dot" role="img" aria-label={`${pendingApprovals} approvals waiting`} />
+                        <span className="nav-dot [width:6px] [height:6px] [border-radius:999px] [background:var(--warning)] [box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--warning)_22%,_transparent)]" role="img" aria-label={`${pendingApprovals} approvals waiting`} />
                       ) : null}
                     </button>
                   )
@@ -224,27 +224,27 @@ export function App() {
           ))}
         </div>
 
-        <div className="sidebar-footer">
+        <div className="sidebar-footer [display:grid] [gap:8px] [margin-top:auto]">
           <ThemeSwitcher theme={snapshot.settings.theme} />
-          <div className="device-chip">
-            <div className="device-icon">
+          <div className="device-chip [display:flex] [align-items:center] [gap:9px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:8px_10px]">
+            <div className="device-icon [display:grid] [width:29px] [height:29px] [flex:0_0_auto] [place-items:center] [border-radius:9px] [background:var(--secondary)] [color:var(--muted-foreground)] [&_svg]:[width:14px] [&_svg]:[height:14px]">
               <LaptopIcon />
             </div>
             <div className="min-w-0 flex-1">
               <p className="truncate text-xs font-semibold">{localDevice.name}</p>
-              <p className="truncate text-[10px] text-muted-foreground">{prettyPlatform(localDevice.platform)}</p>
+              <p className="truncate text-[10px] text-[var(--muted-foreground)]">{prettyPlatform(localDevice.platform)}</p>
             </div>
           </div>
         </div>
       </aside>
 
-      <main className="main-panel">
-        <header className="topbar">
+      <main className="main-panel [display:grid] [min-width:0] [min-height:0] [grid-template-rows:auto_minmax(0,_1fr)]">
+        <header className="topbar [display:flex] [min-height:84px] [align-items:center] [justify-content:space-between] [gap:24px] [border-bottom:1px_solid_color-mix(in_oklab,_var(--border)_60%,_transparent)] [padding:16px_24px] [background:color-mix(in_oklab,_var(--background)_82%,_transparent)] [backdrop-filter:blur(20px)] [&_h1]:[margin:2px_0_0] [&_h1]:[font-size:clamp(19px,_1.9vw,_25px)] [&_h1]:[font-weight:660] [&_h1]:[letter-spacing:-0.038em] max-[900px]:[padding-inline:16px]">
           <div className="min-w-0">
-            <p className="eyebrow">{allNavItems.find((item) => item.id === view)?.label}</p>
+            <p className="eyebrow [margin:0] [color:var(--muted-foreground)] [font-size:10px] [font-weight:700] [letter-spacing:0.11em] [text-transform:uppercase]">{allNavItems.find((item) => item.id === view)?.label}</p>
             <h1>{viewTitle(view, snapshot)}</h1>
           </div>
-          <div className="topbar-actions">
+          <div className="topbar-actions [display:flex] [align-items:center] [gap:8px]">
             <ConnectionPill route={snapshot.route} paused={snapshot.paused} />
             <Button
               variant="outline"
@@ -273,24 +273,24 @@ export function App() {
                 Pair device
               </Button>
             )}
-            <div className="topbar-divider" aria-hidden="true" />
-            <div className="identity-chip">
-              <span className="identity-avatar" aria-hidden="true">
+            <div className="topbar-divider [width:1px] [height:26px] [margin-inline:2px] [background:var(--border)]" aria-hidden="true" />
+            <div className="identity-chip [display:flex] [height:36px] [align-items:center] [gap:9px] [border:1px_solid_var(--border)] [border-radius:var(--radius-pill)] [background:var(--surface)] [padding:0_12px_0_5px] max-[900px]:[&>div]:[display:none]">
+              <span className="identity-avatar [display:grid] [width:28px] [height:28px] [place-items:center] [border-radius:999px] [background:linear-gradient(145deg,_color-mix(in_oklab,_var(--primary)_70%,_white),_var(--primary))] [color:oklch(0.2_0.03_166)] [font-size:10.5px] [font-weight:700] [letter-spacing:0.02em]" aria-hidden="true">
                 {initials(localDevice.name)}
               </span>
               <div className="min-w-0">
-                <strong>{localDevice.name}</strong>
-                <span>{prettyPlatform(localDevice.platform)}</span>
+                <strong className="block max-w-[150px] truncate text-[11.5px] leading-[13px] font-[620]">{localDevice.name}</strong>
+                <span className="block text-[9.5px] leading-[11px] text-[var(--muted-foreground)]">{prettyPlatform(localDevice.platform)}</span>
               </div>
             </div>
           </div>
         </header>
 
-        <div className="main-body">
+        <div className="main-body [display:flex] [min-width:0] [min-height:0] [flex-direction:column]">
           <UpdateBanner update={snapshot.update} />
           <MappingStoreBanner state={snapshot.mappingStore} />
 
-          <div className="content-scroll">
+          <div className="content-scroll [min-height:0] [flex:1] [overflow:auto] [padding:22px_24px_44px] max-[900px]:[padding-inline:16px]">
             {loading ? <LoadingScreen /> : null}
             {!loading && view === "overview" ? <Overview snapshot={snapshot} onNavigate={setView} /> : null}
             {!loading && view === "folders" ? <FoldersView snapshot={snapshot} onNavigate={setView} /> : null}
@@ -325,15 +325,15 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
   const setupComplete = paired && totalFolders > 0
 
   return (
-    <div className="page-stack">
-      <section className="card status-hero">
-        <div className="mesh" aria-hidden="true" />
-        <div className="status-hero-copy">
-          <p className="welcome-eyebrow">Current status</p>
+    <div className="page-stack [display:grid] [gap:16px] [width:100%] [max-width:1520px] [margin:0_auto]">
+      <section className="card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)] status-hero [position:relative] [flex-direction:row] [align-items:center] [justify-content:space-between] [gap:28px] [overflow:hidden] [border-color:color-mix(in_oklab,_var(--primary)_20%,_var(--border))] [background:radial-gradient(680px_220px_at_92%_-30%,_color-mix(in_oklab,_var(--primary)_13%,_transparent),_transparent_70%),_var(--card-sheen)] [padding:20px_22px] [&>*:not(.mesh)]:[position:relative] [&>*:not(.mesh)]:[z-index:1] max-[1100px]:[flex-direction:column] max-[1100px]:[align-items:stretch]">
+        <div className="mesh [position:absolute] [right:-30px] [bottom:-40px] [width:210px] [height:170px] [background-image:radial-gradient(var(--mesh-dot)_1px,_transparent_1px)] [background-size:9px_9px] [mask-image:radial-gradient(120px_100px_at_70%_80%,_black,_transparent_72%)] [pointer-events:none] [opacity:0.85]" aria-hidden="true" />
+        <div className="status-hero-copy [min-width:0] [flex:1] [&_h2]:[margin:6px_0_0] [&_h2]:[font-size:clamp(18px,_1.6vw,_23px)] [&_h2]:[font-weight:660] [&_h2]:[letter-spacing:-0.04em] [&_h2]:[line-height:1.15] [&>p:last-of-type]:[margin:5px_0_0] [&>p:last-of-type]:[max-width:78ch] [&>p:last-of-type]:[color:var(--muted-foreground)] [&>p:last-of-type]:[font-size:12px] [&>p:last-of-type]:[line-height:1.5]">
+          <p className="welcome-eyebrow [margin:0] [color:var(--muted-foreground)] [font-size:10px] [font-weight:700] [letter-spacing:0.11em] [text-transform:uppercase]">Current status</p>
           <h2>{overallHeadline(snapshot)}</h2>
           <p>{overallDescription(snapshot)}</p>
-          <div className="hero-chips">
-            <span className="hero-chip">
+          <div className="hero-chips [display:flex] [flex-wrap:wrap] [gap:8px] [margin-top:14px]">
+            <span className="hero-chip [display:inline-flex] [min-width:0] [align-items:center] [gap:8px] [border:1px_solid_var(--border)] [border-radius:var(--radius-pill)] [background:color-mix(in_oklab,_var(--surface-sunken)_70%,_transparent)] [padding:4px_11px_4px_9px] [&_strong]:[overflow:hidden] [&_strong]:[max-width:34ch] [&_strong]:[color:var(--muted-foreground)] [&_strong]:[font-size:10.5px] [&_strong]:[font-weight:550] [&_strong]:[text-overflow:ellipsis] [&_strong]:[white-space:nowrap]">
               <StatusPill
                 tone={snapshot.engineStatus === "ready" ? "success" : snapshot.engineStatus === "starting" ? "info" : "warning"}
                 bare
@@ -343,7 +343,7 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
               </StatusPill>
               <strong>{snapshot.engineMessage ?? pretty(snapshot.engineStatus)}</strong>
             </span>
-            <span className="hero-chip">
+            <span className="hero-chip [display:inline-flex] [min-width:0] [align-items:center] [gap:8px] [border:1px_solid_var(--border)] [border-radius:var(--radius-pill)] [background:color-mix(in_oklab,_var(--surface-sunken)_70%,_transparent)] [padding:4px_11px_4px_9px] [&_strong]:[overflow:hidden] [&_strong]:[max-width:34ch] [&_strong]:[color:var(--muted-foreground)] [&_strong]:[font-size:10.5px] [&_strong]:[font-weight:550] [&_strong]:[text-overflow:ellipsis] [&_strong]:[white-space:nowrap]">
               <StatusPill tone={snapshot.route === "offline" ? "neutral" : "success"} bare>
                 Transport
               </StatusPill>
@@ -351,7 +351,7 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
             </span>
           </div>
         </div>
-        <div className="status-hero-side">
+        <div className="status-hero-side [display:flex] [flex:0_0_auto] [align-items:center] [gap:22px]">
           {totalFolders > 0 ? (
             <Gauge
               value={healthyFolders / totalFolders}
@@ -363,7 +363,7 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
               ariaLabel={`${healthyFolders} of ${totalFolders} folders up to date`}
             />
           ) : null}
-          <div className="status-hero-actions">
+          <div className="status-hero-actions [display:flex] [flex:0_0_auto] [align-items:center] [gap:8px] max-[1100px]:[justify-content:flex-start]">
             <Button onClick={() => onNavigate(paired ? "folders" : "devices")}>
               {paired ? "Manage folders" : "Pair a computer"}
               <ArrowRightIcon data-icon="inline-end" />
@@ -376,7 +376,7 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
       </section>
 
       {setupComplete ? null : (
-        <section className="card setup-steps">
+        <section className="card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)] setup-steps [display:grid] [grid-template-columns:repeat(3,_minmax(0,_1fr))] max-[1100px]:[grid-template-columns:1fr]">
           <SetupStep
             index={1}
             state={paired ? "done" : "active"}
@@ -401,7 +401,7 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
       )}
 
       {paired || totalFolders > 0 ? (
-        <div className="metric-strip">
+        <div className="metric-strip [display:grid] [grid-template-columns:repeat(4,_minmax(0,_1fr))] [gap:14px] max-[1360px]:[grid-template-columns:repeat(2,_minmax(0,_1fr))]">
           <MetricTile
             icon={FolderIcon}
             label="Folders up to date"
@@ -457,29 +457,29 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
       ) : null}
 
       {totalFolders > 0 ? (
-        <section className="card">
-          <div className="card-head">
+        <section className="card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)]">
+          <div className="card-head [display:flex] [align-items:flex-start] [justify-content:space-between] [gap:14px] [padding:15px_16px_0]">
             <div className="min-w-0">
-              <h2 className="card-title">Transfer throughput</h2>
-              <p className="card-caption">Live sample of all folder transfers, taken every 2 seconds.</p>
+              <h2 className="card-title [margin:0] [font-size:14.5px] [font-weight:640] [letter-spacing:-0.02em]">Transfer throughput</h2>
+              <p className="card-caption [margin:3px_0_0] [color:var(--muted-foreground)] [font-size:10.5px] [line-height:1.45]">Live sample of all folder transfers, taken every 2 seconds.</p>
             </div>
-            <div className="network-stats">
-              <span className="network-stat" data-dir="up">
+            <div className="network-stats [display:flex] [align-items:center] [gap:14px]">
+              <span className="network-stat [display:inline-flex] [align-items:center] [gap:5px] [color:var(--muted-foreground)] [font-size:10.5px] [font-variant-numeric:tabular-nums] [&_svg]:[width:12px] [&_svg]:[height:12px] [&_strong]:[color:var(--foreground)] [&_strong]:[font-weight:620] [&[data-dir='up']_svg]:[color:var(--chart-1)] [&[data-dir='down']_svg]:[color:var(--chart-2)]" data-dir="up">
                 <ArrowUpIcon />
                 <strong>{formatRate(throughput)}</strong>
               </span>
-              <span className="network-stat" data-dir="down">
+              <span className="network-stat [display:inline-flex] [align-items:center] [gap:5px] [color:var(--muted-foreground)] [font-size:10.5px] [font-variant-numeric:tabular-nums] [&_svg]:[width:12px] [&_svg]:[height:12px] [&_strong]:[color:var(--foreground)] [&_strong]:[font-weight:620] [&[data-dir='up']_svg]:[color:var(--chart-1)] [&[data-dir='down']_svg]:[color:var(--chart-2)]" data-dir="down">
                 <ArrowDownIcon />
                 <strong>{formatRate(0)}</strong>
               </span>
             </div>
           </div>
-          <div className="card-body">
-            <div className="chart-frame">
+          <div className="card-body [display:flex] [min-width:0] [flex:1] [flex-direction:column] [justify-content:space-between] [padding:14px_16px_16px]">
+            <div className="chart-frame [position:relative] [flex:1] [min-height:118px] [margin-top:14px]">
               {hasLiveThroughput ? (
                 <Sparkline points={history} height={132} />
               ) : (
-                <div className="chart-overlay">
+                <div className="chart-overlay [position:absolute] [inset:0] [display:grid] [place-items:center] [align-content:center] [gap:4px] [border:1px_dashed_color-mix(in_oklab,_var(--border)_90%,_transparent)] [border-radius:var(--radius-tile)] [background:color-mix(in_oklab,_var(--surface-sunken)_70%,_transparent)] [color:var(--muted-foreground)] [text-align:center] [&_strong]:[color:var(--foreground)] [&_strong]:[font-size:11.5px] [&_span]:[max-width:34ch] [&_span]:[font-size:10px] [&_span]:[line-height:1.45]">
                   <strong>No transfers yet</strong>
                   <span>
                     {snapshot.engineStatus === "ready"
@@ -493,14 +493,14 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
         </section>
       ) : null}
 
-      <div className="split-even">
-        <section className="card">
-          <div className="card-head">
+      <div className="split-even [display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [align-items:start] [gap:14px] max-[1100px]:[grid-template-columns:1fr]">
+        <section className="card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)]">
+          <div className="card-head [display:flex] [align-items:flex-start] [justify-content:space-between] [gap:14px] [padding:15px_16px_0]">
             <div className="min-w-0">
-              <h2 className="card-title">Recent activity</h2>
-              <p className="card-caption">Configuration and connection events.</p>
+              <h2 className="card-title [margin:0] [font-size:14.5px] [font-weight:640] [letter-spacing:-0.02em]">Recent activity</h2>
+              <p className="card-caption [margin:3px_0_0] [color:var(--muted-foreground)] [font-size:10.5px] [line-height:1.45]">Configuration and connection events.</p>
             </div>
-            <button type="button" className="card-link" onClick={() => onNavigate("activity")}>
+            <button type="button" className="card-link [display:inline-flex] [align-items:center] [gap:5px] [border:0] [border-radius:7px] [background:transparent] [padding:4px_6px] [color:var(--muted-foreground)] [font-size:11px] [font-weight:600] [transition:140ms_ease] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:13px] [&_svg]:[height:13px]" onClick={() => onNavigate("activity")}>
               View log
               <ArrowRightIcon />
             </button>
@@ -508,7 +508,7 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
           {latestActivity.length === 0 ? (
             <CompactEmptyState icon={ActivityIcon} title="Nothing to show" description="Events appear here as you configure and sync." />
           ) : (
-            <div className="activity-list compact">
+            <div className="activity-list [position:relative] [&.compact_.activity-row]:[padding:11px_16px] compact">
               {latestActivity.map((event) => (
                 <ActivityRow key={event.id} event={event} />
               ))}
@@ -516,33 +516,33 @@ function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate:
           )}
         </section>
 
-        <section className="card">
-          <div className="card-head">
+        <section className="card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)]">
+          <div className="card-head [display:flex] [align-items:flex-start] [justify-content:space-between] [gap:14px] [padding:15px_16px_0]">
             <div className="min-w-0">
-              <h2 className="card-title">Platform settings</h2>
-              <p className="card-caption">The switches you change most often.</p>
+              <h2 className="card-title [margin:0] [font-size:14.5px] [font-weight:640] [letter-spacing:-0.02em]">Platform settings</h2>
+              <p className="card-caption [margin:3px_0_0] [color:var(--muted-foreground)] [font-size:10.5px] [line-height:1.45]">The switches you change most often.</p>
             </div>
-            <button type="button" className="card-link" onClick={() => onNavigate("settings")}>
+            <button type="button" className="card-link [display:inline-flex] [align-items:center] [gap:5px] [border:0] [border-radius:7px] [background:transparent] [padding:4px_6px] [color:var(--muted-foreground)] [font-size:11px] [font-weight:600] [transition:140ms_ease] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:13px] [&_svg]:[height:13px]" onClick={() => onNavigate("settings")}>
               All settings
               <ArrowRightIcon />
             </button>
           </div>
-          <div className="card-body">
-            <p className="panel-subheading">General preferences</p>
-            <div className="settings-panel-list">
+          <div className="card-body [display:flex] [min-width:0] [flex:1] [flex-direction:column] [justify-content:space-between] [padding:14px_16px_16px]">
+            <p className="panel-subheading [margin:14px_0_6px] [color:var(--muted-foreground)] [font-size:9px] [font-weight:700] [letter-spacing:0.11em] [text-transform:uppercase] [&:first-child]:[margin-top:0]">General preferences</p>
+            <div className="settings-panel-list [display:grid] [gap:2px] [margin-top:4px]">
               <QuickSetting label="Keep syncing in the tray" setting="closeToTray" settings={snapshot.settings} />
               <QuickSetting label="Launch after sign-in" setting="launchAtLogin" settings={snapshot.settings} />
               <QuickSetting label="Start minimised" setting="startMinimised" settings={snapshot.settings} />
             </div>
-            <p className="panel-subheading">Network safeguards</p>
-            <div className="settings-panel-list">
+            <p className="panel-subheading [margin:14px_0_6px] [color:var(--muted-foreground)] [font-size:9px] [font-weight:700] [letter-spacing:0.11em] [text-transform:uppercase] [&:first-child]:[margin-top:0]">Network safeguards</p>
+            <div className="settings-panel-list [display:grid] [gap:2px] [margin-top:4px]">
               <QuickSetting label="Pause on metered networks" setting="pauseOnMetered" settings={snapshot.settings} />
             </div>
           </div>
         </section>
       </div>
 
-      <div className="tile-row">
+      <div className="tile-row [display:grid] [grid-template-columns:repeat(3,_minmax(0,_1fr))] [gap:14px] max-[1360px]:[grid-template-columns:repeat(3,_minmax(0,_1fr))] max-[1100px]:[grid-template-columns:1fr]">
         <FeatureTile
           icon={FolderIcon}
           title="Folders"
@@ -589,14 +589,14 @@ function SetupStep({
   action?: { label: string; onClick: () => void }
 }) {
   return (
-    <div className="setup-step" data-state={state}>
-      <span className="setup-step-index">{state === "done" ? <CheckCircle2Icon /> : index}</span>
+    <div className="setup-step [display:flex] [align-items:center] [gap:11px] [border-right:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [padding:14px_16px] [&:last-child]:[border-right:0] [&[data-state='done']_.setup-step-index]:[background:color-mix(in_oklab,_var(--success)_16%,_transparent)] [&[data-state='done']_.setup-step-index]:[color:var(--success)] [&[data-state='active']_.setup-step-index]:[background:var(--primary)] [&[data-state='active']_.setup-step-index]:[color:var(--primary-foreground)] [&[data-state='active']]:[background:color-mix(in_oklab,_var(--primary)_5%,_transparent)] [&[data-state='todo']]:[opacity:0.62] max-[1100px]:[border-right:0] max-[1100px]:[border-bottom:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] max-[1100px]:[&:last-child]:[border-bottom:0]" data-state={state}>
+      <span className="setup-step-index [display:grid] [width:26px] [height:26px] [flex:0_0_auto] [place-items:center] [border-radius:999px] [background:var(--secondary)] [color:var(--muted-foreground)] [font-size:11px] [font-weight:700] [&_svg]:[width:15px] [&_svg]:[height:15px]">{state === "done" ? <CheckCircle2Icon /> : index}</span>
       <div className="min-w-0 flex-1">
-        <strong>{title}</strong>
-        <span>{detail}</span>
+        <strong className="block text-xs font-[620]">{title}</strong>
+        <span className="mt-0.5 block truncate text-[10.5px] text-[var(--muted-foreground)]">{detail}</span>
       </div>
       {action ? (
-        <button type="button" className="tile-button" onClick={action.onClick}>
+        <button type="button" className="tile-button [display:inline-flex] [height:30px] [align-items:center] [gap:6px] [border:1px_solid_var(--border)] [border-radius:8px] [background:var(--surface-strong)] [padding:0_11px] [color:var(--foreground)] [font-size:11.5px] [font-weight:600] [transition:140ms_ease] [&:hover]:[border-color:color-mix(in_oklab,_var(--primary)_40%,_var(--border))] [&:hover]:[background:color-mix(in_oklab,_var(--primary)_10%,_var(--surface-strong))] [&:hover]:[color:var(--primary)] [&_svg]:[width:13px] [&_svg]:[height:13px]" onClick={action.onClick}>
           {action.label}
           <ArrowRightIcon />
         </button>
@@ -616,19 +616,19 @@ interface MetricTileProps {
 
 function MetricTile({ icon: Icon, label, value, tone, status, meter }: MetricTileProps) {
   return (
-    <article className="metric-tile">
-      <div className="metric-tile-head">
-        <span className="icon-tile" data-size="sm" data-tone={tone === "neutral" ? "neutral" : undefined}>
+    <article className="metric-tile [display:flex] [min-width:0] [flex-direction:column] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [padding:14px_15px_15px] [box-shadow:var(--elevation-card)] [&_.meter]:[margin-top:13px]">
+      <div className="metric-tile-head [display:flex] [align-items:center] [justify-content:space-between] [gap:10px]">
+        <span className="icon-tile [display:grid] [width:36px] [height:36px] [flex:0_0_auto] [place-items:center] [border-radius:11px] [background:color-mix(in_oklab,_var(--primary)_12%,_var(--surface-strong))] [color:var(--primary)] [box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--primary)_16%,_transparent)] [&_svg]:[width:17px] [&_svg]:[height:17px] [&[data-size='lg']]:[width:46px] [&[data-size='lg']]:[height:46px] [&[data-size='lg']]:[border-radius:14px] [&[data-size='lg']_svg]:[width:21px] [&[data-size='lg']_svg]:[height:21px] [&[data-tone='neutral']]:[background:var(--secondary)] [&[data-tone='neutral']]:[color:var(--muted-foreground)] [&[data-tone='neutral']]:[box-shadow:none] [&[data-tone='warning']]:[background:color-mix(in_oklab,_var(--warning)_14%,_var(--surface-strong))] [&[data-tone='warning']]:[color:var(--warning)] [&[data-tone='warning']]:[box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--warning)_20%,_transparent)] [&[data-tone='danger']]:[background:color-mix(in_oklab,_var(--danger)_14%,_var(--surface-strong))] [&[data-tone='danger']]:[color:var(--danger)] [&[data-tone='danger']]:[box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--danger)_20%,_transparent)] [&[data-size='sm']]:[width:30px] [&[data-size='sm']]:[height:30px] [&[data-size='sm']]:[border-radius:9px] [&[data-size='sm']_svg]:[width:15px] [&[data-size='sm']_svg]:[height:15px]" data-size="sm" data-tone={tone === "neutral" ? "neutral" : undefined}>
           <Icon />
         </span>
         <StatusPill tone={tone} bare>
           {status}
         </StatusPill>
       </div>
-      <strong className="metric-tile-value" title={value}>
+      <strong className="metric-tile-value [display:block] [overflow:hidden] [margin-top:13px] [font-size:22px] [font-weight:660] [letter-spacing:-0.035em] [text-overflow:ellipsis] [white-space:nowrap] [font-variant-numeric:tabular-nums]" title={value}>
         {value}
       </strong>
-      <span className="metric-tile-label">{label}</span>
+      <span className="metric-tile-label [display:block] [overflow:hidden] [margin-top:2px] [color:var(--muted-foreground)] [font-size:10.5px] [text-overflow:ellipsis] [white-space:nowrap]">{label}</span>
       <Meter label={meter.label} value={meter.value} readout={meter.readout} tone={meter.tone} />
     </article>
   )
@@ -654,10 +654,10 @@ function FeatureTile({
   onAction: () => void
 }) {
   return (
-    <section className={cn("card feature-tile", className)}>
-      <div className="mesh" aria-hidden="true" />
+    <section className={cn("card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)] feature-tile [position:relative] [justify-content:space-between] [min-height:148px] [padding:16px] [&>*:not(.mesh)]:[position:relative] [&>*:not(.mesh)]:[z-index:1] [&_h3]:[margin:0] [&_h3]:[font-size:14.5px] [&_h3]:[font-weight:640] [&_h3]:[letter-spacing:-0.02em] [&>p]:[margin:3px_0_0] [&>p]:[color:var(--muted-foreground)] [&>p]:[font-size:10.5px]", className)}>
+      <div className="mesh [position:absolute] [right:-30px] [bottom:-40px] [width:210px] [height:170px] [background-image:radial-gradient(var(--mesh-dot)_1px,_transparent_1px)] [background-size:9px_9px] [mask-image:radial-gradient(120px_100px_at_70%_80%,_black,_transparent_72%)] [pointer-events:none] [opacity:0.85]" aria-hidden="true" />
       <div className="flex items-start gap-3">
-        <div className="icon-tile" data-tone={tone === "neutral" ? "neutral" : undefined}>
+        <div className="icon-tile [display:grid] [width:36px] [height:36px] [flex:0_0_auto] [place-items:center] [border-radius:11px] [background:color-mix(in_oklab,_var(--primary)_12%,_var(--surface-strong))] [color:var(--primary)] [box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--primary)_16%,_transparent)] [&_svg]:[width:17px] [&_svg]:[height:17px] [&[data-size='lg']]:[width:46px] [&[data-size='lg']]:[height:46px] [&[data-size='lg']]:[border-radius:14px] [&[data-size='lg']_svg]:[width:21px] [&[data-size='lg']_svg]:[height:21px] [&[data-tone='neutral']]:[background:var(--secondary)] [&[data-tone='neutral']]:[color:var(--muted-foreground)] [&[data-tone='neutral']]:[box-shadow:none] [&[data-tone='warning']]:[background:color-mix(in_oklab,_var(--warning)_14%,_var(--surface-strong))] [&[data-tone='warning']]:[color:var(--warning)] [&[data-tone='warning']]:[box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--warning)_20%,_transparent)] [&[data-tone='danger']]:[background:color-mix(in_oklab,_var(--danger)_14%,_var(--surface-strong))] [&[data-tone='danger']]:[color:var(--danger)] [&[data-tone='danger']]:[box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--danger)_20%,_transparent)] [&[data-size='sm']]:[width:30px] [&[data-size='sm']]:[height:30px] [&[data-size='sm']]:[border-radius:9px] [&[data-size='sm']_svg]:[width:15px] [&[data-size='sm']_svg]:[height:15px]" data-tone={tone === "neutral" ? "neutral" : undefined}>
           <Icon />
         </div>
         <div className="min-w-0">
@@ -665,11 +665,11 @@ function FeatureTile({
           <p>{description}</p>
         </div>
       </div>
-      <div className="feature-tile-foot">
+      <div className="feature-tile-foot [display:flex] [align-items:center] [justify-content:space-between] [gap:12px] [margin-top:20px]">
         <StatusPill tone={tone} bare>
           {status}
         </StatusPill>
-        <button type="button" className="tile-button" onClick={onAction}>
+        <button type="button" className="tile-button [display:inline-flex] [height:30px] [align-items:center] [gap:6px] [border:1px_solid_var(--border)] [border-radius:8px] [background:var(--surface-strong)] [padding:0_11px] [color:var(--foreground)] [font-size:11.5px] [font-weight:600] [transition:140ms_ease] [&:hover]:[border-color:color-mix(in_oklab,_var(--primary)_40%,_var(--border))] [&:hover]:[background:color-mix(in_oklab,_var(--primary)_10%,_var(--surface-strong))] [&:hover]:[color:var(--primary)] [&_svg]:[width:13px] [&_svg]:[height:13px]" onClick={onAction}>
           {action}
           <ArrowRightIcon />
         </button>
@@ -684,7 +684,7 @@ type BooleanSetting = {
 
 function QuickSetting({ label, setting, settings }: { label: string; setting: BooleanSetting; settings: AppSettings }) {
   return (
-    <div className="settings-panel-row">
+    <div className="settings-panel-row [display:flex] [align-items:center] [justify-content:space-between] [gap:14px] [border-radius:9px] [padding:8px_8px_8px_0] [&>span]:[min-width:0] [&>span]:[color:var(--foreground)] [&>span]:[font-size:11.5px] [&>span]:[font-weight:500]">
       <span>{label}</span>
       <Switch
         aria-label={label}
@@ -740,14 +740,14 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
   }, [snapshot.folders, filter])
 
   return (
-    <div className="page-stack">
-      <section className="section-intro">
+    <div className="page-stack [display:grid] [gap:16px] [width:100%] [max-width:1520px] [margin:0_auto]">
+      <section className="section-intro [display:flex] [align-items:center] [justify-content:space-between] [gap:24px] [&_h2]:[margin:0] [&_h2]:[font-size:17px] [&_h2]:[font-weight:650] [&_h2]:[letter-spacing:-0.03em] [&_p]:[margin:3px_0_0] [&_p]:[max-width:80ch] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:11.5px] [&_p]:[line-height:1.5]">
         <div>
           <h2>Folder mappings</h2>
           <p>Each mapping has independent paths, direction, exclusions, history and bandwidth settings.</p>
         </div>
         {snapshot.folders.length > 0 ? (
-          <div className="segmented" role="group" aria-label="Filter folders">
+          <div className="segmented [display:inline-flex] [gap:2px] [border:1px_solid_var(--border)] [border-radius:10px] [background:var(--surface-sunken)] [padding:3px] [&_button]:[height:28px] [&_button]:[border:0] [&_button]:[border-radius:7px] [&_button]:[background:transparent] [&_button]:[padding:0_12px] [&_button]:[color:var(--muted-foreground)] [&_button]:[font-size:11.5px] [&_button]:[font-weight:600] [&_button]:[transition:140ms_ease] [&_button:hover]:[color:var(--foreground)] [&_button[data-active='true']]:[background:var(--surface-strong)] [&_button[data-active='true']]:[color:var(--foreground)] [&_button[data-active='true']]:[box-shadow:0_1px_3px_oklch(0_0_0_/_0.2)]" role="group" aria-label="Filter folders">
             {folderFilters.map((option) => (
               <button
                 key={option.id}
@@ -766,18 +766,18 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
       </section>
 
       {!pairedDevice ? (
-        <section className="pairing-gate-card">
-          <div className="pairing-gate-icon">
+        <section className="pairing-gate-card [position:relative] [display:grid] [grid-template-columns:auto_minmax(0,_1fr)_auto] [align-items:center] [gap:20px] [overflow:hidden] [border:1px_solid_color-mix(in_oklab,_var(--primary)_20%,_var(--border))] [border-radius:var(--radius-card)] [background:radial-gradient(600px_260px_at_92%_-20%,_color-mix(in_oklab,_var(--primary)_13%,_transparent),_transparent_70%),_var(--card-sheen)] [padding:20px] [box-shadow:var(--elevation-card)] [&>*]:[position:relative] [&>*]:[z-index:1] max-[1100px]:[grid-template-columns:auto_minmax(0,_1fr)] max-[1100px]:[&>button]:[grid-column:2] max-[1100px]:[&>button]:[justify-self:start]">
+          <div className="pairing-gate-icon [display:grid] [width:50px] [height:50px] [place-items:center] [border-radius:15px] [background:color-mix(in_oklab,_var(--primary)_13%,_var(--surface-strong))] [color:var(--primary)] [box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--primary)_20%,_transparent)] [&_svg]:[width:22px] [&_svg]:[height:22px]">
             <LockKeyholeIcon />
           </div>
-          <div className="pairing-gate-copy">
-            <p className="eyebrow">Protected setup order</p>
+          <div className="pairing-gate-copy [&_h2]:[margin:4px_0_5px] [&_h2]:[font-size:17px] [&_h2]:[font-weight:650] [&_h2]:[letter-spacing:-0.03em] [&>p:not(.eyebrow)]:[max-width:80ch] [&>p:not(.eyebrow)]:[margin:0] [&>p:not(.eyebrow)]:[color:var(--muted-foreground)] [&>p:not(.eyebrow)]:[font-size:12px] [&>p:not(.eyebrow)]:[line-height:1.55]">
+            <p className="eyebrow [margin:0] [color:var(--muted-foreground)] [font-size:10px] [font-weight:700] [letter-spacing:0.11em] [text-transform:uppercase]">Protected setup order</p>
             <h2>Pair your second computer before choosing folders</h2>
             <p>
               Tethera needs a trusted device identity before it can safely browse a destination or create a folder mapping. No
               folder can be added while this computer is unpaired.
             </p>
-            <div className="pairing-gate-points">
+            <div className="pairing-gate-points [display:flex] [flex-wrap:wrap] [gap:8px_16px] [margin-top:12px] [color:var(--muted-foreground)] [font-size:11px] [&_span]:[display:inline-flex] [&_span]:[align-items:center] [&_span]:[gap:6px] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[color:var(--primary)]">
               <span>
                 <ShieldCheckIcon /> Both computers approve the pairing
               </span>
@@ -794,9 +794,9 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
       ) : null}
 
       {snapshot.mappings.outgoing.length > 0 ? (
-        <section className="mapping-request-list">
+        <section className="mapping-request-list [display:grid] [gap:8px]">
           {snapshot.mappings.outgoing.map((request) => (
-            <div key={request.id} className={`mapping-request-row mapping-request-${request.status}`}>
+            <div key={request.id} data-status={request.status} className="mapping-request-row [display:flex] [align-items:center] [justify-content:space-between] [gap:14px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [padding:11px_13px] [background:var(--surface)] data-[status=failed]:[border-color:color-mix(in_oklab,var(--danger)_30%,var(--border))] data-[status=rejected]:[border-color:color-mix(in_oklab,var(--danger)_30%,var(--border))] [&>div]:[display:flex] [&>div]:[align-items:center] [&>div]:[gap:10px] [&>div]:[min-width:0] [&_svg]:[width:17px] [&_svg]:[color:var(--primary)] [&_span]:[display:grid] [&_span]:[gap:2px] [&_span]:[min-width:0] [&_strong]:[font-size:11px] [&_small]:[overflow:hidden] [&_small]:[text-overflow:ellipsis] [&_small]:[white-space:nowrap] [&_small]:[color:var(--muted-foreground)] [&_small]:[font-size:9.5px]">
               <div>
                 <RefreshCwIcon className={request.status === "pending" ? "animate-spin" : undefined} />
                 <span>
@@ -817,7 +817,7 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
       ) : null}
 
       {snapshot.mappingStore.status === "loading" ? (
-        <section className="card">
+        <section className="card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)]">
           <CompactEmptyState
             icon={RefreshCwIcon}
             title="Loading folder mappings"
@@ -825,8 +825,8 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
           />
         </section>
       ) : snapshot.mappingStore.status !== "ready" ? null : snapshot.folders.length === 0 && pairedDevice ? (
-        <section className="large-empty-state">
-          <div className="large-empty-icon">
+        <section className="large-empty-state [display:grid] [min-height:380px] [place-items:center] [align-content:center] [border:1px_dashed_color-mix(in_oklab,_var(--border)_85%,_var(--primary))] [border-radius:var(--radius-card)] [background:radial-gradient(420px_200px_at_50%_0%,_color-mix(in_oklab,_var(--primary)_7%,_transparent),_transparent_70%),_color-mix(in_oklab,_var(--surface)_55%,_transparent)] [padding:44px] [text-align:center] [&_h2]:[margin:16px_0_6px] [&_h2]:[font-size:18px] [&_h2]:[font-weight:650] [&_h2]:[letter-spacing:-0.03em] [&_p]:[max-width:52ch] [&_p]:[margin:0_0_18px] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:12px] [&_p]:[line-height:1.6]">
+          <div className="large-empty-icon [display:grid] [width:50px] [height:50px] [place-items:center] [border-radius:15px] [background:color-mix(in_oklab,_var(--primary)_12%,_var(--surface))] [color:var(--primary)] [box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--primary)_18%,_transparent)] [&_svg]:[width:21px] [&_svg]:[height:21px]">
             <FolderIcon />
           </div>
           <h2>Choose exactly what stays in sync</h2>
@@ -849,7 +849,7 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
       ) : snapshot.folders.length > 0 ? (
         <>
           {!pairedDevice ? (
-            <div className="attention-banner">
+            <div className="attention-banner [display:flex] [align-items:center] [gap:12px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_28%,_var(--border))] [border-radius:var(--radius-tile)] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:12px_14px] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&_strong]:[display:block] [&_span]:[display:block] [&_strong]:[font-size:12px] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10.5px]">
               <CircleAlertIcon />
               <div>
                 <strong>Existing mappings are inactive</strong>
@@ -858,7 +858,7 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
             </div>
           ) : null}
           {folders.length === 0 ? (
-            <section className="card">
+            <section className="card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)]">
               <CompactEmptyState
                 icon={FolderClockIcon}
                 title="No folders in this filter"
@@ -866,7 +866,7 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
               />
             </section>
           ) : (
-            <section className="folder-grid">
+            <section className="folder-grid [display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [align-items:start] [gap:14px] max-[1100px]:[grid-template-columns:1fr]">
               {folders.map((folder) => (
                 <FolderCard
                   key={folder.id}
@@ -922,9 +922,9 @@ function FolderCard({
   }
 
   return (
-    <article className="folder-card">
-      <div className="folder-card-head">
-        <div className="icon-tile" data-tone={paused ? "neutral" : undefined}>
+    <article className="folder-card [position:relative] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)] [transition:border-color_160ms_ease,_transform_160ms_ease] [&:hover]:[border-color:color-mix(in_oklab,_var(--primary)_26%,_var(--border))]">
+      <div className="folder-card-head [display:flex] [align-items:center] [gap:11px] [padding:15px_15px_13px] [&_h3]:[margin:0] [&_h3]:[font-size:14.5px] [&_h3]:[font-weight:640] [&_h3]:[letter-spacing:-0.02em]">
+        <div className="icon-tile [display:grid] [width:36px] [height:36px] [flex:0_0_auto] [place-items:center] [border-radius:11px] [background:color-mix(in_oklab,_var(--primary)_12%,_var(--surface-strong))] [color:var(--primary)] [box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--primary)_16%,_transparent)] [&_svg]:[width:17px] [&_svg]:[height:17px] [&[data-size='lg']]:[width:46px] [&[data-size='lg']]:[height:46px] [&[data-size='lg']]:[border-radius:14px] [&[data-size='lg']_svg]:[width:21px] [&[data-size='lg']_svg]:[height:21px] [&[data-tone='neutral']]:[background:var(--secondary)] [&[data-tone='neutral']]:[color:var(--muted-foreground)] [&[data-tone='neutral']]:[box-shadow:none] [&[data-tone='warning']]:[background:color-mix(in_oklab,_var(--warning)_14%,_var(--surface-strong))] [&[data-tone='warning']]:[color:var(--warning)] [&[data-tone='warning']]:[box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--warning)_20%,_transparent)] [&[data-tone='danger']]:[background:color-mix(in_oklab,_var(--danger)_14%,_var(--surface-strong))] [&[data-tone='danger']]:[color:var(--danger)] [&[data-tone='danger']]:[box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--danger)_20%,_transparent)] [&[data-size='sm']]:[width:30px] [&[data-size='sm']]:[height:30px] [&[data-size='sm']]:[border-radius:9px] [&[data-size='sm']_svg]:[width:15px] [&[data-size='sm']_svg]:[height:15px]" data-tone={paused ? "neutral" : undefined}>
           <FolderIcon />
         </div>
         <div className="min-w-0 flex-1">
@@ -934,7 +934,7 @@ function FolderCard({
               {folderStatusLabel(folder)}
             </StatusPill>
           </div>
-          <p className="mt-1 truncate text-[11px] text-muted-foreground">{prettyMode(folder.mode)}</p>
+          <p className="mt-1 truncate text-[11px] text-[var(--muted-foreground)]">{prettyMode(folder.mode)}</p>
         </div>
         <Button
           size="icon-sm"
@@ -947,16 +947,16 @@ function FolderCard({
         </Button>
       </div>
 
-      <div className="path-map">
+      <div className="path-map [display:grid] [grid-template-columns:minmax(0,_1fr)_24px_minmax(0,_1fr)] [align-items:center] [gap:8px] [border-block:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [background:var(--surface-sunken)] [padding:12px_15px]">
         <PathBlock label="This computer" path={folder.localPath} onReveal={() => window.folderSync.revealPath(folder.localPath)} />
-        <div className="path-arrow">
+        <div className="path-arrow [display:grid] [place-items:center] [color:var(--primary)] [&_svg]:[width:14px] [&_svg]:[height:14px]">
           <ArrowRightIcon />
         </div>
         <PathBlock label="Paired computer" path={folder.remotePath} />
       </div>
 
       {folder.progress !== undefined ? (
-        <div className="folder-progress">
+        <div className="folder-progress [padding:13px_15px_0]">
           <Meter
             label={folder.currentAction ?? "Transferring"}
             value={folder.progress}
@@ -966,13 +966,13 @@ function FolderCard({
       ) : null}
 
       {folder.currentAction && folder.progress === undefined ? (
-        <div className="folder-action-note" role={folder.status === "needs-attention" ? "alert" : undefined}>
+        <div className="folder-action-note [display:flex] [align-items:center] [gap:8px] [margin:12px_15px_0] [border-radius:8px] [background:color-mix(in_oklab,_var(--primary)_9%,_var(--surface))] [padding:8px_10px] [color:var(--muted-foreground)] [font-size:10px] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[color:var(--primary)]" role={folder.status === "needs-attention" ? "alert" : undefined}>
           {folder.status === "needs-attention" ? <CircleAlertIcon /> : <ShieldCheckIcon />}
           <span>{folder.currentAction}</span>
         </div>
       ) : null}
 
-      <div className="folder-stats">
+      <div className="folder-stats [display:grid] [grid-template-columns:repeat(3,_1fr)] [gap:1px] [margin-top:13px] [background:color-mix(in_oklab,_var(--border)_70%,_transparent)] [&>div]:[background:var(--surface)] [&>div]:[padding:12px_15px] [&_span]:[display:block] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9.5px] [&_span]:[font-weight:550] [&_strong]:[display:block] [&_strong]:[margin-top:3px] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:620] [&_strong]:[font-variant-numeric:tabular-nums]">
         <div>
           <span>Files</span>
           <strong>{folder.fileCount?.toLocaleString("en-GB") ?? "Not scanned"}</strong>
@@ -987,7 +987,7 @@ function FolderCard({
         </div>
       </div>
 
-      <div className="folder-card-footer">
+      <div className="folder-card-footer [display:flex] [align-items:center] [gap:6px] [border-top:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [padding:10px_12px]">
         {folder.setupStatus === "ready-for-initial-sync" ? (
           <Button
             size="sm"
@@ -1035,8 +1035,8 @@ function FolderCard({
 
 function ActivityView({ activity }: { activity: ActivityEvent[] }) {
   return (
-    <div className="page-stack">
-      <section className="section-intro">
+    <div className="page-stack [display:grid] [gap:16px] [width:100%] [max-width:1520px] [margin:0_auto]">
+      <section className="section-intro [display:flex] [align-items:center] [justify-content:space-between] [gap:24px] [&_h2]:[margin:0] [&_h2]:[font-size:17px] [&_h2]:[font-weight:650] [&_h2]:[letter-spacing:-0.03em] [&_p]:[margin:3px_0_0] [&_p]:[max-width:80ch] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:11.5px] [&_p]:[line-height:1.5]">
         <div>
           <h2>Activity log</h2>
           <p>Configuration, connections, transfers, conflicts and recovery operations are recorded locally.</p>
@@ -1047,11 +1047,11 @@ function ActivityView({ activity }: { activity: ActivityEvent[] }) {
         </Button>
       </section>
 
-      <section className="card">
+      <section className="card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)]">
         {activity.length === 0 ? (
           <CompactEmptyState icon={ActivityIcon} title="No activity yet" description="Events appear when you configure or sync folders." />
         ) : (
-          <div className="activity-list">
+          <div className="activity-list [position:relative] [&.compact_.activity-row]:[padding:11px_16px]">
             {activity.map((event) => (
               <ActivityRow key={event.id} event={event} showDate />
             ))}
@@ -1065,15 +1065,20 @@ function ActivityView({ activity }: { activity: ActivityEvent[] }) {
 function ActivityRow({ event, showDate = false }: { event: ActivityEvent; showDate?: boolean }) {
   const Icon = event.level === "success" ? CheckCircle2Icon : event.level === "warning" || event.level === "error" ? CircleAlertIcon : ActivityIcon
   return (
-    <div className="activity-row">
-      <div className={cn("activity-icon", `activity-${event.level}`)}>
+    <div className="activity-row [position:relative] [display:flex] [align-items:flex-start] [gap:12px] [border-bottom:1px_solid_color-mix(in_oklab,_var(--border)_55%,_transparent)] [padding:14px_16px] [&:last-child]:[border-bottom:0] [&:hover]:[background:color-mix(in_oklab,_var(--accent)_40%,_transparent)]">
+      <div className={cn("activity-icon [display:grid] [width:28px] [height:28px] [flex:0_0_auto] [place-items:center] [border-radius:9px] [&_svg]:[width:14px] [&_svg]:[height:14px]", {
+        "[background:color-mix(in_oklab,var(--info)_12%,var(--surface))] [color:var(--info)]": event.level === "info",
+        "[background:color-mix(in_oklab,var(--success)_12%,var(--surface))] [color:var(--success)]": event.level === "success",
+        "[background:color-mix(in_oklab,var(--warning)_12%,var(--surface))] [color:var(--warning)]": event.level === "warning",
+        "[background:color-mix(in_oklab,var(--danger)_12%,var(--surface))] [color:var(--danger)]": event.level === "error",
+      })}>
         <Icon />
       </div>
       <div className="min-w-0 flex-1">
         <p className="text-[12.5px] font-semibold">{event.title}</p>
-        <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">{event.detail}</p>
+        <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--muted-foreground)]">{event.detail}</p>
       </div>
-      <time className="shrink-0 text-[10px] tabular-nums text-muted-foreground" dateTime={event.occurredAt}>
+      <time className="shrink-0 text-[10px] tabular-nums text-[var(--muted-foreground)]" dateTime={event.occurredAt}>
         {showDate ? formatDateTime(event.occurredAt) : formatRelative(event.occurredAt)}
       </time>
     </div>
@@ -1096,8 +1101,8 @@ function DevicesView({
   const pairedDevices = getPairedDevices(snapshot)
 
   return (
-    <div className="page-stack">
-      <section className="section-intro">
+    <div className="page-stack [display:grid] [gap:16px] [width:100%] [max-width:1520px] [margin:0_auto]">
+      <section className="section-intro [display:flex] [align-items:center] [justify-content:space-between] [gap:24px] [&_h2]:[margin:0] [&_h2]:[font-size:17px] [&_h2]:[font-weight:650] [&_h2]:[letter-spacing:-0.03em] [&_p]:[margin:3px_0_0] [&_p]:[max-width:80ch] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:11.5px] [&_p]:[line-height:1.5]">
         <div>
           <h2>Trusted devices</h2>
           <p>
@@ -1114,7 +1119,7 @@ function DevicesView({
       </section>
 
       {snapshot.pairing.incomingRequests.length > 0 ? (
-        <section className="incoming-pairing-banner">
+        <section className="incoming-pairing-banner [display:flex] [align-items:center] [justify-content:space-between] [gap:16px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_30%,_var(--border))] [border-radius:var(--radius-tile)] [background:color-mix(in_oklab,_var(--primary)_9%,_var(--surface))] [padding:12px_14px] [&>div:first-child]:[display:flex] [&>div:first-child]:[align-items:center] [&>div:first-child]:[gap:10px] [&_svg]:[width:18px] [&_svg]:[height:18px] [&_svg]:[color:var(--primary)] [&_span]:[display:grid] [&_span]:[gap:2px] [&_strong]:[font-size:11.5px] [&_small]:[color:var(--muted-foreground)] [&_small]:[font-size:10px] max-[760px]:[align-items:stretch] max-[760px]:[flex-direction:column]">
           <div>
             <ShieldCheckIcon />
             <span>
@@ -1127,7 +1132,7 @@ function DevicesView({
       ) : null}
 
       {snapshot.mappings.incoming.some((request) => request.status === "pending") ? (
-        <section className="incoming-pairing-banner">
+        <section className="incoming-pairing-banner [display:flex] [align-items:center] [justify-content:space-between] [gap:16px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_30%,_var(--border))] [border-radius:var(--radius-tile)] [background:color-mix(in_oklab,_var(--primary)_9%,_var(--surface))] [padding:12px_14px] [&>div:first-child]:[display:flex] [&>div:first-child]:[align-items:center] [&>div:first-child]:[gap:10px] [&_svg]:[width:18px] [&_svg]:[height:18px] [&_svg]:[color:var(--primary)] [&_span]:[display:grid] [&_span]:[gap:2px] [&_strong]:[font-size:11.5px] [&_small]:[color:var(--muted-foreground)] [&_small]:[font-size:10px] max-[760px]:[align-items:stretch] max-[760px]:[flex-direction:column]">
           <div>
             <FolderOpenIcon />
             <span>
@@ -1139,21 +1144,21 @@ function DevicesView({
         </section>
       ) : null}
 
-      <section className="device-grid">
+      <section className="device-grid [display:grid] [grid-template-columns:repeat(3,_minmax(0,_1fr))] [align-items:start] [gap:14px] max-[1360px]:[grid-template-columns:repeat(2,_minmax(0,_1fr))] max-[900px]:[grid-template-columns:1fr]">
         {snapshot.devices.map((device) => (
-          <article className="device-card" key={device.id}>
-            <div className="device-illustration">
+          <article className="device-card [position:relative] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [padding:18px] [box-shadow:var(--elevation-card)] [&_h3]:[margin:0] [&_h3]:[font-size:14.5px] [&_h3]:[font-weight:640] [&_h3]:[letter-spacing:-0.02em]" key={device.id}>
+            <div className="device-illustration [position:relative] [display:grid] [width:50px] [height:50px] [place-items:center] [margin-bottom:16px] [border-radius:15px] [background:color-mix(in_oklab,_var(--primary)_11%,_var(--surface-strong))] [color:var(--primary)] [box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--primary)_16%,_transparent)] [&_svg]:[width:22px] [&_svg]:[height:22px]">
               {device.platform === "windows" ? <ComputerIcon /> : <LaptopIcon />}
-              <span className={cn("presence-dot", device.status === "online" || device.status === "this-device" ? "online" : "offline")} />
+              <span className={cn("presence-dot [position:absolute] [right:1px] [bottom:1px] [width:11px] [height:11px] [border:2px_solid_var(--surface)] [border-radius:999px] [&.online]:[background:var(--success)] [&.offline]:[background:var(--muted-foreground)]", device.status === "online" || device.status === "this-device" ? "online" : "offline")} />
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <h3>{device.name}</h3>
                 {device.status === "this-device" ? <Badge variant="info">This device</Badge> : null}
               </div>
-              <p className="mt-1 text-[11px] text-muted-foreground">{prettyPlatform(device.platform)}</p>
+              <p className="mt-1 text-[11px] text-[var(--muted-foreground)]">{prettyPlatform(device.platform)}</p>
             </div>
-            <dl className="device-details">
+            <dl className="device-details [display:grid] [gap:9px] [margin:18px_0_0] [border-top:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [padding-top:14px] [&>div]:[display:flex] [&>div]:[justify-content:space-between] [&>div]:[gap:12px] [&_dt]:[color:var(--muted-foreground)] [&_dt]:[font-size:10.5px] [&_dd]:[overflow:hidden] [&_dd]:[margin:0] [&_dd]:[font-size:10.5px] [&_dd]:[font-weight:550] [&_dd]:[text-overflow:ellipsis] [&_dd]:[white-space:nowrap]">
               <div>
                 <dt>Status</dt>
                 <dd>
@@ -1172,15 +1177,15 @@ function DevicesView({
               </div>
               <div>
                 <dt>Identity</dt>
-                <dd className="device-fingerprint">{device.fingerprint ?? "Loading…"}</dd>
+                <dd className="device-fingerprint [max-width:180px] [overflow:hidden] [font-family:ui-monospace,_SFMono-Regular,_Menlo,_Monaco,_Consolas,_monospace] [font-size:9px] [text-overflow:ellipsis] [white-space:nowrap]">{device.fingerprint ?? "Loading…"}</dd>
               </div>
             </dl>
             {device.status !== "this-device" ? <RevokeDeviceDialog device={device} /> : null}
           </article>
         ))}
 
-        <article className="pair-device-card">
-          <div className="large-empty-icon">
+        <article className="pair-device-card [display:flex] [min-height:260px] [flex-direction:column] [align-items:center] [justify-content:center] [gap:10px] [border:1px_dashed_color-mix(in_oklab,_var(--primary)_35%,_var(--border))] [border-radius:var(--radius-card)] [background:radial-gradient(300px_160px_at_50%_100%,_color-mix(in_oklab,_var(--primary)_8%,_transparent),_transparent_70%),_color-mix(in_oklab,_var(--surface)_45%,_transparent)] [padding:24px] [text-align:center] [&>strong]:[font-size:14px] [&>strong]:[font-weight:640] [&>span]:[max-width:46ch] [&>span]:[color:var(--muted-foreground)] [&>span]:[font-size:11px] [&>span]:[line-height:1.5]">
+          <div className="large-empty-icon [display:grid] [width:50px] [height:50px] [place-items:center] [border-radius:15px] [background:color-mix(in_oklab,_var(--primary)_12%,_var(--surface))] [color:var(--primary)] [box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--primary)_18%,_transparent)] [&_svg]:[width:21px] [&_svg]:[height:21px]">
             <Link2Icon />
           </div>
           <strong>Pair a second computer</strong>
@@ -1188,7 +1193,7 @@ function DevicesView({
             Nearby devices are discovered over your LAN. Both computers compare a one-time code before their identity keys are
             saved.
           </span>
-          <div className="pair-device-actions">
+          <div className="pair-device-actions [display:flex] [flex-wrap:wrap] [justify-content:center] [gap:8px] [margin-top:8px]">
             <PairDeviceDialog snapshot={snapshot} />
             <Button variant="outline" onClick={() => setPickerOpen(true)}>
               <FolderOpenIcon data-icon="inline-start" />
@@ -1198,7 +1203,7 @@ function DevicesView({
         </article>
       </section>
 
-      <section className="setup-order-card">
+      <section className="setup-order-card [display:grid] [grid-template-columns:auto_minmax(0,_1fr)_auto_auto_minmax(0,_1fr)_auto_auto_minmax(0,_1fr)] [align-items:center] [gap:12px] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [padding:15px_17px] [box-shadow:var(--elevation-card)] [&>span]:[display:grid] [&>span]:[width:27px] [&>span]:[height:27px] [&>span]:[place-items:center] [&>span]:[border-radius:9px] [&>span]:[background:color-mix(in_oklab,_var(--primary)_13%,_var(--surface-strong))] [&>span]:[color:var(--primary)] [&>span]:[font-size:11px] [&>span]:[font-weight:700] [&>svg]:[width:15px] [&>svg]:[height:15px] [&>svg]:[color:var(--muted-foreground)] [&_strong]:[display:block] [&_strong]:[font-size:12px] [&_strong]:[font-weight:620] [&_p]:[margin:2px_0_0] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:10.5px] max-[1100px]:[grid-template-columns:auto_minmax(0,_1fr)] max-[1100px]:[&>svg]:[display:none]">
         <span>1</span>
         <div>
           <strong>Pair</strong>
@@ -1236,15 +1241,15 @@ function DevicesView({
 
 function HistoryView() {
   return (
-    <div className="page-stack">
-      <section className="section-intro">
+    <div className="page-stack [display:grid] [gap:16px] [width:100%] [max-width:1520px] [margin:0_auto]">
+      <section className="section-intro [display:flex] [align-items:center] [justify-content:space-between] [gap:24px] [&_h2]:[margin:0] [&_h2]:[font-size:17px] [&_h2]:[font-weight:650] [&_h2]:[letter-spacing:-0.03em] [&_p]:[margin:3px_0_0] [&_p]:[max-width:80ch] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:11.5px] [&_p]:[line-height:1.5]">
         <div>
           <h2>Version history and deleted files</h2>
           <p>Overwritten and deleted copies will be stored locally in the central recovery archive.</p>
         </div>
       </section>
-      <section className="large-empty-state">
-        <div className="large-empty-icon">
+      <section className="large-empty-state [display:grid] [min-height:380px] [place-items:center] [align-content:center] [border:1px_dashed_color-mix(in_oklab,_var(--border)_85%,_var(--primary))] [border-radius:var(--radius-card)] [background:radial-gradient(420px_200px_at_50%_0%,_color-mix(in_oklab,_var(--primary)_7%,_transparent),_transparent_70%),_color-mix(in_oklab,_var(--surface)_55%,_transparent)] [padding:44px] [text-align:center] [&_h2]:[margin:16px_0_6px] [&_h2]:[font-size:18px] [&_h2]:[font-weight:650] [&_h2]:[letter-spacing:-0.03em] [&_p]:[max-width:52ch] [&_p]:[margin:0_0_18px] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:12px] [&_p]:[line-height:1.6]">
+        <div className="large-empty-icon [display:grid] [width:50px] [height:50px] [place-items:center] [border-radius:15px] [background:color-mix(in_oklab,_var(--primary)_12%,_var(--surface))] [color:var(--primary)] [box-shadow:inset_0_0_0_1px_color-mix(in_oklab,_var(--primary)_18%,_transparent)] [&_svg]:[width:21px] [&_svg]:[height:21px]">
           <HistoryIcon />
         </div>
         <h2>No recoverable versions yet</h2>
@@ -1261,7 +1266,7 @@ function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
   }
 
   return (
-    <div className="page-stack max-w-4xl">
+    <div className="page-stack [display:grid] [gap:16px] [width:100%] [max-width:1520px] [margin:0_auto] max-w-4xl">
       <SettingsSection
         title="Mapping database"
         description="SQLite is the authoritative owner of folder configuration and removal history."
@@ -1288,7 +1293,7 @@ function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
             </Button>
           )}
         </SettingRow>
-        <div className="mapping-diagnostics">
+        <div className="mapping-diagnostics [padding:10px_18px_14px] [color:var(--muted-foreground)] [font-size:10.5px] [&_summary]:[cursor:pointer] [&_summary]:[font-weight:600] [&_dl]:[display:grid] [&_dl]:[gap:6px] [&_dl]:[margin:10px_0_0] [&_dl>div]:[display:flex] [&_dl>div]:[justify-content:space-between] [&_dl>div]:[gap:20px] [&_dt]:[margin:0] [&_dd]:[margin:0] [&_dd]:[color:var(--foreground)] [&_dd]:[font-family:ui-monospace,_SFMono-Regular,_Menlo,_Monaco,_Consolas,_monospace]">
           <details>
             <summary>Advanced database details</summary>
             <dl>
@@ -1344,7 +1349,7 @@ function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
       <SettingsSection title="Appearance" description="The interface follows your system theme by default.">
         <SettingRow title="Theme" description="Change the desktop interface without affecting sync behaviour.">
           <select
-            className="field-control w-40"
+            className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55] w-40"
             value={settings.theme}
             onChange={(event: ChangeEvent<HTMLSelectElement>) => update("theme", event.target.value as AppSettings["theme"])}
           >
@@ -1360,19 +1365,19 @@ function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
 
 function SettingsSection({ title, description, children }: { title: string; description: string; children: ReactNode }) {
   return (
-    <section className="settings-section">
-      <div className="settings-heading">
+    <section className="settings-section [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)]">
+      <div className="settings-heading [border-bottom:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [padding:15px_18px] [&_h2]:[margin:0] [&_h2]:[font-size:14px] [&_h2]:[font-weight:640] [&_h2]:[letter-spacing:-0.02em] [&_p]:[margin:3px_0_0] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:11px] [&_p]:[line-height:1.5]">
         <h2>{title}</h2>
         <p>{description}</p>
       </div>
-      <div className="settings-list">{children}</div>
+      <div className="settings-list [display:grid]">{children}</div>
     </section>
   )
 }
 
 function SettingRow({ title, description, children }: { title: string; description: string; children: ReactNode }) {
   return (
-    <div className="setting-row">
+    <div className="setting-row [display:flex] [min-height:66px] [align-items:center] [justify-content:space-between] [gap:26px] [border-bottom:1px_solid_color-mix(in_oklab,_var(--border)_55%,_transparent)] [padding:13px_18px] [&:last-child]:[border-bottom:0] [&_h3]:[margin:0] [&_h3]:[font-size:12px] [&_h3]:[font-weight:600] [&_p]:[margin:3px_0_0] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:10.5px] [&_p]:[line-height:1.45]">
       <div>
         <h3>{title}</h3>
         <p>{description}</p>
@@ -1394,16 +1399,16 @@ function ThemeSwitcher({ theme }: { theme: AppSettings["theme"] }) {
   ] as const
 
   return (
-    <div className="theme-switcher">
+    <div className="theme-switcher [display:grid] [gap:8px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:9px_10px] [&>span]:[color:var(--muted-foreground)] [&>span]:[font-size:9px] [&>span]:[font-weight:700] [&>span]:[letter-spacing:0.1em] [&>span]:[text-transform:uppercase]">
       <span>Appearance</span>
-      <div className="theme-options" role="group" aria-label="Theme">
+      <div className="theme-options [display:grid] [grid-template-columns:repeat(3,_1fr)] [gap:3px] [border-radius:8px] [background:var(--surface-sunken)] [padding:3px]" role="group" aria-label="Theme">
         {options.map((option) => {
           const Icon = option.icon
           return (
             <button
               key={option.id}
               type="button"
-              className="theme-option"
+              className="theme-option [display:grid] [height:26px] [place-items:center] [border:0] [border-radius:6px] [background:transparent] [color:var(--muted-foreground)] [transition:140ms_ease] [&_svg]:[width:14px] [&_svg]:[height:14px] [&:hover]:[color:var(--foreground)] [&[data-active='true']]:[background:var(--surface-strong)] [&[data-active='true']]:[color:var(--primary)] [&[data-active='true']]:[box-shadow:0_1px_3px_oklch(0_0_0_/_0.18)]"
               data-active={theme === option.id}
               aria-label={option.label}
               aria-pressed={theme === option.id}
@@ -1421,7 +1426,7 @@ function ThemeSwitcher({ theme }: { theme: AppSettings["theme"] }) {
 
 function PathBlock({ label, path, onReveal }: { label: string; path: string; onReveal?: () => void }) {
   return (
-    <div className="path-block">
+    <div className="path-block [min-width:0] [&>span]:[display:block] [&>span]:[margin-bottom:4px] [&>span]:[color:var(--muted-foreground)] [&>span]:[font-size:9px] [&>span]:[font-weight:700] [&>span]:[letter-spacing:0.07em] [&>span]:[text-transform:uppercase] [&>div]:[display:flex] [&>div]:[min-width:0] [&>div]:[align-items:center] [&>div]:[gap:5px] [&_code]:[overflow:hidden] [&_code]:[min-width:0] [&_code]:[color:var(--foreground)] [&_code]:[font-family:ui-monospace,_SFMono-Regular,_Menlo,_monospace] [&_code]:[font-size:10.5px] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap] [&_button]:[display:grid] [&_button]:[width:20px] [&_button]:[height:20px] [&_button]:[flex:0_0_auto] [&_button]:[place-items:center] [&_button]:[border:0] [&_button]:[border-radius:5px] [&_button]:[background:transparent] [&_button]:[color:var(--muted-foreground)] [&_button:hover]:[background:var(--accent)] [&_button:hover]:[color:var(--foreground)] [&_button_svg]:[width:11px] [&_button_svg]:[height:11px]">
       <span>{label}</span>
       <div>
         <code title={path}>{path}</code>
@@ -1456,7 +1461,7 @@ function UpdateBanner({ update }: { update: UpdateState }) {
 
   if (update.status === "error") {
     return (
-      <div className="update-banner update-banner-error">
+      <div className="update-banner [display:flex] [align-items:center] [gap:10px] [margin:0_24px] [padding:10px_14px] [border-radius:10px] [border:1px_solid_var(--border)] [background:var(--accent)] [font-size:12.5px] [font-weight:560] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex-shrink:0] [&_span]:[flex:1] [&_span]:[min-width:0] update-banner-error [border-color:color-mix(in_srgb,_var(--destructive)_45%,_var(--border))] [color:var(--destructive)]">
         <CircleAlertIcon />
         <span>Update check failed: {update.message ?? "Unknown error."}</span>
       </div>
@@ -1465,7 +1470,7 @@ function UpdateBanner({ update }: { update: UpdateState }) {
 
   if (update.status === "available") {
     return (
-      <div className="update-banner">
+      <div className="update-banner [display:flex] [align-items:center] [gap:10px] [margin:0_24px] [padding:10px_14px] [border-radius:10px] [border:1px_solid_var(--border)] [background:var(--accent)] [font-size:12.5px] [font-weight:560] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex-shrink:0] [&_span]:[flex:1] [&_span]:[min-width:0]">
         <DownloadIcon />
         <span>Tethera {update.version} is available.</span>
         <Button size="sm" onClick={() => void window.folderSync.downloadUpdate()}>
@@ -1477,7 +1482,7 @@ function UpdateBanner({ update }: { update: UpdateState }) {
 
   if (update.status === "downloading") {
     return (
-      <div className="update-banner">
+      <div className="update-banner [display:flex] [align-items:center] [gap:10px] [margin:0_24px] [padding:10px_14px] [border-radius:10px] [border:1px_solid_var(--border)] [background:var(--accent)] [font-size:12.5px] [font-weight:560] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex-shrink:0] [&_span]:[flex:1] [&_span]:[min-width:0]">
         <DownloadIcon />
         <span>Downloading update… {update.progressPercent ?? 0}%</span>
       </div>
@@ -1485,7 +1490,7 @@ function UpdateBanner({ update }: { update: UpdateState }) {
   }
 
   return (
-    <div className="update-banner">
+    <div className="update-banner [display:flex] [align-items:center] [gap:10px] [margin:0_24px] [padding:10px_14px] [border-radius:10px] [border:1px_solid_var(--border)] [background:var(--accent)] [font-size:12.5px] [font-weight:560] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex-shrink:0] [&_span]:[flex:1] [&_span]:[min-width:0]">
       <CheckCircle2Icon />
       <span>Tethera {update.version} is ready to install.</span>
       <Button size="sm" onClick={() => void window.folderSync.quitAndInstall()}>
@@ -1497,7 +1502,7 @@ function UpdateBanner({ update }: { update: UpdateState }) {
 
 function CompactEmptyState({ icon: Icon, title, description }: { icon: typeof FolderIcon; title: string; description: string }) {
   return (
-    <div className="compact-empty">
+    <div className="compact-empty [display:flex] [min-height:112px] [align-items:center] [justify-content:center] [gap:12px] [padding:22px] [color:var(--muted-foreground)] [&>svg]:[width:20px] [&>svg]:[height:20px] [&_p]:[margin:0] [&_p]:[color:var(--foreground)] [&_p]:[font-size:12.5px] [&_p]:[font-weight:600] [&_span]:[display:block] [&_span]:[max-width:38ch] [&_span]:[margin-top:2px] [&_span]:[font-size:10.5px] [&_span]:[line-height:1.45]">
       <Icon />
       <div>
         <p>{title}</p>
@@ -1509,7 +1514,7 @@ function CompactEmptyState({ icon: Icon, title, description }: { icon: typeof Fo
 
 function LoadingScreen() {
   return (
-    <div className="loading-screen">
+    <div className="loading-screen [display:grid] [min-height:400px] [place-items:center] [align-content:center] [gap:12px] [color:var(--muted-foreground)] [&_svg]:[width:21px] [&_svg]:[height:21px] [&_p]:[margin:0] [&_p]:[font-size:12px]">
       <RefreshCwIcon className="animate-spin" />
       <p>Loading Tethera…</p>
     </div>
