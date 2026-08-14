@@ -1,4 +1,4 @@
-import { useId } from "react"
+import { type CSSProperties, useId } from "react"
 import { cn } from "@/lib/utils"
 
 interface SparklineProps {
@@ -40,10 +40,10 @@ export function Sparkline({ points, height = 108, className, filled = true }: Sp
 
   return (
     <svg
-      className={cn("sparkline", className)}
+      className={cn("sparkline [display:block] [width:100%] [height:var(--sparkline-height)] [overflow:visible]", className)}
       viewBox={`0 0 ${VIEWBOX_WIDTH} ${height}`}
       preserveAspectRatio="none"
-      style={{ height }}
+      style={{ "--sparkline-height": `${height}px` } as CSSProperties}
       aria-hidden="true"
     >
       <defs>
@@ -53,7 +53,7 @@ export function Sparkline({ points, height = 108, className, filled = true }: Sp
         </linearGradient>
       </defs>
       {filled ? <path d={area} fill={`url(#${gradientId})`} /> : null}
-      <path className="sparkline-line" d={line} />
+      <path className="sparkline-line [fill:none] [stroke:var(--chart-2)] [stroke-width:1.75] [stroke-linecap:round] [stroke-linejoin:round] [vector-effect:non-scaling-stroke]" d={line} />
     </svg>
   )
 }

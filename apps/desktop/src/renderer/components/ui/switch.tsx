@@ -8,7 +8,7 @@ function Switch({ className, ...props }: SwitchProps) {
   return (
     <SwitchPrimitive.Root
       className={cn(
-        "relative inline-flex h-[22px] w-[38px] shrink-0 items-center rounded-full bg-input outline-none transition-colors data-[checked]:bg-primary focus-visible:ring-2 focus-visible:ring-ring/45",
+        "relative inline-flex h-[22px] w-[38px] shrink-0 items-center rounded-full bg-[var(--input)] outline-none transition-colors data-[checked]:bg-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[color-mix(in_oklab,var(--ring)_45%,transparent)]",
         className,
       )}
       {...props}

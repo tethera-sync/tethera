@@ -4,16 +4,16 @@ import type * as React from "react"
 import { cn } from "@/lib/utils"
 
 const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-lg text-sm font-medium transition-[background,color,border-color,box-shadow,transform] outline-none disabled:pointer-events-none disabled:opacity-45 focus-visible:ring-2 focus-visible:ring-ring/45 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 active:translate-y-px",
+  "inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-lg text-sm font-medium transition-[background,color,border-color,box-shadow,transform] outline-none disabled:pointer-events-none disabled:opacity-45 focus-visible:ring-2 focus-visible:ring-[color-mix(in_oklab,var(--ring)_45%,transparent)] [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 active:translate-y-px",
   {
     variants: {
       variant: {
         default:
-          "bg-primary text-primary-foreground shadow-[0_1px_2px_rgba(0,0,0,0.25),0_6px_18px_color-mix(in_oklab,var(--primary)_28%,transparent)] hover:bg-primary/90",
-        secondary: "bg-secondary text-secondary-foreground hover:bg-secondary/75",
-        outline: "border border-border bg-surface-strong text-foreground shadow-xs hover:border-primary/40 hover:bg-accent",
-        ghost: "text-muted-foreground hover:bg-accent hover:text-foreground",
-        destructive: "bg-destructive text-white hover:bg-destructive/90",
+          "bg-[var(--primary)] text-[var(--primary-foreground)] shadow-[0_1px_2px_rgba(0,0,0,0.25),0_6px_18px_color-mix(in_oklab,var(--primary)_28%,transparent)] hover:bg-[color-mix(in_oklab,var(--primary)_90%,transparent)]",
+        secondary: "bg-[var(--secondary)] text-[var(--secondary-foreground)] hover:bg-[color-mix(in_oklab,var(--secondary)_75%,transparent)]",
+        outline: "border border-[var(--border)] bg-[var(--surface-strong)] text-[var(--foreground)] shadow-xs hover:border-[color-mix(in_oklab,var(--primary)_40%,transparent)] hover:bg-[var(--accent)]",
+        ghost: "text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
+        destructive: "bg-[var(--destructive)] text-white hover:bg-[color-mix(in_oklab,var(--destructive)_90%,transparent)]",
       },
       size: {
         default: "h-9 px-3.5 text-[13px]",

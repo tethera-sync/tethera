@@ -16,14 +16,14 @@ function DialogContent({ className, children, showCloseButton = true, ...props }
       <div className="fixed inset-0 z-50 grid place-items-center overflow-y-auto p-4">
         <DialogPrimitive.Popup
           className={cn(
-            "relative w-full max-w-xl rounded-2xl border border-border bg-popover p-6 text-popover-foreground shadow-2xl outline-none transition-[transform,opacity] data-[ending-style]:scale-95 data-[ending-style]:opacity-0 data-[starting-style]:scale-95 data-[starting-style]:opacity-0",
+            "relative w-full max-w-xl rounded-2xl border border-[var(--border)] bg-[var(--popover)] p-6 text-[var(--popover-foreground)] shadow-2xl outline-none transition-[transform,opacity] data-[ending-style]:scale-95 data-[ending-style]:opacity-0 data-[starting-style]:scale-95 data-[starting-style]:opacity-0",
             className,
           )}
           {...props}
         >
           {children}
           {showCloseButton ? (
-            <DialogPrimitive.Close className="absolute right-4 top-4 grid size-8 place-items-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/45">
+            <DialogPrimitive.Close className="absolute right-4 top-4 grid size-8 place-items-center rounded-md text-[var(--muted-foreground)] outline-none transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)] focus-visible:ring-2 focus-visible:ring-[color-mix(in_oklab,var(--ring)_45%,transparent)]">
               <XIcon className="size-4" />
               <span className="sr-only">Close</span>
             </DialogPrimitive.Close>
@@ -51,7 +51,7 @@ function DialogTitle({ className, ...props }: DialogTitleProps) {
 type DialogDescriptionProps = Omit<React.ComponentProps<typeof DialogPrimitive.Description>, "className"> & { className?: string }
 
 function DialogDescription({ className, ...props }: DialogDescriptionProps) {
-  return <DialogPrimitive.Description className={cn("text-sm text-muted-foreground", className)} {...props} />
+  return <DialogPrimitive.Description className={cn("text-sm text-[var(--muted-foreground)]", className)} {...props} />
 }
 
 export {

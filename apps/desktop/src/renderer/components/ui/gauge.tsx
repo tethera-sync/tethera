@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react"
 import { cn } from "@/lib/utils"
 
 export type GaugeTone = "primary" | "warning" | "danger" | "neutral"
@@ -39,15 +40,15 @@ export function Gauge({
 
   return (
     <div
-      className={cn("gauge", className)}
+      className={cn("gauge [position:relative] [display:grid] [width:var(--gauge-size)] [height:var(--gauge-size)] [flex:0_0_auto] [place-items:center] [&_svg]:[overflow:visible] [&[data-tone='warning']_.gauge-value]:[stroke:var(--warning)] [&[data-tone='danger']_.gauge-value]:[stroke:var(--danger)] [&[data-tone='neutral']_.gauge-value]:[stroke:color-mix(in_oklab,_var(--muted-foreground)_60%,_transparent)]", className)}
       data-tone={tone === "primary" ? undefined : tone}
-      style={{ width: size, height: size }}
+      style={{ "--gauge-size": `${size}px`, "--gauge-rotation": `${rotation}deg` } as CSSProperties}
       role="img"
       aria-label={ariaLabel ?? `${label}${caption ? ` ${caption}` : ""}`}
     >
-      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{ transform: `rotate(${rotation}deg)` }}>
+      <svg className="[transform:rotate(var(--gauge-rotation))]" width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
         <circle
-          className="gauge-track"
+          className="gauge-track [stroke:var(--chart-track)]"
           cx={size / 2}
           cy={size / 2}
           r={radius}
@@ -57,7 +58,7 @@ export function Gauge({
           strokeDasharray={`${arc} ${circumference - arc}`}
         />
         <circle
-          className="gauge-value"
+          className="gauge-value [stroke:var(--chart-1)] [transition:stroke-dasharray_620ms_cubic-bezier(0.32,_0.72,_0,_1)]"
           cx={size / 2}
           cy={size / 2}
           r={radius}
@@ -67,7 +68,7 @@ export function Gauge({
           strokeDasharray={`${arc * fraction} ${circumference - arc * fraction}`}
         />
       </svg>
-      <div className="gauge-label" aria-hidden="true">
+      <div className="gauge-label [position:absolute] [display:grid] [place-items:center] [text-align:center] [&_strong]:[font-size:17px] [&_strong]:[font-weight:660] [&_strong]:[letter-spacing:-0.03em] [&_strong]:[font-variant-numeric:tabular-nums] [&_span]:[margin-top:1px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:8.5px] [&_span]:[font-weight:600] [&_span]:[letter-spacing:0.05em] [&_span]:[text-transform:uppercase]" aria-hidden="true">
         <strong>{label}</strong>
         {caption ? <span>{caption}</span> : null}
       </div>
