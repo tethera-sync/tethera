@@ -6,18 +6,74 @@ The goal is not to make code compile at any cost. The goal is to make changes th
 
 Leave the codebase better than you found it.
 
+## Repository context
+
+Tethera is a private, peer-to-peer desktop folder-sync application. It is not a conventional web app or a TypeScript-only project.
+
+The stack is:
+
+* a Bun workspace for JavaScript and TypeScript tooling;
+* Electron and electron-vite for the desktop shell;
+* React, strict TypeScript, Tailwind CSS, and shadcn-style components built on Base UI for the renderer;
+* a Cargo workspace for the Rust sync engine, protocol, storage, crypto, platform, transport, and test support;
+* SQLite for authoritative durable sync and mapping state; and
+* authenticated local RPC and authenticated peer protocols at process and device boundaries.
+
+Before changing behaviour, read the narrowest relevant source of truth:
+
+* `README.md` for the supported stack and root commands;
+* `CONTRIBUTING.md` for repository-wide safety and tooling rules;
+* `docs/02-ARCHITECTURE.md` for the intended process and crate boundaries;
+* `docs/03-SYNC-SEMANTICS.md` for convergence, conflict, deletion, and recovery rules;
+* `docs/05-SECURITY.md` for the threat model;
+* `docs/11-TESTING.md` for required validation;
+* `docs/15-IMPLEMENTATION-STATUS.md` for what is implemented rather than merely planned; and
+* the protocol documents in `docs/` when changing IPC, local RPC, pairing, or peer messages.
+
+Some design documents describe future work. Do not implement against a planned topology as though it already exists. Confirm the live ownership in source and tests, and keep `docs/15-IMPLEMENTATION-STATUS.md` accurate when an implementation boundary moves.
+
+## Non-negotiable architecture boundaries
+
+Preserve the process boundaries unless the task explicitly changes the architecture:
+
+* The React renderer is sandboxed. It must not import Node.js, Electron, filesystem, child-process, database, or private-key APIs.
+* The preload exposes a narrow, capability-shaped `contextBridge` API. Never expose raw `ipcRenderer`, arbitrary channels, unrestricted paths, shell execution, or Node modules.
+* Electron main owns desktop integration, window/tray lifecycle, validated IPC, Rust engine supervision, and the TypeScript-side orchestration that still lives there.
+* The Rust engine and Rust crates own the authoritative mapping database, durable sync state, migrations, and the engine-side domain rules already assigned to them.
+* The TypeScript-to-Rust boundary is authenticated newline-delimited JSON over child-process stdio. Changes to a request, response, method, error code, or protocol version must update both producers and consumers and add compatibility-focused tests.
+* Authenticated peer messages are also untrusted input. Validate their size, shape, participant identity, revision, and path scope before they can affect local state.
+* React state, browser storage, Electron preference state, and legacy JSON are not substitutes for authoritative Rust/SQLite state.
+
+Keep types shared only within the boundary that owns them. TypeScript renderer/main contracts belong in `apps/desktop/src/shared`; Rust wire contracts belong in `sync-protocol`; persistence types and migrations belong in `sync-storage`. Do not create a third competing representation without a concrete boundary reason.
+
+## Data integrity and filesystem safety
+
+Tethera handles user files. A change that is merely convenient is not acceptable if it weakens recovery, path containment, authentication, or durable state.
+
+* Treat local paths, remote paths, directory entries, file metadata, RPC payloads, peer messages, and persisted rows as untrusted at their boundary.
+* Never perform a sync file operation outside the exact approved mapping root. The only permitted paths outside a mapping root are dedicated app-managed state, staging, archive, and recovery locations defined by the existing design; read or write them through their narrow owning modules, never through an arbitrary peer- or renderer-supplied path. Account for traversal, symlinks, junctions, reparse points, case differences, and time-of-check/time-of-use races.
+* Preserve remote Windows drive paths, UNC paths, and Linux paths as opaque values until the machine that owns the path validates or resolves it. Do not run a remote path through host-platform path semantics.
+* Preserve the existing staged-write, digest-verification, fsync, atomic no-replace, archive, and replacement-journal guarantees. Do not replace them with a simpler direct write or rename.
+* Persist multi-step state transitions transactionally. Startup recovery must be idempotent, and a retry must not duplicate an operation or revive deleted state.
+* An unavailable, locked, corrupt, migration-failed, or newer-schema database must fail closed. Never reinterpret it as an empty mapping set, silently recreate it, or fall back to stale legacy state.
+* Do not enable deletion, rename propagation, conflict winner selection, or cleanup of recovery evidence unless the task includes the required recovery semantics and tests.
+* Do not implement cryptographic primitives. Use the existing audited libraries and protocol construction, and preserve domain separation, replay protection, and authenticated identities.
+* Tests must use temporary/synthetic roots. Never point automated tests or development migrations at real user folders.
+
+Linux and Windows are first-class targets. Avoid Unix-only process, permission, separator, atomicity, executable-bit, case-sensitivity, or filename assumptions in shared behaviour. When platform behaviour differs, isolate it in `sync-platform` or the narrowest platform-specific desktop boundary and test both representations.
+
 ## Priorities
 
 When making trade-offs, use this order:
 
-1. Correctness
-2. Simplicity
-3. User experience
-4. Clear architecture
-5. Type safety
-6. Developer experience
-7. Maintainability
-8. Accessibility and security
+1. Data integrity and recoverability
+2. Security and privacy
+3. Correctness
+4. Cross-platform behaviour
+5. Simplicity and clear architecture
+6. User experience and accessibility
+7. Type safety and maintainability
+8. Developer experience
 9. Performance
 10. Delivery speed
 
@@ -98,6 +154,31 @@ Avoid:
 Use the language and framework properly.
 
 In TypeScript, make the type system do useful work.
+
+## TypeScript and Electron
+
+Keep TypeScript strict and follow the renderer/preload/main boundaries above. A compile-time type on one side of IPC, RPC, persistence, or a peer connection does not validate the runtime payload on the other side.
+
+Do not make browser-preview success stand in for Electron runtime verification. Browser previews do not provide the real preload bridge. Likewise, a renderer build does not prove that the packaged Rust binary is present, spawnable, protocol-compatible, or able to recover its database.
+
+## Rust
+
+Use the repository's stable Rust toolchain, respect the workspace's Rust 1.85 minimum and Rust 2024 edition, and do not assume the floating `stable` channel is an exact version pin. `unsafe` is forbidden at workspace level. Keep `cargo fmt` clean and treat Clippy warnings as errors in completed work.
+
+Use these broad crate boundaries, confirming current ownership against source and `docs/15-IMPLEMENTATION-STATUS.md` when the architecture document describes planned or older behaviour:
+
+* `sync-core` contains pure domain and reconciliation rules and should not gain filesystem, network, or SQLite dependencies;
+* `sync-protocol` owns versioned serialisable Rust wire types;
+* `sync-crypto` owns identity and cryptographic integration while delegating primitives to audited crates;
+* `sync-storage` owns SQLite schemas, migrations, journals, and durable state;
+* `sync-platform` owns platform filesystem behaviour;
+* `sync-transport` owns discovery, secure framing, connection, and transport concerns;
+* `sync-engine` composes the implemented engine-side runtime; and
+* `sync-testkit` owns reusable deterministic and fault-oriented test support.
+
+Prefer explicit domain types and `Result`-based errors. Do not use `unwrap`, `expect`, `panic!`, or `unreachable!` on data, filesystem, database, network, peer, or RPC paths. In tests, or for a truly local invariant, an `expect` is acceptable when its message explains the invariant.
+
+For serialised contracts, keep naming and unknown-field behaviour intentional. Rust's `serde` shape, TypeScript's runtime validator/parser, and both sides' tests must agree. Do not assume a successful TypeScript typecheck proves Rust/TypeScript wire compatibility.
 
 ## Never use `any`
 
@@ -249,36 +330,17 @@ src/
 
 Keep feature-specific code with the feature that owns it.
 
-A typical structure might look like:
+A simplified map of this repository is:
 
 ```text
-src/
-  features/
-    auth/
-      components/
-      server/
-      schemas.ts
-      types.ts
-
-    billing/
-      components/
-      server/
-      billing.ts
-      types.ts
-
-  components/
-    ui/
-    layout/
-
-  lib/
-    database/
-    auth/
-    logging/
-
-  app/
+apps/desktop/src/
+  main/       privileged Electron orchestration
+  preload/    narrow context bridge
+  renderer/   React UI
+  shared/     renderer/main contracts
+crates/
+  sync-*/     Rust domains described in docs/02-ARCHITECTURE.md
 ```
-
-This is an example, not a mandatory template.
 
 Follow the architecture already used by the repository when it is sensible.
 
@@ -290,32 +352,29 @@ Shared folders are for code that is actually shared.
 
 ## Avoid dumping grounds
 
-Be suspicious of files and folders named:
+Be suspicious of vague files and folders named:
 
 ```text
 utils
 helpers
 common
-shared
 misc
-services
 types
 constants
-manager
 processor
 ```
 
-Those names are not automatically wrong, but they often become places where architecture goes to die.
+Those names are not automatically wrong, but they often become places where architecture goes to die. Domain names such as `PeerSessionService`, `EngineSupervisor`, or the deliberate `shared` contract boundary are not dumping grounds merely because they use a general suffix.
 
 Prefer names based on what the code does.
 
 For example:
 
 ```text
-format-release-date.ts
-refund-policy.ts
-subscription-permissions.ts
-parse-game-slug.ts
+path-safety.ts
+folder-manifest.ts
+version-archive.ts
+mapping-authority.ts
 ```
 
 is usually clearer than:
@@ -338,7 +397,7 @@ Database modules should not depend on React components.
 
 Generic libraries should not import application routes.
 
-Server-only code must not leak into client bundles.
+Privileged Electron main/preload code, Node-only modules, and Rust integration details must not leak into the renderer bundle.
 
 Avoid circular dependencies.
 
@@ -401,7 +460,7 @@ For React code:
 * avoid unnecessary context providers;
 * use stable keys;
 * keep expensive or stateful work out of render;
-* do not make everything client-side because one child needs interaction.
+* do not move privileged main-process or engine work into the renderer because one component needs interaction.
 
 Some components only need to exist for one screen.
 
@@ -493,16 +552,15 @@ Treat external data as untrusted.
 
 Validate values entering from:
 
-* API requests;
+* Electron IPC calls;
+* local TypeScript-to-Rust RPC;
+* authenticated peer messages;
 * forms;
-* URL parameters;
 * environment variables;
-* third-party APIs;
-* webhooks;
 * imported files;
-* local storage;
-* browser persistence;
-* database data when its shape is not guaranteed.
+* filesystem and watcher APIs;
+* persisted JSON; and
+* SQLite rows when their shape or schema version is not guaranteed.
 
 Use the repository's existing validation system.
 
@@ -552,6 +610,8 @@ Find the race.
 
 ## Database code
 
+The authoritative database belongs to Rust's `sync-storage` crate. Renderer and preload code must not access SQLite, and Electron main must go through the authenticated engine RPC for engine-owned state.
+
 Avoid:
 
 * N+1 queries;
@@ -568,6 +628,8 @@ Do not keep transactions open while doing unrelated work.
 Use database constraints for invariants the database genuinely owns.
 
 Treat schema changes as real migrations, not casual edits.
+
+Migrations must preserve existing installations, run transactionally, be restart-safe and idempotent, and refuse a newer unknown schema without modifying it. Update migration tests and `docs/06-DATA-MODEL.md` or `docs/15-IMPLEMENTATION-STATUS.md` when the persisted contract changes.
 
 ## Performance
 
@@ -625,7 +687,7 @@ Expensive repository-wide checks can live in CI when they do not need to block e
 
 ## Dependencies have a cost
 
-Use the package manager already chosen by the repository.
+Use Bun for the JavaScript/TypeScript workspace and Cargo for Rust.
 
 Do not introduce another lockfile.
 
@@ -747,11 +809,11 @@ If code is no longer needed, remove it.
 
 ## Security
 
-Never trust client-side authorization.
+Never trust renderer state, IPC callers, RPC payloads, discovery packets, paired peers, or path strings merely because they came through an expected code path.
 
-Sensitive operations must be checked at the trusted server boundary.
+Sensitive operations must be checked at the trusted boundary that performs them: validated Electron main IPC, authenticated Rust RPC, or authenticated peer-session dispatch.
 
-Check ownership, not just authentication.
+Check mapping/device participation and path scope, not just authentication.
 
 Do not expose secrets, tokens, credentials, private identifiers, internal metadata, or sensitive user information where they do not belong.
 
@@ -775,12 +837,15 @@ Test behaviour that matters.
 Good candidates include:
 
 * business rules;
-* permissions;
-* money;
+* IPC and RPC contracts;
+* protocol compatibility;
+* mapping revisions and migrations;
 * destructive actions;
 * state transitions;
 * validation;
 * parsing;
+* path containment and cross-platform path representation;
+* interrupted transfer, restart, retry, and recovery behaviour;
 * tricky edge cases;
 * previous regressions.
 
@@ -798,19 +863,23 @@ Do not call a task finished because the editor stopped showing errors.
 
 Use the checks provided by the repository.
 
-That will usually include some combination of:
+Use the narrowest relevant checks while iterating and when completing a task confined to one stack. For a pull request, release, cross-stack change, or high-risk sync/security/persistence change, the full local validation set is:
 
-```text
-format
-lint
-typecheck
-test
-build
+```bash
+bun run desktop:typecheck
+bun run desktop:test
+bun run desktop:build
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+git diff --check
 ```
 
-Use the narrowest useful checks while iterating.
+`bun run check` is a useful combined typecheck/test command, but it does not run the desktop build, Rust formatting, or Clippy. Do not present it as the complete pull-request gate by itself.
 
-Run the broader relevant checks before finishing a substantial change.
+For renderer-only work, manually verify the affected states and interactions. For preload, IPC, engine-spawn, filesystem, updater, tray, packaging, or cross-process work, verify in Electron rather than only a browser. For peer sync or platform-sensitive work, unit tests on one Linux machine are not proof of a real Linux-to-Windows run; state that limitation unless the physical/platform matrix was exercised.
+
+Changes limited to documentation do not require the full application suite unless they alter executable examples or build configuration. Still verify links, commands, formatting, and the final diff.
 
 Do not claim a command passed unless you actually ran it.
 
@@ -877,4 +946,3 @@ Do not hide failed checks.
 Do not write a victory speech.
 
 Just report the result clearly.
-
