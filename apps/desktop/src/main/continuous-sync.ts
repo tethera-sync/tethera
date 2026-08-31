@@ -39,6 +39,23 @@ export interface FileSyncOperation {
   updatedAt: string
 }
 
+export interface ExactConflictChoice {
+  direction: FileSyncDirection
+  localDigest: string
+  localSize: number
+  remoteDigest: string
+  remoteSize: number
+}
+
+export interface PeerFileOperationIdentity {
+  id: number
+  path: string
+  direction: FileSyncDirection
+  sourceDigest: string
+  sourceSize: number
+  expectedDestinationDigest?: string
+}
+
 export interface FileSyncConflict {
   mappingId: string
   path: string
@@ -80,6 +97,59 @@ export function observedFiles(manifest: FileManifest): ObservedFile[] {
     if (!entry.digest) throw new Error(`The full-content scan did not produce a digest for ${entry.path}.`)
     return { path: entry.path, size: entry.size, digest: entry.digest }
   })
+}
+
+/**
+ * Selects durable work whose source and destination still match the observations that created it.
+ * This resumes interrupted work before reconciliation without ever applying a stale operation.
+ */
+export function replayableOperations(
+  operations: FileSyncOperation[],
+  local: ObservedFile[],
+  remote: ObservedFile[],
+): FileSyncOperation[] {
+  const localByPath = new Map(local.map((file) => [file.path, file]))
+  const remoteByPath = new Map(remote.map((file) => [file.path, file]))
+  return operations.filter((operation) => {
+    const source = operation.direction === "push-local"
+      ? localByPath.get(operation.path)
+      : remoteByPath.get(operation.path)
+    const destination = operation.direction === "push-local"
+      ? remoteByPath.get(operation.path)
+      : localByPath.get(operation.path)
+    if (!source || source.digest !== operation.sourceDigest || source.size !== operation.sourceSize) {
+      return false
+    }
+    return operation.expectedDestinationDigest === undefined
+      ? destination === undefined
+      : destination?.digest === operation.expectedDestinationDigest
+  })
+}
+
+/** Mirrors a coordinator's exact conflict choice into the paired computer's local orientation. */
+export function mirrorConflictChoice(choice: ExactConflictChoice): ExactConflictChoice {
+  return {
+    direction: choice.direction === "push-local" ? "pull-remote" : "push-local",
+    localDigest: choice.remoteDigest,
+    localSize: choice.remoteSize,
+    remoteDigest: choice.localDigest,
+    remoteSize: choice.localSize,
+  }
+}
+
+/** Finds the paired participant's exact durable half of one synchronization operation. */
+export function findMirroredPeerOperation(
+  operation: FileSyncOperation,
+  peerOperations: PeerFileOperationIdentity[],
+): PeerFileOperationIdentity | undefined {
+  const peerDirection: FileSyncDirection = operation.direction === "push-local" ? "pull-remote" : "push-local"
+  return peerOperations.find((candidate) =>
+    candidate.path === operation.path &&
+    candidate.direction === peerDirection &&
+    candidate.sourceDigest === operation.sourceDigest &&
+    candidate.sourceSize === operation.sourceSize &&
+    candidate.expectedDestinationDigest === operation.expectedDestinationDigest,
+  )
 }
 
 export function conflictSummary(conflicts: FileSyncConflict[]): string {

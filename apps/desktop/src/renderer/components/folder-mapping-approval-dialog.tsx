@@ -19,6 +19,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { formatBytes } from "@/lib/format"
 
 export function FolderMappingApprovalDialog({
   request,
@@ -177,10 +178,4 @@ function prettyMode(mode: string): string {
   if (mode === "two-way") return "Two-way"
   if (mode === "send-only") return "Receive from them"
   return "Send to them"
-}
-
-function formatBytes(value: number): string {
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  const index = value > 0 ? Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1) : 0
-  return `${(value / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`
 }

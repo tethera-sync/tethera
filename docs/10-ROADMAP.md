@@ -8,10 +8,10 @@ Recursive scan, ignore engine, watcher plus reconciliation, SQLite migrations, s
 
 Delivered local-index foundation:
 
-- SQLite schema v3 is authoritative for folder mappings and verified file-sync state.
+- SQLite schema v4 is authoritative for folder mappings, verified file-sync state, and the replacement/archive journal.
 - Versioned active events, terminal tombstones, exact pending-delivery acknowledgements, and one-time `state.json` migration are implemented.
 - Mapping-store health and fail-closed renderer states are implemented.
-- SQLite schema v3 stores per-file verified baselines, retryable operations, and conflicts.
+- SQLite schema v4 stores per-file verified baselines, retryable operations, conflicts, archive objects, and replacement recovery state.
 - Native recursive watchers plus a periodic safety scan drive continuous reconciliation.
 
 Still outstanding in M1: scan generations/paging, incremental hashing at scale, and moving the live desktop scanner onto a single Rust implementation.
@@ -19,10 +19,10 @@ Still outstanding in M1: scan generations/paging, incremental hashing at scale, 
 ## M2 LAN technical MVP
 Identity/pairing, LAN discovery, encrypted mutual session, folder mapping, previewed initial merge, whole-file transfer, atomic journalled commit, two-way sync, history/archive.
 
-Pairing, authenticated Electron peer sessions, mapping approval, mapping-configuration reconciliation, a coordinated additive initial merge, and safe continuous file updates are implemented. Transfers are chunked and verified; replacements require the destination's last observed digest and use an atomic verified commit. Engine-owned networking, resumable chunks, deletion/rename propagation, and history/archive are not.
+Pairing, authenticated Electron peer sessions, mapping approval, mapping-configuration reconciliation, a coordinated additive initial merge, and safe continuous file updates are implemented. Transfers are chunked and verified; replacements require the destination's last observed digest and use an atomic verified commit. Replaced content has a local content-addressed archive and restart-safe journal, and exact two-copy conflicts can be resolved explicitly through that path. Engine-owned networking, resumable chunks, deletion/rename propagation, and general archive browsing/retention are not implemented.
 
 ## M3 Correctness hardening
-Logical revisions, concurrent conflicts, rename, open files, cross-platform incompatibilities, history restore, retention, one-way modes, removal workflow, property/fault tests.
+Logical revisions, missing-copy/deletion conflicts, rename, open files, cross-platform incompatibilities, general history browsing, retention, removal workflow, and property/fault tests. Two-copy conflict selection, one-way enforcement, and the archive-backed restore primitive are implemented foundations rather than complete lifecycle UX.
 
 ## M4 Remote/performance
 Tailscale route selection, resume, content-defined chunks, bandwidth/metered controls, paged inventories and profiling toward 1 TB collections.
@@ -38,4 +38,4 @@ More devices, native NAT/relay, optional self-hosted rendezvous, other OSes, at-
 
 ## Recommended next pull request
 
-The next milestone should add an explicit archive-backed conflict-resolution flow, using the implemented replacement journal and restore primitive whenever a user chooses a winner. Deletion and rename propagation should remain disabled until that recovery flow is exposed and proven safe end to end.
+The next milestone should add focused archive-history browsing and retention over the implemented replacement journal and restore primitive. Deletion and rename propagation should remain disabled until archive recovery and interruption behavior are proven safe end to end.

@@ -7,16 +7,22 @@ import type {
   ApproveFolderMappingInput,
   BrowseDirectoryInput,
   CreateDirectoryInput,
+  ConflictInspectionInput,
   TetheraApi,
   PreviewFolderMappingInput,
   RequestFolderMappingInput,
   RefreshIncomingMappingPreviewInput,
+  ResolveFileConflictInput,
 } from "../shared/contracts"
 
 const api: TetheraApi = {
   getSnapshot: () => ipcRenderer.invoke("app:get-snapshot"),
   retryMappingStore: () => ipcRenderer.invoke("mapping-store:retry"),
   restoreArchivedVersion: (entryId: string) => ipcRenderer.invoke("archive:restore", entryId),
+  getRecoveryState: () => ipcRenderer.invoke("recovery:get-state"),
+  inspectFileConflict: (input: ConflictInspectionInput) => ipcRenderer.invoke("recovery:inspect-conflict", input),
+  resolveFileConflict: (input: ResolveFileConflictInput) => ipcRenderer.invoke("recovery:resolve-conflict", input),
+  revealConflictFile: (input: ConflictInspectionInput) => ipcRenderer.invoke("recovery:reveal-conflict-file", input),
   pauseAll: () => ipcRenderer.invoke("app:pause-all"),
   resumeAll: () => ipcRenderer.invoke("app:resume-all"),
   browseDirectory: (input: BrowseDirectoryInput) => ipcRenderer.invoke("filesystem:browse-directory", input),

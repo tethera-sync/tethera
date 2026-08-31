@@ -34,6 +34,13 @@ export type DirectoryLocationKind =
   | "drive"
   | "mount"
 
+export type FileConflictKind =
+  | "unbased-divergence"
+  | "simultaneous-modification"
+  | "deletion-not-propagated"
+  | "direction-blocked"
+  | "initial-merge"
+
 export type PairingSessionStatus =
   | "connecting"
   | "confirm-code"
@@ -71,6 +78,8 @@ export interface FolderSummary {
   ignorePatterns: string[]
   historyDays?: number
   historyMaxBytes?: number
+  conflictCount?: number
+  recoveryIssueCount?: number
 }
 
 export interface DeviceSummary {
@@ -229,6 +238,68 @@ export interface MappingStoreState {
   cleanupWarning?: string
 }
 
+export interface RecoveryConflict {
+  mappingId: string
+  folderName: string
+  path: string
+  kind: FileConflictKind
+  detectedAt?: string
+  localDeviceId: string
+  localDeviceName: string
+  localDigest?: string
+  remoteDeviceId: string
+  remoteDeviceName: string
+  remoteDigest?: string
+  resolutionQueued: boolean
+  detail: string
+}
+
+export interface RecoveryIssue {
+  id: string
+  mappingId: string
+  folderName: string
+  path: string
+  state: "recovery-required" | "integrity-failed"
+  detail: string
+}
+
+export interface RecoveryState {
+  conflicts: RecoveryConflict[]
+  issues: RecoveryIssue[]
+}
+
+export interface ConflictInspectionInput {
+  mappingId: string
+  path: string
+}
+
+export interface ConflictCopyInspection {
+  deviceId: string
+  deviceName: string
+  location: "this-computer" | "paired-computer"
+  present: boolean
+  digest?: string
+  size?: number
+  modifiedAt?: string
+}
+
+export interface ConflictInspection {
+  conflict: RecoveryConflict
+  local: ConflictCopyInspection
+  remote: ConflictCopyInspection
+}
+
+export interface ConflictCopyExpectation {
+  deviceId: string
+  digest: string
+  size: number
+}
+
+export interface ResolveFileConflictInput extends ConflictInspectionInput {
+  winnerDeviceId: string
+  inspectedCopies: [ConflictCopyExpectation, ConflictCopyExpectation]
+}
+
 export interface AppSnapshot {
   status: OverallStatus
   route: ConnectionRoute
@@ -316,6 +387,10 @@ export interface TetheraApi {
   getSnapshot(): Promise<AppSnapshot>
   retryMappingStore(): Promise<AppSnapshot>
   restoreArchivedVersion(entryId: string): Promise<AppSnapshot>
+  getRecoveryState(): Promise<RecoveryState>
+  inspectFileConflict(input: ConflictInspectionInput): Promise<ConflictInspection>
+  resolveFileConflict(input: ResolveFileConflictInput): Promise<AppSnapshot>
+  revealConflictFile(input: ConflictInspectionInput): Promise<void>
   pauseAll(): Promise<AppSnapshot>
   resumeAll(): Promise<AppSnapshot>
   browseDirectory(input: BrowseDirectoryInput): Promise<DirectoryListing>

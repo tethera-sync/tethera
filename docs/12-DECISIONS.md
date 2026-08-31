@@ -15,7 +15,7 @@
 | ADR-011 | Two-way immediate default | Expected simple behaviour, configurable. |
 | ADR-012 | Previewed initial merge | Prevent surprising overwrite/delete. |
 | ADR-013 | Causal revisions | Clocks are not sufficient. |
-| ADR-014 | Auto winner + history | One live path with recovery, configurable. |
+| ADR-014 | Explicit winner + history | One live path only after an exact user choice, with the displaced copy preserved. |
 | ADR-015 | Local archives only | Avoid recursive history and traffic. |
 | ADR-016 | Central archive default | Keep metadata outside user roots. |
 | ADR-017 | Time + size retention | Bounded disk with recovery window. |

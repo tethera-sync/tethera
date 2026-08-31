@@ -15,8 +15,8 @@ import net, { type Server, type Socket } from "node:net"
 import type { PairingService } from "./pairing-service"
 
 const DEFAULT_SESSION_PORT = 47_656
-// Version 3 adds durable continuous-reconciliation and verified replacement requests.
-const PROTOCOL_VERSION = 3
+// Version 4 adds conflict-scoped inspection and explicit winner selection.
+const PROTOCOL_VERSION = 4
 const CONNECT_TIMEOUT_MS = 10_000
 const REQUEST_TIMEOUT_MS = 45_000
 const RESPONSE_FLUSH_TIMEOUT_MS = 15_000

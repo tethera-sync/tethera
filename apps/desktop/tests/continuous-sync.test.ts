@@ -4,13 +4,86 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import {
   conflictSummary,
+  findMirroredPeerOperation,
   FolderChangeMonitor,
+  mirrorConflictChoice,
   observedFiles,
+  replayableOperations,
   type FileSyncConflict,
 } from "../src/main/continuous-sync"
 import { invertMode } from "../src/main/mapping-index"
 
 describe("continuous sync helpers", () => {
+  test("replays only durable operations whose source and destination are still exact", () => {
+    const operation = {
+      id: 1,
+      mappingId: "mapping-1",
+      path: "notes.txt",
+      direction: "push-local" as const,
+      sourceDigest: "b".repeat(64),
+      sourceSize: 4,
+      expectedDestinationDigest: "c".repeat(64),
+      status: "pending" as const,
+      attempts: 0,
+      createdAt: "2026-08-31T12:00:00Z",
+      updatedAt: "2026-08-31T12:00:00Z",
+    }
+    expect(replayableOperations(
+      [operation],
+      [{ path: "notes.txt", size: 4, digest: "b".repeat(64) }],
+      [{ path: "notes.txt", size: 4, digest: "c".repeat(64) }],
+    )).toEqual([operation])
+    expect(replayableOperations(
+      [operation],
+      [{ path: "notes.txt", size: 4, digest: "d".repeat(64) }],
+      [{ path: "notes.txt", size: 4, digest: "c".repeat(64) }],
+    )).toEqual([])
+  })
+
+  test("mirrors a conflict choice into the paired computer's orientation", () => {
+    expect(mirrorConflictChoice({
+      direction: "push-local",
+      localDigest: "a".repeat(64),
+      localSize: 10,
+      remoteDigest: "b".repeat(64),
+      remoteSize: 20,
+    })).toEqual({
+      direction: "pull-remote",
+      localDigest: "b".repeat(64),
+      localSize: 20,
+      remoteDigest: "a".repeat(64),
+      remoteSize: 10,
+    })
+  })
+
+  test("binds an acknowledgement to the exact mirrored durable operation", () => {
+    const localOperation = {
+      id: 7,
+      mappingId: "mapping-1",
+      path: "notes.txt",
+      direction: "pull-remote" as const,
+      sourceDigest: "b".repeat(64),
+      sourceSize: 20,
+      expectedDestinationDigest: "a".repeat(64),
+      status: "pending" as const,
+      attempts: 0,
+      createdAt: "2026-08-31T12:00:00Z",
+      updatedAt: "2026-08-31T12:00:00Z",
+    }
+    const exactPeerOperation = {
+      id: 11,
+      path: "notes.txt",
+      direction: "push-local" as const,
+      sourceDigest: "b".repeat(64),
+      sourceSize: 20,
+      expectedDestinationDigest: "a".repeat(64),
+    }
+    expect(findMirroredPeerOperation(localOperation, [
+      { ...exactPeerOperation, id: 10, expectedDestinationDigest: "c".repeat(64) },
+      exactPeerOperation,
+    ])).toEqual(exactPeerOperation)
+  })
+
   test("requires full digests before sending an observation to Rust", () => {
     expect(() => observedFiles({
       rootPath: "/tmp/root",

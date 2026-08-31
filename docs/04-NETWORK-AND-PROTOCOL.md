@@ -9,6 +9,8 @@
 
 Normal use requires no public inbound port and never uses Tailscale Funnel. Application-layer authenticated encryption is mandatory on every route.
 
+The current desktop peer-session protocol is version 4. Version 4 adds conflict-scoped copy inspection and explicit winner selection; incompatible peers fail the authenticated session handshake rather than silently omitting those safety checks.
+
 ## Discovery privacy
 
 Advertise only protocol versions, ephemeral discovery ID and listening port. Never broadcast folder names, usernames or file metadata. Tailscale support should use local client information and not depend on hosted admin APIs, allowing Headscale-backed clients where ordinary peer connectivity works.

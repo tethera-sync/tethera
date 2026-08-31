@@ -11,7 +11,6 @@ import {
   FolderClockIcon,
   FolderIcon,
   FolderOpenIcon,
-  HistoryIcon,
   LaptopIcon,
   LayoutDashboardIcon,
   Link2Icon,
@@ -45,12 +44,14 @@ import { FolderMappingApprovalDialog } from "@/components/folder-mapping-approva
 import { MappingStoreBanner } from "@/components/mapping-store-banner"
 import { PairDeviceDialog } from "@/components/pair-device-dialog"
 import { RevokeDeviceDialog } from "@/components/revoke-device-dialog"
+import { RecoveryView } from "@/components/recovery-view"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Meter } from "@/components/ui/meter"
 import { StatusPill, type Tone } from "@/components/ui/status-pill"
 import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
+import { formatBytes, formatDateTime, formatRelative } from "@/lib/format"
 
 const emptySnapshot: AppSnapshot = {
   status: "offline",
@@ -133,6 +134,10 @@ export function App() {
   const pairedDevice = getPairedDevices(snapshot)[0]
   const pendingMapping = snapshot.mappings.incoming.find((request) => request.status === "pending")
   const attentionCount = snapshot.folders.filter((folder) => folder.status === "needs-attention").length
+  const recoveryCount = snapshot.folders.reduce(
+    (total, folder) => total + (folder.conflictCount ?? 0) + (folder.recoveryIssueCount ?? 0),
+    0,
+  )
   const pendingApprovals = snapshot.pairing.incomingRequests.length + snapshot.mappings.incoming.filter((request) => request.status === "pending").length
   const { enabled: mappingMutationsEnabled, reason: mappingMutationReason } = mappingMutationAvailability(
     snapshot.mappingStore,
@@ -194,6 +199,14 @@ export function App() {
                       ) : null}
                       {item.id === "folders" && attentionCount > 0 ? (
                         <span className="nav-dot [width:6px] [height:6px] [border-radius:999px] [background:var(--warning)] [box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--warning)_22%,_transparent)]" role="img" aria-label={`${attentionCount} folders need attention`} />
+                      ) : null}
+                      {item.id === "history" && recoveryCount > 0 ? (
+                        <span
+                          className="nav-count [min-width:19px] [border-radius:999px] [background:color-mix(in_oklab,_var(--warning)_20%,_transparent)] [padding:2px_6px] [color:var(--warning)] [font-size:9.5px] [font-weight:700] [text-align:center]"
+                          aria-label={`${recoveryCount} recovery items waiting`}
+                        >
+                          {Math.min(recoveryCount, 99)}
+                        </span>
                       ) : null}
                       {item.id === "devices" && pendingApprovals > 0 ? (
                         <span className="nav-dot [width:6px] [height:6px] [border-radius:999px] [background:var(--warning)] [box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--warning)_22%,_transparent)]" role="img" aria-label={`${pendingApprovals} approvals waiting`} />
@@ -266,7 +279,7 @@ export function App() {
             {!loading && view === "devices" ? (
               <DevicesView snapshot={snapshot} onReviewMapping={() => setMappingApprovalOpen(true)} />
             ) : null}
-            {!loading && view === "history" ? <HistoryView /> : null}
+            {!loading && view === "history" ? <RecoveryView snapshot={snapshot} /> : null}
             {!loading && view === "settings" ? <SettingsView snapshot={snapshot} /> : null}
           </div>
         </div>
@@ -663,6 +676,7 @@ function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNaviga
                   folder={folder}
                   mutationsEnabled={mappingMutationsEnabled}
                   disabledReason={mappingMutationReason}
+                  onReviewRecovery={() => onNavigate("history")}
                 />
               ))}
             </section>
@@ -677,10 +691,12 @@ function FolderCard({
   folder,
   mutationsEnabled,
   disabledReason,
+  onReviewRecovery,
 }: {
   folder: FolderSummary
   mutationsEnabled: boolean
   disabledReason: string
+  onReviewRecovery: () => void
 }) {
   const [busy, setBusy] = useState(false)
   const [syncing, setSyncing] = useState(false)
@@ -778,6 +794,11 @@ function FolderCard({
           >
             <RefreshCwIcon data-icon="inline-start" />
             {folder.status === "syncing" ? "Merging…" : "Start initial merge"}
+          </Button>
+        ) : null}
+        {(folder.conflictCount ?? 0) + (folder.recoveryIssueCount ?? 0) > 0 ? (
+          <Button size="sm" variant="outline" onClick={onReviewRecovery}>
+            <CircleAlertIcon data-icon="inline-start" />Review recovery
           </Button>
         ) : null}
         <Button
@@ -985,28 +1006,8 @@ function DevicesView({
 }
 
 /* -------------------------------------------------------------------------- */
-/* Recovery + settings                                                         */
+/* Settings                                                                    */
 /* -------------------------------------------------------------------------- */
-
-function HistoryView() {
-  return (
-    <div className="page-stack [display:grid] [gap:16px] [width:100%] [max-width:1180px] [margin:0_auto]">
-      <section className="section-intro [display:flex] [align-items:center] [justify-content:space-between] [gap:24px] [&_h2]:[margin:0] [&_h2]:[font-size:17px] [&_h2]:[font-weight:650] [&_h2]:[letter-spacing:-0.03em] [&_p]:[margin:3px_0_0] [&_p]:[max-width:80ch] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:11.5px] [&_p]:[line-height:1.5]">
-        <div>
-          <h2>Version history and deleted files</h2>
-          <p>Versions protected during replacement and deletion stay on this computer.</p>
-        </div>
-      </section>
-      <section className="large-empty-state [display:grid] [min-height:220px] [place-items:center] [align-content:center] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--surface)] [padding:32px] [text-align:center] [&_h2]:[margin:13px_0_5px] [&_h2]:[font-size:15px] [&_h2]:[font-weight:640] [&_p]:[max-width:52ch] [&_p]:[margin:0] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:11px] [&_p]:[line-height:1.55]">
-        <div className="large-empty-icon [display:grid] [width:40px] [height:40px] [place-items:center] [border-radius:10px] [background:var(--secondary)] [color:var(--muted-foreground)] [&_svg]:[width:18px] [&_svg]:[height:18px]">
-          <HistoryIcon />
-        </div>
-        <h2>No archived versions</h2>
-        <p>Replaced or deleted files will appear here after a folder has synced.</p>
-      </section>
-    </div>
-  )
-}
 
 function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
   const { settings, mappingStore } = snapshot
@@ -1360,14 +1361,6 @@ function formatRate(bytesPerSecond: number): string {
   return `${formatBytes(bytesPerSecond)}/s`
 }
 
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
-  const value = bytes / 1024 ** exponent
-  return `${value >= 10 || exponent === 0 ? Math.round(value) : value.toFixed(1)} ${units[exponent]}`
-}
-
 function getLocalDevice(snapshot: AppSnapshot): DeviceSummary {
   return (
     snapshot.devices.find((device) => device.status === "this-device") ?? {
@@ -1384,22 +1377,4 @@ function getPairedDevices(snapshot: AppSnapshot): DeviceSummary[] {
   return snapshot.devices.filter(
     (device) => device.id !== "local-device" && (device.status === "online" || device.status === "offline"),
   )
-}
-
-function formatRelative(iso: string): string {
-  const difference = Date.now() - new Date(iso).getTime()
-  const minutes = Math.floor(difference / 60_000)
-  if (minutes < 1) return "Just now"
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
-}
-
-function formatDateTime(iso: string): string {
-  return new Intl.DateTimeFormat("en-GB", {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(iso))
 }

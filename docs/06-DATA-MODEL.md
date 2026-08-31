@@ -87,6 +87,8 @@ The same-directory `.tethera-displaced-*` inode is reserved and excluded from sc
 
 States are `planned`, `archived`, `installed`, `completed`, `aborted`, `recovery-required`, and `integrity-failed`. Sync completion and the `completed` transition share one immediate transaction. Archive staging names are derived from the journal ID; startup can publish a complete verified stage, while partial or corrupt evidence is retained. Startup uses verified live/archive digests and the canonical root identity to roll forward or abort; mismatches remain inspectable failures.
 
+Explicit conflict selection does not add another persistence model or schema version. While the exact `file_sync_conflicts` row remains present, each participant records the user's choice as a normal `file_sync_operations` row in its local orientation, containing the selected direction and exact source/destination metadata. Repeating the same exact choice is idempotent; a stale version or a different queued operation for that path is rejected. Each participant's verified-completion transaction independently advances its baseline, removes its operation, and clears its local conflict after exact completion is recorded; authenticated peer acknowledgement drives the other participant's transaction.
+
 ## Not implemented in this schema
 
-Logical content revisions, scan generations, transfer/chunk resume state, archive retention/pruning, and file deletion propagation remain future work. They must arrive in later versioned migrations rather than being inferred from mapping configuration.
+Logical content revisions, scan generations, transfer/chunk resume state, archive retention/pruning, and file deletion propagation remain future work. They must arrive in later versioned migrations rather than being inferred from mapping configuration. General archive browsing is also not represented by the conflict-resolution projection.

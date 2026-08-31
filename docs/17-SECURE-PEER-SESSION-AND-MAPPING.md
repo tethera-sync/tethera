@@ -28,11 +28,12 @@ The server currently accepts only bounded typed operations:
 - build a read-only file manifest for an explicitly selected folder;
 - submit a folder-mapping proposal;
 - deliver an approval or rejection for a known proposal;
-- deliver a versioned active mapping event or durable mapping tombstone; and
-- coordinate the inverse pass of an explicitly started initial merge; and
+- deliver a versioned active mapping event or durable mapping tombstone;
+- coordinate the inverse pass of an explicitly started initial merge;
+- inspect and durably mirror an exact two-copy conflict choice for an active mapping; and
 - describe and serve approved mapping-relative files in bounded encrypted chunks.
 
-Pairing/discovery and peer-session protocols are version 3. Older applications are filtered during discovery or rejected during negotiation because they do not implement the same coordinated continuous-sync request set.
+Pairing/discovery remains protocol version 3. The authenticated peer-session protocol is version 4 because conflict inspection and mirrored winner selection require the same request set on both computers. Older applications are filtered during discovery or rejected during the relevant negotiation rather than silently omitting those checks.
 
 Remote browsing returns folder names, paths, link/directory type and hidden status. It does not return file names or file contents. Creating a folder from the remote browser is disabled; the receiving user may choose or create a different local destination during approval.
 
@@ -80,7 +81,7 @@ After activation, only the deterministic lower device ID coordinates reconciliat
 
 Both full SHA-256 manifests are reconciled in Rust against a durable common baseline. A new file or a file changed on only one computer becomes a durable directional operation when the mapping mode permits it. Existing destinations are committed only while they still match the expected baseline digest. The receiving device binds the request to its durable pull operation, moves the exact destination entry aside, copies and verifies it in the external content-addressed archive, and records the archive journal before installing the staged replacement. Successful writes update the baseline and journal together. Failed or interrupted operations retain bounded diagnostics and explicit recovery state for restart/reconnect reconciliation.
 
-The first scan marks a mapping observed but never guesses about one-sided legacy files. Simultaneous edits, one-sided deletions, blocked-direction changes, and unbased divergent paths become durable conflicts. The UI reports their paths and states explicitly. Tethera does not pick a newest timestamp, delete either copy, or claim that history exists.
+The first scan marks a mapping observed but never guesses about one-sided legacy files. Simultaneous edits, one-sided deletions, blocked-direction changes, and unbased divergent paths become durable conflicts. The UI reports their paths and states explicitly. For two present copies, the user may choose one only after both authenticated participants freshly verify the device-bound digests and sizes the renderer displayed; the exact mirrored choice is durable on both computers before transfer, acknowledgements name its operation ID, and the receiving side archives its displaced copy through the normal replacement journal. Tethera does not pick a newest timestamp or delete either copy. Missing-copy conflicts remain untouched, and unresolved replacement recovery evidence blocks later reconciliation.
 
 ## Configuration reconciliation and removal
 

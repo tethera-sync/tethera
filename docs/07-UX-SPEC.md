@@ -6,7 +6,7 @@ A calm utility answering: are devices connected, are folders current, and does a
 
 ## Navigation
 
-Overview, Folders, Activity, History, Devices, Settings; connection indicator in sidebar footer.
+Overview, Folders, Activity, Recovery, Devices, Settings; connection indicator in sidebar footer.
 
 ## Overview
 
@@ -40,9 +40,9 @@ Virtualised feed filtered by transfers, changes, conflicts, warnings/errors and 
 
 Search path, filter rule/preset, show exact matching pattern, test paths, edit rules, and preview which items enter/leave sync.
 
-## History
+## Recovery
 
-Search/group by live path, show reason/device/size/date/expiry, restore original/alternate, pin and permanent delete. Restore creates a new revision and protects current live content first.
+Show durable conflicts and replacement-journal failures first. A two-copy conflict displays both devices, current sizes, modified times and SHA-256 values; only an exact copy allowed by the mapping direction can be selected, and the displaced copy is archived before replacement. Missing-copy conflicts remain read-only. General archive search/grouping, expiry, pinning and permanent deletion are later history-browser work; restore creates a new revision and protects current live content first.
 
 ## Devices
 
