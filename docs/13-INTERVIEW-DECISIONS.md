@@ -24,7 +24,7 @@
 - Central configurable local archive; no default archive replication.
 - Rename detection, signed update notification/optional auto install.
 - Logical revisions rather than timestamps.
-- Auto concurrent winner with loser in history, configurable.
+- Explicit concurrent winner selection with the displaced copy preserved in history.
 - Ask which copies to retain when removing a folder pair.
 - Visible configurable hidden/system presets.
 - Electron + React + TypeScript + Vite + Tailwind + shadcn Base UI.

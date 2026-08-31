@@ -13,7 +13,9 @@ use sync_core::manifest::{
 };
 use sync_platform::scan::scan_folder;
 use sync_protocol::{HealthResponse, MappingStoreHealth, ProtocolVersion, RpcRequest, RpcResponse};
-use sync_storage::file_sync::ReconcileRequest;
+use sync_storage::file_sync::{
+    AuthorizeFileApplicationRequest, ReconcileRequest, ResolveConflictRequest,
+};
 use sync_storage::mapping::{
     LegacyImportRequest, LegacyMigrationState, MappingConfiguration, MappingEvent, MappingStore,
     MappingStoreError, check_identifier,
@@ -315,6 +317,8 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
             handle_mapping_record_migration_failure(request, mapping_store)
         }
         "fileSync.reconcile" => handle_file_sync_reconcile(request, mapping_store),
+        "fileSync.resolveConflict" => handle_file_sync_resolve_conflict(request, mapping_store),
+        "fileSync.authorizeApply" => handle_file_sync_authorize_apply(request, mapping_store),
         "fileSync.getState" => handle_file_sync_get_state(request, mapping_store),
         "fileSync.complete" => handle_file_sync_complete(request, mapping_store),
         "fileSync.applyVerified" => handle_file_sync_apply_verified(request, mapping_store),
@@ -688,6 +692,50 @@ fn handle_file_sync_reconcile(request: RpcRequest, mapping_store: &MappingStoreS
     }
 }
 
+fn handle_file_sync_resolve_conflict(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: ResolveConflictRequest =
+        match parse_params(request.params, "fileSync.resolveConflict") {
+            Ok(params) => params,
+            Err(message) => {
+                return error_response_with_code(request.id, "INVALID_PARAMS", message);
+            }
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.resolve_file_conflict(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(request.id, "Failed to resolve file conflict", &error),
+    }
+}
+
+fn handle_file_sync_authorize_apply(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: AuthorizeFileApplicationRequest =
+        match parse_params(request.params, "fileSync.authorizeApply") {
+            Ok(params) => params,
+            Err(message) => {
+                return error_response_with_code(request.id, "INVALID_PARAMS", message);
+            }
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.authorize_file_application(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => {
+            store_error_response(request.id, "File application was not authorized", &error)
+        }
+    }
+}
+
 fn handle_file_sync_get_state(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
     let id = match mapping_id(request.params, "fileSync.getState") {
         Ok(id) => id,
@@ -734,19 +782,8 @@ fn handle_file_sync_complete(request: RpcRequest, mapping_store: &MappingStoreSl
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct FileSyncApplyVerifiedParams {
-    mapping_id: String,
-    path: String,
-    digest: String,
-    size: i64,
-    verified_at: String,
-    replacement_journal_id: Option<String>,
-}
-
 fn handle_file_sync_apply_verified(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
-    let params: FileSyncApplyVerifiedParams =
+    let params: sync_storage::file_sync::ApplyVerifiedFileRequest =
         match parse_params(request.params, "fileSync.applyVerified") {
             Ok(params) => params,
             Err(message) => {
@@ -757,14 +794,7 @@ fn handle_file_sync_apply_verified(request: RpcRequest, mapping_store: &MappingS
         Ok(store) => store,
         Err(failure) => return rpc_failure_response(request.id, failure),
     };
-    match store.apply_verified_file(
-        &params.mapping_id,
-        &params.path,
-        &params.digest,
-        params.size,
-        &params.verified_at,
-        params.replacement_journal_id.as_deref(),
-    ) {
+    match store.apply_verified_file(&params) {
         Ok(state) => success_response(request.id, state),
         Err(error) => store_error_response(request.id, "Failed to record verified file", &error),
     }
@@ -1265,6 +1295,8 @@ mod tests {
             "mapping.importLegacy",
             "mapping.recordMigrationFailure",
             "fileSync.reconcile",
+            "fileSync.resolveConflict",
+            "fileSync.authorizeApply",
             "fileSync.getState",
             "fileSync.complete",
             "fileSync.applyVerified",
@@ -1599,6 +1631,79 @@ mod tests {
         );
         assert_eq!(response["result"]["initialized"], true);
         assert_eq!(response["result"]["operations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn file_sync_rpc_records_an_exact_conflict_choice() {
+        let store = ready_store();
+        let mut upsert: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("mapping json");
+        upsert["mapping"]["setupStatus"] = serde_json::json!("active");
+        assert_eq!(
+            handle_line(
+                &request("mapping.upsert", &upsert.to_string()),
+                "correct",
+                &store,
+            )["ok"],
+            true
+        );
+
+        let local_digest = "b".repeat(64);
+        let remote_digest = "c".repeat(64);
+        let reconcile = serde_json::json!({
+            "mappingId": "mapping-1",
+            "local": [{ "path": "notes.txt", "size": 4, "digest": local_digest }],
+            "remote": [{ "path": "notes.txt", "size": 4, "digest": remote_digest }],
+            "mode": "two-way",
+            "observedAt": "2026-08-01T00:01:00Z",
+            "queueOperations": true,
+        });
+        assert_eq!(
+            handle_line(
+                &request("fileSync.reconcile", &reconcile.to_string()),
+                "correct",
+                &store,
+            )["result"]["conflicts"][0]["path"],
+            "notes.txt"
+        );
+
+        let resolution = serde_json::json!({
+            "mappingId": "mapping-1",
+            "path": "notes.txt",
+            "direction": "pull-remote",
+            "localDigest": "b".repeat(64),
+            "localSize": 4,
+            "remoteDigest": "c".repeat(64),
+            "remoteSize": 4,
+            "requestedAt": "2026-08-01T00:02:00Z",
+        });
+        let response = handle_line(
+            &request("fileSync.resolveConflict", &resolution.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["result"]["operations"][0]["direction"],
+            "pull-remote"
+        );
+        assert_eq!(response["result"]["conflicts"][0]["path"], "notes.txt");
+
+        let authorization = serde_json::json!({
+            "mappingId": "mapping-1",
+            "path": "notes.txt",
+            "digest": "c".repeat(64),
+            "size": 4,
+            "expectedDestinationDigest": "b".repeat(64),
+        });
+        let authorized = handle_line(
+            &request("fileSync.authorizeApply", &authorization.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(authorized["ok"], true);
+        assert_eq!(authorized["result"]["alreadyVerified"], false);
+        assert!(authorized["result"]["operationId"].is_number());
     }
 
     #[test]

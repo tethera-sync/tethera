@@ -51,9 +51,9 @@
 ### Conflicts
 
 - Use logical revision metadata, not wall-clock time alone.
-- Concurrent edits default to a deterministic winner at the live path.
-- Preserve the loser in history and record a conflict event.
-- Folder policy may instead keep both, ask, or pause the entry.
+- Concurrent edits remain untouched until the user selects one exact current copy.
+- Preserve the displaced copy in history and record the resolution event.
+- Missing-copy conflicts remain paused until deletion has recovery-safe semantics.
 
 ### Desktop experience
 

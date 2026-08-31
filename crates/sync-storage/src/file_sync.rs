@@ -124,6 +124,49 @@ pub struct ReconcileRequest {
     pub queue_operations: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveConflictRequest {
+    pub mapping_id: String,
+    pub path: String,
+    pub direction: SyncDirection,
+    pub local_digest: String,
+    pub local_size: i64,
+    pub remote_digest: String,
+    pub remote_size: i64,
+    pub requested_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizeFileApplicationRequest {
+    pub mapping_id: String,
+    pub path: String,
+    pub digest: String,
+    pub size: i64,
+    pub expected_destination_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApplyVerifiedFileRequest {
+    pub operation_id: i64,
+    pub mapping_id: String,
+    pub path: String,
+    pub digest: String,
+    pub size: i64,
+    pub verified_at: String,
+    pub replacement_journal_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileApplicationAuthorization {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<i64>,
+    pub already_verified: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconcileResult {
@@ -194,6 +237,12 @@ impl MappingStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         require_active_mapping(&transaction, &request.mapping_id)?;
+        if has_active_replacement_journal(&transaction, &request.mapping_id)? {
+            return Err(MappingStoreError::Invalid(
+                "file reconciliation is blocked by an active replacement recovery journal"
+                    .to_owned(),
+            ));
+        }
         let initialized = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM file_sync_mapping_state WHERE mapping_id = ?1)",
             params![request.mapping_id],
@@ -255,6 +304,158 @@ impl MappingStore {
         })
     }
 
+    /// Turns one exact two-sided conflict into durable retryable transfer work.
+    ///
+    /// The conflict remains present until the normal verified-operation completion path advances
+    /// the common baseline. Repeating the same choice is idempotent; a different or stale choice
+    /// is rejected rather than replacing work that may already be in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, missing-conflict, stale-conflict, active-operation, mapping-state, or
+    /// database error without committing a partial transition.
+    pub fn resolve_file_conflict(
+        &self,
+        request: &ResolveConflictRequest,
+    ) -> Result<FileSyncState, MappingStoreError> {
+        self.ensure_import_completed()?;
+        check_identifier("mappingId", &request.mapping_id)?;
+        validate_path(&request.path)?;
+        validate_digest(&request.local_digest)?;
+        validate_size(request.local_size)?;
+        validate_digest(&request.remote_digest)?;
+        validate_size(request.remote_size)?;
+        validate_timestamp("requestedAt", &request.requested_at)?;
+
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        require_active_mapping(&transaction, &request.mapping_id)?;
+        let conflict = read_conflicts(&transaction, &request.mapping_id)?
+            .into_iter()
+            .find(|conflict| conflict.path == request.path)
+            .ok_or_else(|| {
+                MappingStoreError::NotFound(format!(
+                    "file conflict {}:{}",
+                    request.mapping_id, request.path
+                ))
+            })?;
+        if conflict.local_digest.as_deref() != Some(request.local_digest.as_str())
+            || conflict.remote_digest.as_deref() != Some(request.remote_digest.as_str())
+        {
+            return Err(MappingStoreError::Invalid(
+                "the file conflict changed before the selected version could be recorded"
+                    .to_owned(),
+            ));
+        }
+
+        let operation = match request.direction {
+            SyncDirection::PushLocal => PlannedOperation {
+                path: request.path.clone(),
+                direction: request.direction,
+                source_digest: request.local_digest.clone(),
+                source_size: request.local_size,
+                expected_destination_digest: Some(request.remote_digest.clone()),
+            },
+            SyncDirection::PullRemote => PlannedOperation {
+                path: request.path.clone(),
+                direction: request.direction,
+                source_digest: request.remote_digest.clone(),
+                source_size: request.remote_size,
+                expected_destination_digest: Some(request.local_digest.clone()),
+            },
+        };
+        if let Some(existing) = read_operations(&transaction, &request.mapping_id)?
+            .into_iter()
+            .find(|candidate| candidate.path == request.path)
+        {
+            let same_choice = existing.direction == operation.direction
+                && existing.source_digest == operation.source_digest
+                && existing.source_size == operation.source_size
+                && existing.expected_destination_digest == operation.expected_destination_digest;
+            if !same_choice {
+                return Err(MappingStoreError::Invalid(
+                    "a different file operation is already pending for this conflict".to_owned(),
+                ));
+            }
+            transaction.rollback()?;
+            return self.file_sync_state(&request.mapping_id);
+        }
+
+        insert_operation(
+            &transaction,
+            &request.mapping_id,
+            &request.requested_at,
+            &operation,
+        )?;
+        transaction.commit()?;
+        self.file_sync_state(&request.mapping_id)
+    }
+
+    /// Authorizes an incoming file application only when it matches exact durable pull work.
+    /// A missing operation is accepted solely as an idempotent retry of the current verified
+    /// baseline, never as permission to mutate the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, inactive-mapping, unauthorized-application, corrupt-metadata, or
+    /// database error.
+    pub fn authorize_file_application(
+        &self,
+        request: &AuthorizeFileApplicationRequest,
+    ) -> Result<FileApplicationAuthorization, MappingStoreError> {
+        self.ensure_import_completed()?;
+        check_identifier("mappingId", &request.mapping_id)?;
+        validate_path(&request.path)?;
+        validate_digest(&request.digest)?;
+        validate_size(request.size)?;
+        if let Some(digest) = request.expected_destination_digest.as_deref() {
+            validate_digest(digest)?;
+        }
+
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        require_active_mapping(&transaction, &request.mapping_id)?;
+        let operations = read_operations(&transaction, &request.mapping_id)?;
+        if let Some(operation) = operations.iter().find(|operation| {
+            operation.path == request.path
+                && operation.direction == SyncDirection::PullRemote
+                && operation.source_digest == request.digest
+                && operation.source_size == request.size
+                && operation.expected_destination_digest == request.expected_destination_digest
+        }) {
+            let result = FileApplicationAuthorization {
+                operation_id: Some(operation.id),
+                already_verified: false,
+            };
+            transaction.commit()?;
+            return Ok(result);
+        }
+        if operations
+            .iter()
+            .any(|operation| operation.path == request.path)
+        {
+            return Err(MappingStoreError::Invalid(
+                "incoming file application does not match the durable operation".to_owned(),
+            ));
+        }
+        let baseline = read_baselines(&transaction, &request.mapping_id)?
+            .get(&request.path)
+            .cloned();
+        let has_conflict = read_conflicts(&transaction, &request.mapping_id)?
+            .iter()
+            .any(|conflict| conflict.path == request.path);
+        if baseline.as_ref() == Some(&(request.digest.clone(), request.size)) && !has_conflict {
+            transaction.commit()?;
+            return Ok(FileApplicationAuthorization {
+                operation_id: None,
+                already_verified: true,
+            });
+        }
+        Err(MappingStoreError::Invalid(
+            "incoming file application has no matching durable operation".to_owned(),
+        ))
+    }
+
     /// Commits a successfully verified operation into the common baseline.
     ///
     /// # Errors
@@ -314,46 +515,69 @@ impl MappingStore {
     /// Returns a validation, inactive-mapping, migration-state, or database error.
     pub fn apply_verified_file(
         &self,
-        mapping_id: &str,
-        path: &str,
-        digest: &str,
-        size: i64,
-        verified_at: &str,
-        replacement_journal_id: Option<&str>,
+        request: &ApplyVerifiedFileRequest,
     ) -> Result<FileSyncState, MappingStoreError> {
         self.ensure_import_completed()?;
-        check_identifier("mappingId", mapping_id)?;
-        validate_path(path)?;
-        validate_digest(digest)?;
-        validate_size(size)?;
-        validate_timestamp("verifiedAt", verified_at)?;
+        check_identifier("mappingId", &request.mapping_id)?;
+        validate_path(&request.path)?;
+        validate_digest(&request.digest)?;
+        validate_size(request.size)?;
+        validate_timestamp("verifiedAt", &request.verified_at)?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        require_active_mapping(&transaction, mapping_id)?;
-        let operation = read_operations(&transaction, mapping_id)?
-            .into_iter()
-            .find(|operation| operation.path == path && operation.source_digest == digest);
-        let installed_entry = operation
-            .as_ref()
-            .map(|operation| {
-                installed_replacement_entry(&transaction, operation, replacement_journal_id)
-            })
-            .transpose()?
-            .flatten();
-        upsert_baseline(&transaction, mapping_id, path, digest, size, verified_at)?;
+        require_active_mapping(&transaction, &request.mapping_id)?;
+        let operation = operation_by_id(&transaction, request.operation_id)?;
+        let Some(operation) = operation else {
+            let baseline = read_baselines(&transaction, &request.mapping_id)?
+                .get(&request.path)
+                .cloned();
+            let has_conflict = read_conflicts(&transaction, &request.mapping_id)?
+                .iter()
+                .any(|conflict| conflict.path == request.path);
+            if baseline.as_ref() == Some(&(request.digest.clone(), request.size)) && !has_conflict {
+                transaction.commit()?;
+                return self.file_sync_state(&request.mapping_id);
+            }
+            return Err(MappingStoreError::Invalid(
+                "verified file did not match durable synchronization work".to_owned(),
+            ));
+        };
+        if operation.mapping_id != request.mapping_id
+            || operation.path != request.path
+            || operation.direction != SyncDirection::PullRemote
+            || operation.source_digest != request.digest
+            || operation.source_size != request.size
+        {
+            return Err(MappingStoreError::Invalid(
+                "verified file did not match the exact durable pull operation".to_owned(),
+            ));
+        }
+        let installed_entry = installed_replacement_entry(
+            &transaction,
+            &operation,
+            request.replacement_journal_id.as_deref(),
+        )?;
+        upsert_baseline(
+            &transaction,
+            &request.mapping_id,
+            &request.path,
+            &request.digest,
+            request.size,
+            &request.verified_at,
+        )?;
         transaction.execute(
-            "DELETE FROM file_sync_operations WHERE mapping_id = ?1 AND relative_path = ?2",
-            params![mapping_id, path],
+            "DELETE FROM file_sync_operations WHERE id = ?1",
+            params![request.operation_id],
         )?;
         if let Some(entry_id) = installed_entry {
-            mark_completed(&transaction, &entry_id, verified_at)?;
+            mark_completed(&transaction, &entry_id, &request.verified_at)?;
         }
         transaction.execute(
             "DELETE FROM file_sync_conflicts WHERE mapping_id = ?1 AND relative_path = ?2",
-            params![mapping_id, path],
+            params![request.mapping_id, request.path],
         )?;
         transaction.commit()?;
-        self.file_sync_state(mapping_id)
+        self.file_sync_state(&request.mapping_id)
     }
 
     /// Persists a bounded failure diagnostic and increments the operation attempt count.
@@ -547,6 +771,8 @@ fn persist_operations(
             )
         })
         .collect::<HashMap<_, _>>();
+    let active_replacement_operation_ids =
+        active_replacement_operation_ids(transaction, &request.mapping_id)?;
     let desired_keys = if request.queue_operations {
         operations
             .iter()
@@ -562,6 +788,9 @@ fn persist_operations(
     };
     for (key, operation) in &existing {
         if !desired_keys.contains(key) {
+            if active_replacement_operation_ids.contains(&operation.id) {
+                continue;
+            }
             transaction.execute(
                 "DELETE FROM file_sync_operations WHERE id = ?1",
                 params![operation.id],
@@ -580,11 +809,55 @@ fn persist_operations(
                     && current.expected_destination_digest == operation.expected_destination_digest
             });
             if !unchanged {
-                insert_operation(transaction, request, operation)?;
+                if existing
+                    .get(&key)
+                    .is_some_and(|current| active_replacement_operation_ids.contains(&current.id))
+                {
+                    return Err(MappingStoreError::Invalid(
+                        "reconciliation cannot replace an operation with an active recovery journal"
+                            .to_owned(),
+                    ));
+                }
+                insert_operation(
+                    transaction,
+                    &request.mapping_id,
+                    &request.observed_at,
+                    operation,
+                )?;
             }
         }
     }
     Ok(())
+}
+
+fn active_replacement_operation_ids(
+    transaction: &Transaction<'_>,
+    mapping_id: &str,
+) -> Result<BTreeSet<i64>, MappingStoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT sync_operation_id FROM file_replacement_journal
+         WHERE mapping_id = ?1 AND sync_operation_id IS NOT NULL
+           AND state IN ('planned', 'archived', 'installed', 'recovery-required', 'integrity-failed')",
+    )?;
+    let rows = statement.query_map(params![mapping_id], |row| row.get::<_, i64>(0))?;
+    rows.collect::<Result<BTreeSet<_>, _>>().map_err(Into::into)
+}
+
+fn has_active_replacement_journal(
+    transaction: &Transaction<'_>,
+    mapping_id: &str,
+) -> Result<bool, MappingStoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM file_replacement_journal
+                WHERE mapping_id = ?1
+                  AND state IN ('planned', 'archived', 'installed', 'recovery-required', 'integrity-failed')
+            )",
+            params![mapping_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
 }
 
 fn persist_conflicts(
@@ -641,7 +914,8 @@ fn persist_conflicts(
 
 fn insert_operation(
     transaction: &Transaction<'_>,
-    request: &ReconcileRequest,
+    mapping_id: &str,
+    created_at: &str,
     operation: &PlannedOperation,
 ) -> Result<(), MappingStoreError> {
     transaction.execute(
@@ -656,13 +930,13 @@ fn insert_operation(
             status = 'pending', attempts = 0, last_error = NULL,
             created_at = excluded.created_at, updated_at = excluded.updated_at",
         params![
-            request.mapping_id,
+            mapping_id,
             operation.path,
             operation.direction.as_str(),
             operation.source_digest,
             operation.source_size,
             operation.expected_destination_digest,
-            request.observed_at,
+            created_at,
         ],
     )?;
     Ok(())
@@ -975,6 +1249,7 @@ fn read_conflicts(
 mod tests {
     use super::*;
     use crate::mapping::{LegacyImportRequest, MappingConfiguration};
+    use crate::version_archive::PrepareReplacementRequest;
 
     const NOW: &str = "2026-08-08T12:00:00Z";
 
@@ -1041,6 +1316,35 @@ mod tests {
                 queue_operations: true,
             })
             .expect("reconcile")
+    }
+
+    fn apply_verified(
+        store: &MappingStore,
+        operation_id: i64,
+        path: &str,
+        digest: &str,
+        replacement_journal_id: Option<&str>,
+    ) -> Result<FileSyncState, MappingStoreError> {
+        store.apply_verified_file(&ApplyVerifiedFileRequest {
+            operation_id,
+            mapping_id: "mapping-1".to_owned(),
+            path: path.to_owned(),
+            digest: digest.to_owned(),
+            size: 4,
+            verified_at: NOW.to_owned(),
+            replacement_journal_id: replacement_journal_id.map(str::to_owned),
+        })
+    }
+
+    fn assert_no_conflicts(store: &MappingStore, participant: &str) {
+        assert!(
+            store
+                .file_sync_state("mapping-1")
+                .unwrap_or_else(|error| panic!("read {participant} state: {error}"))
+                .conflicts
+                .is_empty(),
+            "{participant} retained a conflict after exact completion"
+        );
     }
 
     #[test]
@@ -1242,6 +1546,312 @@ mod tests {
             result.conflicts[0].kind,
             ConflictKind::SimultaneousModification
         );
+    }
+
+    #[test]
+    fn an_explicit_exact_conflict_choice_becomes_durable_retryable_work() {
+        let store = active_store();
+        reconcile(
+            &store,
+            vec![file("notes.txt", 'a')],
+            vec![file("notes.txt", 'a')],
+        );
+        reconcile(
+            &store,
+            vec![file("notes.txt", 'b')],
+            vec![file("notes.txt", 'c')],
+        );
+
+        let resolved = store
+            .resolve_file_conflict(&ResolveConflictRequest {
+                mapping_id: "mapping-1".to_owned(),
+                path: "notes.txt".to_owned(),
+                direction: SyncDirection::PushLocal,
+                local_digest: "b".repeat(64),
+                local_size: 4,
+                remote_digest: "c".repeat(64),
+                remote_size: 4,
+                requested_at: "2026-08-08T12:01:00Z".to_owned(),
+            })
+            .expect("resolve exact conflict");
+
+        assert_eq!(resolved.operations.len(), 1);
+        assert_eq!(resolved.operations[0].direction, SyncDirection::PushLocal);
+        assert_eq!(resolved.operations[0].source_digest, "b".repeat(64));
+        assert_eq!(
+            resolved.operations[0].expected_destination_digest,
+            Some("c".repeat(64))
+        );
+        assert_eq!(resolved.conflicts.len(), 1);
+
+        let repeated = store
+            .resolve_file_conflict(&ResolveConflictRequest {
+                mapping_id: "mapping-1".to_owned(),
+                path: "notes.txt".to_owned(),
+                direction: SyncDirection::PushLocal,
+                local_digest: "b".repeat(64),
+                local_size: 4,
+                remote_digest: "c".repeat(64),
+                remote_size: 4,
+                requested_at: "2026-08-08T12:02:00Z".to_owned(),
+            })
+            .expect("repeat exact resolution");
+        assert_eq!(repeated.operations[0].id, resolved.operations[0].id);
+    }
+
+    #[test]
+    fn conflict_resolution_rejects_stale_or_missing_versions() {
+        let store = active_store();
+        reconcile(
+            &store,
+            vec![file("notes.txt", 'b')],
+            vec![file("notes.txt", 'c')],
+        );
+
+        let stale = store.resolve_file_conflict(&ResolveConflictRequest {
+            mapping_id: "mapping-1".to_owned(),
+            path: "notes.txt".to_owned(),
+            direction: SyncDirection::PullRemote,
+            local_digest: "d".repeat(64),
+            local_size: 4,
+            remote_digest: "c".repeat(64),
+            remote_size: 4,
+            requested_at: "2026-08-08T12:01:00Z".to_owned(),
+        });
+        assert!(stale.is_err());
+
+        let one_sided = active_store();
+        reconcile(&one_sided, vec![file("only-here.txt", 'a')], Vec::new());
+        let missing = one_sided.resolve_file_conflict(&ResolveConflictRequest {
+            mapping_id: "mapping-1".to_owned(),
+            path: "only-here.txt".to_owned(),
+            direction: SyncDirection::PushLocal,
+            local_digest: "a".repeat(64),
+            local_size: 4,
+            remote_digest: "b".repeat(64),
+            remote_size: 4,
+            requested_at: "2026-08-08T12:01:00Z".to_owned(),
+        });
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn incoming_application_requires_exact_durable_work_or_an_identical_baseline() {
+        let store = active_store();
+        reconcile(&store, Vec::new(), Vec::new());
+        reconcile(&store, Vec::new(), vec![file("remote.txt", 'b')]);
+
+        let authorized = store
+            .authorize_file_application(&AuthorizeFileApplicationRequest {
+                mapping_id: "mapping-1".to_owned(),
+                path: "remote.txt".to_owned(),
+                digest: "b".repeat(64),
+                size: 4,
+                expected_destination_digest: None,
+            })
+            .expect("exact durable pull is authorized");
+        assert!(!authorized.already_verified);
+        assert!(authorized.operation_id.is_some());
+
+        let unauthorized = store.authorize_file_application(&AuthorizeFileApplicationRequest {
+            mapping_id: "mapping-1".to_owned(),
+            path: "remote.txt".to_owned(),
+            digest: "c".repeat(64),
+            size: 4,
+            expected_destination_digest: None,
+        });
+        assert!(unauthorized.is_err());
+
+        let operation_id = authorized.operation_id.expect("authorized operation id");
+        let wrong_operation = apply_verified(
+            &store,
+            operation_id + 1,
+            "remote.txt",
+            &"b".repeat(64),
+            None,
+        );
+        assert!(wrong_operation.is_err());
+        assert_eq!(
+            store
+                .file_sync_state("mapping-1")
+                .expect("state after rejected acknowledgement")
+                .operations[0]
+                .id,
+            operation_id
+        );
+
+        apply_verified(&store, operation_id, "remote.txt", &"b".repeat(64), None)
+            .expect("record verified incoming file");
+        let repeated = store
+            .authorize_file_application(&AuthorizeFileApplicationRequest {
+                mapping_id: "mapping-1".to_owned(),
+                path: "remote.txt".to_owned(),
+                digest: "b".repeat(64),
+                size: 4,
+                expected_destination_digest: None,
+            })
+            .expect("lost acknowledgement is idempotent");
+        assert!(repeated.already_verified);
+        assert_eq!(repeated.operation_id, None);
+    }
+
+    #[test]
+    fn recovery_issue_blocks_reconciliation_without_orphaning_its_operation() {
+        let store = active_store();
+        reconcile(
+            &store,
+            vec![file("notes.txt", 'a')],
+            vec![file("notes.txt", 'a')],
+        );
+        let pending = reconcile(
+            &store,
+            vec![file("notes.txt", 'a')],
+            vec![file("notes.txt", 'b')],
+        );
+        let operation = pending.operations[0].clone();
+        store
+            .prepare_replacement(&PrepareReplacementRequest {
+                id: "replacement-recovery-1".to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                path: "notes.txt".to_owned(),
+                sync_operation_id: Some(operation.id),
+                old_digest: "a".repeat(64),
+                old_size: 4,
+                replacement_digest: "b".repeat(64),
+                replacement_size: 4,
+                local_root: "/tmp/a".to_owned(),
+                created_at: NOW.to_owned(),
+            })
+            .expect("prepare replacement");
+        store
+            .record_replacement_issue(
+                "replacement-recovery-1",
+                false,
+                "installation interrupted",
+                NOW,
+            )
+            .expect("record recovery issue");
+
+        let result = store.reconcile_files(&ReconcileRequest {
+            mapping_id: "mapping-1".to_owned(),
+            local: vec![file("notes.txt", 'c')],
+            remote: vec![file("notes.txt", 'c')],
+            mode: "two-way".to_owned(),
+            observed_at: NOW.to_owned(),
+            queue_operations: true,
+        });
+        assert!(result.is_err());
+
+        let state = store.file_sync_state("mapping-1").expect("state");
+        assert_eq!(state.operations, vec![operation]);
+        assert_eq!(state.recovery_issues.len(), 1);
+    }
+
+    #[test]
+    fn mirrored_two_peer_choice_archives_the_receiver_and_clears_both_conflicts() {
+        let coordinator = active_store();
+        let peer = active_store();
+        reconcile(
+            &coordinator,
+            vec![file("notes.txt", 'a')],
+            vec![file("notes.txt", 'a')],
+        );
+        reconcile(
+            &peer,
+            vec![file("notes.txt", 'a')],
+            vec![file("notes.txt", 'a')],
+        );
+        reconcile(
+            &coordinator,
+            vec![file("notes.txt", 'b')],
+            vec![file("notes.txt", 'c')],
+        );
+        reconcile(
+            &peer,
+            vec![file("notes.txt", 'c')],
+            vec![file("notes.txt", 'b')],
+        );
+
+        let coordinator_state = coordinator
+            .resolve_file_conflict(&ResolveConflictRequest {
+                mapping_id: "mapping-1".to_owned(),
+                path: "notes.txt".to_owned(),
+                direction: SyncDirection::PushLocal,
+                local_digest: "b".repeat(64),
+                local_size: 4,
+                remote_digest: "c".repeat(64),
+                remote_size: 4,
+                requested_at: NOW.to_owned(),
+            })
+            .expect("record coordinator choice");
+        let peer_state = peer
+            .resolve_file_conflict(&ResolveConflictRequest {
+                mapping_id: "mapping-1".to_owned(),
+                path: "notes.txt".to_owned(),
+                direction: SyncDirection::PullRemote,
+                local_digest: "c".repeat(64),
+                local_size: 4,
+                remote_digest: "b".repeat(64),
+                remote_size: 4,
+                requested_at: NOW.to_owned(),
+            })
+            .expect("record mirrored peer choice");
+        let peer_operation = &peer_state.operations[0];
+        let authorization = peer
+            .authorize_file_application(&AuthorizeFileApplicationRequest {
+                mapping_id: "mapping-1".to_owned(),
+                path: "notes.txt".to_owned(),
+                digest: "b".repeat(64),
+                size: 4,
+                expected_destination_digest: Some("c".repeat(64)),
+            })
+            .expect("authorize mirrored incoming replacement");
+        assert_eq!(authorization.operation_id, Some(peer_operation.id));
+
+        let journal = peer
+            .prepare_replacement(&PrepareReplacementRequest {
+                id: "peer-replacement-1".to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                path: "notes.txt".to_owned(),
+                sync_operation_id: authorization.operation_id,
+                old_digest: "c".repeat(64),
+                old_size: 4,
+                replacement_digest: "b".repeat(64),
+                replacement_size: 4,
+                local_root: "/tmp/b".to_owned(),
+                created_at: NOW.to_owned(),
+            })
+            .expect("prepare receiver archive");
+        peer.mark_replacement_archived(
+            &journal.id,
+            &"c".repeat(64),
+            4,
+            &format!("sha256/cc/{}", "c".repeat(64)),
+            NOW,
+        )
+        .expect("archive displaced peer copy");
+        peer.mark_replacement_installed(&journal.id, NOW)
+            .expect("install selected copy");
+        apply_verified(
+            &peer,
+            peer_operation.id,
+            "notes.txt",
+            &"b".repeat(64),
+            Some(&journal.id),
+        )
+        .expect("complete receiver replacement");
+        coordinator
+            .complete_file_operation(
+                coordinator_state.operations[0].id,
+                &"b".repeat(64),
+                4,
+                NOW,
+                None,
+            )
+            .expect("complete coordinator operation");
+
+        assert_no_conflicts(&coordinator, "coordinator");
+        assert_no_conflicts(&peer, "peer");
     }
 
     #[test]

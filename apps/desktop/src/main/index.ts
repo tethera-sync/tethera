@@ -24,6 +24,9 @@ import type {
   AppSnapshot,
   ApproveFolderMappingInput,
   BrowseDirectoryInput,
+  ConflictInspection,
+  ConflictInspectionInput,
+  ConflictCopyExpectation,
   CreateDirectoryInput,
   DeviceSummary,
   DirectoryEntry,
@@ -38,6 +41,9 @@ import type {
   PreviewFolderMappingInput,
   RequestFolderMappingInput,
   RefreshIncomingMappingPreviewInput,
+  RecoveryConflict,
+  RecoveryState,
+  ResolveFileConflictInput,
   UpdateState,
 } from "../shared/contracts"
 import {
@@ -88,13 +94,20 @@ import {
 } from "./desktop-state-storage"
 import { PairingService } from "./pairing-service"
 import { PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
-import { isTetheraStagingPath } from "./path-safety"
+import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import {
   conflictSummary,
+  findMirroredPeerOperation,
   FolderChangeMonitor,
+  mirrorConflictChoice,
   observedFiles,
+  replayableOperations,
   type FileSyncConflict,
+  type FileSyncDirection,
+  type FileSyncOperation,
+  type PeerFileOperationIdentity,
   type FileSyncState,
+  type ExactConflictChoice,
   type ReconcileFilesResult,
 } from "./continuous-sync"
 import {
@@ -117,6 +130,18 @@ interface PlannedFileResult {
   completedDuringRecovery?: boolean
 }
 
+interface PeerConflictCopy {
+  present: boolean
+  size?: number
+  modifiedMs?: number
+  digest?: string
+}
+
+interface FileApplicationAuthorization {
+  operationId?: number
+  alreadyVerified: boolean
+}
+
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let isQuitting = false
@@ -128,6 +153,8 @@ const initialSyncInFlight = new Set<string>()
 const initialSyncCompletions = new Map<string, { promise: Promise<void>; resolve: () => void }>()
 const initialSyncForwarded = new Set<string>()
 const archiveRestoreInFlight = new Set<string>()
+const conflictResolutionInFlight = new Set<string>()
+const conflictHashingInFlight = new Set<string>()
 const peerFileOperationsInFlight = new Set<string>()
 const initialSyncPeerLeases = new Map<string, { peerId: string; expiresAt: number }>()
 const continuousSyncInFlight = new Set<string>()
@@ -142,6 +169,7 @@ const INITIAL_SYNC_LEASE_MS = 35 * 60_000
 const INITIAL_SYNC_HEARTBEAT_MS = 5 * 60_000
 const MAX_CONCURRENT_CONTINUOUS_CYCLES = 2
 const CONTINUOUS_SYNC_RPC_TIMEOUT_MS = 5 * 60_000
+const CONFLICT_RESOLUTION_CONFIRM_TIMEOUT_MS = 15_000
 const CONTINUOUS_SYNC_RETRY_MS = 5_000
 const CONTINUOUS_SYNC_CAPACITY_RETRY_MS = 1_000
 const PROGRESS_BROADCAST_INTERVAL_MS = 100
@@ -157,6 +185,27 @@ let pairing: PairingService | null = null
 let peerSessions: PeerSessionService | null = null
 let continuousCyclesInProgress = 0
 const execFileAsync = promisify(execFile)
+
+function hasConflictResolutionInFlight(folderId?: string): boolean {
+  if (!folderId) return conflictResolutionInFlight.size > 0
+  const prefix = `${folderId}\0`
+  return [...conflictResolutionInFlight].some((key) => key.startsWith(prefix))
+}
+
+async function withConflictHashing<T>(folderId: string, operation: () => Promise<T>): Promise<T> {
+  if (conflictHashingInFlight.has(folderId)) {
+    throw new Error("The current conflict copies are already being inspected.")
+  }
+  if (conflictHashingInFlight.size >= MAX_CONCURRENT_CONTINUOUS_CYCLES) {
+    throw new Error("Tethera is already inspecting its maximum number of conflict copies. Retry shortly.")
+  }
+  conflictHashingInFlight.add(folderId)
+  try {
+    return await operation()
+  } finally {
+    conflictHashingInFlight.delete(folderId)
+  }
+}
 
 const emptyPairingState: PairingState = {
   localFingerprint: "Loading…",
@@ -513,7 +562,7 @@ async function startNetworkServices(): Promise<void> {
 }
 
 async function setAllPaused(paused: boolean): Promise<AppSnapshot> {
-  if (paused && (initialSyncInFlight.size > 0 || initialSyncForwarded.size > 0 || archiveRestoreInFlight.size > 0 || hasAnyInitialSyncPeerLease() || continuousSyncInFlight.size > 0)) {
+  if (paused && (initialSyncInFlight.size > 0 || initialSyncForwarded.size > 0 || archiveRestoreInFlight.size > 0 || hasConflictResolutionInFlight() || hasAnyInitialSyncPeerLease() || continuousSyncInFlight.size > 0)) {
     throw new Error("Wait for active file transfers to finish before pausing all folders.")
   }
   const next = await mutate(() => {
@@ -756,6 +805,8 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
     const runtime = previous.get(projected.id)
     const outcome = initialSyncOutcomes[projected.id]
     const conflicts = outcome?.conflicts ?? []
+    const conflictCount = Math.max(runtime?.conflictCount ?? 0, conflicts.length)
+    const recoveryIssueCount = runtime?.recoveryIssueCount ?? 0
     const peer = projected.remoteDeviceId ? getPairedDevice(projected.remoteDeviceId) : undefined
     return [
       {
@@ -766,7 +817,11 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
               bytesPerSecond: runtime.bytesPerSecond,
               fileCount: runtime.fileCount ?? outcome?.fileCount,
               lastSyncedAt: runtime.lastSyncedAt ?? outcome?.completedAt,
-              currentAction: projected.currentAction ?? runtime.currentAction,
+              currentAction: conflictCount > 0 || recoveryIssueCount > 0
+                ? runtime.currentAction ?? projected.currentAction
+                : projected.currentAction ?? runtime.currentAction,
+              conflictCount,
+              recoveryIssueCount,
             }
           : {
               fileCount: outcome?.fileCount,
@@ -774,11 +829,12 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
               currentAction: conflicts.length > 0
                 ? `${conflicts.length} same-path conflict${conflicts.length === 1 ? " needs" : "s need"} attention; neither copy was changed.`
                 : projected.currentAction,
+              conflictCount,
             }),
         status:
           projected.paused || snapshot.paused
             ? "paused"
-            : record.pendingDelivery || conflicts.length > 0 || (runtime?.status === "needs-attention" && runtime.currentAction?.includes("conflict"))
+            : record.pendingDelivery || conflictCount > 0 || recoveryIssueCount > 0
               ? "needs-attention"
               : peer
                 ? idleFolderStatus(projected.remoteDeviceId, projected.setupStatus)
@@ -1257,7 +1313,11 @@ function applyFileSyncStateToFolder(folderId: string, state: FileSyncState, sync
   const folder = snapshot.folders.find((item) => item.id === folderId)
   if (!folder) return
   const peer = getPairedDevice(folder.remoteDeviceId)
-  const hasConflicts = state.conflicts.length > 0
+  const durablePaths = new Set(state.conflicts.map((conflict) => conflict.path))
+  const legacyConflictCount = (initialSyncOutcomes[folderId]?.conflicts ?? [])
+    .filter((conflict) => !durablePaths.has(conflict.path)).length
+  const conflictCount = state.conflicts.length + legacyConflictCount
+  const hasConflicts = conflictCount > 0
   const hasRecoveryIssues = state.recoveryIssues.length > 0
   updateFolder(folderId, {
     status: folder.paused || snapshot.paused
@@ -1270,7 +1330,9 @@ function applyFileSyncStateToFolder(folderId: string, state: FileSyncState, sync
     currentAction: hasRecoveryIssues
       ? state.recoveryIssues[0]?.lastError ?? `${state.recoveryIssues.length} file replacement${state.recoveryIssues.length === 1 ? " requires" : "s require"} recovery.`
       : hasConflicts
-      ? conflictSummary(state.conflicts)
+      ? state.conflicts.length > 0
+        ? conflictSummary(state.conflicts)
+        : `${legacyConflictCount} initial-merge conflict${legacyConflictCount === 1 ? " needs" : "s need"} an authoritative two-sided scan.`
       : state.operations.length > 0
         ? `${state.operations.length} change${state.operations.length === 1 ? " is" : "s are"} waiting to retry.`
         : "Watching for changes.",
@@ -1278,6 +1340,8 @@ function applyFileSyncStateToFolder(folderId: string, state: FileSyncState, sync
     bytesPerSecond: undefined,
     lastSyncedAt: syncedAt ?? folder.lastSyncedAt,
     fileCount: state.baselineCount,
+    conflictCount,
+    recoveryIssueCount: state.recoveryIssues.length,
   })
 }
 
@@ -1292,6 +1356,414 @@ function conflictDetail(conflict: FileSyncConflict): string {
     return "The detected change conflicts with this folder's one-way sync direction. Neither version was replaced."
   }
   return "The computers did not have a verified common baseline for this path. Neither version was replaced."
+}
+
+function recoveryConflict(
+  folder: FolderSummary,
+  conflict: FileSyncConflict,
+  operations: FileSyncOperation[],
+): RecoveryConflict {
+  const peer = getPairedDevice(folder.remoteDeviceId)
+  return {
+    mappingId: folder.id,
+    folderName: folder.name,
+    path: conflict.path,
+    kind: conflict.kind,
+    detectedAt: conflict.detectedAt,
+    localDeviceId: getLocalIdentityId(),
+    localDeviceName: os.hostname(),
+    localDigest: conflict.localDigest,
+    remoteDeviceId: peer?.id ?? folder.remoteDeviceId ?? "unavailable-peer",
+    remoteDeviceName: peer?.name ?? "Paired computer",
+    remoteDigest: conflict.remoteDigest,
+    resolutionQueued: operations.some((operation) => operation.path === conflict.path),
+    detail: conflictDetail(conflict),
+  }
+}
+
+function validateConflictInput(input: ConflictInspectionInput): void {
+  if (!input || typeof input.mappingId !== "string" || !input.mappingId || typeof input.path !== "string" || !input.path) {
+    throw new Error("Choose a valid file conflict.")
+  }
+  if (input.mappingId.length > 200 || input.path.length > 4_096 || input.mappingId.includes("\0") || input.path.includes("\0")) {
+    throw new Error("The selected file conflict is invalid.")
+  }
+}
+
+function parseConflictCopyExpectation(value: unknown): ConflictCopyExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The inspected conflict copy is invalid.")
+  }
+  const candidate = value as Partial<ConflictCopyExpectation>
+  if (
+    typeof candidate.deviceId !== "string" || !candidate.deviceId || candidate.deviceId.length > 200 ||
+    typeof candidate.digest !== "string" || !/^[a-f0-9]{64}$/.test(candidate.digest) ||
+    typeof candidate.size !== "number" || !Number.isSafeInteger(candidate.size) || candidate.size < 0
+  ) {
+    throw new Error("The inspected conflict copy is invalid.")
+  }
+  return { deviceId: candidate.deviceId, digest: candidate.digest, size: candidate.size }
+}
+
+function parseResolveFileConflictInput(value: unknown): ResolveFileConflictInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Choose a valid file conflict.")
+  }
+  const candidate = value as Partial<ResolveFileConflictInput>
+  const mappingId = candidate.mappingId
+  const conflictPath = candidate.path
+  if (typeof mappingId !== "string" || typeof conflictPath !== "string") {
+    throw new Error("Choose a valid file conflict.")
+  }
+  validateConflictInput({ mappingId, path: conflictPath })
+  if (typeof candidate.winnerDeviceId !== "string" || !candidate.winnerDeviceId) {
+    throw new Error("Choose which computer's copy to keep.")
+  }
+  if (!Array.isArray(candidate.inspectedCopies) || candidate.inspectedCopies.length !== 2) {
+    throw new Error("Refresh both conflict copies before choosing a version.")
+  }
+  const inspectedCopies = candidate.inspectedCopies.map(parseConflictCopyExpectation) as [
+    ConflictCopyExpectation,
+    ConflictCopyExpectation,
+  ]
+  if (
+    inspectedCopies[0].deviceId === inspectedCopies[1].deviceId ||
+    !inspectedCopies.some((copy) => copy.deviceId === candidate.winnerDeviceId)
+  ) {
+    throw new Error("The inspected conflict copies do not match this folder's participants.")
+  }
+  return {
+    mappingId,
+    path: conflictPath,
+    winnerDeviceId: candidate.winnerDeviceId,
+    inspectedCopies,
+  }
+}
+
+function requireUnchangedInspectedCopies(
+  input: ResolveFileConflictInput,
+  inspection: ConflictInspection,
+): void {
+  const expectedByDevice = new Map(input.inspectedCopies.map((copy) => [copy.deviceId, copy]))
+  for (const copy of [inspection.local, inspection.remote]) {
+    const expected = expectedByDevice.get(copy.deviceId)
+    if (!expected || copy.digest !== expected.digest || copy.size !== expected.size) {
+      throw new Error("One of the conflict copies changed since you reviewed it. Refresh both versions before choosing again.")
+    }
+  }
+}
+
+function requireRecoveryFolder(mappingId: string): { folder: FolderSummary; peer: DeviceSummary; record: MappingRecord } {
+  const folder = snapshot.folders.find((candidate) => candidate.id === mappingId)
+  const record = mappingRecords.get(mappingId)
+  if (!folder || !record || folder.setupStatus !== "active") {
+    throw new Error("This conflict's folder is no longer active.")
+  }
+  const peer = getPairedDevice(folder.remoteDeviceId)
+  if (!peer) throw new Error("The paired computer for this conflict is no longer trusted.")
+  return { folder, peer, record }
+}
+
+async function getRecoveryState(): Promise<RecoveryState> {
+  if (engine.state.status !== "ready" || snapshot.mappingStore.status !== "ready") {
+    throw new Error("Recovery information is unavailable until the mapping database is ready.")
+  }
+  const activeFolders = snapshot.folders.filter((folder) => folder.setupStatus === "active")
+  const states = await Promise.all(
+    activeFolders.map(async (folder) => ({
+      folder,
+      state: await engine.request<FileSyncState>("fileSync.getState", { id: folder.id }),
+    })),
+  )
+  const conflicts: RecoveryConflict[] = []
+  const issues: RecoveryState["issues"] = []
+  for (const { folder, state } of states) {
+    const durablePaths = new Set(state.conflicts.map((conflict) => conflict.path))
+    conflicts.push(...state.conflicts.map((conflict) => recoveryConflict(folder, conflict, state.operations)))
+    const peer = getPairedDevice(folder.remoteDeviceId)
+    for (const conflict of initialSyncOutcomes[folder.id]?.conflicts ?? []) {
+      if (durablePaths.has(conflict.path)) continue
+      conflicts.push({
+        mappingId: folder.id,
+        folderName: folder.name,
+        path: conflict.path,
+        kind: "initial-merge",
+        detectedAt: initialSyncOutcomes[folder.id]?.completedAt,
+        localDeviceId: getLocalIdentityId(),
+        localDeviceName: os.hostname(),
+        remoteDeviceId: peer?.id ?? folder.remoteDeviceId ?? "unavailable-peer",
+        remoteDeviceName: peer?.name ?? "Paired computer",
+        resolutionQueued: false,
+        detail: "The initial merge preserved different copies. Tethera is waiting for an authoritative two-sided scan before a version can be selected.",
+      })
+    }
+    issues.push(...state.recoveryIssues.map((issue) => ({
+      id: issue.id,
+      mappingId: folder.id,
+      folderName: folder.name,
+      path: issue.path,
+      state: issue.state,
+      detail: issue.lastError ?? "The replacement journal needs manual recovery before this path can sync.",
+    })))
+  }
+  conflicts.sort((left, right) => left.folderName.localeCompare(right.folderName) || left.path.localeCompare(right.path))
+  issues.sort((left, right) => left.folderName.localeCompare(right.folderName) || left.path.localeCompare(right.path))
+  return { conflicts, issues }
+}
+
+async function describeConflictCopy(
+  rootPath: string,
+  relativePath: string,
+  expectedDigest: string | undefined,
+): Promise<PeerConflictCopy> {
+  try {
+    const descriptor = await describeTransferFile(rootPath, relativePath)
+    if (!expectedDigest || descriptor.digest !== expectedDigest) {
+      throw new Error("The file changed after this conflict was recorded. Refresh the conflict before choosing a version.")
+    }
+    return { present: true, ...descriptor }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && expectedDigest === undefined) {
+      return { present: false }
+    }
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error("A conflict copy is no longer present. Tethera will rescan before offering another choice.", { cause: error })
+    }
+    throw error
+  }
+}
+
+function parsePeerConflictCopy(value: unknown): PeerConflictCopy {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The paired computer returned invalid conflict metadata.")
+  }
+  const candidate = value as Partial<PeerConflictCopy>
+  if (typeof candidate.present !== "boolean") {
+    throw new Error("The paired computer returned invalid conflict availability.")
+  }
+  if (!candidate.present) return { present: false }
+  if (
+    !Number.isSafeInteger(candidate.size) || (candidate.size ?? -1) < 0 ||
+    !Number.isFinite(candidate.modifiedMs) ||
+    typeof candidate.digest !== "string" || !/^[a-f0-9]{64}$/.test(candidate.digest)
+  ) {
+    throw new Error("The paired computer returned invalid conflict file metadata.")
+  }
+  return {
+    present: true,
+    size: candidate.size,
+    modifiedMs: candidate.modifiedMs,
+    digest: candidate.digest,
+  }
+}
+
+function parseExactConflictChoice(request: PeerRequest): ExactConflictChoice {
+  const direction = request.direction
+  const localDigest = request.localDigest
+  const localSize = request.localSize
+  const remoteDigest = request.remoteDigest
+  const remoteSize = request.remoteSize
+  if (
+    (direction !== "pull-remote" && direction !== "push-local") ||
+    typeof localDigest !== "string" || !/^[a-f0-9]{64}$/.test(localDigest) ||
+    typeof localSize !== "number" || !Number.isSafeInteger(localSize) || localSize < 0 ||
+    typeof remoteDigest !== "string" || !/^[a-f0-9]{64}$/.test(remoteDigest) ||
+    typeof remoteSize !== "number" || !Number.isSafeInteger(remoteSize) || remoteSize < 0
+  ) {
+    throw new Error("The paired computer sent an invalid exact conflict choice.")
+  }
+  return {
+    direction,
+    localDigest,
+    localSize,
+    remoteDigest,
+    remoteSize,
+  }
+}
+
+function requireAllowedConflictDirection(mode: FolderSummary["mode"], direction: FileSyncDirection): void {
+  if ((direction === "push-local" && mode === "receive-only") || (direction === "pull-remote" && mode === "send-only")) {
+    throw new Error("That version conflicts with this folder's one-way direction.")
+  }
+}
+
+async function inspectFileConflict(input: ConflictInspectionInput): Promise<ConflictInspection> {
+  validateConflictInput(input)
+  const { folder, peer } = requireRecoveryFolder(input.mappingId)
+  if (folder.paused || snapshot.paused) throw new Error("Resume this folder before inspecting its conflict copies.")
+  if (peer.status !== "online") throw new Error(`${peer.name} must be online to inspect both copies.`)
+  return withConflictHashing(folder.id, async () => {
+    const state = await engine.request<FileSyncState>("fileSync.getState", { id: folder.id })
+    const durable = state.conflicts.find((conflict) => conflict.path === input.path)
+    if (!durable) {
+      if (initialSyncOutcomes[folder.id]?.conflicts.some((conflict) => conflict.path === input.path)) {
+        await notifyContinuousSyncCoordinator(folder.id)
+        throw new Error("Tethera is refreshing this initial-merge conflict. Try again after the next two-sided scan.")
+      }
+      throw new Error("This file conflict no longer exists.")
+    }
+    const [local, remoteValue] = await Promise.all([
+      describeConflictCopy(folder.localPath, durable.path, durable.localDigest),
+      requirePeerSessions().request<unknown>(peer.id, {
+        type: "continuous-sync-inspect-conflict",
+        folderId: folder.id,
+        path: durable.path,
+      }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS),
+    ])
+    const remote = parsePeerConflictCopy(remoteValue)
+    if (remote.digest !== durable.remoteDigest || remote.present !== (durable.remoteDigest !== undefined)) {
+      await notifyContinuousSyncCoordinator(folder.id)
+      throw new Error("The paired copy changed after this conflict was recorded. Tethera will rescan it before another choice.")
+    }
+    const conflict = recoveryConflict(folder, durable, state.operations)
+    return {
+      conflict,
+      local: {
+        deviceId: conflict.localDeviceId,
+        deviceName: conflict.localDeviceName,
+        location: "this-computer",
+        present: local.present,
+        digest: local.digest,
+        size: local.size,
+        modifiedAt: local.modifiedMs === undefined ? undefined : new Date(local.modifiedMs).toISOString(),
+      },
+      remote: {
+        deviceId: conflict.remoteDeviceId,
+        deviceName: conflict.remoteDeviceName,
+        location: "paired-computer",
+        present: remote.present,
+        digest: remote.digest,
+        size: remote.size,
+        modifiedAt: remote.modifiedMs === undefined ? undefined : new Date(remote.modifiedMs).toISOString(),
+      },
+    }
+  })
+}
+
+async function resolveFileConflictLocally(input: ResolveFileConflictInput): Promise<AppSnapshot> {
+  validateConflictInput(input)
+  requireMappingMutations()
+  const { folder, peer, record } = requireRecoveryFolder(input.mappingId)
+  if (!isLocalContinuousCoordinator(record)) {
+    throw new Error("Only the elected synchronization coordinator can record a conflict choice.")
+  }
+  if (typeof input.winnerDeviceId !== "string" || !input.winnerDeviceId) {
+    throw new Error("Choose which computer's copy to keep.")
+  }
+  if (folder.paused || snapshot.paused) throw new Error("Resume this folder before resolving a conflict.")
+  if (peer.status !== "online") throw new Error(`${peer.name} must be online to resolve this conflict.`)
+  if (continuousSyncInFlight.has(folder.id) || initialSyncInFlight.has(folder.id) || archiveRestoreInFlight.has(folder.id)) {
+    throw new Error("Wait for the current folder operation to finish before resolving this conflict.")
+  }
+  const key = `${folder.id}\0${input.path}`
+  if (conflictResolutionInFlight.has(key)) throw new Error("This conflict resolution is already being prepared.")
+  conflictResolutionInFlight.add(key)
+  try {
+    const inspection = await inspectFileConflict(input)
+    requireUnchangedInspectedCopies(input, inspection)
+    if (!inspection.local.present || !inspection.remote.present) {
+      throw new Error("Deletion conflicts remain protected until deletion propagation has a recovery-safe design.")
+    }
+    if (
+      inspection.local.digest === undefined || inspection.local.size === undefined ||
+      inspection.remote.digest === undefined || inspection.remote.size === undefined
+    ) {
+      throw new Error("Both conflict copies must have verified size and digest metadata before resolution.")
+    }
+    const localWins = input.winnerDeviceId === inspection.local.deviceId
+    const remoteWins = input.winnerDeviceId === inspection.remote.deviceId
+    if (!localWins && !remoteWins) throw new Error("The selected version does not belong to this folder's participants.")
+    const direction: FileSyncDirection = localWins ? "push-local" : "pull-remote"
+    requireAllowedConflictDirection(folder.mode, direction)
+    const state = await engine.request<FileSyncState>("fileSync.resolveConflict", {
+      mappingId: folder.id,
+      path: input.path,
+      direction,
+      localDigest: inspection.local.digest,
+      localSize: inspection.local.size,
+      remoteDigest: inspection.remote.digest,
+      remoteSize: inspection.remote.size,
+      requestedAt: new Date().toISOString(),
+    })
+    applyFileSyncStateToFolder(folder.id, state)
+    pushActivity(
+      "Conflict resolution queued",
+      `${folder.name}: ${input.path} will use ${localWins ? "this computer's" : `${peer.name}'s`} copy; the replaced copy will be archived first.`,
+      "info",
+      folder.id,
+    )
+    await persistState()
+    scheduleContinuousSync(folder.id)
+    return broadcastSnapshot()
+  } finally {
+    conflictResolutionInFlight.delete(key)
+  }
+}
+
+async function resolveFileConflict(value: unknown): Promise<AppSnapshot> {
+  const input = parseResolveFileConflictInput(value)
+  requireMappingMutations()
+  const { folder, peer, record } = requireRecoveryFolder(input.mappingId)
+  if (isLocalContinuousCoordinator(record)) return resolveFileConflictLocally(input)
+  if (continuousSyncInFlight.has(folder.id) || initialSyncInFlight.has(folder.id) || archiveRestoreInFlight.has(folder.id)) {
+    throw new Error("Wait for the current folder operation to finish before resolving this conflict.")
+  }
+  if (peer.id !== continuousCoordinatorId(record) || peer.status !== "online") {
+    throw new Error("The coordinating computer must be online to resolve this conflict.")
+  }
+  const localExpectation = input.inspectedCopies.find((copy) => copy.deviceId === getLocalIdentityId())
+  const remoteExpectation = input.inspectedCopies.find((copy) => copy.deviceId === peer.id)
+  if (!localExpectation || !remoteExpectation) {
+    throw new Error("The inspected conflict copies do not match this folder's participants.")
+  }
+  const key = `${folder.id}\0${input.path}`
+  if (conflictResolutionInFlight.has(key)) throw new Error("This conflict resolution is already being prepared.")
+  conflictResolutionInFlight.add(key)
+  const requestResolution = async (timeoutMs: number): Promise<void> => {
+    const response = await requirePeerSessions().request<{ accepted: boolean }>(peer.id, {
+      type: "continuous-sync-resolve-conflict",
+      folderId: folder.id,
+      path: input.path,
+      winnerDeviceId: input.winnerDeviceId,
+      inspectedCopies: input.inspectedCopies,
+    }, timeoutMs)
+    if (response.accepted !== true) throw new Error("The coordinating computer did not accept the conflict choice.")
+  }
+  try {
+    await requestResolution(CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
+  } catch {
+    const direction: FileSyncDirection = input.winnerDeviceId === getLocalIdentityId() ? "push-local" : "pull-remote"
+    const selected = direction === "push-local" ? localExpectation : remoteExpectation
+    const replaced = direction === "push-local" ? remoteExpectation : localExpectation
+    try {
+      await requestResolution(CONFLICT_RESOLUTION_CONFIRM_TIMEOUT_MS)
+    } catch (retryError) {
+      const state = await engine.request<FileSyncState>("fileSync.getState", { id: folder.id }).catch(() => undefined)
+      const exactWorkExists = state?.operations.some((operation) =>
+        operation.path === input.path &&
+        operation.direction === direction &&
+        operation.sourceDigest === selected.digest &&
+        operation.sourceSize === selected.size &&
+        operation.expectedDestinationDigest === replaced.digest,
+      ) ?? false
+      let completed = false
+      if (state && !state.conflicts.some((conflict) => conflict.path === input.path)) {
+        const live = await describeTransferFile(folder.localPath, input.path).catch(() => undefined)
+        completed = live?.digest === selected.digest && live.size === selected.size
+      }
+      if (!exactWorkExists && !completed) throw retryError
+    }
+  } finally {
+    conflictResolutionInFlight.delete(key)
+  }
+  pushActivity(
+    "Conflict resolution requested",
+    `${folder.name}: the coordinating computer accepted the selected version for ${input.path}.`,
+    "info",
+    folder.id,
+  )
+  await persistState()
+  return broadcastSnapshot()
 }
 
 function recordContinuousConflicts(folder: FolderSummary, conflicts: FileSyncConflict[]): void {
@@ -1416,11 +1888,143 @@ async function refreshContinuousSyncMonitors(): Promise<void> {
   }
 }
 
+async function retireInitialConflictProjection(folderId: string, state: FileSyncState): Promise<void> {
+  const outcome = initialSyncOutcomes[folderId]
+  if (!state.initialized || !outcome || outcome.conflicts.length === 0) return
+  initialSyncOutcomes = {
+    ...initialSyncOutcomes,
+    [folderId]: { ...outcome, conflicts: [] },
+  }
+  await persistState()
+}
+
+async function executeContinuousOperations(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  remoteManifest: FileManifest,
+  operations: FileSyncOperation[],
+  peerOperations: PeerFileOperationIdentity[],
+): Promise<number> {
+  const remoteFilesByPath = new Map(remoteManifest.files.map((entry) => [entry.path, entry]))
+  const totalBytes = operations.reduce((total, operation) => total + operation.sourceSize, 0)
+  let copiedBytes = 0
+  let copiedFiles = 0
+  const startedAt = Date.now()
+  let lastProgressBroadcastAt = 0
+  for (const operation of operations) {
+    const current = snapshot.folders.find((item) => item.id === folder.id)
+    if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
+    const reportProgress = (fileBytes: number) => {
+      const transferred = copiedBytes + fileBytes
+      updateFolder(folder.id, {
+        status: "syncing",
+        currentAction: `Syncing ${operation.path} (${copiedFiles + 1}/${operations.length})`,
+        progress: totalBytes > 0 ? Math.min(transferred / totalBytes, 1) : 1,
+        bytesPerSecond: Math.round(transferred / Math.max((Date.now() - startedAt) / 1_000, 0.001)),
+      })
+      const now = Date.now()
+      if (now - lastProgressBroadcastAt >= PROGRESS_BROADCAST_INTERVAL_MS || transferred >= totalBytes) {
+        lastProgressBroadcastAt = now
+        broadcastSnapshot()
+      }
+    }
+    try {
+      reportProgress(0)
+      if (operation.direction === "pull-remote") {
+        const peerOperation = findMirroredPeerOperation(operation, peerOperations)
+        if (!peerOperation) {
+          throw new Error(`${operation.path} has no exact durable operation on the paired computer.`)
+        }
+        const entry = remoteFilesByPath.get(operation.path)
+        if (!entry || entry.digest !== operation.sourceDigest || entry.size !== operation.sourceSize) {
+          throw new Error(`${operation.path} changed after reconciliation; it will be retried.`)
+        }
+        const transfer = await pullPlannedFile(
+          folder,
+          peer,
+          entry,
+          reportProgress,
+          operation.expectedDestinationDigest,
+          operation.id,
+        )
+        if (!transfer.completedDuringRecovery) {
+          await engine.request("fileSync.complete", {
+            operationId: operation.id,
+            digest: operation.sourceDigest,
+            size: operation.sourceSize,
+            verifiedAt: new Date().toISOString(),
+            replacementJournalId: transfer.replacementJournalId,
+          })
+        }
+        await requirePeerSessions().request(peer.id, {
+          type: "continuous-sync-verified",
+          folderId: folder.id,
+          operationId: peerOperation.id,
+          path: operation.path,
+          digest: operation.sourceDigest,
+          size: operation.sourceSize,
+          expectedDestinationDigest: operation.expectedDestinationDigest,
+        })
+      } else {
+        const response = await requirePeerSessions().request<{ applied: boolean }>(peer.id, {
+          type: "continuous-sync-apply",
+          folderId: folder.id,
+          path: operation.path,
+          digest: operation.sourceDigest,
+          size: operation.sourceSize,
+          expectedDestinationDigest: operation.expectedDestinationDigest,
+        }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
+        if (response.applied !== true) throw new Error(`The peer did not apply ${operation.path}.`)
+        await engine.request("fileSync.complete", {
+          operationId: operation.id,
+          digest: operation.sourceDigest,
+          size: operation.sourceSize,
+          verifiedAt: new Date().toISOString(),
+        })
+      }
+      copiedFiles += 1
+      copiedBytes += operation.sourceSize
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "The transfer failed."
+      await engine.request("fileSync.fail", {
+        operationId: operation.id,
+        detail,
+        failedAt: new Date().toISOString(),
+      }).catch((recordError) => console.warn("[continuous-sync] unable to persist transfer failure", recordError))
+      throw error
+    }
+  }
+  return copiedFiles
+}
+
+async function recordPeerConflictChoice(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  path: string,
+  exactChoice: ExactConflictChoice,
+): Promise<PeerFileOperationIdentity[]> {
+  const response = await requirePeerSessions().request<unknown>(peer.id, {
+    type: "continuous-sync-record-conflict-choice",
+    folderId: folder.id,
+    path,
+    ...mirrorConflictChoice(exactChoice),
+  }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
+  if (!response || typeof response !== "object" || Array.isArray(response) || (response as { recorded?: unknown }).recorded !== true) {
+    throw new Error(`The peer did not durably record the selected version for ${path}.`)
+  }
+  return parsePeerFileOperations(response)
+}
+
 async function flushContinuousSync(folderId: string): Promise<void> {
   if (!continuousSyncQueued.has(folderId) || continuousSyncInFlight.has(folderId)) return
   continuousSyncQueued.delete(folderId)
   const record = mappingRecords.get(folderId)
   const folder = snapshot.folders.find((item) => item.id === folderId)
+  if (hasConflictResolutionInFlight(folderId) || conflictHashingInFlight.has(folderId)) {
+    continuousSyncQueued.add(folderId)
+    scheduleContinuousSyncRetry(folderId, CONTINUOUS_SYNC_CAPACITY_RETRY_MS, () => void flushContinuousSync(folderId))
+    return
+  }
   if (
     !record ||
     record.pendingDelivery ||
@@ -1451,6 +2055,11 @@ async function flushContinuousSync(folderId: string): Promise<void> {
   broadcastSnapshot()
   let reconciledState: ReconcileFilesResult | undefined
   try {
+    const durableBeforeReconcile = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+    if (durableBeforeReconcile.recoveryIssues.length > 0) {
+      applyFileSyncStateToFolder(folderId, durableBeforeReconcile)
+      throw new Error("A replacement recovery issue must be repaired before this folder can synchronize.")
+    }
     const observedAt = new Date().toISOString()
     const [localManifest, remoteManifest] = await Promise.all([
       scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true }),
@@ -1461,113 +2070,87 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     ])
     assertCompleteTransferManifest(localManifest, "This computer")
     assertCompleteTransferManifest(remoteManifest, peer.name)
+    const localObservation = observedFiles(localManifest)
+    const remoteObservation = observedFiles(remoteManifest)
+
+    const replayable = replayableOperations(
+      durableBeforeReconcile.operations,
+      localObservation,
+      remoteObservation,
+    )
+    if (replayable.length > 0) {
+      let peerOperations = parsePeerFileOperations(await requirePeerSessions().request<unknown>(peer.id, {
+        type: "continuous-sync-get-operations",
+        folderId,
+      }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS))
+      const conflictPaths = new Set(durableBeforeReconcile.conflicts.map((conflict) => conflict.path))
+      const localByPath = new Map(localObservation.map((file) => [file.path, file]))
+      const remoteByPath = new Map(remoteObservation.map((file) => [file.path, file]))
+      for (const operation of replayable) {
+        if (!conflictPaths.has(operation.path)) continue
+        const local = localByPath.get(operation.path)
+        const remote = remoteByPath.get(operation.path)
+        if (!local || !remote) {
+          throw new Error(`Both exact copies of ${operation.path} are required to resume its conflict resolution.`)
+        }
+        peerOperations = await recordPeerConflictChoice(folder, peer, operation.path, {
+          direction: operation.direction,
+          localDigest: local.digest,
+          localSize: local.size,
+          remoteDigest: remote.digest,
+          remoteSize: remote.size,
+        })
+      }
+      const copiedFiles = await executeContinuousOperations(folder, peer, remoteManifest, replayable, peerOperations)
+      const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+      await retireInitialConflictProjection(folderId, state)
+      applyFileSyncStateToFolder(folderId, state, new Date().toISOString())
+      continuousLastErrors.delete(folderId)
+      const resolvedConflicts = replayable.filter((operation) => conflictPaths.has(operation.path)).length
+      pushActivity(
+        resolvedConflicts > 0 ? "Conflict resolution completed" : "Folder changes synchronized",
+        resolvedConflicts > 0
+          ? `${folder.name}: applied ${resolvedConflicts} selected file version${resolvedConflicts === 1 ? "" : "s"}; each replaced copy was archived first.`
+          : `${folder.name}: safely retried ${copiedFiles} file${copiedFiles === 1 ? "" : "s"} with ${peer.name}.`,
+        "success",
+        folderId,
+      )
+      recordContinuousConflicts(folder, state.conflicts)
+      continuousSyncQueued.add(folderId)
+      return
+    }
 
     const result = await engine.request<ReconcileFilesResult>("fileSync.reconcile", {
       mappingId: folderId,
-      local: observedFiles(localManifest),
-      remote: observedFiles(remoteManifest),
+      local: localObservation,
+      remote: remoteObservation,
       mode: folder.mode,
       observedAt,
       queueOperations: true,
     }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
     reconciledState = result
+    await retireInitialConflictProjection(folderId, result)
     if (result.conflicts.length > 0) {
       applyFileSyncStateToFolder(folderId, result)
       recordContinuousConflicts(folder, result.conflicts)
       broadcastSnapshot()
     }
-    await requirePeerSessions().request(peer.id, {
+    const peerResult = await requirePeerSessions().request<unknown>(peer.id, {
       type: "continuous-sync-observe",
       folderId,
-      local: observedFiles(remoteManifest),
-      remote: observedFiles(localManifest),
+      local: remoteObservation,
+      remote: localObservation,
       mode: invertMode(folder.mode),
       observedAt,
     }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
 
-    const remoteFilesByPath = new Map(remoteManifest.files.map((entry) => [entry.path, entry]))
-    const totalBytes = result.operations.reduce((total, operation) => total + operation.sourceSize, 0)
-    let copiedBytes = 0
-    let copiedFiles = 0
-    const startedAt = Date.now()
-    let lastProgressBroadcastAt = 0
-    for (const operation of result.operations) {
-      const current = snapshot.folders.find((item) => item.id === folderId)
-      if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
-      const reportProgress = (fileBytes: number) => {
-        const transferred = copiedBytes + fileBytes
-        updateFolder(folderId, {
-          status: "syncing",
-          currentAction: `Syncing ${operation.path} (${copiedFiles + 1}/${result.operations.length})`,
-          progress: totalBytes > 0 ? Math.min(transferred / totalBytes, 1) : 1,
-          bytesPerSecond: Math.round(transferred / Math.max((Date.now() - startedAt) / 1_000, 0.001)),
-        })
-        const now = Date.now()
-        if (now - lastProgressBroadcastAt >= PROGRESS_BROADCAST_INTERVAL_MS || transferred >= totalBytes) {
-          lastProgressBroadcastAt = now
-          broadcastSnapshot()
-        }
-      }
-      try {
-        reportProgress(0)
-        if (operation.direction === "pull-remote") {
-          const entry = remoteFilesByPath.get(operation.path)
-          if (!entry || entry.digest !== operation.sourceDigest || entry.size !== operation.sourceSize) {
-            throw new Error(`${operation.path} changed after reconciliation; it will be retried.`)
-          }
-          const transfer = await pullPlannedFile(
-            folder,
-            peer,
-            entry,
-            reportProgress,
-            operation.expectedDestinationDigest,
-            operation.id,
-          )
-          if (!transfer.completedDuringRecovery) {
-            await engine.request("fileSync.complete", {
-              operationId: operation.id,
-              digest: operation.sourceDigest,
-              size: operation.sourceSize,
-              verifiedAt: new Date().toISOString(),
-              replacementJournalId: transfer.replacementJournalId,
-            })
-          }
-          await requirePeerSessions().request(peer.id, {
-            type: "continuous-sync-verified",
-            folderId,
-            path: operation.path,
-            digest: operation.sourceDigest,
-            size: operation.sourceSize,
-          })
-        } else {
-          const response = await requirePeerSessions().request<{ applied: boolean }>(peer.id, {
-            type: "continuous-sync-apply",
-            folderId,
-            path: operation.path,
-            digest: operation.sourceDigest,
-            size: operation.sourceSize,
-            expectedDestinationDigest: operation.expectedDestinationDigest,
-          }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
-          if (response.applied !== true) throw new Error(`The peer did not apply ${operation.path}.`)
-          await engine.request("fileSync.complete", {
-            operationId: operation.id,
-            digest: operation.sourceDigest,
-            size: operation.sourceSize,
-            verifiedAt: new Date().toISOString(),
-          })
-        }
-        copiedFiles += 1
-        copiedBytes += operation.sourceSize
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : "The transfer failed."
-        await engine.request("fileSync.fail", {
-          operationId: operation.id,
-          detail,
-          failedAt: new Date().toISOString(),
-        }).catch((recordError) => console.warn("[continuous-sync] unable to persist transfer failure", recordError))
-        throw error
-      }
-    }
+    const copiedFiles = await executeContinuousOperations(
+      folder,
+      peer,
+      remoteManifest,
+      result.operations,
+      parsePeerFileOperations(peerResult),
+    )
 
     const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
     const completedAt = new Date().toISOString()
@@ -1586,15 +2169,13 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     const message = error instanceof Error ? error.message : "Continuous synchronization failed."
     const online = getPairedDevice(folder.remoteDeviceId)?.status === "online"
     const durableConflicts = reconciledState?.conflicts ?? []
-    const latestState = durableConflicts.length > 0
-      ? await engine.request<FileSyncState>("fileSync.getState", { id: folderId }).catch((stateError) => {
-          console.warn(`[continuous-sync] unable to refresh durable conflict state for ${folderId}`, stateError)
-          return undefined
-        })
-      : undefined
+    const latestState = await engine.request<FileSyncState>("fileSync.getState", { id: folderId }).catch((stateError) => {
+      console.warn(`[continuous-sync] unable to refresh durable file-sync state for ${folderId}`, stateError)
+      return undefined
+    })
     if (latestState) {
       recordContinuousConflicts(folder, latestState.conflicts)
-      if (latestState.conflicts.length > 0) {
+      if (latestState.conflicts.length > 0 || latestState.recoveryIssues.length > 0) {
         applyFileSyncStateToFolder(folderId, latestState)
       } else {
         updateFolder(folderId, {
@@ -1624,7 +2205,9 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       pushActivity("Folder sync interrupted", `${folder.name}: ${message}`, "error", folderId)
       continuousLastErrors.set(folderId, message)
     }
-    scheduleContinuousSyncRetry(folderId, CONTINUOUS_SYNC_RETRY_MS, () => scheduleContinuousSync(folderId))
+    if ((latestState?.recoveryIssues.length ?? 0) === 0) {
+      scheduleContinuousSyncRetry(folderId, CONTINUOUS_SYNC_RETRY_MS, () => scheduleContinuousSync(folderId))
+    }
   } finally {
     continuousSyncInFlight.delete(folderId)
     continuousCyclesInProgress -= 1
@@ -2359,6 +2942,49 @@ function validateContinuousOperationRequest(request: PeerRequest): {
   return { folderId, path: relativePath, digest, size, expectedDestinationDigest }
 }
 
+function parsePeerFileOperations(value: unknown): PeerFileOperationIdentity[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The paired computer returned invalid durable operation state.")
+  }
+  const operations = (value as { operations?: unknown }).operations
+  if (!Array.isArray(operations) || operations.length > 10_000) {
+    throw new Error("The paired computer returned invalid durable operation state.")
+  }
+  return operations.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("The paired computer returned an invalid durable operation.")
+    }
+    const operation = value as Partial<PeerFileOperationIdentity>
+    if (
+      typeof operation.id !== "number" || !Number.isSafeInteger(operation.id) || operation.id <= 0 ||
+      typeof operation.path !== "string" || !operation.path || operation.path.length > 4_096 ||
+      isTetheraStagingPath(operation.path) ||
+      (operation.direction !== "pull-remote" && operation.direction !== "push-local") ||
+      typeof operation.sourceDigest !== "string" || !/^[a-f0-9]{64}$/.test(operation.sourceDigest) ||
+      typeof operation.sourceSize !== "number" || !Number.isSafeInteger(operation.sourceSize) || operation.sourceSize < 0 ||
+      (operation.expectedDestinationDigest !== undefined &&
+        (typeof operation.expectedDestinationDigest !== "string" || !/^[a-f0-9]{64}$/.test(operation.expectedDestinationDigest)))
+    ) {
+      throw new Error("The paired computer returned an invalid durable operation.")
+    }
+    return {
+      id: operation.id,
+      path: operation.path,
+      direction: operation.direction,
+      sourceDigest: operation.sourceDigest,
+      sourceSize: operation.sourceSize,
+      expectedDestinationDigest: operation.expectedDestinationDigest,
+    }
+  })
+}
+
+function validatePeerOperationId(request: PeerRequest): number {
+  if (typeof request.operationId !== "number" || !Number.isSafeInteger(request.operationId) || request.operationId <= 0) {
+    throw new Error("The continuous-sync operation identity is invalid.")
+  }
+  return request.operationId
+}
+
 async function withPeerFileOperation<T>(context: PeerRequestContext, folderId: string, operation: () => Promise<T>): Promise<T> {
   const key = `${context.peerId}:${folderId}`
   if (peerFileOperationsInFlight.has(key)) {
@@ -2416,6 +3042,78 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true }),
     )
   }
+  if (request.type === "continuous-sync-get-operations") {
+    const folderId = typeof request.folderId === "string" ? request.folderId : ""
+    requireSharedActiveFolder(context, folderId)
+    return withPeerFileOperation(context, folderId, async () => {
+      const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+      return { operations: state.operations }
+    })
+  }
+  if (request.type === "continuous-sync-inspect-conflict") {
+    const folderId = typeof request.folderId === "string" ? request.folderId : ""
+    const relativePath = typeof request.path === "string" ? request.path : ""
+    const folder = requireSharedFolder(context, folderId)
+    if (folder.setupStatus !== "active" || folder.paused || snapshot.paused) {
+      throw new Error("This folder is not available for conflict inspection.")
+    }
+    if (isManifestPathIgnored(relativePath, folder.ignorePatterns) || isTetheraStagingPath(relativePath)) {
+      throw new Error("The requested conflict path is not eligible for synchronization.")
+    }
+    return withPeerFileOperation(context, folderId, () => withConflictHashing(folderId, async () => {
+      const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+      const conflict = state.conflicts.find((candidate) => candidate.path === relativePath)
+      if (!conflict) throw new Error("This file conflict no longer exists on the paired computer.")
+      return describeConflictCopy(folder.localPath, relativePath, conflict.localDigest)
+    }))
+  }
+  if (request.type === "continuous-sync-resolve-conflict") {
+    const input = parseResolveFileConflictInput({
+      mappingId: request.folderId,
+      path: request.path,
+      winnerDeviceId: request.winnerDeviceId,
+      inspectedCopies: request.inspectedCopies,
+    })
+    const folderId = input.mappingId
+    const folder = requireSharedFolder(context, folderId)
+    const record = mappingRecords.get(folderId)
+    if (!record || !isLocalContinuousCoordinator(record) || context.peerId === getLocalIdentityId()) {
+      throw new Error("This computer is not the elected conflict-resolution coordinator.")
+    }
+    await resolveFileConflictLocally(input)
+    return { accepted: true }
+  }
+  if (request.type === "continuous-sync-record-conflict-choice") {
+    requireMappingMutations()
+    const folderId = typeof request.folderId === "string" ? request.folderId : ""
+    const relativePath = typeof request.path === "string" ? request.path : ""
+    validateConflictInput({ mappingId: folderId, path: relativePath })
+    const folder = requireSharedActiveFolder(context, folderId)
+    const record = mappingRecords.get(folderId)
+    if (!record || isLocalContinuousCoordinator(record) || context.peerId !== continuousCoordinatorId(record)) {
+      throw new Error("Only this folder's elected coordinator can record its conflict choice.")
+    }
+    if (initialSyncInFlight.has(folderId) || archiveRestoreInFlight.has(folderId) || continuousSyncInFlight.has(folderId)) {
+      throw new Error("Wait for the current folder operation to finish before recording a conflict choice.")
+    }
+    return withPeerFileOperation(context, folderId, () => withConflictHashing(folderId, async () => {
+      const choice = parseExactConflictChoice(request)
+      requireAllowedConflictDirection(folder.mode, choice.direction)
+      const local = await describeConflictCopy(folder.localPath, relativePath, choice.localDigest)
+      if (!local.present || local.size !== choice.localSize) {
+        throw new Error("The local conflict copy no longer matches the coordinator's exact choice.")
+      }
+      const state = await engine.request<FileSyncState>("fileSync.resolveConflict", {
+        mappingId: folderId,
+        path: relativePath,
+        ...choice,
+        requestedAt: new Date().toISOString(),
+      })
+      applyFileSyncStateToFolder(folderId, state)
+      broadcastSnapshot()
+      return { recorded: true, operations: state.operations }
+    }))
+  }
   if (request.type === "continuous-sync-notify") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     requireContinuousSyncNotification(context, folderId)
@@ -2426,19 +3124,22 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     requireMappingMutations()
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     requireSharedActiveFolder(context, folderId)
-    const state = await engine.request<ReconcileFilesResult>("fileSync.reconcile", {
-      mappingId: folderId,
-      local: request.local,
-      remote: request.remote,
-      mode: request.mode,
-      observedAt: request.observedAt,
-      queueOperations: true,
-    }, 5 * 60_000)
-    applyFileSyncStateToFolder(folderId, state, new Date().toISOString())
-    const folder = snapshot.folders.find((item) => item.id === folderId)
-    if (folder) recordContinuousConflicts(folder, state.conflicts)
-    broadcastSnapshot()
-    return state
+    return withPeerFileOperation(context, folderId, async () => {
+      const state = await engine.request<ReconcileFilesResult>("fileSync.reconcile", {
+        mappingId: folderId,
+        local: request.local,
+        remote: request.remote,
+        mode: request.mode,
+        observedAt: request.observedAt,
+        queueOperations: true,
+      }, 5 * 60_000)
+      await retireInitialConflictProjection(folderId, state)
+      applyFileSyncStateToFolder(folderId, state, new Date().toISOString())
+      const folder = snapshot.folders.find((item) => item.id === folderId)
+      if (folder) recordContinuousConflicts(folder, state.conflicts)
+      broadcastSnapshot()
+      return state
+    })
   }
   if (request.type === "continuous-sync-apply") {
     requireMappingMutations()
@@ -2456,6 +3157,23 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       }
       const peer = getPairedDevice(context.peerId)
       if (!peer) throw new Error("The synchronization coordinator is no longer trusted.")
+      const authorization = await engine.request<FileApplicationAuthorization>("fileSync.authorizeApply", {
+        mappingId: operation.folderId,
+        path: operation.path,
+        digest: operation.digest,
+        size: operation.size,
+        expectedDestinationDigest: operation.expectedDestinationDigest,
+      })
+      if (authorization.alreadyVerified) {
+        const current = await describeTransferFile(folder.localPath, operation.path)
+        if (current.digest !== operation.digest || current.size !== operation.size) {
+          throw new Error("The verified baseline no longer matches the live destination file.")
+        }
+        return { applied: true }
+      }
+      if (authorization.operationId === undefined) {
+        throw new Error("The incoming file application has no durable operation identity.")
+      }
       continuousCyclesInProgress += 1
       continuousSyncInFlight.add(operation.folderId)
       updateFolder(operation.folderId, { status: "syncing", currentAction: `Receiving ${operation.path} from ${peer.name}…` })
@@ -2467,10 +3185,18 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
           modifiedMs: 0,
           digest: operation.digest,
         }
-        const transfer = await pullPlannedFile(folder, peer, entry, () => undefined, operation.expectedDestinationDigest)
+        const transfer = await pullPlannedFile(
+          folder,
+          peer,
+          entry,
+          () => undefined,
+          operation.expectedDestinationDigest,
+          authorization.operationId,
+        )
         const state = transfer.completedDuringRecovery
           ? await engine.request<FileSyncState>("fileSync.getState", { id: operation.folderId })
           : await engine.request<FileSyncState>("fileSync.applyVerified", {
+              operationId: authorization.operationId,
               mappingId: operation.folderId,
               path: operation.path,
               digest: operation.digest,
@@ -2478,6 +3204,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
               verifiedAt: new Date().toISOString(),
               replacementJournalId: transfer.replacementJournalId,
             })
+        await retireInitialConflictProjection(operation.folderId, state)
         applyFileSyncStateToFolder(operation.folderId, state, new Date().toISOString())
         broadcastSnapshot()
         return { applied: true }
@@ -2490,17 +3217,31 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
   if (request.type === "continuous-sync-verified") {
     requireMappingMutations()
     const operation = validateContinuousOperationRequest(request)
+    const operationId = validatePeerOperationId(request)
     requireSharedActiveFolder(context, operation.folderId)
-    const state = await engine.request<FileSyncState>("fileSync.applyVerified", {
-      mappingId: operation.folderId,
-      path: operation.path,
-      digest: operation.digest,
-      size: operation.size,
-      verifiedAt: new Date().toISOString(),
+    return withPeerFileOperation(context, operation.folderId, async () => {
+      const current = await engine.request<FileSyncState>("fileSync.getState", { id: operation.folderId })
+      const exact = current.operations.find((candidate) =>
+        candidate.id === operationId &&
+        candidate.path === operation.path &&
+        candidate.direction === "push-local" &&
+        candidate.sourceDigest === operation.digest &&
+        candidate.sourceSize === operation.size &&
+        candidate.expectedDestinationDigest === operation.expectedDestinationDigest,
+      )
+      if (!exact) throw new Error("The verification did not match the exact durable push operation.")
+      await engine.request("fileSync.complete", {
+        operationId,
+        digest: operation.digest,
+        size: operation.size,
+        verifiedAt: new Date().toISOString(),
+      })
+      const state = await engine.request<FileSyncState>("fileSync.getState", { id: operation.folderId })
+      await retireInitialConflictProjection(operation.folderId, state)
+      applyFileSyncStateToFolder(operation.folderId, state, new Date().toISOString())
+      broadcastSnapshot()
+      return { recorded: true }
     })
-    applyFileSyncStateToFolder(operation.folderId, state, new Date().toISOString())
-    broadcastSnapshot()
-    return { recorded: true }
   }
   if (request.type === "mapping-propose") {
     const proposal = request.proposal as FolderMappingProposal | undefined
@@ -2545,7 +3286,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       hasInitialSyncPeerLease(mappingId) &&
       !isCoordinatorCompletion
     const localOperationBlocksEvent =
-      (initialSyncInFlight.has(mappingId) || initialSyncForwarded.has(mappingId) || archiveRestoreInFlight.has(mappingId) || continuousSyncInFlight.has(mappingId)) &&
+      (initialSyncInFlight.has(mappingId) || initialSyncForwarded.has(mappingId) || archiveRestoreInFlight.has(mappingId) || hasConflictResolutionInFlight(mappingId) || continuousSyncInFlight.has(mappingId)) &&
       !isCoordinatorCompletion
     if (localOperationBlocksEvent || peerLeaseBlocksEvent) {
       throw new Error("Wait for the initial merge to finish before changing or removing this mapping.")
@@ -2738,8 +3479,8 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
 function registerIpc(): void {
   ipcMain.handle("app:get-snapshot", () => snapshot)
   ipcMain.handle("mapping-store:retry", async () => {
-    if (archiveRestoreInFlight.size > 0) {
-      throw new Error("Wait for the archived-version restore to finish before restarting storage.")
+    if (archiveRestoreInFlight.size > 0 || hasConflictResolutionInFlight()) {
+      throw new Error("Wait for the current recovery operation to finish before restarting storage.")
     }
     snapshot.mappingStore = {
       ...snapshot.mappingStore,
@@ -2751,6 +3492,28 @@ function registerIpc(): void {
     await engine.restart()
     return snapshot
   })
+  ipcMain.handle("recovery:get-state", async (event) => {
+    requireTrustedMainRenderer(event)
+    return getRecoveryState()
+  })
+  ipcMain.handle("recovery:inspect-conflict", async (event, input: ConflictInspectionInput) => {
+    requireTrustedMainRenderer(event)
+    return inspectFileConflict(input)
+  })
+  ipcMain.handle("recovery:resolve-conflict", async (event, input: unknown) => {
+    requireTrustedMainRenderer(event)
+    return resolveFileConflict(input)
+  })
+  ipcMain.handle("recovery:reveal-conflict-file", async (event, input: ConflictInspectionInput) => {
+    requireTrustedMainRenderer(event)
+    validateConflictInput(input)
+    const { folder } = requireRecoveryFolder(input.mappingId)
+    const state = await engine.request<FileSyncState>("fileSync.getState", { id: folder.id })
+    if (!state.conflicts.some((conflict) => conflict.path === input.path)) {
+      throw new Error("This file conflict no longer exists.")
+    }
+    shell.showItemInFolder(resolveWithinRoot(folder.localPath, input.path))
+  })
   ipcMain.handle("archive:restore", async (event, entryId: string) => {
     requireTrustedMainRenderer(event)
     requireMappingMutations()
@@ -2758,7 +3521,13 @@ function registerIpc(): void {
     const source = await engine.request<ReplacementJournalEntry>("archive.get", { entryId })
     const folder = snapshot.folders.find((candidate) => candidate.id === source.mappingId)
     if (!folder) throw new Error("The archived version's folder mapping is no longer active.")
-    if (continuousSyncInFlight.has(folder.id) || initialSyncInFlight.has(folder.id) || archiveRestoreInFlight.has(folder.id)) {
+    if (
+      continuousSyncInFlight.has(folder.id) ||
+      initialSyncInFlight.has(folder.id) ||
+      archiveRestoreInFlight.has(folder.id) ||
+      hasConflictResolutionInFlight(folder.id) ||
+      conflictHashingInFlight.has(folder.id)
+    ) {
       throw new Error("Wait for the current folder operation to finish before restoring a version.")
     }
     archiveRestoreInFlight.add(folder.id)
@@ -2796,7 +3565,7 @@ function registerIpc(): void {
     requireMappingMutations()
     const release = blockContinuousSync(folderId)
     try {
-      if (paused && (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId))) {
+      if (paused && (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasConflictResolutionInFlight(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId))) {
         throw new Error("Wait for the active file transfer to finish before pausing this folder.")
       }
       const record = mappingRecords.get(folderId)
@@ -2826,7 +3595,7 @@ function registerIpc(): void {
     requireMappingMutations()
     const release = blockContinuousSync(folderId)
     try {
-      if (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId)) {
+      if (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasConflictResolutionInFlight(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId)) {
         throw new Error("Wait for the active file transfer to finish before removing this folder.")
       }
       const record = mappingRecords.get(folderId)
@@ -2912,7 +3681,7 @@ function requireTrustedMainRenderer(event: Electron.IpcMainInvokeEvent): void {
     event.senderFrame !== mainWindow.webContents.mainFrame ||
     !isTrustedRendererUrl(event.senderFrame.url)
   ) {
-    throw new Error("Archived versions can only be restored from Tethera's main window.")
+    throw new Error("Recovery actions can only be performed from Tethera's main window.")
   }
 }
 

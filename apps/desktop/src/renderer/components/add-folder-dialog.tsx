@@ -29,6 +29,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog"
 import { cn } from "@/lib/utils"
+import { formatBytes } from "@/lib/format"
 
 const defaultIgnorePatterns = [".DS_Store", "Thumbs.db", "desktop.ini", "*.tmp", "~$*"]
 type PickerTarget = "local" | "remote" | null
@@ -324,13 +325,6 @@ function PathChooser({ value, placeholder, onBrowse }: { value: string; placehol
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return <label className="grid gap-2"><span className="text-sm font-medium">{label}</span>{children}{hint ? <span className="text-xs text-[var(--muted-foreground)]">{hint}</span> : null}</label>
-}
-
-function formatBytes(value: number): string {
-  if (value <= 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)
-  return `${(value / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`
 }
 
 function previewCategory(category: FolderMappingPreview["samples"][number]["category"]): string {

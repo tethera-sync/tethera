@@ -11,6 +11,7 @@ This document separates implemented behaviour from planned behaviour so the prod
 - An explicitly initiated, direction-aware additive initial merge coordinated across both computers. Missing files transfer in 512 KiB encrypted requests with a full SHA-256 check and an atomic no-replace destination commit. Same-path differences are left untouched and surfaced.
 - Automatic post-merge reconciliation. Both participants debounce native directory watches, the non-coordinator reports changes over the authenticated peer session, a five-minute full scan covers missed/coalesced notifications, and one deterministic mapping participant coordinates each cycle.
 - Rust/SQLite verified-file baselines, durable retry operations, and explicit non-destructive conflicts. Only a one-sided change from a common digest may replace an existing file.
+- A Recovery screen that projects durable conflicts and replacement-journal failures without exposing archive roots or internal object keys. For a conflict with two present copies, it freshly hashes both computers and lets the user select an exact version permitted by the mapping direction.
 
 ## Authoritative Rust/SQLite mapping index
 
@@ -69,7 +70,7 @@ Renderer access remains `renderer -> preload -> Electron main -> authenticated R
 - `mapping.upsert` and `mapping.remove`;
 - `mapping.applyRemote` and `mapping.acknowledgeDelivery`; and
 - `mapping.getMigrationStatus`, `mapping.importLegacy` and `mapping.recordMigrationFailure`.
-- `fileSync.reconcile`, `fileSync.getState`, `fileSync.complete`, `fileSync.applyVerified` and `fileSync.fail`.
+- `fileSync.reconcile`, `fileSync.getState`, `fileSync.resolveConflict`, `fileSync.authorizeApply`, `fileSync.complete`, `fileSync.applyVerified` and `fileSync.fail`.
 
 The RPC exposes no SQL, no arbitrary file operation and no identity private key.
 
@@ -83,22 +84,24 @@ After activation, the lower participant device ID is the deterministic coordinat
 
 Existing destinations are replaced only if their digest still matches the planner's expected destination digest. The new file is staged and verified beside the destination. The exact destination entry is then moved to a reserved same-directory displaced path, copied into `userData/version-archive/objects/sha256/<prefix>/<digest>`, fsynced, re-hashed, and recorded as `archived` in SQLite before the new file is installed with an atomic no-replace link. A path created concurrently in the installation or rollback window is never overwritten. Sync completion and the journal's `completed` transition commit together. Deterministic archive staging can be verified and published after restart, and every journal entry is bound to the canonical local root that created it. The reserved displaced inode is retained and ignored by scans because POSIX permits late writes through an already-open handle; a future retention policy may remove it only under an explicit safety rule. The external content-addressed object remains the authoritative archived version. New destinations use the same atomic no-replace link.
 
-Startup processes incomplete replacement rows before watchers resume. An unchanged old live digest aborts work safely; the exact planned replacement plus a verified archive rolls forward; missing/corrupt archive content becomes `integrity-failed`; every ambiguous observation becomes `recovery-required`. Restore uses the same pipeline and archives a current live file before replacing it. A minimal Electron API exposes the engine-backed restore primitive, while the History screen remains a placeholder.
+Startup processes incomplete replacement rows before watchers resume. An unchanged old live digest aborts work safely; the exact planned replacement plus a verified archive rolls forward; missing/corrupt archive content becomes `integrity-failed`; every ambiguous observation becomes `recovery-required`. Restore uses the same pipeline and archives a current live file before replacing it. A minimal Electron API exposes the engine-backed restore primitive; replacement failures are visible in Recovery, while general archive browsing remains unimplemented.
 
-The first observation of a legacy/imported active mapping never assumes a one-sided file is new. Simultaneous modifications, one- or two-sided deletions, direction-blocked changes, and paths without a verified baseline become durable conflicts; files are not deleted and the folder/activity UI identifies affected paths.
+The first observation of a legacy/imported active mapping never assumes a one-sided file is new. Simultaneous modifications, one- or two-sided deletions, direction-blocked changes, and paths without a verified baseline become durable conflicts; files are not deleted and the folder/activity UI identifies affected paths. Legacy initial-merge conflict outcomes are promoted into the authoritative SQLite projection before their stale JSON copy is retired.
+
+For a durable conflict where both files are present, the coordinator can inspect both copies through the authenticated peer session and queue one exact version as normal durable sync work. The renderer submits the device-bound digests and sizes it displayed; the coordinator freshly revalidates both copies before accepting that choice and replay validates them again. Each transfer acknowledgement names the exact mirrored durable operation. The receiving side authorizes every incoming file application against that exact pull operation; a missing operation is accepted only as a no-write retry when the verified baseline and live file already match. Restart preserves selected intent, but a changed or missing source/destination blocks it and forces reconciliation. Installation reuses the existing verified transfer and archive-backed replacement journal; each local conflict remains until exact completion is committed. An unresolved replacement recovery issue blocks reconciliation before scanning and its referenced operation cannot be deleted or rewritten by a later plan. One-way direction is enforced, and missing/deletion conflicts cannot be selected.
 
 ## Clearly not implemented
 
 - Scan generations, incremental hashing, paging beyond 10,000 files, or production-scale performance work.
 - Engine-owned filesystem watching/network transfer, resumable/content-defined chunking, or bandwidth scheduling.
-- File deletion or rename propagation, archive browsing/retention, or conflict winner selection.
+- File deletion or rename propagation, general archive browsing/retention, or resolving conflicts where either copy is missing.
 - NAT traversal, cloud services, accounts or telemetry.
 - Removal of the 10,000-file manifest ceiling.
 - Code-signed/notarised release builds.
 
 ## Recommended next pull request
 
-The next milestone should add an explicit archive-backed conflict-resolution flow so the user can inspect both copies and select a result without bypassing the replacement journal. Deletion and rename propagation should remain disabled until that flow is proven safe.
+The next milestone should add a focused archive-history browser and retention policy over the existing content-addressed objects and replacement journal. Deletion and rename propagation should remain disabled until archive recovery and cross-platform interruption tests prove the lifecycle safe.
 
 ## LAN ports
 

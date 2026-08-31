@@ -113,7 +113,7 @@ Technical users comfortable installing Tailscale and interpreting actionable dia
 | Remote transport | Tailscale |
 | Startup | Manual app launch |
 | Window close | Continue in tray |
-| Conflict | Choose deterministic winner, preserve loser in history |
+| Conflict | Ask for an exact current copy, preserve the displaced copy in history |
 | Deletion | Archive before deleting |
 | Overwrite | Preserve prior version |
 | History retention | 30 days or 10 GB per folder, oldest first |

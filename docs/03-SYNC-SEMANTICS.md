@@ -37,9 +37,12 @@ A revision wins sequentially when it descends from another. Revisions are concur
 ## Conflict default
 
 - Descendant beats ancestor.
-- Concurrent files use a deterministic revision/device-ID tie-breaker, never wall clock alone.
-- Preserve the loser in history and record a conflict event.
-- Per-folder alternatives: keep both, ask, or pause the entry.
+- Concurrent files remain untouched until a user explicitly chooses one of the exact current copies; wall clock is never a winner selector.
+- Preserve the displaced copy in history and keep the durable conflict until the selected replacement is verified and indexed on both participants.
+- A choice is valid only while both current digests and sizes still match the recorded conflict. A changed or missing copy forces a fresh scan instead of applying stale intent.
+- One-way folder direction still applies to manual resolution. Deletion conflicts remain read-only until deletion propagation has complete recovery semantics.
+
+The coordinator records a valid choice as ordinary durable `push-local` or `pull-remote` work. Before transfer, the authenticated peer records the exact mirrored operation in its own local orientation so the receiving journal can bind replacement to durable work. Restart recovery replays it only when both observed source and destination still match that exact operation. Replacement then uses the normal staging, digest verification, archive, journal and atomic no-replace commit path; conflict-specific code does not bypass those guarantees.
 
 ## Change observation
 

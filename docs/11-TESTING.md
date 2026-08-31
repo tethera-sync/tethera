@@ -20,7 +20,7 @@ Desktop tests exercise the one-time `state.json` import and cleanup independentl
 
 Initial-merge tests cover direction-aware additive planning, fresh-scan convergence gating, large-file eligibility, strict two-pass completion ordering, durable conflict outcome projection, bounded source reads, source mutation detection, full-file SHA-256 verification, incomplete-staging cleanup, atomic no-replace commits, and source/destination symlink escape rejection. Full-integrity manifest tests prove files above the preview hashing ceiling receive digests and crash-residue staging names are never synchronized.
 
-Continuous-sync tests cover watcher delivery, full-digest observation conversion, one-way mode inversion, compare-and-replace destination checks, first-observation fail-safe behavior, verified-baseline advancement, durable retry state, simultaneous modifications, one-sided deletions, unbased divergence, and cascade cleanup when a mapping is removed.
+Continuous-sync tests cover watcher delivery, full-digest observation conversion, one-way mode inversion, compare-and-replace destination checks, first-observation fail-safe behavior, verified-baseline advancement, durable retry state, simultaneous modifications, one-sided deletions, unbased divergence, exact replay of a queued conflict choice, mirrored operation-ID matching, rejection of stale observations, and cascade cleanup when a mapping is removed. Rust storage and authenticated RPC tests cover idempotent exact conflict selection, stale/missing version rejection, projection into durable retry work, exact incoming-application authorization and operation binding, safe lost-ack idempotency, recovery-issue reconciliation blocking without journal orphaning, and a mirrored two-store choice completing through an installed archive journal on the receiver.
 
 ## Migration and restart integration
 
@@ -48,7 +48,7 @@ CI runs the equivalent desktop typecheck/test and Rust format/clippy/test gates 
 
 The file-sync suite covers its schema migration, deterministic planner, durable operations/conflicts, restart reads, and safe transfer staging. Scan generations, power-loss fault injection, large-scale/cross-platform stress, resumable chunks, archive recovery, and deletion propagation still require dedicated suites before those features are enabled.
 
-Future file-operation properties remain: journal recovery after process/power failure, displaced-version recovery across a power loss, deterministic user-directed conflict resolution, and convergence under repeated transport interruption. The additive initial merge already enforces that partial transfer never creates a live path and paths never escape an approved root.
+Future file-operation properties remain: journal recovery after process/power failure, displaced-version recovery across a power loss, deletion propagation, and convergence under repeated transport interruption. User-directed conflict selection is deterministic and durable for two present exact copies, while the additive initial merge already enforces that partial transfer never creates a live path and paths never escape an approved root.
 
 ## Release gates
 
