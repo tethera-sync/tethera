@@ -37,7 +37,7 @@ import type {
   OverallStatus,
   UpdateState,
 } from "@shared/contracts"
-import tetheraLogo from "@/assets/tethera-logo-flat.png"
+import tetheraMark from "@/assets/tethera-mark.svg"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { FolderMappingApprovalDialog } from "@/components/folder-mapping-approval-dialog"
@@ -161,7 +161,7 @@ export function App() {
       <aside className="sidebar [display:flex] [min-height:0] [flex-direction:column] [gap:14px] [border-right:1px_solid_var(--border)] [background:var(--surface-sunken)] [padding:16px_12px_14px]">
         <div className="brand [display:flex] [align-items:center] [gap:10px] [padding:4px_4px_0]">
           <div className="brand-mark grid size-[34px] shrink-0 place-items-center" aria-hidden="true">
-            <img className="h-auto w-[30px] max-w-none translate-y-[6px] object-contain" src={tetheraLogo} alt="" />
+            <img className="size-full object-contain" src={tetheraMark} alt="" />
           </div>
           <div className="brand-text [display:flex] [min-width:0] [flex:1] [align-items:center]">
             <p className="brand-name [margin:0] [font-size:15px] [font-weight:680] [letter-spacing:-0.025em]">Tethera</p>
