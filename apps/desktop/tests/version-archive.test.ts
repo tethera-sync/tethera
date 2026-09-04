@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test"
-import { createHash } from "node:crypto"
 import { link, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -15,8 +14,7 @@ import {
   verifyArchiveObject,
   type ReplacementJournalEntry,
 } from "../src/main/version-archive"
-
-const digest = (content: Buffer | string) => createHash("sha256").update(content).digest("hex")
+import { sha256Hex as digest } from "./helpers"
 
 describe("durable version archive", () => {
   test("archives exact pre-replacement content outside the live root", async () => {

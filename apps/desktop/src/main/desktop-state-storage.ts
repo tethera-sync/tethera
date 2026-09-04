@@ -3,6 +3,7 @@ import { constants } from "node:fs"
 import { mkdir, open, rename, unlink } from "node:fs/promises"
 import path from "node:path"
 import type { ActivityEvent, AppSettings, MappingState } from "../shared/contracts"
+import { syncDirectory } from "./fs-durability"
 
 export interface PersistedDesktopProjection {
   paused: boolean
@@ -113,15 +114,5 @@ export async function writeJsonAtomic(targetPath: string, document: Record<strin
       }
     }
     throw error
-  }
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  if (process.platform === "win32") return
-  const handle = await open(directory, "r")
-  try {
-    await handle.sync()
-  } finally {
-    await handle.close()
   }
 }

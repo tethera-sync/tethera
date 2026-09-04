@@ -6,6 +6,13 @@ import { resolveWithinRoot } from "./path-safety"
 /** Keeps base64 responses comfortably below the peer session's 16 MiB line limit. */
 export const TRANSFER_CHUNK_BYTES = 512 * 1024
 
+const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/
+
+/** Type-guard for lowercase SHA-256 hex digests used across transfer, archive, and sync paths. */
+export function isSha256HexDigest(value: unknown): value is string {
+  return typeof value === "string" && SHA256_HEX_PATTERN.test(value)
+}
+
 export interface TransferFileDescriptor {
   size: number
   modifiedMs: number

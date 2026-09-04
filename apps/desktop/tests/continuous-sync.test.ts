@@ -11,7 +11,6 @@ import {
   replayableOperations,
   type FileSyncConflict,
 } from "../src/main/continuous-sync"
-import { invertMode } from "../src/main/mapping-index"
 
 describe("continuous sync helpers", () => {
   test("replays only durable operations whose source and destination are still exact", () => {
@@ -92,12 +91,6 @@ describe("continuous sync helpers", () => {
       unreadable: 0,
       truncated: false,
     })).toThrow("did not produce a digest")
-  })
-
-  test("inverts directional rules for the peer view", () => {
-    expect(invertMode("send-only")).toBe("receive-only")
-    expect(invertMode("receive-only")).toBe("send-only")
-    expect(invertMode("two-way")).toBe("two-way")
   })
 
   test("summarises durable conflict kinds without claiming a winner", () => {

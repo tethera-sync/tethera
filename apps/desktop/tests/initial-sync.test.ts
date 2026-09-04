@@ -1,9 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import { createHash } from "node:crypto"
 import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import type { FileManifest } from "../src/main/folder-manifest"
 import {
   assessInitialMergeConvergence,
   computeSyncPlan,
@@ -11,12 +9,8 @@ import {
   writeFileAtomic,
   writeFileChunksAtomic,
 } from "../src/main/initial-sync"
-import { isTetheraStagingPath, resolveWithinRoot } from "../src/main/path-safety"
 import { archiveObjectPath } from "../src/main/version-archive"
-
-function manifest(files: FileManifest["files"]): FileManifest {
-  return { rootPath: "/tmp/test", files, ignored: 0, unreadable: 0, truncated: false }
-}
+import { manifest, sha256Hex } from "./helpers"
 
 describe("computeSyncPlan", () => {
   test("pulls remote-only files and skips divergent ones", () => {
@@ -39,16 +33,6 @@ describe("computeSyncPlan", () => {
     ])
   })
 
-  test("plans remote-only files of any size for chunked transfer", () => {
-    const plan = computeSyncPlan(
-      manifest([]),
-      manifest([{ path: "huge.bin", size: 128 * 1024 * 1024, modifiedMs: 1, digest: "x" }]),
-      "two-way",
-    )
-    expect(plan.toPull.map((entry) => entry.path)).toEqual(["huge.bin"])
-    expect(plan.skipped).toEqual([])
-  })
-
   test("send-only mode never pulls", () => {
     const plan = computeSyncPlan(
       manifest([{ path: "conflict.txt", size: 1, modifiedMs: 1, digest: "local" }]),
@@ -62,16 +46,24 @@ describe("computeSyncPlan", () => {
     expect(plan.skipped.map((skip) => skip.path)).toEqual(["conflict.txt"])
   })
 
+  test("plans remote-only files of any size for chunked transfer", () => {
+    const plan = computeSyncPlan(
+      manifest([]),
+      manifest([{ path: "huge.bin", size: 128 * 1024 * 1024, modifiedMs: 1, digest: "remote-version" }]),
+      "two-way",
+    )
+    expect(plan.toPull.map((entry) => entry.path)).toEqual(["huge.bin"])
+    expect(plan.skipped).toEqual([])
+  })
+
   test("receive-only mode pulls remote-only files", () => {
-    const plan = computeSyncPlan(manifest([]), manifest([{ path: "new.txt", size: 1, modifiedMs: 1, digest: "x" }]), "receive-only")
+    const plan = computeSyncPlan(
+      manifest([]),
+      manifest([{ path: "new.txt", size: 1, modifiedMs: 1, digest: "remote-version" }]),
+      "receive-only",
+    )
     expect(plan.toPull.map((entry) => entry.path)).toEqual(["new.txt"])
   })
-})
-
-test("reserved staging detection handles every valid POSIX basename character", () => {
-  const suffix = ".tethera-tmp-0123456789abcdef0123456789abcdef"
-  expect(isTetheraStagingPath(`.line\nbreak${suffix}`)).toBe(true)
-  expect(isTetheraStagingPath(`.back\\slash${suffix}`)).toBe(true)
 })
 
 describe("runCoordinatedInitialMerge", () => {
@@ -118,16 +110,6 @@ describe("assessInitialMergeConvergence", () => {
     )
     expect(result.complete).toBe(true)
     expect(result.skipped.map((skip) => skip.path)).toEqual(["notes.txt"])
-  })
-})
-
-describe("resolveWithinRoot", () => {
-  test("resolves a plain relative path under the root", () => {
-    expect(resolveWithinRoot("/tmp/root", "sub/file.txt")).toBe(path.resolve("/tmp/root", "sub/file.txt"))
-  })
-
-  test.each(["../escape.txt", "/etc/passwd", "sub/../../escape.txt", "sub/../..", ""])("rejects unsafe path %p", (unsafe) => {
-    expect(() => resolveWithinRoot("/tmp/root", unsafe)).toThrow()
   })
 })
 
@@ -183,7 +165,7 @@ describe("writeFileChunksAtomic", () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-chunk-test-"))
     const chunks = [Buffer.from("hello "), Buffer.from("from "), Buffer.from("chunks")]
     const content = Buffer.concat(chunks)
-    const digest = createHash("sha256").update(content).digest("hex")
+    const digest = sha256Hex(content)
     try {
       await writeFileChunksAtomic(root, "nested/large.bin", content.length, digest, async function* () {
         for (const chunk of chunks) yield chunk
@@ -214,8 +196,8 @@ describe("writeFileChunksAtomic", () => {
     const archiveRoot = await mkdtemp(path.join(tmpdir(), "tethera-archive-test-"))
     const original = Buffer.from("verified original")
     const replacement = Buffer.from("safe replacement")
-    const originalDigest = createHash("sha256").update(original).digest("hex")
-    const replacementDigest = createHash("sha256").update(replacement).digest("hex")
+    const originalDigest = sha256Hex(original)
+    const replacementDigest = sha256Hex(replacement)
     try {
       await writeFile(path.join(root, "notes.txt"), original)
       await writeFileChunksAtomic(
@@ -246,9 +228,9 @@ describe("writeFileChunksAtomic", () => {
   test("preserves a destination changed after reconciliation", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-chunk-test-"))
     const archiveRoot = await mkdtemp(path.join(tmpdir(), "tethera-archive-test-"))
-    const staleDigest = createHash("sha256").update("old baseline").digest("hex")
+    const staleDigest = sha256Hex("old baseline")
     const replacement = Buffer.from("remote replacement")
-    const replacementDigest = createHash("sha256").update(replacement).digest("hex")
+    const replacementDigest = sha256Hex(replacement)
     try {
       await writeFile(path.join(root, "notes.txt"), "new local edit")
       await expect(writeFileChunksAtomic(

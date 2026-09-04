@@ -4,16 +4,17 @@ import { createHash, randomBytes } from "node:crypto"
 import path from "node:path"
 import type { SyncMode } from "../shared/contracts"
 import type { FileManifest, FileManifestEntry } from "./folder-manifest"
+import { manifestEntriesMatch } from "./folder-manifest"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
-import { describeTransferFile } from "./file-transfer"
+import { describeTransferFile, isSha256HexDigest } from "./file-transfer"
 import { invertMode } from "./mapping-index"
 import {
   archiveDisplacedFile,
   displacedFilePath,
   replacementStagingPath,
-  syncDirectory,
   type DurableReplacementHooks,
 } from "./version-archive"
+import { syncDirectory } from "./fs-durability"
 
 const MIN_FREE_SPACE_AFTER_TRANSFER = 64 * 1024 * 1024
 
@@ -77,13 +78,7 @@ export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode:
       continue
     }
 
-    const digestMatch = Boolean(localEntry.digest && remoteEntry.digest && localEntry.digest === remoteEntry.digest)
-    const metadataMatch =
-      !localEntry.digest &&
-      !remoteEntry.digest &&
-      localEntry.size === remoteEntry.size &&
-      Math.abs(localEntry.modifiedMs - remoteEntry.modifiedMs) <= 2_000
-    if (digestMatch || metadataMatch) continue
+    if (manifestEntriesMatch(localEntry, remoteEntry)) continue
 
     skipped.push({
       path: remoteEntry.path,
@@ -134,8 +129,8 @@ export async function writeFileChunksAtomic(
 ): Promise<void> {
   const { onChunk, expectedDestinationDigest, expectedDestinationSize, replacement } = options
   if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) throw new Error("The transferred file size is invalid.")
-  if (!/^[a-f0-9]{64}$/.test(expectedDigest)) throw new Error("The transferred file digest is invalid.")
-  if (expectedDestinationDigest !== undefined && !/^[a-f0-9]{64}$/.test(expectedDestinationDigest)) {
+  if (!isSha256HexDigest(expectedDigest)) throw new Error("The transferred file digest is invalid.")
+  if (expectedDestinationDigest !== undefined && !isSha256HexDigest(expectedDestinationDigest)) {
     throw new Error("The expected destination digest is invalid.")
   }
   if (expectedDestinationDigest !== undefined && (!replacement || expectedDestinationSize === undefined)) {

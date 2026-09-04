@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test"
-import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -9,8 +8,7 @@ import {
   archiveObjectPath,
   type ReplacementJournalEntry,
 } from "../src/main/version-archive"
-
-const digest = (content: Buffer | string) => createHash("sha256").update(content).digest("hex")
+import { sha256Hex as digest } from "./helpers"
 
 test("restore recreates an archived version and archives the version it replaces", async () => {
   const live = await mkdtemp(path.join(tmpdir(), "tethera-restore-live-"))

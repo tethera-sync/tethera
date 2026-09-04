@@ -8,6 +8,7 @@ import {
   type LegacyImportRecord,
   type LegacyImportRequest,
 } from "./mapping-index"
+import { syncDirectory } from "./fs-durability"
 
 export type LegacyStateSource =
   | { kind: "missing"; document: Record<string, unknown>; modifiedAt: string }
@@ -417,16 +418,6 @@ function isBoundedPathArray(value: unknown): value is string[] {
 
 function isBoundedPath(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 4_096 && !value.includes("\0")
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  if (process.platform === "win32") return
-  const handle = await open(directory, "r")
-  try {
-    await handle.sync()
-  } finally {
-    await handle.close()
-  }
 }
 
 export function canonicalJson(value: unknown): string {

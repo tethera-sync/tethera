@@ -2,7 +2,8 @@ import { constants } from "node:fs"
 import { createHash } from "node:crypto"
 import { chmod, link, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises"
 import path from "node:path"
-import { describeTransferFile, readTransferFileChunk, TRANSFER_CHUNK_BYTES } from "./file-transfer"
+import { describeTransferFile, isSha256HexDigest, readTransferFileChunk, TRANSFER_CHUNK_BYTES } from "./file-transfer"
+import { syncDirectory } from "./fs-durability"
 import { resolveWithinRoot } from "./path-safety"
 
 export const VERSION_ARCHIVE_DIRECTORY = "version-archive"
@@ -374,15 +375,5 @@ async function ensureArchiveDirectory(directory: string, archiveRoot = directory
 }
 
 function assertDigest(digest: string): void {
-  if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error("The archive digest is invalid.")
-}
-
-export async function syncDirectory(directory: string): Promise<void> {
-  if (process.platform === "win32") return
-  const handle = await open(directory, "r")
-  try {
-    await handle.sync()
-  } finally {
-    await handle.close()
-  }
+  if (!isSha256HexDigest(digest)) throw new Error("The archive digest is invalid.")
 }

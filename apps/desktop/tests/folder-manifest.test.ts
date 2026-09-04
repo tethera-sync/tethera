@@ -2,12 +2,8 @@ import { describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm, truncate, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import type { FileManifest } from "../src/main/folder-manifest"
 import { folderManifestTestHelpers, isManifestPathIgnored, scanFolder } from "../src/main/folder-manifest"
-
-function manifest(files: FileManifest["files"]): FileManifest {
-  return { rootPath: "/tmp/test", files, ignored: 0, unreadable: 0, truncated: false }
-}
+import { manifest } from "./helpers"
 
 describe("folder mapping comparison", () => {
   test("classifies identical, one-sided and different files", () => {

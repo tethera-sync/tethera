@@ -1,5 +1,5 @@
 import type { CSSProperties } from "react"
-import { cn } from "@/lib/utils"
+import { clamp01, cn } from "@/lib/utils"
 
 interface MeterProps {
   label: string
@@ -12,7 +12,7 @@ interface MeterProps {
 }
 
 export function Meter({ label, readout, value, tone = "primary", className }: MeterProps) {
-  const fraction = Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 0
+  const fraction = clamp01(value)
   const percentage = Math.round(fraction * 100)
 
   return (

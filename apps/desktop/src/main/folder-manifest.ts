@@ -104,6 +104,18 @@ export async function scanFolder(
   return { rootPath: root, files, ignored, unreadable, truncated }
 }
 
+/**
+ * Decides whether two same-path manifest entries describe identical content.
+ * A matching full-content digest wins; without digests, size plus a 2-second
+ * mtime tolerance applies. Mixed digest presence never matches.
+ */
+export function manifestEntriesMatch(a: FileManifestEntry, b: FileManifestEntry): boolean {
+  if (a.digest || b.digest) {
+    return Boolean(a.digest && b.digest && a.digest === b.digest)
+  }
+  return a.size === b.size && Math.abs(a.modifiedMs - b.modifiedMs) <= 2_000
+}
+
 export function compareManifests(
   local: FileManifest,
   remote: FileManifest,
@@ -138,13 +150,7 @@ export function compareManifests(
     }
     if (!localEntry || !remoteEntry) continue
 
-    const digestMatch = Boolean(localEntry.digest && remoteEntry.digest && localEntry.digest === remoteEntry.digest)
-    const metadataMatch =
-      !localEntry.digest &&
-      !remoteEntry.digest &&
-      localEntry.size === remoteEntry.size &&
-      Math.abs(localEntry.modifiedMs - remoteEntry.modifiedMs) <= 2_000
-    if (digestMatch || metadataMatch) {
+    if (manifestEntriesMatch(localEntry, remoteEntry)) {
       identicalFiles += 1
       continue
     }

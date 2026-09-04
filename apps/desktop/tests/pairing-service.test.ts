@@ -14,19 +14,28 @@ describe("pairing identity helpers", () => {
     expect(pairingTestHelpers.fingerprint(key)).toMatch(/^[0-9A-F]{4}( [0-9A-F]{4}){4}$/)
   })
 
-  test("both computers derive the same six-digit comparison code", () => {
+  test("the transcript binds identities, nonces, and roles to the comparison code", () => {
     const initiator = publicKey()
     const responder = publicKey()
-    const transcript = pairingTestHelpers.buildTranscriptHash(
+    const baseline = pairingTestHelpers.buildTranscriptHash(
       "session-1",
       initiator,
       responder,
       "initiator-nonce",
       "responder-nonce",
     )
+    expect(pairingTestHelpers.comparisonCode(baseline)).toMatch(/^\d{3} \d{3}$/)
 
-    expect(pairingTestHelpers.comparisonCode(transcript)).toMatch(/^\d{3} \d{3}$/)
-    expect(pairingTestHelpers.comparisonCode(transcript)).toBe(pairingTestHelpers.comparisonCode(transcript))
+    // Any change to the bound inputs must change what both computers display.
+    const variants = [
+      pairingTestHelpers.buildTranscriptHash("session-1", publicKey(), responder, "initiator-nonce", "responder-nonce"),
+      pairingTestHelpers.buildTranscriptHash("session-1", initiator, publicKey(), "initiator-nonce", "responder-nonce"),
+      pairingTestHelpers.buildTranscriptHash("session-1", initiator, responder, "other-nonce", "responder-nonce"),
+      pairingTestHelpers.buildTranscriptHash("session-1", responder, initiator, "initiator-nonce", "responder-nonce"),
+    ]
+    for (const variant of variants) {
+      expect(variant).not.toBe(baseline)
+    }
   })
 
   test("presence beacons are also sent directly to known peer addresses", () => {
@@ -39,15 +48,6 @@ describe("pairing identity helpers", () => {
         "Unknown address",
       ),
     ).toEqual(["255.255.255.255", "192.168.0.123", "192.168.0.210"])
-  })
-
-  test("changing either identity changes the transcript", () => {
-    const initiator = publicKey()
-    const responder = publicKey()
-    const otherResponder = publicKey()
-    const first = pairingTestHelpers.buildTranscriptHash("session-1", initiator, responder, "a", "b")
-    const second = pairingTestHelpers.buildTranscriptHash("session-1", initiator, otherResponder, "a", "b")
-    expect(first).not.toBe(second)
   })
 
   test("rejects pairing messages from an incompatible protocol", () => {

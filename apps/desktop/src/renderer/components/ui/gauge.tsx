@@ -1,5 +1,5 @@
 import type { CSSProperties } from "react"
-import { cn } from "@/lib/utils"
+import { clamp01, cn } from "@/lib/utils"
 
 export type GaugeTone = "primary" | "warning" | "danger" | "neutral"
 
@@ -31,7 +31,7 @@ export function Gauge({
   className,
   ariaLabel,
 }: GaugeProps) {
-  const fraction = Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 0
+  const fraction = clamp01(value)
   const radius = (size - thickness) / 2
   const circumference = 2 * Math.PI * radius
   const arc = circumference * sweep
