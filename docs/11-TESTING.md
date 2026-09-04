@@ -33,16 +33,21 @@ No migration or configuration test may scan a mapped directory. Paths in these t
 Run from the repository root:
 
 ```bash
-cargo fmt --all --check
+bun run verify
+```
+
+That single command runs exactly this sequence, so the list below is what `verify` executes rather than a second source of truth:
+
+```bash
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 bun run desktop:typecheck
 bun run desktop:test
 bun run desktop:build
-bun run check
 ```
 
-CI runs the equivalent desktop typecheck/test and Rust format/clippy/test gates on Linux. Cross-platform path preservation is unit-tested without resolving the paths on the host platform.
+CI runs the equivalent desktop typecheck/test/build and Rust format/clippy/test gates on Linux. Cross-platform path preservation is unit-tested without resolving the paths on the host platform.
 
 ## Future sync-engine tests
 

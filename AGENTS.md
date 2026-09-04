@@ -875,7 +875,7 @@ cargo test --workspace
 git diff --check
 ```
 
-`bun run check` is a useful combined typecheck/test command, but it does not run the desktop build, Rust formatting, or Clippy. Do not present it as the complete pull-request gate by itself.
+`bun run verify` is the complete pull-request gate (Rust fmt, Clippy, workspace tests, desktop typecheck/test/build). `bun run check` is only the quicker typecheck/test subset for iterating — do not present it as the complete gate by itself.
 
 For renderer-only work, manually verify the affected states and interactions. For preload, IPC, engine-spawn, filesystem, updater, tray, packaging, or cross-process work, verify in Electron rather than only a browser. For peer sync or platform-sensitive work, unit tests on one Linux machine are not proof of a real Linux-to-Windows run; state that limitation unless the physical/platform matrix was exercised.
 

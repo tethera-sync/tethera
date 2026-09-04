@@ -61,9 +61,7 @@ Mapping data lives at `TETHERA_DATA_DIR/mappings.sqlite3`; the desktop passes it
 
 ```bash
 bun install
-cd apps/desktop
-bun run electron:install
-cd ../..
+bun run desktop:setup
 ```
 
 The explicit `electron:install` step matters because of how Bun's isolated workspace layout and lifecycle-script security interact with Electron's postinstall.
@@ -90,11 +88,13 @@ bun run desktop:test
 cargo test --workspace
 ```
 
-Or everything at once:
+Or the full validation gate at once:
 
 ```bash
-bun run check
+bun run verify
 ```
+
+(`bun run check` is the quicker typecheck/test-only subset for iterating.)
 
 ## Networking
 

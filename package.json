@@ -18,6 +18,7 @@
     "desktop:dev:full": "cargo build -p sync-engine && bun run desktop:setup && bun run desktop:dev",
     "rust:build": "cargo build -p sync-engine",
     "check": "bun run desktop:typecheck && bun run desktop:test && cargo test --workspace",
+    "verify": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace && bun run desktop:typecheck && bun run desktop:test && bun run desktop:build",
     "desktop:test": "bun run --filter @tethera/desktop test"
   },
   "trustedDependencies": [
