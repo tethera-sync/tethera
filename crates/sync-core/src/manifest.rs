@@ -7,6 +7,7 @@
 //! uses `SHA-256`) — this module never hashes anything itself, it only compares what it's given.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -18,6 +19,12 @@ static WINDOWS_RESERVED_NAME: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 const MAX_SAMPLE_ITEMS: usize = 14;
+
+/// Longest ignore pattern the matcher accepts, mirroring the desktop and
+/// engine envelopes (256 patterns of at most 512 units). Anything longer
+/// fails closed instead of reaching the regex compiler, so a hostile caller
+/// can never turn pattern compilation into a panic.
+const MAX_IGNORE_PATTERN_LENGTH: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -248,7 +255,15 @@ impl CompareTally {
                     Some(local_entry.size.max(remote_entry.size)),
                 );
             }
-            (None, None) => unreachable!("path came from one of the two manifests"),
+            (None, None) => {
+                // `paths` is the deduped union of both manifests' keys, so at
+                // least one side always has an entry. Guard the construction
+                // invariant without panicking if a future refactor breaks it.
+                debug_assert!(
+                    false,
+                    "classify paths come from the union of both manifests"
+                );
+            }
         }
     }
 }
@@ -388,39 +403,72 @@ pub fn compute_sync_plan(local: &FileManifest, remote: &FileManifest, mode: Sync
 
 /// Matches relative paths against gitignore-flavoured patterns: `*`, `?`, `**`, a trailing `/`
 /// for directory-only rules, and basename-only matching when a pattern has no `/`.
+#[derive(Debug)]
 pub struct IgnoreMatcher {
     rules: Vec<IgnoreRule>,
 }
 
+#[derive(Debug)]
 struct IgnoreRule {
     directory_only: bool,
     basename_only: bool,
     regex: Regex,
 }
 
+/// Rejected ignore pattern, carrying the offending value for a precise error.
+/// Display truncates it so an oversized pattern never floods logs or RPC errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidIgnorePattern {
+    pub pattern: String,
+}
+
+impl fmt::Display for InvalidIgnorePattern {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const SHOWN: usize = 64;
+        let shown: String = self.pattern.chars().take(SHOWN).collect();
+        if self.pattern.chars().count() > SHOWN {
+            write!(formatter, "invalid ignore pattern {shown:?}…")
+        } else {
+            write!(formatter, "invalid ignore pattern {shown:?}")
+        }
+    }
+}
+
+impl std::error::Error for InvalidIgnorePattern {}
+
 impl IgnoreMatcher {
+    /// Builds a matcher for already-validated patterns, skipping anything that
+    /// cannot compile. Construction sites that must fail closed on hostile
+    /// input (folder scans) use [`IgnoreMatcher::try_new`] instead.
     #[must_use]
     pub fn new(patterns: &[String]) -> Self {
         let rules = patterns
             .iter()
-            .map(|pattern| strip_leading_dot_slash(&pattern.trim().replace('\\', "/")))
-            .filter(|pattern| !pattern.is_empty() && !pattern.starts_with('#'))
-            .map(|pattern| {
-                let directory_only = pattern.ends_with('/');
-                let normalized_pattern = if directory_only {
-                    pattern[..pattern.len() - 1].to_owned()
-                } else {
-                    pattern
-                };
-                let basename_only = !normalized_pattern.contains('/');
-                IgnoreRule {
-                    directory_only,
-                    basename_only,
-                    regex: glob_to_regex(&normalized_pattern),
-                }
-            })
+            .filter_map(|pattern| build_rule(pattern))
             .collect();
         Self { rules }
+    }
+
+    /// Builds a matcher, rejecting the first pattern that is oversized or
+    /// cannot compile instead of silently changing what gets ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidIgnorePattern`] for the first pattern that exceeds
+    /// the length envelope or cannot compile; blanks and comments are still
+    /// skipped silently.
+    pub fn try_new(patterns: &[String]) -> Result<Self, InvalidIgnorePattern> {
+        let mut rules = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            if let Some(rule) = build_rule(pattern) {
+                rules.push(rule);
+            } else if !ignorable_pattern(pattern) {
+                return Err(InvalidIgnorePattern {
+                    pattern: pattern.clone(),
+                });
+            }
+        }
+        Ok(Self { rules })
     }
 
     #[must_use]
@@ -451,7 +499,37 @@ fn strip_leading_dot_slash(path: &str) -> String {
         .map_or_else(|| path.to_owned(), ToOwned::to_owned)
 }
 
-fn glob_to_regex(pattern: &str) -> Regex {
+/// Patterns that never become rules: blanks and comments, after the same
+/// normalization the matcher applies.
+fn ignorable_pattern(pattern: &str) -> bool {
+    let normalized = strip_leading_dot_slash(&pattern.trim().replace('\\', "/"));
+    normalized.is_empty() || normalized.starts_with('#')
+}
+
+fn build_rule(pattern: &str) -> Option<IgnoreRule> {
+    let normalized = strip_leading_dot_slash(&pattern.trim().replace('\\', "/"));
+    if normalized.is_empty() || normalized.starts_with('#') {
+        return None;
+    }
+    let directory_only = normalized.ends_with('/');
+    let source = if directory_only {
+        normalized[..normalized.len() - 1].to_owned()
+    } else {
+        normalized
+    };
+    if source.len() > MAX_IGNORE_PATTERN_LENGTH {
+        return None;
+    }
+    let basename_only = !source.contains('/');
+    let regex = glob_to_regex(&source)?;
+    Some(IgnoreRule {
+        directory_only,
+        basename_only,
+        regex,
+    })
+}
+
+fn glob_to_regex(pattern: &str) -> Option<Regex> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut source = String::new();
     let mut index = 0;
@@ -469,7 +547,7 @@ fn glob_to_regex(pattern: &str) -> Regex {
         }
         index += 1;
     }
-    Regex::new(&format!("(?i)^{source}$")).expect("a translated glob pattern should always compile")
+    Regex::new(&format!("(?i)^{source}$")).ok()
 }
 
 #[must_use]
@@ -590,6 +668,38 @@ mod tests {
         assert!(matcher.is_ignored("cache/file.tmp", false));
         assert!(matcher.is_ignored("build/assets/app.js", false));
         assert!(!matcher.is_ignored("src/app.ts", false));
+    }
+
+    #[test]
+    fn oversized_patterns_fail_closed_instead_of_reaching_the_regex_compiler() {
+        let oversized = "a".repeat(513);
+        let error = IgnoreMatcher::try_new(std::slice::from_ref(&oversized))
+            .expect_err("an oversized pattern must fail closed");
+        assert_eq!(error.pattern, oversized);
+
+        let boundary = "b".repeat(512);
+        let matcher = IgnoreMatcher::try_new(&[boundary])
+            .expect("a 512-unit pattern stays inside the envelope");
+        assert!(!matcher.is_ignored("other.txt", false));
+    }
+
+    #[test]
+    fn lenient_construction_skips_only_the_uncompilable_rule() {
+        let matcher = IgnoreMatcher::new(&["*.tmp".to_owned(), "a".repeat(600)]);
+        assert!(matcher.is_ignored("cache/file.tmp", false));
+        assert!(!matcher.is_ignored("src/app.ts", false));
+    }
+
+    #[test]
+    fn invalid_pattern_display_truncates_oversized_values() {
+        let rendered = format!(
+            "{}",
+            super::InvalidIgnorePattern {
+                pattern: "x".repeat(200),
+            }
+        );
+        assert!(rendered.len() < 200);
+        assert!(rendered.contains('…'));
     }
 
     #[test]

@@ -27,6 +27,11 @@ use sync_storage::version_archive::{
 /// Longest path `manifest.scan` will accept, so a malformed request cannot hand the walker an
 /// unbounded string.
 const MAX_SCAN_PATH_LENGTH: usize = 4096;
+/// Most ignore patterns a single scan accepts, and the longest any one pattern may be —
+/// the same envelope the desktop UI enforces before sending a scan, so anything beyond it
+/// fails closed here instead of reaching the folder walker.
+const MAX_SCAN_IGNORE_PATTERNS: usize = 256;
+const MAX_SCAN_IGNORE_PATTERN_LENGTH: usize = 512;
 
 fn main() {
     if env::args().any(|argument| argument == "--rpc-stdio") {
@@ -1159,6 +1164,24 @@ fn handle_manifest_scan(request: RpcRequest) -> Value {
             format!("manifest.scan path must be at most {MAX_SCAN_PATH_LENGTH} characters"),
         );
     }
+    if params.ignore_patterns.len() > MAX_SCAN_IGNORE_PATTERNS {
+        return error_response(
+            request.id,
+            format!("manifest.scan accepts at most {MAX_SCAN_IGNORE_PATTERNS} ignore patterns"),
+        );
+    }
+    if params
+        .ignore_patterns
+        .iter()
+        .any(|pattern| pattern.len() > MAX_SCAN_IGNORE_PATTERN_LENGTH || pattern.contains('\0'))
+    {
+        return error_response(
+            request.id,
+            format!(
+                "manifest.scan ignore patterns must be at most {MAX_SCAN_IGNORE_PATTERN_LENGTH} characters with no NUL bytes"
+            ),
+        );
+    }
     let path = Path::new(&params.path);
     if !path.is_absolute() {
         return error_response(
@@ -2267,6 +2290,60 @@ mod tests {
             &second,
         );
         assert_eq!(response["result"]["mapping"]["id"], "mapping-1");
+    }
+
+    #[test]
+    fn manifest_scan_accepts_a_valid_ignore_envelope() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(root.path().join("kept.txt"), b"kept").expect("write file");
+        let params = serde_json::json!({"path": root.path(), "ignorePatterns": ["node_modules/"]})
+            .to_string();
+        let response = handle_line(
+            &request("manifest.scan", &params),
+            "correct",
+            &ready_store(),
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["result"]["files"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn manifest_scan_rejects_an_oversized_ignore_pattern() {
+        let overlong = "a".repeat(513);
+        let params = format!(r#"{{"path":"/tmp/whatever","ignorePatterns":[{overlong:?}]}}"#);
+        let response = handle_line(
+            &request("manifest.scan", &params),
+            "correct",
+            &ready_store(),
+        );
+        assert_eq!(response["ok"], false);
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ignore patterns")
+        );
+    }
+
+    #[test]
+    fn manifest_scan_rejects_too_many_ignore_patterns() {
+        let many = format!("[{}]", vec!["\"*.log\""; 257].join(","));
+        let params = format!(r#"{{"path":"/tmp/whatever","ignorePatterns":{many}}}"#);
+        let response = handle_line(
+            &request("manifest.scan", &params),
+            "correct",
+            &ready_store(),
+        );
+        assert_eq!(response["ok"], false);
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("at most 256")
+        );
     }
 
     #[test]

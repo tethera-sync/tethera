@@ -67,9 +67,11 @@ const MAX_SCAN_DEPTH: usize = 64;
 ///
 /// # Errors
 ///
-/// Returns `Err` if `root` does not exist or is not a directory. Failures *within* the tree —
-/// an unreadable subdirectory or file — are counted in `FileManifest::unreadable` and do not
-/// abort the scan.
+/// Returns `Err` if `root` does not exist or is not a directory, or if an
+/// ignore pattern is invalid: a scan must never silently change what gets
+/// ignored because a pattern could not be understood. Failures *within* the
+/// tree — an unreadable subdirectory or file — are counted in
+/// `FileManifest::unreadable` and do not abort the scan.
 pub fn scan_folder(root: &Path, ignore_patterns: &[String]) -> io::Result<FileManifest> {
     if !root.is_dir() {
         return Err(io::Error::new(
@@ -78,7 +80,12 @@ pub fn scan_folder(root: &Path, ignore_patterns: &[String]) -> io::Result<FileMa
         ));
     }
 
-    let matcher = IgnoreMatcher::new(ignore_patterns);
+    let matcher = IgnoreMatcher::try_new(ignore_patterns).map_err(|invalid| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to scan with {invalid}"),
+        )
+    })?;
     let mut state = ScanState::default();
     visit(root, "", 0, &matcher, &mut state);
 
@@ -465,6 +472,17 @@ mod tests {
         }
         found.sort();
         found
+    }
+
+    #[test]
+    fn an_invalid_ignore_pattern_fails_the_scan_closed() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        fs::write(root.path().join("kept.txt"), b"kept").expect("write kept file");
+
+        let error = scan_folder(root.path(), &["a".repeat(600)]).expect_err(
+            "an oversized pattern must fail the scan instead of changing what is ignored",
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
