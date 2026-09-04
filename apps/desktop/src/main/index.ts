@@ -19,7 +19,6 @@ import { pathToFileURL } from "node:url"
 import { promisify } from "node:util"
 import type {
   AddFolderInput,
-  AppSettingKey,
   AppSettings,
   AppSnapshot,
   ApproveFolderMappingInput,
@@ -63,6 +62,7 @@ import {
 } from "./initial-sync"
 import {
   describeTransferFile,
+  isSha256HexDigest,
   readTransferFileChunk,
   TRANSFER_CHUNK_BYTES,
   type TransferFileDescriptor,
@@ -95,6 +95,13 @@ import {
 import { PairingService } from "./pairing-service"
 import { PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
+import {
+  applySettingUpdate,
+  parsePeerScanManifest,
+  parseRevealPath,
+  parseSettingUpdate,
+  validateMappingInput,
+} from "./ipc-validation"
 import {
   conflictSummary,
   findMirroredPeerOperation,
@@ -730,25 +737,6 @@ async function createLocalDirectory(input: CreateDirectoryInput): Promise<Direct
   const parentPath = normaliseBrowsePath(input.parentPath)
   await mkdir(path.join(parentPath, name))
   return browseHostDirectory(parentPath, true, "local-device", getLocalDevice().name)
-}
-
-function validateMappingInput(input: AddFolderInput): void {
-  if (!input.localPath?.trim() || !input.remotePath?.trim()) throw new Error("Choose both folders before continuing.")
-  if (!input.remoteDeviceId?.trim()) throw new Error("Choose a paired computer.")
-  if (!(["two-way", "send-only", "receive-only"] as const).includes(input.mode)) throw new Error("The sync direction is invalid.")
-  if (!Number.isInteger(input.historyDays) || input.historyDays < 1 || input.historyDays > 3_650) {
-    throw new Error("Version history must be between 1 and 3,650 days.")
-  }
-  if (!Number.isSafeInteger(input.historyMaxBytes) || input.historyMaxBytes < 1024 ** 3 || input.historyMaxBytes > 4 * 1024 ** 4) {
-    throw new Error("The history storage cap must be between 1 GB and 4 TB.")
-  }
-  if (!Array.isArray(input.ignorePatterns) || input.ignorePatterns.length > 256) {
-    throw new Error("Use no more than 256 ignore patterns.")
-  }
-  if (input.ignorePatterns.some((pattern) => typeof pattern !== "string" || pattern.length > 512 || pattern.includes("\0"))) {
-    throw new Error("An ignore pattern is invalid or too long.")
-  }
-  if (input.name.length > 120) throw new Error("The folder name must be 120 characters or fewer.")
 }
 
 function requireMappingMutations(): void {
@@ -1397,7 +1385,7 @@ function parseConflictCopyExpectation(value: unknown): ConflictCopyExpectation {
   const candidate = value as Partial<ConflictCopyExpectation>
   if (
     typeof candidate.deviceId !== "string" || !candidate.deviceId || candidate.deviceId.length > 200 ||
-    typeof candidate.digest !== "string" || !/^[a-f0-9]{64}$/.test(candidate.digest) ||
+    !isSha256HexDigest(candidate.digest) ||
     typeof candidate.size !== "number" || !Number.isSafeInteger(candidate.size) || candidate.size < 0
   ) {
     throw new Error("The inspected conflict copy is invalid.")
@@ -1545,7 +1533,7 @@ function parsePeerConflictCopy(value: unknown): PeerConflictCopy {
   if (
     !Number.isSafeInteger(candidate.size) || (candidate.size ?? -1) < 0 ||
     !Number.isFinite(candidate.modifiedMs) ||
-    typeof candidate.digest !== "string" || !/^[a-f0-9]{64}$/.test(candidate.digest)
+    !isSha256HexDigest(candidate.digest)
   ) {
     throw new Error("The paired computer returned invalid conflict file metadata.")
   }
@@ -1565,9 +1553,9 @@ function parseExactConflictChoice(request: PeerRequest): ExactConflictChoice {
   const remoteSize = request.remoteSize
   if (
     (direction !== "pull-remote" && direction !== "push-local") ||
-    typeof localDigest !== "string" || !/^[a-f0-9]{64}$/.test(localDigest) ||
+    !isSha256HexDigest(localDigest) ||
     typeof localSize !== "number" || !Number.isSafeInteger(localSize) || localSize < 0 ||
-    typeof remoteDigest !== "string" || !/^[a-f0-9]{64}$/.test(remoteDigest) ||
+    !isSha256HexDigest(remoteDigest) ||
     typeof remoteSize !== "number" || !Number.isSafeInteger(remoteSize) || remoteSize < 0
   ) {
     throw new Error("The paired computer sent an invalid exact conflict choice.")
@@ -2273,7 +2261,7 @@ function validateTransferDescriptor(entry: FileManifest["files"][number], value:
     !Number.isSafeInteger(value.size) ||
     value.size < 0 ||
     !Number.isFinite(value.modifiedMs) ||
-    !/^[a-f0-9]{64}$/.test(value.digest)
+    !isSha256HexDigest(value.digest)
   ) {
     throw new Error(`The peer returned invalid transfer metadata for ${entry.path}.`)
   }
@@ -2932,10 +2920,10 @@ function validateContinuousOperationRequest(request: PeerRequest): {
     !folderId ||
     !relativePath ||
     isTetheraStagingPath(relativePath) ||
-    !/^[a-f0-9]{64}$/.test(digest) ||
+    !isSha256HexDigest(digest) ||
     !Number.isSafeInteger(size) ||
     size < 0 ||
-    (expectedDestinationDigest !== undefined && !/^[a-f0-9]{64}$/.test(expectedDestinationDigest))
+    (expectedDestinationDigest !== undefined && !isSha256HexDigest(expectedDestinationDigest))
   ) {
     throw new Error("The continuous-sync file operation is invalid.")
   }
@@ -3009,15 +2997,9 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     )
   }
   if (request.type === "scan-manifest") {
-    if (
-      typeof request.path !== "string" ||
-      !Array.isArray(request.ignorePatterns) ||
-      request.ignorePatterns.some((item) => typeof item !== "string")
-    ) {
-      throw new Error("The manifest request is invalid.")
-    }
-    const requestedPath = request.path
-    const ignorePatterns = request.ignorePatterns as string[]
+    // The envelope our own UI enforces before sending a scan; anything else
+    // fails closed here instead of reaching the folder walker.
+    const { path: requestedPath, ignorePatterns } = parsePeerScanManifest(request)
     const hashAllFiles = request.hashAllFiles === true
     if (hashAllFiles) {
       const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -3620,15 +3602,17 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle("shell:reveal-path", async (_event: Electron.IpcMainInvokeEvent, targetPath: string) => {
-    if (targetPath) await shell.openPath(targetPath)
+  ipcMain.handle("shell:reveal-path", async (event: Electron.IpcMainInvokeEvent, targetPath: unknown) => {
+    requireTrustedMainRenderer(event)
+    await shell.openPath(parseRevealPath(targetPath))
   })
 
-  ipcMain.handle("settings:update", async (_event: Electron.IpcMainInvokeEvent, key: AppSettingKey, value: AppSettings[AppSettingKey]) =>
+  ipcMain.handle("settings:update", async (event: Electron.IpcMainInvokeEvent, key: unknown, value: unknown) =>
     mutate(() => {
-      snapshot.settings = { ...snapshot.settings, [key]: value }
-      if (key === "launchAtLogin") app.setLoginItemSettings({ openAtLogin: Boolean(value), openAsHidden: snapshot.settings.startMinimised })
-      if (key === "startMinimised" && snapshot.settings.launchAtLogin) app.setLoginItemSettings({ openAtLogin: true, openAsHidden: Boolean(value) })
+      const update = parseSettingUpdate(key, value)
+      snapshot.settings = applySettingUpdate(snapshot.settings, update)
+      if (update.key === "launchAtLogin") app.setLoginItemSettings({ openAtLogin: update.value, openAsHidden: snapshot.settings.startMinimised })
+      if (update.key === "startMinimised" && snapshot.settings.launchAtLogin) app.setLoginItemSettings({ openAtLogin: true, openAsHidden: update.value })
     }),
   )
 
@@ -3681,7 +3665,7 @@ function requireTrustedMainRenderer(event: Electron.IpcMainInvokeEvent): void {
     event.senderFrame !== mainWindow.webContents.mainFrame ||
     !isTrustedRendererUrl(event.senderFrame.url)
   ) {
-    throw new Error("Recovery actions can only be performed from Tethera's main window.")
+    throw new Error("This action can only be performed from Tethera's main window.")
   }
 }
 
