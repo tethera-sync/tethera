@@ -1,15 +1,28 @@
 import { z } from "zod"
-import type { AddFolderInput, AppSettings } from "../shared/contracts"
+import type {
+  AddFolderInput,
+  AppSettings,
+  ConflictCopyExpectation,
+  ConflictInspection,
+  ConflictInspectionInput,
+  ResolveFileConflictInput,
+  SyncMode,
+} from "../shared/contracts"
+import type { ExactConflictChoice, FileSyncDirection, PeerFileOperationIdentity } from "./continuous-sync"
+import { isSha256HexDigest, type TransferFileDescriptor } from "./file-transfer"
+import type { FileManifest } from "./folder-manifest"
+import type { InitialSyncPassResult } from "./initial-sync"
+import { isTetheraStagingPath } from "./path-safety"
+import type { PeerRequest } from "./peer-session-service"
 
 /**
  * Runtime validators for the renderer/IPC and peer/message boundaries.
  *
  * A compile-time TypeScript type on one side of IPC does not validate the
  * payload arriving from the other side, so every handler below parses its
- * input before acting on it. The ignore-pattern envelope mirrors
- * `validateMappingInput` in `index.ts` and the `manifest.scan` limits in the
- * Rust engine: anything our own UI can send passes, anything it could never
- * send fails closed.
+ * input before acting on it. The ignore-pattern envelope mirrors the
+ * `manifest.scan` limits in the Rust engine: anything our own UI can send
+ * passes, anything it could never send fails closed.
  */
 export const MAX_SCAN_PATH_LENGTH = 4096
 export const MAX_IGNORE_PATTERNS = 256
@@ -107,4 +120,248 @@ export function parsePeerScanManifest(request: unknown): { path: string; ignoreP
   const parsed = peerScanManifestSchema.safeParse(request)
   if (!parsed.success) throw new Error("The manifest request is invalid.")
   return parsed.data
+}
+
+/**
+ * Pure peer/payload parsers, moved out of `index.ts` unchanged. Each takes an
+ * untrusted value and either returns a fully typed result or throws a
+ * user-presentable error; none touches module state, the filesystem, or the
+ * network, which is what makes them safe to unit-test in isolation.
+ */
+export function validateConflictInput(input: ConflictInspectionInput): void {
+  if (!input || typeof input.mappingId !== "string" || !input.mappingId || typeof input.path !== "string" || !input.path) {
+    throw new Error("Choose a valid file conflict.")
+  }
+  if (input.mappingId.length > 200 || input.path.length > 4_096 || input.mappingId.includes("\0") || input.path.includes("\0")) {
+    throw new Error("The selected file conflict is invalid.")
+  }
+}
+
+export function parseConflictCopyExpectation(value: unknown): ConflictCopyExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The inspected conflict copy is invalid.")
+  }
+  const candidate = value as Partial<ConflictCopyExpectation>
+  if (
+    typeof candidate.deviceId !== "string" || !candidate.deviceId || candidate.deviceId.length > 200 ||
+    !isSha256HexDigest(candidate.digest) ||
+    typeof candidate.size !== "number" || !Number.isSafeInteger(candidate.size) || candidate.size < 0
+  ) {
+    throw new Error("The inspected conflict copy is invalid.")
+  }
+  return { deviceId: candidate.deviceId, digest: candidate.digest, size: candidate.size }
+}
+
+export function parseResolveFileConflictInput(value: unknown): ResolveFileConflictInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Choose a valid file conflict.")
+  }
+  const candidate = value as Partial<ResolveFileConflictInput>
+  const mappingId = candidate.mappingId
+  const conflictPath = candidate.path
+  if (typeof mappingId !== "string" || typeof conflictPath !== "string") {
+    throw new Error("Choose a valid file conflict.")
+  }
+  validateConflictInput({ mappingId, path: conflictPath })
+  if (typeof candidate.winnerDeviceId !== "string" || !candidate.winnerDeviceId) {
+    throw new Error("Choose which computer's copy to keep.")
+  }
+  if (!Array.isArray(candidate.inspectedCopies) || candidate.inspectedCopies.length !== 2) {
+    throw new Error("Refresh both conflict copies before choosing a version.")
+  }
+  const inspectedCopies = candidate.inspectedCopies.map(parseConflictCopyExpectation) as [
+    ConflictCopyExpectation,
+    ConflictCopyExpectation,
+  ]
+  if (
+    inspectedCopies[0].deviceId === inspectedCopies[1].deviceId ||
+    !inspectedCopies.some((copy) => copy.deviceId === candidate.winnerDeviceId)
+  ) {
+    throw new Error("The inspected conflict copies do not match this folder's participants.")
+  }
+  return {
+    mappingId,
+    path: conflictPath,
+    winnerDeviceId: candidate.winnerDeviceId,
+    inspectedCopies,
+  }
+}
+
+export function requireUnchangedInspectedCopies(
+  input: ResolveFileConflictInput,
+  inspection: ConflictInspection,
+): void {
+  const expectedByDevice = new Map(input.inspectedCopies.map((copy) => [copy.deviceId, copy]))
+  for (const copy of [inspection.local, inspection.remote]) {
+    const expected = expectedByDevice.get(copy.deviceId)
+    if (!expected || copy.digest !== expected.digest || copy.size !== expected.size) {
+      throw new Error("One of the conflict copies changed since you reviewed it. Refresh both versions before choosing again.")
+    }
+  }
+}
+
+export interface PeerConflictCopy {
+  present: boolean
+  size?: number
+  modifiedMs?: number
+  digest?: string
+}
+
+export function parsePeerConflictCopy(value: unknown): PeerConflictCopy {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The paired computer returned invalid conflict metadata.")
+  }
+  const candidate = value as Partial<PeerConflictCopy>
+  if (typeof candidate.present !== "boolean") {
+    throw new Error("The paired computer returned invalid conflict availability.")
+  }
+  if (!candidate.present) return { present: false }
+  if (
+    !Number.isSafeInteger(candidate.size) || (candidate.size ?? -1) < 0 ||
+    !Number.isFinite(candidate.modifiedMs) ||
+    !isSha256HexDigest(candidate.digest)
+  ) {
+    throw new Error("The paired computer returned invalid conflict file metadata.")
+  }
+  return {
+    present: true,
+    size: candidate.size,
+    modifiedMs: candidate.modifiedMs,
+    digest: candidate.digest,
+  }
+}
+
+export function parseExactConflictChoice(request: PeerRequest): ExactConflictChoice {
+  const direction = request.direction
+  const localDigest = request.localDigest
+  const localSize = request.localSize
+  const remoteDigest = request.remoteDigest
+  const remoteSize = request.remoteSize
+  if (
+    (direction !== "pull-remote" && direction !== "push-local") ||
+    !isSha256HexDigest(localDigest) ||
+    typeof localSize !== "number" || !Number.isSafeInteger(localSize) || localSize < 0 ||
+    !isSha256HexDigest(remoteDigest) ||
+    typeof remoteSize !== "number" || !Number.isSafeInteger(remoteSize) || remoteSize < 0
+  ) {
+    throw new Error("The paired computer sent an invalid exact conflict choice.")
+  }
+  return {
+    direction,
+    localDigest,
+    localSize,
+    remoteDigest,
+    remoteSize,
+  }
+}
+
+export function requireAllowedConflictDirection(mode: SyncMode, direction: FileSyncDirection): void {
+  if ((direction === "push-local" && mode === "receive-only") || (direction === "pull-remote" && mode === "send-only")) {
+    throw new Error("That version conflicts with this folder's one-way direction.")
+  }
+}
+
+export function validateTransferDescriptor(entry: FileManifest["files"][number], value: TransferFileDescriptor): void {
+  if (
+    !Number.isSafeInteger(value.size) ||
+    value.size < 0 ||
+    !Number.isFinite(value.modifiedMs) ||
+    !isSha256HexDigest(value.digest)
+  ) {
+    throw new Error(`The peer returned invalid transfer metadata for ${entry.path}.`)
+  }
+  if (value.size !== entry.size || value.digest !== entry.digest) {
+    throw new Error(`${entry.path} changed after the folders were compared. Retry the initial merge.`)
+  }
+}
+
+export function validateInitialSyncPassResult(value: unknown): InitialSyncPassResult {
+  if (!value || typeof value !== "object") throw new Error("The peer returned an invalid initial-merge result.")
+  const result = value as Partial<InitialSyncPassResult>
+  if (
+    !Number.isSafeInteger(result.copiedFiles) || (result.copiedFiles ?? -1) < 0 ||
+    !Number.isSafeInteger(result.copiedBytes) || (result.copiedBytes ?? -1) < 0 ||
+    !Number.isSafeInteger(result.fileCount) || (result.fileCount ?? -1) < 0 ||
+    !Array.isArray(result.skipped) ||
+    result.skipped.length > 10_000 ||
+    result.skipped.some((item) =>
+      !item || typeof item.path !== "string" || item.path.length > 4_096 ||
+      typeof item.reason !== "string" || item.reason.length > 1_024
+    )
+  ) {
+    throw new Error("The peer returned an invalid initial-merge result.")
+  }
+  return result as InitialSyncPassResult
+}
+
+export function validateContinuousOperationRequest(request: PeerRequest): {
+  folderId: string
+  path: string
+  digest: string
+  size: number
+  expectedDestinationDigest?: string
+} {
+  const folderId = typeof request.folderId === "string" ? request.folderId : ""
+  const relativePath = typeof request.path === "string" ? request.path : ""
+  const digest = typeof request.digest === "string" ? request.digest : ""
+  const size = typeof request.size === "number" ? request.size : Number.NaN
+  const expectedDestinationDigest = request.expectedDestinationDigest === undefined
+    ? undefined
+    : typeof request.expectedDestinationDigest === "string"
+      ? request.expectedDestinationDigest
+      : ""
+  if (
+    !folderId ||
+    !relativePath ||
+    isTetheraStagingPath(relativePath) ||
+    !isSha256HexDigest(digest) ||
+    !Number.isSafeInteger(size) ||
+    size < 0 ||
+    (expectedDestinationDigest !== undefined && !isSha256HexDigest(expectedDestinationDigest))
+  ) {
+    throw new Error("The continuous-sync file operation is invalid.")
+  }
+  return { folderId, path: relativePath, digest, size, expectedDestinationDigest }
+}
+
+export function parsePeerFileOperations(value: unknown): PeerFileOperationIdentity[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The paired computer returned invalid durable operation state.")
+  }
+  const operations = (value as { operations?: unknown }).operations
+  if (!Array.isArray(operations) || operations.length > 10_000) {
+    throw new Error("The paired computer returned invalid durable operation state.")
+  }
+  return operations.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("The paired computer returned an invalid durable operation.")
+    }
+    const operation = value as Partial<PeerFileOperationIdentity>
+    if (
+      typeof operation.id !== "number" || !Number.isSafeInteger(operation.id) || operation.id <= 0 ||
+      typeof operation.path !== "string" || !operation.path || operation.path.length > 4_096 ||
+      isTetheraStagingPath(operation.path) ||
+      (operation.direction !== "pull-remote" && operation.direction !== "push-local") ||
+      !isSha256HexDigest(operation.sourceDigest) ||
+      typeof operation.sourceSize !== "number" || !Number.isSafeInteger(operation.sourceSize) || operation.sourceSize < 0 ||
+      (operation.expectedDestinationDigest !== undefined && !isSha256HexDigest(operation.expectedDestinationDigest))
+    ) {
+      throw new Error("The paired computer returned an invalid durable operation.")
+    }
+    return {
+      id: operation.id,
+      path: operation.path,
+      direction: operation.direction,
+      sourceDigest: operation.sourceDigest,
+      sourceSize: operation.sourceSize,
+      expectedDestinationDigest: operation.expectedDestinationDigest,
+    }
+  })
+}
+
+export function validatePeerOperationId(request: PeerRequest): number {
+  if (typeof request.operationId !== "number" || !Number.isSafeInteger(request.operationId) || request.operationId <= 0) {
+    throw new Error("The continuous-sync operation identity is invalid.")
+  }
+  return request.operationId
 }
