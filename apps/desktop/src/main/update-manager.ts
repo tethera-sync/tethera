@@ -8,18 +8,6 @@ export const UPDATE_STARTUP_DELAY_MS = 10_000
 export const UPDATE_PROGRESS_THROTTLE_MS = 750
 export const UPDATE_PROGRESS_MIN_DELTA = 1
 
-export interface ReleaseNotesInput {
-  releaseNotes?: unknown
-  releaseName?: unknown
-}
-
-export interface DownloadProgressInput {
-  percent?: unknown
-  bytesPerSecond?: unknown
-  transferred?: unknown
-  total?: unknown
-}
-
 /**
  * electron-updater reports release notes as a string, an array of
  * `{ version, note }` entries, or null. Normalise to a short plain-text
@@ -56,8 +44,6 @@ export function formatUpdateError(error: unknown): string {
     if (/ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|network|offline/i.test(message)) {
       return "Couldn't reach the update server. Check your connection — we'll retry automatically."
     }
-    if (message.length > 220) return `${message.slice(0, 217)}…`
-    return message
   }
   return "The update check failed. We'll retry automatically."
 }

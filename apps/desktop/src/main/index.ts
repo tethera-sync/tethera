@@ -3594,7 +3594,7 @@ async function requestUpdateDownload(): Promise<void> {
       currentVersion: currentAppVersion(),
       lastCheckedAt: nowIso(),
     })
-    throw error instanceof Error ? error : new Error(formatUpdateError(error))
+    throw new Error(formatUpdateError(error))
   }
 }
 
