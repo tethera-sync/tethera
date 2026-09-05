@@ -169,7 +169,9 @@ export function AddFolderDialog({
     <>
       <Dialog
         open={open}
+        disablePointerDismissal={compare !== null}
         onOpenChange={(nextOpen: boolean) => {
+          if (!nextOpen && compare !== null) return
           setOpen(nextOpen)
           if (!nextOpen) setPickerTarget(null)
         }}
@@ -178,7 +180,7 @@ export function AddFolderDialog({
           <PlusIcon data-icon="inline-start" />
           Add folder
         </DialogTrigger>
-        <DialogContent className="mapping-wizard-dialog [max-width:780px]">
+        <DialogContent className="mapping-wizard-dialog [max-width:780px]" showCloseButton={!compare}>
           <DialogHeader>
             <DialogTitle>Create a folder mapping</DialogTitle>
             <DialogDescription>
@@ -208,7 +210,7 @@ export function AddFolderDialog({
           ) : null}
 
           {step === "rules" ? (
-            <div className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px]">
+            <fieldset disabled={compare !== null} className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px] [border:0] [padding:0] [min-width:0]">
               <Field label="Sync direction">
                 <select className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55]" value={mode} onChange={(event: ChangeEvent<HTMLSelectElement>) => { setMode(event.target.value as SyncMode); setPreview(null) }}>
                   <option value="two-way">Two-way sync</option>
@@ -227,7 +229,7 @@ export function AddFolderDialog({
               <Field label="Ignore patterns" hint="One glob-style pattern per line. Subfolders sync recursively unless ignored.">
                 <textarea className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55] min-h-36 resize-y font-mono text-xs" value={patterns} onChange={(event: ChangeEvent<HTMLTextAreaElement>) => { setPatterns(event.target.value); setPreview(null) }} />
               </Field>
-            </div>
+            </fieldset>
           ) : null}
 
           {step === "preview" && preview ? (
@@ -248,7 +250,7 @@ export function AddFolderDialog({
           {error ? <p className="mapping-error [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_34%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_10%,_var(--surface))] [padding:10px_12px] [color:var(--destructive)] [font-size:12px]">{error}</p> : null}
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => {
+            <Button variant="outline" disabled={compare !== null} onClick={() => {
               if (step === "paths") setOpen(false)
               else setStep(step === "preview" ? "rules" : "paths")
             }}>
