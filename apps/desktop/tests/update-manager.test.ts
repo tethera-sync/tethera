@@ -6,6 +6,7 @@ import {
   formatUpdateError,
   isUpdateBusy,
   normalizeReleaseNotes,
+  parsePreviewProgressToken,
   shouldBroadcastProgress,
   shouldPreserveDownloadedOnError,
   toOptionalFiniteNumber,
@@ -58,6 +59,19 @@ describe("update state guards", () => {
     expect(shouldPreserveDownloadedOnError({ status: "downloading", version: "1.2.0", progressPercent: 5 })).toBe(
       false,
     )
+  })
+})
+
+describe("parsePreviewProgressToken", () => {
+  test("accepts short opaque client tokens and rejects everything else", () => {
+    expect(parsePreviewProgressToken("550e8400-e29b-41d4-a716-446655440000")).toBe(
+      "550e8400-e29b-41d4-a716-446655440000",
+    )
+    expect(parsePreviewProgressToken(undefined)).toBeUndefined()
+    expect(parsePreviewProgressToken(42)).toBeUndefined()
+    expect(parsePreviewProgressToken("   ")).toBeUndefined()
+    expect(parsePreviewProgressToken("a".repeat(65))).toBeUndefined()
+    expect(parsePreviewProgressToken("bad\0token")).toBeUndefined()
   })
 })
 

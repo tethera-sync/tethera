@@ -79,6 +79,21 @@ describe("folder mapping comparison", () => {
     }
   })
 
+  test("reports scan progress so comparisons can show what is happening", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-progress-test-"))
+    try {
+      for (let index = 0; index < 600; index += 1) {
+        await writeFile(path.join(root, `file-${index}.txt`), "data")
+      }
+      const seen: number[] = []
+      const result = await scanFolder(root, [], { onProgress: (scanned) => seen.push(scanned) })
+      expect(result.files).toHaveLength(600)
+      expect(seen).toEqual([500])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test("never synchronizes reserved replacement recovery copies", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-recovery-test-"))
     try {

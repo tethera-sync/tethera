@@ -112,3 +112,15 @@ export function toOptionalFiniteNumber(value: unknown): number | undefined {
 export function nowIso(): string {
   return new Date().toISOString()
 }
+
+/**
+ * Client-generated progress tokens are untrusted renderer input: accept only a
+ * short opaque string, otherwise the caller runs silently without progress
+ * events. Pure so the folder-preview IPC handlers stay thin.
+ */
+export function parsePreviewProgressToken(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const token = value.trim()
+  if (!token || token.length > 64 || token.includes("\0")) return undefined
+  return token
+}
