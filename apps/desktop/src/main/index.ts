@@ -3353,10 +3353,22 @@ function registerIpc(): void {
   ipcMain.handle("app:resume-all", () => setAllPaused(false))
   ipcMain.handle("filesystem:browse-directory", (_event, input: BrowseDirectoryInput) => browseDirectory(input))
   ipcMain.handle("filesystem:create-directory", (_event, input: CreateDirectoryInput) => createLocalDirectory(input))
-  ipcMain.handle("folders:preview-mapping", (_event, input: PreviewFolderMappingInput, progressOperationId: unknown) => previewFolderMapping(input, progressOperationId))
-  ipcMain.handle("folders:request-mapping", (_event, input: RequestFolderMappingInput, progressOperationId: unknown) => requestFolderMapping(input, progressOperationId))
-  ipcMain.handle("folders:refresh-incoming-preview", (_event, input: RefreshIncomingMappingPreviewInput, progressOperationId: unknown) => refreshIncomingMappingPreview(input, progressOperationId))
-  ipcMain.handle("folders:approve-mapping", (_event, input: ApproveFolderMappingInput, progressOperationId: unknown) => approveFolderMapping(input, progressOperationId))
+  ipcMain.handle("folders:preview-mapping", (event, input: PreviewFolderMappingInput, progressOperationId: unknown) => {
+    requireTrustedMainRenderer(event)
+    return previewFolderMapping(input, progressOperationId)
+  })
+  ipcMain.handle("folders:request-mapping", (event, input: RequestFolderMappingInput, progressOperationId: unknown) => {
+    requireTrustedMainRenderer(event)
+    return requestFolderMapping(input, progressOperationId)
+  })
+  ipcMain.handle("folders:refresh-incoming-preview", (event, input: RefreshIncomingMappingPreviewInput, progressOperationId: unknown) => {
+    requireTrustedMainRenderer(event)
+    return refreshIncomingMappingPreview(input, progressOperationId)
+  })
+  ipcMain.handle("folders:approve-mapping", (event, input: ApproveFolderMappingInput, progressOperationId: unknown) => {
+    requireTrustedMainRenderer(event)
+    return approveFolderMapping(input, progressOperationId)
+  })
   ipcMain.handle("folders:reject-mapping", (_event, requestId: string) => rejectFolderMapping(requestId))
   ipcMain.handle("folders:start-initial-sync", (_event, folderId: string) => startInitialSync(folderId))
 
