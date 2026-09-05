@@ -69,7 +69,8 @@ describe("update state guards", () => {
     expect(state.status).toBe("downloading")
     expect(isUpdateBusy(state)).toBe(true)
     await expect(runUpdateDownload(state, download, setState)).rejects.toThrow("Check for updates")
-    resolveDownload?.()
+    if (!resolveDownload) throw new Error("download was not invoked")
+    resolveDownload()
     await first
   })
 
