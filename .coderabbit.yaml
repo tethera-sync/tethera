@@ -1,0 +1,344 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "en-GB"
+
+tone_instructions: >
+  Be concise and technical. Prioritise correctness, data loss, security,
+  recoverability and cross-platform bugs over cosmetic style suggestions.
+
+reviews:
+  # Tethera handles real user files, so prefer finding potential problems
+  # over staying quiet.
+  profile: "assertive"
+
+  # Keep CodeRabbit advisory initially rather than allowing it to control
+  # whether a PR can merge.
+  request_changes_workflow: false
+
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+
+  review_status: true
+  review_details: true
+  review_progress: true
+  collapse_walkthrough: true
+
+  in_progress_fortune: false
+  poem: false
+
+  # Include useful fix instructions that can be handed to coding agents.
+  enable_prompt_for_ai_agents: true
+
+  auto_review:
+    enabled: true
+
+    # Review draft PRs too.
+    drafts: true
+
+    # Review every push to an existing PR.
+    auto_incremental_review: true
+
+    # CodeRabbit normally pauses after 5 reviewed commits.
+    # 0 disables that pause.
+    auto_pause_after_reviewed_commits: 0
+
+    # Review PRs targeting ANY branch, not only main.
+    base_branches:
+      - ".*"
+
+    # Don't waste reviews on automated GitHub Actions PRs.
+    # Remove Dependabot below if you also want dependency PRs reviewed.
+    ignore_usernames:
+      - "github-actions[bot]"
+
+  path_filters:
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/coverage/**"
+    - "!assets/**"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.jpeg"
+    - "!**/*.webp"
+    - "!**/*.ico"
+
+  path_instructions:
+    - path: "crates/**"
+      instructions: |
+        Treat AGENTS.md as mandatory repository policy.
+
+        Prioritise correctness, data integrity and recoverability over style.
+
+        Pay particular attention to:
+        - data loss or corruption;
+        - incorrect sync behaviour;
+        - authentication and trust boundaries;
+        - retries and startup recovery that are not idempotent;
+        - concurrency and race conditions;
+        - duplicate or reordered operations;
+        - protocol compatibility;
+        - Windows/Linux behavioural differences;
+        - panic, unwrap, expect or unreachable on untrusted runtime paths.
+
+        Do not recommend unnecessary abstractions or architectural rewrites
+        when a smaller correct change solves the problem.
+
+    - path: "crates/sync-platform/**"
+      instructions: |
+        Review filesystem behaviour especially strictly.
+
+        Focus on:
+        - approved mapping-root containment;
+        - path traversal;
+        - symlinks, junctions and reparse points;
+        - canonicalisation;
+        - time-of-check/time-of-use races;
+        - case sensitivity and case preservation;
+        - Windows drive and UNC paths;
+        - Linux path semantics;
+        - atomic filesystem operations;
+        - temporary and staged files;
+        - replacement behaviour.
+
+        Flag any path where untrusted input could cause reads, writes,
+        moves or deletion outside its approved root.
+
+        Preserve remote paths as opaque values until validated by the
+        machine that owns them.
+
+    - path: "crates/sync-storage/**"
+      instructions: |
+        Review durable state, SQLite and migrations especially strictly.
+
+        Focus on:
+        - transactional state transitions;
+        - idempotent startup recovery;
+        - idempotent retries;
+        - migration safety;
+        - schema-version handling;
+        - locked databases;
+        - corrupt databases;
+        - newer-schema databases;
+        - partial writes;
+        - stale state resurrection;
+        - concurrency between database connections;
+        - journals and recovery evidence.
+
+        Database failures must fail closed rather than silently becoming
+        an empty, recreated or legacy-backed state.
+
+        A migration must not leave the database in a partially upgraded
+        state.
+
+    - path: "crates/sync-crypto/**"
+      instructions: |
+        Review authentication and cryptographic integration especially strictly.
+
+        Focus on:
+        - authenticated device identities;
+        - key handling;
+        - nonce handling;
+        - replay protection;
+        - domain separation;
+        - identity binding;
+        - accidental downgrade or authentication bypass;
+        - sensitive information exposure.
+
+        Do not suggest implementing custom cryptographic primitives.
+
+        Prefer the repository's existing audited libraries and protocol
+        construction.
+
+    - path: "crates/sync-protocol/**"
+      instructions: |
+        Treat all deserialised RPC and peer data as untrusted.
+
+        Check:
+        - protocol compatibility;
+        - request and response versioning;
+        - size limits;
+        - range limits;
+        - unexpected fields;
+        - unknown-field behaviour;
+        - malformed input;
+        - participant identity;
+        - revision validation;
+        - operation identity;
+        - backwards compatibility.
+
+        Flag wire-format changes where producers, consumers and
+        compatibility tests are not updated together.
+
+    - path: "crates/sync-transport/**"
+      instructions: |
+        Review network and peer-session behaviour especially strictly.
+
+        Focus on:
+        - authentication before privileged behaviour;
+        - message framing;
+        - truncation;
+        - partial reads and writes;
+        - connection shutdown;
+        - replay or duplicate messages;
+        - peer identity;
+        - unbounded inputs;
+        - denial-of-service risks;
+        - disconnect and reconnect behaviour.
+
+        Assume the remote peer and network are untrusted.
+
+    - path: "crates/sync-engine/**"
+      instructions: |
+        Prioritise sync correctness, idempotency, concurrency and recovery.
+
+        Look for:
+        - duplicate operations;
+        - reordered operations;
+        - stale acknowledgements;
+        - acknowledgements bound to the wrong operation;
+        - race conditions;
+        - incomplete crash recovery;
+        - non-idempotent retries;
+        - incorrect conflict resolution;
+        - state transitions that can diverge between peers;
+        - destructive operations without recovery evidence;
+        - writes that bypass required archive or journal behaviour.
+
+        Any conflict-resolution path must preserve recoverability and must
+        not silently destroy either user's version.
+
+    - path: "crates/sync-core/**"
+      instructions: |
+        Keep sync-core focused on pure domain and reconciliation behaviour.
+
+        Flag:
+        - filesystem dependencies;
+        - network dependencies;
+        - SQLite dependencies;
+        - hidden side effects;
+        - reconciliation rules that can violate convergence;
+        - invalid or ambiguous domain states;
+        - behaviour that belongs in a narrower owning crate.
+
+    - path: "apps/desktop/src/**"
+      instructions: |
+        Treat AGENTS.md as mandatory repository policy.
+
+        Enforce Electron renderer, preload and main-process trust boundaries.
+
+        Flag:
+        - Node.js access from the renderer;
+        - Electron APIs from the renderer;
+        - filesystem access from the renderer;
+        - database access from the renderer;
+        - private-key access from the renderer;
+        - raw ipcRenderer exposure;
+        - arbitrary IPC channels;
+        - unrestricted paths exposed through contextBridge;
+        - overly broad preload capabilities;
+        - unvalidated IPC or RPC payloads;
+        - renderer state replacing authoritative durable Rust/SQLite state;
+        - browser storage being treated as authoritative sync state;
+        - TypeScript assertions replacing runtime validation;
+        - use of any;
+        - unsafe non-null assertions;
+        - UI that reports success before durable state confirms it;
+        - Windows/Linux assumptions in shared behaviour.
+
+        Prefer narrow capability-shaped APIs at process boundaries.
+
+    - path: "apps/desktop/src/renderer/**"
+      instructions: |
+        Review React and UI code for correctness and accessibility without
+        generating unnecessary style comments.
+
+        Focus on:
+        - stale state;
+        - race conditions in async UI behaviour;
+        - stale request results overwriting newer results;
+        - incorrect loading or error states;
+        - actions remaining enabled when unsafe;
+        - inaccessible interactive controls;
+        - incorrect success messaging;
+        - renderer trust-boundary violations.
+
+        Do not suggest moving authoritative sync behaviour into React state.
+
+    - path: "apps/desktop/src/preload/**"
+      instructions: |
+        Review preload code as a security boundary.
+
+        Expose only narrow capability-shaped APIs through contextBridge.
+
+        Flag:
+        - raw ipcRenderer exposure;
+        - arbitrary channel names;
+        - generic invoke/send wrappers;
+        - unrestricted path access;
+        - Node.js objects leaking into the renderer;
+        - APIs broader than the renderer actually requires.
+
+    - path: "apps/desktop/src/main/**"
+      instructions: |
+        Review Electron main-process code for boundary validation and
+        lifecycle correctness.
+
+        Focus on:
+        - validating renderer-controlled input;
+        - process supervision;
+        - authenticated Rust RPC;
+        - child-process lifecycle;
+        - filesystem access;
+        - platform-specific behaviour;
+        - shutdown and restart behaviour;
+        - state reported to the renderer before durable operations finish.
+
+    - path: "**/*test*"
+      instructions: |
+        Review whether tests prove meaningful behaviour rather than merely
+        exercising happy paths.
+
+        Look for missing:
+        - failure cases;
+        - retry cases;
+        - restart/crash recovery;
+        - corruption cases;
+        - malformed input;
+        - concurrency cases;
+        - duplicate-operation cases;
+        - cross-platform cases;
+        - security regressions.
+
+        Filesystem tests must use temporary or synthetic roots and must
+        never operate on real user folders.
+
+        Avoid tests that only duplicate implementation details without
+        proving observable behaviour.
+
+    - path: "crates/**/tests/**"
+      instructions: |
+        Review tests with particular attention to data integrity, recovery
+        and edge cases.
+
+        Filesystem tests must use temporary or synthetic roots.
+
+        Where relevant, test failure between individual steps of a durable
+        multi-step operation rather than testing only successful completion.
+
+    - path: ".github/workflows/**"
+      instructions: |
+        Review CI and release changes for supply-chain and release safety.
+
+        Focus on:
+        - unnecessary write permissions;
+        - unpinned or suspicious third-party actions;
+        - secrets exposure;
+        - untrusted PR code receiving secrets;
+        - release artifacts built differently from tested artifacts;
+        - skipped tests or validation;
+        - changes that weaken existing CI gates.
+
+        Do not suggest broad permissions when narrower permissions work.
+
+

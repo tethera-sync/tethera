@@ -3708,6 +3708,10 @@ function createWindow(): void {
     show: false,
     title: "Tethera",
     backgroundColor: "#0b0d12",
+    // Tethera's navigation lives in the renderer sidebar and tray menu; the
+    // default Electron menu bar would be dead weight (and on Windows it
+    // renders a native File/Edit/View strip above the custom UI).
+    autoHideMenuBar: true,
     icon: resolveResourcePath("icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
@@ -3716,6 +3720,7 @@ function createWindow(): void {
       sandbox: true,
     },
   })
+  mainWindow.setMenu(null)
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }))
   mainWindow.webContents.on("will-navigate", (event: Electron.Event, url: string) => {
     if (!isTrustedRendererUrl(url)) event.preventDefault()
