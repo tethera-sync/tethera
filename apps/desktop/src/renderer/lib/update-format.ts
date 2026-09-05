@@ -58,6 +58,7 @@ export function downloadReadout(input: {
   const transferred = formatBytes(input.transferredBytes)
   const total = formatBytes(input.totalBytes)
   if (transferred && total) parts.push(`${transferred} of ${total}`)
+  else if (transferred) parts.push(transferred)
   else if (total) parts.push(`of ${total}`)
   const speed = formatUpdateSpeed(input.bytesPerSecond)
   if (speed) parts.push(speed)

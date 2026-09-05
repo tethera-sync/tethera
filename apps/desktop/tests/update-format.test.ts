@@ -38,5 +38,6 @@ describe("downloadReadout", () => {
       }),
     ).toBe("42% · 18.0 MB of 96.0 MB · 2.0 MB/s")
     expect(downloadReadout({ progressPercent: 7 })).toBe("7%")
+    expect(downloadReadout({ progressPercent: 7, transferredBytes: 4 * 1024 * 1024 })).toBe("7% · 4.0 MB")
   })
 })

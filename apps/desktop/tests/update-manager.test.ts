@@ -7,10 +7,12 @@ import {
   isUpdateBusy,
   normalizeReleaseNotes,
   parsePreviewProgressToken,
+  runUpdateDownload,
   shouldBroadcastProgress,
   shouldPreserveDownloadedOnError,
   toOptionalFiniteNumber,
 } from "../src/main/update-manager"
+import type { UpdateState } from "../src/shared/contracts"
 
 describe("normalizeReleaseNotes", () => {
   test("passes plain strings through with a length cap", () => {
@@ -34,6 +36,9 @@ describe("formatUpdateError", () => {
   test("falls back for unknown shapes", () => {
     expect(formatUpdateError(null)).toContain("retry automatically")
     expect(formatUpdateError(new Error(""))).toContain("retry automatically")
+    expect(formatUpdateError(new Error("Cannot find latest.yml at https://updates.example/cache/latest.yml"))).toBe(
+      "The update check failed. We'll retry automatically.",
+    )
   })
 })
 
@@ -52,6 +57,22 @@ describe("update state guards", () => {
     expect(canDownloadUpdate({ status: "error", message: "nope" })).toBe(false)
     expect(canInstallUpdate({ status: "downloaded", version: "1.2.0" })).toBe(true)
     expect(canInstallUpdate({ status: "available", version: "1.2.0" })).toBe(false)
+  })
+
+  test("claims a download before awaiting it and rejects a concurrent request", async () => {
+    let state: UpdateState = { status: "available", version: "1.2.0", currentVersion: "1.1.0" }
+    let resolveDownload: (() => void) | undefined
+    const download = () => new Promise<void>((resolve) => { resolveDownload = resolve })
+    const setState = (next: Extract<UpdateState, { status: "downloading" }>) => { state = next }
+
+    const first = runUpdateDownload(state, download, setState)
+    await Promise.resolve()
+    expect(state.status).toBe("downloading")
+    expect(isUpdateBusy(state)).toBe(true)
+    await expect(runUpdateDownload(state, download, setState)).rejects.toThrow("Check for updates")
+    if (!resolveDownload) throw new Error("download was not invoked")
+    resolveDownload()
+    await first
   })
 
   test("a staged download survives later feed errors", () => {

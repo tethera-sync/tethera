@@ -149,6 +149,7 @@ import {
   parsePreviewProgressToken,
   shouldBroadcastProgress,
   shouldPreserveDownloadedOnError,
+  runUpdateDownload,
   toOptionalFiniteNumber,
 } from "./update-manager"
 
@@ -3622,17 +3623,20 @@ async function requestUpdateDownload(): Promise<void> {
   lastUpdateProgressPercent = null
   lastUpdateProgressAt = null
   try {
-    await autoUpdater.downloadUpdate()
+    await runUpdateDownload(snapshot.update, async () => {
+      await autoUpdater.downloadUpdate()
+    }, setUpdateState)
   } catch (error) {
     console.error("[updater] download failed", error)
+    const message = formatUpdateError(error)
     setUpdateState({
       status: "error",
-      message: formatUpdateError(error),
+      message,
       version: updateVersionHint(),
       currentVersion: currentAppVersion(),
       lastCheckedAt: nowIso(),
     })
-    throw error instanceof Error ? error : new Error(formatUpdateError(error))
+    throw new Error(message)
   }
 }
 
@@ -3640,8 +3644,14 @@ function requestUpdateInstall(): void {
   if (!canInstallUpdate(snapshot.update)) {
     throw new Error("No downloaded update is ready to install yet.")
   }
-  isQuitting = true
-  autoUpdater.quitAndInstall()
+  try {
+    isQuitting = true
+    autoUpdater.quitAndInstall()
+  } catch (error) {
+    isQuitting = false
+    console.error("[updater] install failed", error)
+    throw new Error(formatUpdateError(error))
+  }
 }
 
 function scheduleUpdateChecks(): void {
@@ -3736,6 +3746,10 @@ function createWindow(): void {
     show: false,
     title: "Tethera",
     backgroundColor: "#0b0d12",
+    // Tethera's navigation lives in the renderer sidebar and tray menu; the
+    // default Electron menu bar would be dead weight (and on Windows it
+    // renders a native File/Edit/View strip above the custom UI).
+    autoHideMenuBar: true,
     icon: resolveResourcePath("icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
@@ -3744,6 +3758,7 @@ function createWindow(): void {
       sandbox: true,
     },
   })
+  mainWindow.setMenu(null)
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }))
   mainWindow.webContents.on("will-navigate", (event: Electron.Event, url: string) => {
     if (!isTrustedRendererUrl(url)) event.preventDefault()

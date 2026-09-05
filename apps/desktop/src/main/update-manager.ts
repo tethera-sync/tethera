@@ -8,18 +8,6 @@ export const UPDATE_STARTUP_DELAY_MS = 10_000
 export const UPDATE_PROGRESS_THROTTLE_MS = 750
 export const UPDATE_PROGRESS_MIN_DELTA = 1
 
-export interface ReleaseNotesInput {
-  releaseNotes?: unknown
-  releaseName?: unknown
-}
-
-export interface DownloadProgressInput {
-  percent?: unknown
-  bytesPerSecond?: unknown
-  transferred?: unknown
-  total?: unknown
-}
-
 /**
  * electron-updater reports release notes as a string, an array of
  * `{ version, note }` entries, or null. Normalise to a short plain-text
@@ -56,8 +44,6 @@ export function formatUpdateError(error: unknown): string {
     if (/ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|network|offline/i.test(message)) {
       return "Couldn't reach the update server. Check your connection — we'll retry automatically."
     }
-    if (message.length > 220) return `${message.slice(0, 217)}…`
-    return message
   }
   return "The update check failed. We'll retry automatically."
 }
@@ -75,6 +61,32 @@ export function isUpdateBusy(state: UpdateState): boolean {
 /** Downloads may only start from a confirmed `available` state. */
 export function canDownloadUpdate(state: UpdateState): boolean {
   return state.status === "available"
+}
+
+/** Claim an available update before awaiting electron-updater so other actions see the download as active. */
+function beginUpdateDownload(
+  state: UpdateState,
+): Extract<UpdateState, { status: "downloading" }> | undefined {
+  if (state.status !== "available") return undefined
+  return {
+    status: "downloading",
+    version: state.version,
+    progressPercent: 0,
+    currentVersion: state.currentVersion,
+    lastCheckedAt: state.lastCheckedAt,
+  }
+}
+
+/** Mark a download active before awaiting the updater so concurrent callers observe the claimed state. */
+export async function runUpdateDownload(
+  current: UpdateState,
+  download: () => Promise<void>,
+  setState: (state: Extract<UpdateState, { status: "downloading" }>) => void,
+): Promise<void> {
+  const downloading = beginUpdateDownload(current)
+  if (!downloading) throw new Error("Check for updates before downloading.")
+  setState(downloading)
+  await download()
 }
 
 /** Installs may only run once the installer has been verified on disk. */
