@@ -2,15 +2,16 @@ import { describe, expect, test } from "bun:test"
 import {
   canDownloadUpdate,
   canInstallUpdate,
-  beginUpdateDownload,
   clampProgressPercent,
   formatUpdateError,
   isUpdateBusy,
   normalizeReleaseNotes,
+  runUpdateDownload,
   shouldBroadcastProgress,
   shouldPreserveDownloadedOnError,
   toOptionalFiniteNumber,
 } from "../src/main/update-manager"
+import type { UpdateState } from "../src/shared/contracts"
 
 describe("normalizeReleaseNotes", () => {
   test("passes plain strings through with a length cap", () => {
@@ -57,15 +58,18 @@ describe("update state guards", () => {
     expect(canInstallUpdate({ status: "available", version: "1.2.0" })).toBe(false)
   })
 
-  test("claims an available download before awaiting updater work", () => {
-    expect(beginUpdateDownload({ status: "available", version: "1.2.0", currentVersion: "1.1.0" })).toEqual({
-      status: "downloading",
-      version: "1.2.0",
-      progressPercent: 0,
-      currentVersion: "1.1.0",
-      lastCheckedAt: undefined,
-    })
-    expect(beginUpdateDownload({ status: "downloading", version: "1.2.0", progressPercent: 2 })).toBeUndefined()
+  test("claims a download before awaiting it and rejects a concurrent request", async () => {
+    let state: UpdateState = { status: "available", version: "1.2.0", currentVersion: "1.1.0" }
+    let resolveDownload: (() => void) | undefined
+    const download = () => new Promise<void>((resolve) => { resolveDownload = resolve })
+    const setState = (next: Extract<UpdateState, { status: "downloading" }>) => { state = next }
+
+    const first = runUpdateDownload(state, download, setState)
+    await Promise.resolve()
+    expect(state.status).toBe("downloading")
+    await expect(runUpdateDownload(state, download, setState)).rejects.toThrow("Check for updates")
+    resolveDownload?.()
+    await first
   })
 
   test("a staged download survives later feed errors", () => {

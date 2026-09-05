@@ -138,7 +138,6 @@ import { restoreArchivedVersion } from "./archive-restore"
 import {
   UPDATE_CHECK_INTERVAL_MS,
   UPDATE_STARTUP_DELAY_MS,
-  beginUpdateDownload,
   canDownloadUpdate,
   canInstallUpdate,
   clampProgressPercent,
@@ -148,6 +147,7 @@ import {
   nowIso,
   shouldBroadcastProgress,
   shouldPreserveDownloadedOnError,
+  runUpdateDownload,
   toOptionalFiniteNumber,
 } from "./update-manager"
 
@@ -3584,11 +3584,10 @@ async function requestUpdateDownload(): Promise<void> {
   }
   lastUpdateProgressPercent = null
   lastUpdateProgressAt = null
-  const downloadingState = beginUpdateDownload(snapshot.update)
-  if (!downloadingState) throw new Error("Check for updates before downloading.")
-  setUpdateState(downloadingState)
   try {
-    await autoUpdater.downloadUpdate()
+    await runUpdateDownload(snapshot.update, async () => {
+      await autoUpdater.downloadUpdate()
+    }, setUpdateState)
   } catch (error) {
     console.error("[updater] download failed", error)
     const message = formatUpdateError(error)

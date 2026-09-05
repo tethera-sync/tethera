@@ -77,6 +77,18 @@ export function beginUpdateDownload(
   }
 }
 
+/** Mark a download active before awaiting the updater so concurrent callers observe the claimed state. */
+export async function runUpdateDownload(
+  current: UpdateState,
+  download: () => Promise<void>,
+  setState: (state: Extract<UpdateState, { status: "downloading" }>) => void,
+): Promise<void> {
+  const downloading = beginUpdateDownload(current)
+  if (!downloading) throw new Error("Check for updates before downloading.")
+  setState(downloading)
+  await download()
+}
+
 /** Installs may only run once the installer has been verified on disk. */
 export function canInstallUpdate(state: UpdateState): boolean {
   return state.status === "downloaded"
