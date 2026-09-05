@@ -1103,7 +1103,12 @@ function previewsEqual(left: FolderMappingPreview, right: FolderMappingPreview):
 function emitPreviewProgress(operationId: string | undefined, phase: FolderPreviewProgress["phase"], scannedFiles?: number): void {
   if (!operationId || !mainWindow) return
   const progress: FolderPreviewProgress = scannedFiles === undefined ? { operationId, phase } : { operationId, phase, scannedFiles }
-  mainWindow.webContents.send("folders:preview-progress", progress)
+  try {
+    if (mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
+    mainWindow.webContents.send("folders:preview-progress", progress)
+  } catch {
+    // Progress is advisory. Window teardown must not fail the scan or mapping request.
+  }
 }
 
 async function previewFolderMapping(input: PreviewFolderMappingInput, progressOperationId?: unknown): Promise<FolderMappingPreview> {

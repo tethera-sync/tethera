@@ -101,9 +101,18 @@ export async function scanFolder(
       }
       try {
         files.push(await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true))
-        if (files.length % SCAN_PROGRESS_INTERVAL === 0) options.onProgress?.(files.length)
       } catch {
         unreadable += 1
+        continue
+      }
+      if (files.length % SCAN_PROGRESS_INTERVAL === 0) {
+        // Progress is a best-effort UI update. A renderer can disappear while a
+        // file scan is completing; that must not classify the scanned file as unreadable.
+        try {
+          options.onProgress?.(files.length)
+        } catch {
+          // Ignore only progress callback failures; filesystem failures are handled above.
+        }
       }
     }
   }
