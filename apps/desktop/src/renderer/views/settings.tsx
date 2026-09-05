@@ -1,10 +1,11 @@
-import type { ChangeEvent, ReactNode } from "react"
-import { CheckCircle2Icon, RefreshCwIcon } from "lucide-react"
-import type { AppSettings, AppSnapshot } from "@shared/contracts"
+import { useState, type ChangeEvent, type ReactNode } from "react"
+import { CheckCircle2Icon, DownloadIcon, RefreshCwIcon, RocketIcon } from "lucide-react"
+import type { AppSettings, AppSnapshot, UpdateState } from "@shared/contracts"
 import { Button } from "@/components/ui/button"
 import { StatusPill } from "@/components/ui/status-pill"
 import { Switch } from "@/components/ui/switch"
 import { pretty } from "@/lib/format"
+import { downloadReadout, formatLastChecked } from "@/lib/update-format"
 
 export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
   const { settings, mappingStore } = snapshot
@@ -51,6 +52,13 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
             </dl>
           </details>
         </div>
+      </SettingsSection>
+
+      <SettingsSection
+        title="Updates"
+        description="Tethera checks at startup and every few hours, then only downloads when you ask."
+      >
+        <UpdateSettingsRow update={snapshot.update} />
       </SettingsSection>
 
       <SettingsSection
@@ -131,5 +139,115 @@ function SettingRow({ title, description, children }: { title: string; descripti
       </div>
       <div className="shrink-0">{children}</div>
     </div>
+  )
+}
+
+function updateHeadline(update: UpdateState): { title: string; description: string } {
+  const checked = formatLastChecked(update.lastCheckedAt)
+  const checkedSuffix = checked ? ` · Last checked ${checked}` : ""
+  switch (update.status) {
+    case "checking":
+      return { title: "Checking for updates…", description: "Comparing your build with the latest release." }
+    case "available":
+      return {
+        title: `Tethera v${update.version} is available`,
+        description: `You're on v${update.currentVersion ?? "unknown"}${checkedSuffix}. Downloading starts only when you ask.`,
+      }
+    case "downloading":
+      return {
+        title: `Downloading v${update.version}… ${Math.round(update.progressPercent)}%`,
+        description: `${downloadReadout(update)}${checkedSuffix}. Keep Tethera open until it finishes.`,
+      }
+    case "downloaded":
+      return {
+        title: `Tethera v${update.version} is ready`,
+        description: "Restart to switch to the new version. Folders and pairings carry over.",
+      }
+    case "not-available":
+      return {
+        title: "You're up to date",
+        description: `Tethera v${update.currentVersion ?? "unknown"}${checkedSuffix}.`,
+      }
+    case "error":
+      return { title: "Update check failed", description: `${update.message} We'll retry automatically.` }
+    case "idle":
+    default:
+      return {
+        title: "Automatic updates",
+        description: `You're on v${update.currentVersion ?? "unknown"}. Installed builds check at startup and every few hours.`,
+      }
+  }
+}
+
+function UpdateSettingsRow({ update }: { update: UpdateState }) {
+  const [working, setWorking] = useState<"check" | "download" | "install" | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const { title, description } = updateHeadline(update)
+  const releaseNotes = "releaseNotes" in update ? update.releaseNotes : undefined
+  const releaseVersion = "version" in update && update.version ? update.version : undefined
+
+  async function run(action: "check" | "download" | "install") {
+    if (working) return
+    setWorking(action)
+    setActionError(null)
+    try {
+      if (action === "check") await window.folderSync.checkForUpdates()
+      else if (action === "download") await window.folderSync.downloadUpdate()
+      else await window.folderSync.quitAndInstall()
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "That didn't work. Try again shortly.")
+    } finally {
+      setWorking(null)
+    }
+  }
+
+  return (
+    <>
+      <SettingRow title={title} description={actionError ?? description}>
+        <div className="[display:flex] [align-items:center] [gap:8px]">
+          {update.status === "downloaded" ? (
+            <StatusPill tone="success">
+              <CheckCircle2Icon className="size-3" /> Ready
+            </StatusPill>
+          ) : null}
+          {update.status === "available" ? (
+            <Button size="sm" disabled={working === "download"} onClick={() => void run("download")}>
+              <DownloadIcon data-icon="inline-start" />
+              {working === "download" ? "Starting…" : `Download v${update.version}`}
+            </Button>
+          ) : null}
+          {update.status === "downloaded" ? (
+            <Button size="sm" disabled={working === "install"} onClick={() => void run("install")}>
+              <RocketIcon data-icon="inline-start" />
+              {working === "install" ? "Restarting…" : "Restart & update"}
+            </Button>
+          ) : null}
+          {update.status !== "checking" && update.status !== "downloading" && update.status !== "downloaded" ? (
+            <Button
+              size="sm"
+              variant={update.status === "available" ? "outline" : "default"}
+              disabled={working === "check"}
+              onClick={() => void run("check")}
+            >
+              <RefreshCwIcon className={working === "check" ? "animate-spin" : undefined} data-icon="inline-start" />
+              {working === "check" ? "Checking…" : update.status === "error" ? "Retry" : "Check for updates"}
+            </Button>
+          ) : null}
+          {update.status === "downloading" ? (
+            <StatusPill tone="info" pulse>
+              Downloading
+            </StatusPill>
+          ) : null}
+        </div>
+      </SettingRow>
+      {releaseNotes && releaseVersion ? (
+        <div className="update-release-notes [padding:10px_18px_14px] [color:var(--muted-foreground)] [font-size:10.5px] [&_summary]:[cursor:pointer] [&_summary]:[font-weight:600] [&_p]:[margin:8px_0_0] [&_p]:[white-space:pre-line] [&_p]:[line-height:1.5]">
+          <details>
+            <summary>What&apos;s new in v{releaseVersion}</summary>
+            <p>{releaseNotes}</p>
+          </details>
+        </div>
+      ) : null}
+    </>
   )
 }

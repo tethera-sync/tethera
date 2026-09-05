@@ -135,6 +135,21 @@ import {
   type ReplacementJournalEntry,
 } from "./version-archive"
 import { restoreArchivedVersion } from "./archive-restore"
+import {
+  UPDATE_CHECK_INTERVAL_MS,
+  UPDATE_STARTUP_DELAY_MS,
+  canDownloadUpdate,
+  canInstallUpdate,
+  clampProgressPercent,
+  formatUpdateError,
+  isUpdateBusy,
+  normalizeReleaseNotes,
+  nowIso,
+  shouldBroadcastProgress,
+  shouldPreserveDownloadedOnError,
+  runUpdateDownload,
+  toOptionalFiniteNumber,
+} from "./update-manager"
 
 interface TransferChunkResponse {
   offset: number
@@ -226,6 +241,21 @@ const emptyPairingState: PairingState = {
 
 const emptyMappingState: MappingState = { incoming: [], outgoing: [] }
 const idleUpdateState: UpdateState = { status: "idle" }
+let updateCheckTimer: NodeJS.Timeout | null = null
+let lastUpdateProgressPercent: number | null = null
+let lastUpdateProgressAt: number | null = null
+
+function currentAppVersion(): string {
+  try {
+    return app.getVersion()
+  } catch {
+    return "unknown"
+  }
+}
+
+function idleUpdateStateWithVersion(): UpdateState {
+  return { status: "idle", currentVersion: currentAppVersion() }
+}
 
 const defaultSettings: AppSettings = {
   closeToTray: true,
@@ -307,7 +337,7 @@ function getInitialSnapshot(): AppSnapshot {
       },
     ],
     settings: defaultSettings,
-    update: idleUpdateState,
+    update: idleUpdateStateWithVersion(),
   }
 }
 
@@ -350,7 +380,7 @@ async function loadState(): Promise<void> {
         outgoing: parsed.mappings?.outgoing ?? [],
       },
       settings: { ...defaultSettings, ...(parsed.settings ?? {}) },
-      update: idleUpdateState,
+      update: idleUpdateStateWithVersion(),
     }
   } else {
     pushActivity("Desktop state unavailable", legacyStateSource.detail, "error")
@@ -3416,16 +3446,17 @@ function registerIpc(): void {
     return syncPairingSnapshot()
   })
   ipcMain.handle("window:show", () => showMainWindow())
-  ipcMain.handle("updates:check", () => {
-    if (!app.isPackaged) return
-    void autoUpdater.checkForUpdates()
+  ipcMain.handle("updates:check", async (event) => {
+    requireTrustedMainRenderer(event)
+    await requestUpdateCheck("ipc")
   })
-  ipcMain.handle("updates:download", () => {
-    void autoUpdater.downloadUpdate()
+  ipcMain.handle("updates:download", async (event) => {
+    requireTrustedMainRenderer(event)
+    await requestUpdateDownload()
   })
-  ipcMain.handle("updates:install", () => {
-    isQuitting = true
-    autoUpdater.quitAndInstall()
+  ipcMain.handle("updates:install", async (event) => {
+    requireTrustedMainRenderer(event)
+    requestUpdateInstall()
   })
 }
 
@@ -3503,18 +3534,168 @@ function setUpdateState(update: UpdateState): void {
   broadcastSnapshot()
 }
 
+function updateBaseFields(): { currentVersion: string; lastCheckedAt?: string } {
+  return { currentVersion: currentAppVersion(), lastCheckedAt: snapshot.update.lastCheckedAt }
+}
+
+function updateVersionHint(): string | undefined {
+  const current = snapshot.update
+  return "version" in current && typeof current.version === "string" ? current.version : undefined
+}
+
+async function requestUpdateCheck(source: "ipc" | "tray" | "startup" | "schedule"): Promise<void> {
+  if (!app.isPackaged) {
+    if (source === "ipc") {
+      setUpdateState({
+        status: "error",
+        message: "Automatic updates are only available in installed builds of Tethera.",
+        currentVersion: currentAppVersion(),
+      })
+    }
+    return
+  }
+  if (isUpdateBusy(snapshot.update)) return
+  if (snapshot.update.status === "downloaded") return
+  lastUpdateProgressPercent = null
+  lastUpdateProgressAt = null
+  try {
+    await autoUpdater.checkForUpdates()
+  } catch (error) {
+    console.error("[updater] check failed", error)
+    if (shouldPreserveDownloadedOnError(snapshot.update)) return
+    setUpdateState({
+      status: "error",
+      message: formatUpdateError(error),
+      version: updateVersionHint(),
+      currentVersion: currentAppVersion(),
+      lastCheckedAt: nowIso(),
+    })
+  }
+}
+
+async function requestUpdateDownload(): Promise<void> {
+  if (!app.isPackaged) throw new Error("Automatic updates are only available in installed builds of Tethera.")
+  if (!canDownloadUpdate(snapshot.update)) {
+    throw new Error(
+      snapshot.update.status === "downloaded"
+        ? "This update is already downloaded."
+        : "Check for updates before downloading.",
+    )
+  }
+  lastUpdateProgressPercent = null
+  lastUpdateProgressAt = null
+  try {
+    await runUpdateDownload(snapshot.update, async () => {
+      await autoUpdater.downloadUpdate()
+    }, setUpdateState)
+  } catch (error) {
+    console.error("[updater] download failed", error)
+    const message = formatUpdateError(error)
+    setUpdateState({
+      status: "error",
+      message,
+      version: updateVersionHint(),
+      currentVersion: currentAppVersion(),
+      lastCheckedAt: nowIso(),
+    })
+    throw new Error(message)
+  }
+}
+
+function requestUpdateInstall(): void {
+  if (!canInstallUpdate(snapshot.update)) {
+    throw new Error("No downloaded update is ready to install yet.")
+  }
+  try {
+    isQuitting = true
+    autoUpdater.quitAndInstall()
+  } catch (error) {
+    isQuitting = false
+    console.error("[updater] install failed", error)
+    throw new Error(formatUpdateError(error))
+  }
+}
+
+function scheduleUpdateChecks(): void {
+  if (!app.isPackaged) return
+  if (updateCheckTimer) clearInterval(updateCheckTimer)
+  updateCheckTimer = setInterval(() => {
+    if (isUpdateBusy(snapshot.update) || snapshot.update.status === "downloaded") return
+    void requestUpdateCheck("schedule")
+  }, UPDATE_CHECK_INTERVAL_MS)
+  if (typeof updateCheckTimer.unref === "function") updateCheckTimer.unref()
+}
+
 function setUpAutoUpdater(): void {
   autoUpdater.autoDownload = false
   autoUpdater.autoInstallOnAppQuit = true
+  autoUpdater.allowDowngrade = false
+  autoUpdater.allowPrerelease = false
+  autoUpdater.logger = {
+    debug: (...args: unknown[]) => console.debug("[updater]", ...args),
+    info: (...args: unknown[]) => console.info("[updater]", ...args),
+    warn: (...args: unknown[]) => console.warn("[updater]", ...args),
+    error: (...args: unknown[]) => console.error("[updater]", ...args),
+  }
 
-  autoUpdater.on("checking-for-update", () => setUpdateState({ status: "checking" }))
-  autoUpdater.on("update-available", (info) => setUpdateState({ status: "available", version: info.version }))
-  autoUpdater.on("update-not-available", () => setUpdateState({ status: "not-available" }))
-  autoUpdater.on("error", (error) => setUpdateState({ status: "error", message: error.message }))
-  autoUpdater.on("download-progress", (progress) =>
-    setUpdateState({ status: "downloading", progressPercent: Math.round(progress.percent) }),
-  )
-  autoUpdater.on("update-downloaded", (info) => setUpdateState({ status: "downloaded", version: info.version }))
+  autoUpdater.on("checking-for-update", () => {
+    setUpdateState({ status: "checking", ...updateBaseFields() })
+  })
+  autoUpdater.on("update-available", (info) => {
+    lastUpdateProgressPercent = null
+    lastUpdateProgressAt = null
+    setUpdateState({
+      status: "available",
+      version: info.version,
+      releaseNotes: normalizeReleaseNotes(info.releaseNotes),
+      releaseDate: typeof info.releaseDate === "string" ? info.releaseDate : undefined,
+      currentVersion: currentAppVersion(),
+      lastCheckedAt: nowIso(),
+    })
+  })
+  autoUpdater.on("update-not-available", () => {
+    setUpdateState({ status: "not-available", currentVersion: currentAppVersion(), lastCheckedAt: nowIso() })
+  })
+  autoUpdater.on("error", (error) => {
+    console.error("[updater] error", error)
+    if (shouldPreserveDownloadedOnError(snapshot.update)) return
+    setUpdateState({
+      status: "error",
+      message: formatUpdateError(error),
+      version: updateVersionHint(),
+      currentVersion: currentAppVersion(),
+      lastCheckedAt: nowIso(),
+    })
+  })
+  autoUpdater.on("download-progress", (progress) => {
+    const progressPercent = clampProgressPercent(progress.percent)
+    const now = Date.now()
+    if (!shouldBroadcastProgress(lastUpdateProgressPercent, lastUpdateProgressAt, progressPercent, now)) return
+    lastUpdateProgressPercent = progressPercent
+    lastUpdateProgressAt = now
+    setUpdateState({
+      status: "downloading",
+      version: updateVersionHint() ?? currentAppVersion(),
+      progressPercent,
+      bytesPerSecond: toOptionalFiniteNumber(progress.bytesPerSecond),
+      transferredBytes: toOptionalFiniteNumber(progress.transferred),
+      totalBytes: toOptionalFiniteNumber(progress.total),
+      currentVersion: currentAppVersion(),
+      lastCheckedAt: snapshot.update.lastCheckedAt,
+    })
+  })
+  autoUpdater.on("update-downloaded", (info) => {
+    lastUpdateProgressPercent = null
+    lastUpdateProgressAt = null
+    setUpdateState({
+      status: "downloaded",
+      version: info.version,
+      releaseNotes: normalizeReleaseNotes(info.releaseNotes),
+      releaseDate: typeof info.releaseDate === "string" ? info.releaseDate : undefined,
+      currentVersion: currentAppVersion(),
+      lastCheckedAt: nowIso(),
+    })
+  })
 }
 
 function createWindow(): void {
@@ -3575,6 +3756,35 @@ function createTray(): void {
   rebuildTrayMenu()
 }
 
+function updateTrayEntry(): MenuItemConstructorOptions {
+  const update = snapshot.update
+  if (update.status === "downloaded") {
+    return {
+      label: `Restart to install v${update.version}`,
+      click: () => {
+        try {
+          requestUpdateInstall()
+        } catch (error) {
+          console.error("[updater] tray install failed", error)
+        }
+      },
+    }
+  }
+  if (update.status === "downloading") {
+    return { label: `Downloading update… ${update.progressPercent}%`, enabled: false }
+  }
+  if (update.status === "checking") {
+    return { label: "Checking for updates…", enabled: false }
+  }
+  if (update.status === "available") {
+    return { label: `Download Tethera v${update.version}`, click: () => void requestUpdateDownload().catch(() => {}) }
+  }
+  if (update.status === "error") {
+    return { label: "Retry update check", click: () => void requestUpdateCheck("tray"), enabled: app.isPackaged }
+  }
+  return { label: "Check for updates", click: () => void requestUpdateCheck("tray"), enabled: app.isPackaged }
+}
+
 function rebuildTrayMenu(): void {
   if (!tray || !snapshot) return
   const template: MenuItemConstructorOptions[] = [
@@ -3584,9 +3794,7 @@ function rebuildTrayMenu(): void {
       ? { label: "Resume all", click: () => void setAllPaused(false) }
       : { label: "Pause all", click: () => void setAllPaused(true) },
     { type: "separator" },
-    snapshot.update.status === "downloaded"
-      ? { label: "Restart to update", click: () => { isQuitting = true; autoUpdater.quitAndInstall() } }
-      : { label: "Check for updates", click: () => void autoUpdater.checkForUpdates(), enabled: app.isPackaged },
+    updateTrayEntry(),
     { type: "separator" },
     { label: "Quit", click: () => { isQuitting = true; app.quit() } },
   ]
@@ -3603,7 +3811,10 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   createWindow()
   createTray()
   setUpAutoUpdater()
-  if (app.isPackaged) void autoUpdater.checkForUpdates()
+  if (app.isPackaged && !process.argv.includes("--squirrel-firstrun")) {
+    setTimeout(() => void requestUpdateCheck("startup"), UPDATE_STARTUP_DELAY_MS)
+    scheduleUpdateChecks()
+  }
   try {
     await startNetworkServices()
   } catch (error) {
@@ -3620,6 +3831,7 @@ app.on("window-all-closed", () => {
   app.quit()
 })
 app.on("will-quit", () => {
+  if (updateCheckTimer) clearInterval(updateCheckTimer)
   if (decisionRetryTimer) clearInterval(decisionRetryTimer)
   for (const retry of continuousSyncRetryTimers.values()) clearTimeout(retry)
   continuousSyncRetryTimers.clear()

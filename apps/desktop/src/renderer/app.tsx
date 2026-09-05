@@ -1,9 +1,6 @@
 import { useEffect, useState } from "react"
 import {
-  CheckCircle2Icon,
   ChevronsLeftIcon,
-  CircleAlertIcon,
-  DownloadIcon,
   LaptopIcon,
   Link2Icon,
   MonitorIcon,
@@ -13,16 +10,12 @@ import {
   RefreshCwIcon,
   SunIcon,
 } from "lucide-react"
-import type {
-  AppSettings,
-  AppSnapshot,
-  ConnectionRoute,
-  UpdateState,
-} from "@shared/contracts"
+import type { AppSettings, AppSnapshot, ConnectionRoute } from "@shared/contracts"
 import tetheraMark from "@/assets/tethera-mark.svg"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { FolderMappingApprovalDialog } from "@/components/folder-mapping-approval-dialog"
 import { MappingStoreBanner } from "@/components/mapping-store-banner"
+import { UpdateBanner } from "@/components/update-banner"
 import { RecoveryView } from "@/components/recovery-view"
 import { Button } from "@/components/ui/button"
 import { StatusPill } from "@/components/ui/status-pill"
@@ -300,50 +293,6 @@ function ConnectionPill({ route, paused }: { route: ConnectionRoute; paused: boo
     <StatusPill tone={route === "offline" ? "neutral" : "success"} pulse={route === "connecting"}>
       {prettyRoute(route)}
     </StatusPill>
-  )
-}
-
-function UpdateBanner({ update }: { update: UpdateState }) {
-  if (update.status === "idle" || update.status === "checking" || update.status === "not-available") return null
-
-  if (update.status === "error") {
-    return (
-      <div className="update-banner [display:flex] [align-items:center] [gap:10px] [margin:0_24px] [padding:10px_14px] [border-radius:10px] [border:1px_solid_var(--border)] [background:var(--accent)] [font-size:12.5px] [font-weight:560] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex-shrink:0] [&_span]:[flex:1] [&_span]:[min-width:0] update-banner-error [border-color:color-mix(in_srgb,_var(--destructive)_45%,_var(--border))] [color:var(--destructive)]">
-        <CircleAlertIcon />
-        <span>Update check failed: {update.message ?? "Unknown error."}</span>
-      </div>
-    )
-  }
-
-  if (update.status === "available") {
-    return (
-      <div className="update-banner [display:flex] [align-items:center] [gap:10px] [margin:0_24px] [padding:10px_14px] [border-radius:10px] [border:1px_solid_var(--border)] [background:var(--accent)] [font-size:12.5px] [font-weight:560] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex-shrink:0] [&_span]:[flex:1] [&_span]:[min-width:0]">
-        <DownloadIcon />
-        <span>Tethera {update.version} is available.</span>
-        <Button size="sm" onClick={() => void window.folderSync.downloadUpdate()}>
-          Download
-        </Button>
-      </div>
-    )
-  }
-
-  if (update.status === "downloading") {
-    return (
-      <div className="update-banner [display:flex] [align-items:center] [gap:10px] [margin:0_24px] [padding:10px_14px] [border-radius:10px] [border:1px_solid_var(--border)] [background:var(--accent)] [font-size:12.5px] [font-weight:560] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex-shrink:0] [&_span]:[flex:1] [&_span]:[min-width:0]">
-        <DownloadIcon />
-        <span>Downloading update… {update.progressPercent ?? 0}%</span>
-      </div>
-    )
-  }
-
-  return (
-    <div className="update-banner [display:flex] [align-items:center] [gap:10px] [margin:0_24px] [padding:10px_14px] [border-radius:10px] [border:1px_solid_var(--border)] [background:var(--accent)] [font-size:12.5px] [font-weight:560] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex-shrink:0] [&_span]:[flex:1] [&_span]:[min-width:0]">
-      <CheckCircle2Icon />
-      <span>Tethera {update.version} is ready to install.</span>
-      <Button size="sm" onClick={() => void window.folderSync.quitAndInstall()}>
-        Restart & Update
-      </Button>
-    </div>
   )
 }
 
