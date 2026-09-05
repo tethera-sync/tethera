@@ -4,10 +4,12 @@ import {
   ComputerIcon,
   FileWarningIcon,
   FolderOpenIcon,
+  RefreshCwIcon,
   ShieldCheckIcon,
   XIcon,
 } from "lucide-react"
 import type { DeviceSummary, IncomingMappingRequest } from "@shared/contracts"
+import { CompareStatus } from "@/components/compare-status"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -20,6 +22,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { formatBytes } from "@/lib/format"
+import { formatElapsed, useElapsedSeconds, type ComparePhase } from "@/lib/compare-progress"
 
 export function FolderMappingApprovalDialog({
   request,
@@ -38,8 +41,16 @@ export function FolderMappingApprovalDialog({
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
   const [destinationPath, setDestinationPath] = useState("")
-  const [busy, setBusy] = useState(false)
+  const [compare, setCompare] = useState<{
+    operationId: string
+    kind: "refresh" | "verify"
+    phase: ComparePhase | null
+    scannedFiles?: number
+  } | null>(null)
+  const [action, setAction] = useState<"approve" | "reject" | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const working = compare !== null || action !== null
+  const elapsed = formatElapsed(useElapsedSeconds(compare !== null))
 
   useEffect(() => {
     setDestinationPath(request?.selectedDestinationPath ?? "")
@@ -50,43 +61,62 @@ export function FolderMappingApprovalDialog({
   const proposal = request.proposal
   const blockingWarnings = proposal.preview.invalidWindowsNames.length + proposal.preview.caseCollisions.length
 
+  function trackCompareProgress(operationId: string): () => void {
+    return window.folderSync.onPreviewProgress((progress) => {
+      if (progress.operationId !== operationId) return
+      setCompare((current) =>
+        current?.operationId === operationId
+          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles }
+          : current,
+      )
+    })
+  }
+
   async function refreshDestination(nextPath: string) {
-    if (!request || busy) return
+    if (!request || working) return
+    const operationId = crypto.randomUUID()
     setDestinationPath(nextPath)
-    setBusy(true)
+    setCompare({ operationId, kind: "refresh", phase: null })
     setError(null)
+    const stopTracking = trackCompareProgress(operationId)
     try {
-      await window.folderSync.refreshIncomingMappingPreview({ requestId: request.id, destinationPath: nextPath })
+      await window.folderSync.refreshIncomingMappingPreview({ requestId: request.id, destinationPath: nextPath }, operationId)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Unable to compare the new destination.")
     } finally {
-      setBusy(false)
+      stopTracking()
+      setCompare(null)
     }
   }
 
   async function approve() {
-    if (!request || !destinationPath || busy || blockingWarnings > 0) return
-    setBusy(true)
+    if (!request || !destinationPath || working || blockingWarnings > 0) return
+    const operationId = crypto.randomUUID()
+    setAction("approve")
+    setCompare({ operationId, kind: "verify", phase: null })
     setError(null)
+    const stopTracking = trackCompareProgress(operationId)
     try {
-      await window.folderSync.approveFolderMapping({ requestId: request.id, destinationPath })
+      await window.folderSync.approveFolderMapping({ requestId: request.id, destinationPath }, operationId)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Unable to approve this folder mapping.")
     } finally {
-      setBusy(false)
+      stopTracking()
+      setCompare(null)
+      setAction(null)
     }
   }
 
   async function reject() {
-    if (!request || busy) return
-    setBusy(true)
+    if (!request || working) return
+    setAction("reject")
     setError(null)
     try {
       await window.folderSync.rejectFolderMapping(request.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Unable to reject this folder mapping.")
     } finally {
-      setBusy(false)
+      setAction(null)
     }
   }
 
@@ -118,7 +148,7 @@ export function FolderMappingApprovalDialog({
               <span>Folder on this computer</span>
               <div className="approval-destination-row [display:flex] [gap:8px] [&_code]:[flex:1]">
                 <code title={destinationPath}>{destinationPath}</code>
-                <Button variant="outline" size="sm" disabled={busy} onClick={() => setPickerOpen(true)}><FolderOpenIcon data-icon="inline-start" />Change</Button>
+                <Button variant="outline" size="sm" disabled={working} onClick={() => setPickerOpen(true)}><FolderOpenIcon data-icon="inline-start" />Change</Button>
               </div>
             </div>
           </div>
@@ -146,16 +176,31 @@ export function FolderMappingApprovalDialog({
           {!mutationsEnabled ? <p className="mapping-error [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_34%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_10%,_var(--surface))] [padding:10px_12px] [color:var(--destructive)] [font-size:12px]">{disabledReason}</p> : null}
           {request.message ? <p className="approval-status-note [margin:0] [border:1px_solid_var(--border)] [border-radius:10px] [background:color-mix(in_oklab,_var(--surface-sunken)_80%,_transparent)] [padding:10px_12px] [color:var(--muted-foreground)] [font-size:11.5px] [line-height:1.45]">{request.message}</p> : null}
 
+          {compare ? (
+            <CompareStatus
+              phase={compare.phase}
+              purpose={compare.kind === "verify" ? "verify" : "review"}
+              thisComputer={localDevice.name}
+              otherComputer={request.fromDeviceName}
+              scannedFiles={compare.scannedFiles}
+              elapsed={elapsed}
+            />
+          ) : null}
+
           {error ? <p className="mapping-error [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_34%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_10%,_var(--surface))] [padding:10px_12px] [color:var(--destructive)] [font-size:12px]">{error}</p> : null}
 
           <DialogFooter>
-            <Button variant="outline" disabled={busy} onClick={() => void reject()}><XIcon data-icon="inline-start" />Reject</Button>
+            <Button variant="outline" disabled={working} onClick={() => void reject()}>
+              {action === "reject" ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <XIcon data-icon="inline-start" />}
+              {action === "reject" ? "Rejecting…" : "Reject"}
+            </Button>
             <Button
-              disabled={!mutationsEnabled || busy || !destinationPath || blockingWarnings > 0}
+              disabled={!mutationsEnabled || working || !destinationPath || blockingWarnings > 0}
               title={!mutationsEnabled ? disabledReason : undefined}
               onClick={() => void approve()}
             >
-              <ShieldCheckIcon data-icon="inline-start" />{busy ? "Comparing…" : "Approve mapping"}
+              {working ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <ShieldCheckIcon data-icon="inline-start" />}
+              {action === "approve" ? "Approving…" : compare ? "Comparing…" : "Approve mapping"}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -16,6 +16,7 @@ import type {
   RequestFolderMappingInput,
   SyncMode,
 } from "@shared/contracts"
+import { CompareStatus } from "@/components/compare-status"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -30,6 +31,7 @@ import {
 } from "@/components/ui/dialog"
 import { cn } from "@/lib/utils"
 import { formatBytes } from "@/lib/format"
+import { formatElapsed, useElapsedSeconds, type ComparePhase } from "@/lib/compare-progress"
 
 const defaultIgnorePatterns = [".DS_Store", "Thumbs.db", "desktop.ini", "*.tmp", "~$*"]
 type PickerTarget = "local" | "remote" | null
@@ -53,8 +55,14 @@ export function AddFolderDialog({
   const [open, setOpen] = useState(false)
   const [step, setStep] = useState<Step>("paths")
   const [pickerTarget, setPickerTarget] = useState<PickerTarget>(null)
-  const [busy, setBusy] = useState(false)
+  const [compare, setCompare] = useState<{
+    operationId: string
+    kind: "preview" | "request"
+    phase: ComparePhase | null
+    scannedFiles?: number
+  } | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const elapsed = formatElapsed(useElapsedSeconds(compare !== null))
   const [name, setName] = useState("")
   const [localPath, setLocalPath] = useState("")
   const [remotePath, setRemotePath] = useState("")
@@ -95,34 +103,51 @@ export function AddFolderDialog({
     }
   }
 
+  function trackCompareProgress(operationId: string): () => void {
+    return window.folderSync.onPreviewProgress((progress) => {
+      if (progress.operationId !== operationId) return
+      setCompare((current) =>
+        current?.operationId === operationId
+          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles }
+          : current,
+      )
+    })
+  }
+
   async function buildPreview() {
-    if (!canContinue || busy) return
-    setBusy(true)
+    if (!canContinue || compare) return
+    const operationId = crypto.randomUUID()
+    setCompare({ operationId, kind: "preview", phase: null })
     setError(null)
+    const stopTracking = trackCompareProgress(operationId)
     try {
-      const next = await window.folderSync.previewFolderMapping(mappingInput())
+      const next = await window.folderSync.previewFolderMapping(mappingInput(), operationId)
       setPreview(next)
       setStep("preview")
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Unable to compare the folders.")
     } finally {
-      setBusy(false)
+      stopTracking()
+      setCompare(null)
     }
   }
 
   async function requestApproval() {
-    if (!preview || hasBlockingWarnings || busy) return
-    setBusy(true)
+    if (!preview || hasBlockingWarnings || compare) return
+    const operationId = crypto.randomUUID()
+    setCompare({ operationId, kind: "request", phase: null })
     setError(null)
+    const stopTracking = trackCompareProgress(operationId)
     try {
-      await window.folderSync.requestFolderMapping({ ...mappingInput(), preview })
+      await window.folderSync.requestFolderMapping({ ...mappingInput(), preview }, operationId)
       setOpen(false)
       resetForm()
       onAdded()
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Unable to request folder approval.")
     } finally {
-      setBusy(false)
+      stopTracking()
+      setCompare(null)
     }
   }
 
@@ -144,7 +169,9 @@ export function AddFolderDialog({
     <>
       <Dialog
         open={open}
+        disablePointerDismissal={compare !== null}
         onOpenChange={(nextOpen: boolean) => {
+          if (!nextOpen && compare !== null) return
           setOpen(nextOpen)
           if (!nextOpen) setPickerTarget(null)
         }}
@@ -153,7 +180,7 @@ export function AddFolderDialog({
           <PlusIcon data-icon="inline-start" />
           Add folder
         </DialogTrigger>
-        <DialogContent className="mapping-wizard-dialog [max-width:780px]">
+        <DialogContent className="mapping-wizard-dialog [max-width:780px]" showCloseButton={!compare}>
           <DialogHeader>
             <DialogTitle>Create a folder mapping</DialogTitle>
             <DialogDescription>
@@ -183,7 +210,7 @@ export function AddFolderDialog({
           ) : null}
 
           {step === "rules" ? (
-            <div className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px]">
+            <fieldset disabled={compare !== null} className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px] [border:0] [padding:0] [min-width:0]">
               <Field label="Sync direction">
                 <select className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55]" value={mode} onChange={(event: ChangeEvent<HTMLSelectElement>) => { setMode(event.target.value as SyncMode); setPreview(null) }}>
                   <option value="two-way">Two-way sync</option>
@@ -202,17 +229,28 @@ export function AddFolderDialog({
               <Field label="Ignore patterns" hint="One glob-style pattern per line. Subfolders sync recursively unless ignored.">
                 <textarea className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55] min-h-36 resize-y font-mono text-xs" value={patterns} onChange={(event: ChangeEvent<HTMLTextAreaElement>) => { setPatterns(event.target.value); setPreview(null) }} />
               </Field>
-            </div>
+            </fieldset>
           ) : null}
 
           {step === "preview" && preview ? (
             <MappingPreviewView preview={preview} localName={localDevice.name} remoteName={pairedDevice.name} />
           ) : null}
 
+          {compare ? (
+            <CompareStatus
+              phase={compare.phase}
+              purpose={compare.kind === "request" ? "verify" : "review"}
+              thisComputer={localDevice.name}
+              otherComputer={pairedDevice.name}
+              scannedFiles={compare.scannedFiles}
+              elapsed={elapsed}
+            />
+          ) : null}
+
           {error ? <p className="mapping-error [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_34%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_10%,_var(--surface))] [padding:10px_12px] [color:var(--destructive)] [font-size:12px]">{error}</p> : null}
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => {
+            <Button variant="outline" disabled={compare !== null} onClick={() => {
               if (step === "paths") setOpen(false)
               else setStep(step === "preview" ? "rules" : "paths")
             }}>
@@ -222,15 +260,15 @@ export function AddFolderDialog({
               <Button disabled={!canContinue} onClick={() => setStep("rules")}>Rules and history<ArrowRightIcon data-icon="inline-end" /></Button>
             ) : null}
             {step === "rules" ? (
-              <Button disabled={!canContinue || busy} onClick={() => void buildPreview()}>
-                {busy ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <CheckCircle2Icon data-icon="inline-start" />}
-                {busy ? "Comparing folders…" : "Review initial merge"}
+              <Button disabled={!canContinue || compare !== null} onClick={() => void buildPreview()}>
+                {compare ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <CheckCircle2Icon data-icon="inline-start" />}
+                {compare ? "Comparing folders…" : "Review initial merge"}
               </Button>
             ) : null}
             {step === "preview" ? (
-              <Button disabled={busy || hasBlockingWarnings} onClick={() => void requestApproval()}>
-                <SendIcon data-icon="inline-start" />
-                {busy ? "Sending request…" : "Request approval"}
+              <Button disabled={compare !== null || hasBlockingWarnings} onClick={() => void requestApproval()}>
+                {compare ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <SendIcon data-icon="inline-start" />}
+                {compare ? "Verifying & sending…" : "Request approval"}
               </Button>
             ) : null}
           </DialogFooter>

@@ -32,7 +32,14 @@ export interface CompareManifestOptions {
 export interface ScanFolderOptions {
   /** Hash every file for a transfer decision; preview scans retain the bounded fast path. */
   hashAllFiles?: boolean
+  /**
+   * Called as files accumulate so long scans can report progress. Invoked at
+   * most every 500 files to keep the overhead negligible next to filesystem I/O.
+   */
+  onProgress?: (scannedFiles: number) => void
 }
+
+const SCAN_PROGRESS_INTERVAL = 500
 
 export async function scanFolder(
   rootPath: string,
@@ -96,6 +103,16 @@ export async function scanFolder(
         files.push(await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true))
       } catch {
         unreadable += 1
+        continue
+      }
+      if (files.length % SCAN_PROGRESS_INTERVAL === 0) {
+        // Progress is a best-effort UI update. A renderer can disappear while a
+        // file scan is completing; that must not classify the scanned file as unreadable.
+        try {
+          options.onProgress?.(files.length)
+        } catch {
+          // Ignore only progress callback failures; filesystem failures are handled above.
+        }
       }
     }
   }

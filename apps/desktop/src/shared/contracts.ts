@@ -227,6 +227,20 @@ export interface FolderMappingPreview {
   samples: MappingPreviewItem[]
 }
 
+export type FolderPreviewPhase = "scan-local" | "scan-remote" | "compare"
+
+/**
+ * Transient progress for one folder-comparison operation. Emitted on the
+ * `folders:preview-progress` channel, keyed by the client-generated
+ * `operationId` the renderer passed with its IPC call so concurrent
+ * comparisons in different dialogs never cross-talk. Never persisted.
+ */
+export interface FolderPreviewProgress {
+  operationId: string
+  phase: FolderPreviewPhase
+  scannedFiles?: number
+}
+
 export interface FolderMappingProposal {
   id: string
   name: string
@@ -435,10 +449,10 @@ export interface TetheraApi {
   resumeAll(): Promise<AppSnapshot>
   browseDirectory(input: BrowseDirectoryInput): Promise<DirectoryListing>
   createDirectory(input: CreateDirectoryInput): Promise<DirectoryListing>
-  previewFolderMapping(input: PreviewFolderMappingInput): Promise<FolderMappingPreview>
-  requestFolderMapping(input: RequestFolderMappingInput): Promise<AppSnapshot>
-  refreshIncomingMappingPreview(input: RefreshIncomingMappingPreviewInput): Promise<AppSnapshot>
-  approveFolderMapping(input: ApproveFolderMappingInput): Promise<AppSnapshot>
+  previewFolderMapping(input: PreviewFolderMappingInput, progressOperationId?: string): Promise<FolderMappingPreview>
+  requestFolderMapping(input: RequestFolderMappingInput, progressOperationId?: string): Promise<AppSnapshot>
+  refreshIncomingMappingPreview(input: RefreshIncomingMappingPreviewInput, progressOperationId?: string): Promise<AppSnapshot>
+  approveFolderMapping(input: ApproveFolderMappingInput, progressOperationId?: string): Promise<AppSnapshot>
   rejectFolderMapping(requestId: string): Promise<AppSnapshot>
   startInitialSync(folderId: string): Promise<AppSnapshot>
   addFolder(input: AddFolderInput): Promise<AppSnapshot>
@@ -458,4 +472,5 @@ export interface TetheraApi {
   downloadUpdate(): Promise<void>
   quitAndInstall(): Promise<void>
   subscribe(listener: (snapshot: AppSnapshot) => void): () => void
+  onPreviewProgress(listener: (progress: FolderPreviewProgress) => void): () => void
 }

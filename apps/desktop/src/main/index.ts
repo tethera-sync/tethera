@@ -32,6 +32,7 @@ import type {
   DirectoryLocation,
   FolderMappingProposal,
   FolderMappingPreview,
+  FolderPreviewProgress,
   FolderSummary,
   IncomingMappingRequest,
   MappingState,
@@ -145,6 +146,7 @@ import {
   isUpdateBusy,
   normalizeReleaseNotes,
   nowIso,
+  parsePreviewProgressToken,
   shouldBroadcastProgress,
   shouldPreserveDownloadedOnError,
   runUpdateDownload,
@@ -1099,18 +1101,35 @@ function previewsEqual(left: FolderMappingPreview, right: FolderMappingPreview):
   return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right))
 }
 
-async function previewFolderMapping(input: PreviewFolderMappingInput): Promise<FolderMappingPreview> {
+function emitPreviewProgress(operationId: string | undefined, phase: FolderPreviewProgress["phase"], scannedFiles?: number): void {
+  if (!operationId || !mainWindow) return
+  const progress: FolderPreviewProgress = scannedFiles === undefined ? { operationId, phase } : { operationId, phase, scannedFiles }
+  try {
+    if (mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
+    mainWindow.webContents.send("folders:preview-progress", progress)
+  } catch {
+    // Progress is advisory. Window teardown must not fail the scan or mapping request.
+  }
+}
+
+async function previewFolderMapping(input: PreviewFolderMappingInput, progressOperationId?: unknown): Promise<FolderMappingPreview> {
   validateMappingInput(input)
   const peer = getPairedDevice(input.remoteDeviceId)
   if (!peer) throw new Error("Pair a trusted computer before previewing a folder mapping.")
   if (peer.status !== "online") throw new Error(`${peer.name} must be online to compare the folders.`)
+  const operationId = parsePreviewProgressToken(progressOperationId)
   const localPath = path.resolve(input.localPath)
-  const localManifest = await scanFolder(localPath, input.ignorePatterns)
+  emitPreviewProgress(operationId, "scan-local", 0)
+  const localManifest = await scanFolder(localPath, input.ignorePatterns, {
+    onProgress: (scannedFiles) => emitPreviewProgress(operationId, "scan-local", scannedFiles),
+  })
+  emitPreviewProgress(operationId, "scan-remote")
   const remoteManifest = await requirePeerSessions().request<FileManifest>(peer.id, {
     type: "scan-manifest",
     path: input.remotePath,
     ignorePatterns: input.ignorePatterns,
   }, 5 * 60_000)
+  emitPreviewProgress(operationId, "compare")
   return compareManifests(localManifest, remoteManifest, {
     mode: input.mode,
     localPlatform: platform(),
@@ -1118,13 +1137,13 @@ async function previewFolderMapping(input: PreviewFolderMappingInput): Promise<F
   })
 }
 
-async function requestFolderMapping(input: RequestFolderMappingInput): Promise<AppSnapshot> {
+async function requestFolderMapping(input: RequestFolderMappingInput, progressOperationId?: unknown): Promise<AppSnapshot> {
   requireMappingMutations()
   validateMappingInput(input)
   const peer = getPairedDevice(input.remoteDeviceId)
   if (!peer) throw new Error("Pair a trusted computer before requesting a folder mapping.")
   if (peer.status !== "online") throw new Error(`${peer.name} must be online to approve the mapping.`)
-  const authoritativePreview = await previewFolderMapping(input)
+  const authoritativePreview = await previewFolderMapping(input, progressOperationId)
   if (!previewsEqual(authoritativePreview, input.preview)) {
     throw new Error("The folders changed after the preview. Review the initial merge again before requesting approval.")
   }
@@ -1184,19 +1203,26 @@ async function requestFolderMapping(input: RequestFolderMappingInput): Promise<A
 async function buildIncomingMappingPreview(
   request: IncomingMappingRequest,
   destinationPath: string,
+  progressOperationId?: unknown,
 ): Promise<FolderMappingPreview> {
   const peer = getPairedDevice(request.fromDeviceId)
   if (!peer) throw new Error("The requesting computer is no longer trusted.")
   if (peer.status !== "online") throw new Error(`${peer.name} must be online to compare the folders.`)
+  const operationId = parsePreviewProgressToken(progressOperationId)
   const target = path.resolve(destinationPath)
   const targetStat = await stat(target)
   if (!targetStat.isDirectory()) throw new Error("The selected destination is not a folder.")
+  emitPreviewProgress(operationId, "scan-remote")
   const initiatorManifest = await requirePeerSessions().request<FileManifest>(peer.id, {
     type: "scan-manifest",
     path: request.proposal.initiatorPath,
     ignorePatterns: request.proposal.ignorePatterns,
   }, 5 * 60_000)
-  const responderManifest = await scanFolder(target, request.proposal.ignorePatterns)
+  emitPreviewProgress(operationId, "scan-local", 0)
+  const responderManifest = await scanFolder(target, request.proposal.ignorePatterns, {
+    onProgress: (scannedFiles) => emitPreviewProgress(operationId, "scan-local", scannedFiles),
+  })
+  emitPreviewProgress(operationId, "compare")
   return compareManifests(initiatorManifest, responderManifest, {
     mode: request.proposal.mode,
     localPlatform: peer.platform,
@@ -1204,11 +1230,11 @@ async function buildIncomingMappingPreview(
   })
 }
 
-async function refreshIncomingMappingPreview(input: RefreshIncomingMappingPreviewInput): Promise<AppSnapshot> {
+async function refreshIncomingMappingPreview(input: RefreshIncomingMappingPreviewInput, progressOperationId?: unknown): Promise<AppSnapshot> {
   const request = snapshot.mappings.incoming.find((item) => item.id === input.requestId && item.status === "pending")
   if (!request) throw new Error("The folder mapping request is no longer available.")
   const destinationPath = path.resolve(input.destinationPath)
-  const preview = await buildIncomingMappingPreview(request, destinationPath)
+  const preview = await buildIncomingMappingPreview(request, destinationPath, progressOperationId)
   snapshot.mappings.incoming = snapshot.mappings.incoming.map((item) =>
     item.id === request.id
       ? {
@@ -1223,7 +1249,7 @@ async function refreshIncomingMappingPreview(input: RefreshIncomingMappingPrevie
   return broadcastSnapshot()
 }
 
-async function approveFolderMapping(input: ApproveFolderMappingInput): Promise<AppSnapshot> {
+async function approveFolderMapping(input: ApproveFolderMappingInput, progressOperationId?: unknown): Promise<AppSnapshot> {
   requireMappingMutations()
   const request = snapshot.mappings.incoming.find((item) => item.id === input.requestId)
   if (!request) throw new Error("The folder mapping request is no longer available.")
@@ -1231,7 +1257,7 @@ async function approveFolderMapping(input: ApproveFolderMappingInput): Promise<A
   if (destinationPath !== path.resolve(request.proposal.responderPath)) {
     throw new Error("Refresh the initial comparison for the new destination before approving.")
   }
-  const refreshedPreview = await buildIncomingMappingPreview(request, destinationPath)
+  const refreshedPreview = await buildIncomingMappingPreview(request, destinationPath, progressOperationId)
   if (!previewsEqual(refreshedPreview, request.proposal.preview)) {
     snapshot.mappings.incoming = snapshot.mappings.incoming.map((item) =>
       item.id === request.id
@@ -3333,10 +3359,22 @@ function registerIpc(): void {
   ipcMain.handle("app:resume-all", () => setAllPaused(false))
   ipcMain.handle("filesystem:browse-directory", (_event, input: BrowseDirectoryInput) => browseDirectory(input))
   ipcMain.handle("filesystem:create-directory", (_event, input: CreateDirectoryInput) => createLocalDirectory(input))
-  ipcMain.handle("folders:preview-mapping", (_event, input: PreviewFolderMappingInput) => previewFolderMapping(input))
-  ipcMain.handle("folders:request-mapping", (_event, input: RequestFolderMappingInput) => requestFolderMapping(input))
-  ipcMain.handle("folders:refresh-incoming-preview", (_event, input: RefreshIncomingMappingPreviewInput) => refreshIncomingMappingPreview(input))
-  ipcMain.handle("folders:approve-mapping", (_event, input: ApproveFolderMappingInput) => approveFolderMapping(input))
+  ipcMain.handle("folders:preview-mapping", (event, input: PreviewFolderMappingInput, progressOperationId: unknown) => {
+    requireTrustedMainRenderer(event)
+    return previewFolderMapping(input, progressOperationId)
+  })
+  ipcMain.handle("folders:request-mapping", (event, input: RequestFolderMappingInput, progressOperationId: unknown) => {
+    requireTrustedMainRenderer(event)
+    return requestFolderMapping(input, progressOperationId)
+  })
+  ipcMain.handle("folders:refresh-incoming-preview", (event, input: RefreshIncomingMappingPreviewInput, progressOperationId: unknown) => {
+    requireTrustedMainRenderer(event)
+    return refreshIncomingMappingPreview(input, progressOperationId)
+  })
+  ipcMain.handle("folders:approve-mapping", (event, input: ApproveFolderMappingInput, progressOperationId: unknown) => {
+    requireTrustedMainRenderer(event)
+    return approveFolderMapping(input, progressOperationId)
+  })
   ipcMain.handle("folders:reject-mapping", (_event, requestId: string) => rejectFolderMapping(requestId))
   ipcMain.handle("folders:start-initial-sync", (_event, folderId: string) => startInitialSync(folderId))
 

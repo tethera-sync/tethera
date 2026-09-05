@@ -8,6 +8,7 @@ import type {
   BrowseDirectoryInput,
   CreateDirectoryInput,
   ConflictInspectionInput,
+  FolderPreviewProgress,
   TetheraApi,
   PreviewFolderMappingInput,
   RequestFolderMappingInput,
@@ -27,10 +28,14 @@ const api: TetheraApi = {
   resumeAll: () => ipcRenderer.invoke("app:resume-all"),
   browseDirectory: (input: BrowseDirectoryInput) => ipcRenderer.invoke("filesystem:browse-directory", input),
   createDirectory: (input: CreateDirectoryInput) => ipcRenderer.invoke("filesystem:create-directory", input),
-  previewFolderMapping: (input: PreviewFolderMappingInput) => ipcRenderer.invoke("folders:preview-mapping", input),
-  requestFolderMapping: (input: RequestFolderMappingInput) => ipcRenderer.invoke("folders:request-mapping", input),
-  refreshIncomingMappingPreview: (input: RefreshIncomingMappingPreviewInput) => ipcRenderer.invoke("folders:refresh-incoming-preview", input),
-  approveFolderMapping: (input: ApproveFolderMappingInput) => ipcRenderer.invoke("folders:approve-mapping", input),
+  previewFolderMapping: (input: PreviewFolderMappingInput, progressOperationId?: string) =>
+    ipcRenderer.invoke("folders:preview-mapping", input, progressOperationId),
+  requestFolderMapping: (input: RequestFolderMappingInput, progressOperationId?: string) =>
+    ipcRenderer.invoke("folders:request-mapping", input, progressOperationId),
+  refreshIncomingMappingPreview: (input: RefreshIncomingMappingPreviewInput, progressOperationId?: string) =>
+    ipcRenderer.invoke("folders:refresh-incoming-preview", input, progressOperationId),
+  approveFolderMapping: (input: ApproveFolderMappingInput, progressOperationId?: string) =>
+    ipcRenderer.invoke("folders:approve-mapping", input, progressOperationId),
   rejectFolderMapping: (requestId: string) => ipcRenderer.invoke("folders:reject-mapping", requestId),
   startInitialSync: (folderId: string) => ipcRenderer.invoke("folders:start-initial-sync", folderId),
   addFolder: (input: AddFolderInput) => ipcRenderer.invoke("folders:add", input),
@@ -53,6 +58,11 @@ const api: TetheraApi = {
     const handler = (_event: Electron.IpcRendererEvent, snapshot: AppSnapshot) => listener(snapshot)
     ipcRenderer.on("app:snapshot", handler)
     return () => ipcRenderer.removeListener("app:snapshot", handler)
+  },
+  onPreviewProgress: (listener: (progress: FolderPreviewProgress) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: FolderPreviewProgress) => listener(progress)
+    ipcRenderer.on("folders:preview-progress", handler)
+    return () => ipcRenderer.removeListener("folders:preview-progress", handler)
   },
 }
 
