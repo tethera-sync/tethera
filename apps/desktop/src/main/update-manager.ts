@@ -63,6 +63,20 @@ export function canDownloadUpdate(state: UpdateState): boolean {
   return state.status === "available"
 }
 
+/** Claim an available update before awaiting electron-updater so other actions see the download as active. */
+export function beginUpdateDownload(
+  state: UpdateState,
+): Extract<UpdateState, { status: "downloading" }> | undefined {
+  if (state.status !== "available") return undefined
+  return {
+    status: "downloading",
+    version: state.version,
+    progressPercent: 0,
+    currentVersion: state.currentVersion,
+    lastCheckedAt: state.lastCheckedAt,
+  }
+}
+
 /** Installs may only run once the installer has been verified on disk. */
 export function canInstallUpdate(state: UpdateState): boolean {
   return state.status === "downloaded"

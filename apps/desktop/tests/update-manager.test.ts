@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import {
   canDownloadUpdate,
   canInstallUpdate,
+  beginUpdateDownload,
   clampProgressPercent,
   formatUpdateError,
   isUpdateBusy,
@@ -33,6 +34,9 @@ describe("formatUpdateError", () => {
   test("falls back for unknown shapes", () => {
     expect(formatUpdateError(null)).toContain("retry automatically")
     expect(formatUpdateError(new Error(""))).toContain("retry automatically")
+    expect(formatUpdateError(new Error("Cannot find latest.yml at https://updates.example/cache/latest.yml"))).toBe(
+      "The update check failed. We'll retry automatically.",
+    )
   })
 })
 
@@ -51,6 +55,17 @@ describe("update state guards", () => {
     expect(canDownloadUpdate({ status: "error", message: "nope" })).toBe(false)
     expect(canInstallUpdate({ status: "downloaded", version: "1.2.0" })).toBe(true)
     expect(canInstallUpdate({ status: "available", version: "1.2.0" })).toBe(false)
+  })
+
+  test("claims an available download before awaiting updater work", () => {
+    expect(beginUpdateDownload({ status: "available", version: "1.2.0", currentVersion: "1.1.0" })).toEqual({
+      status: "downloading",
+      version: "1.2.0",
+      progressPercent: 0,
+      currentVersion: "1.1.0",
+      lastCheckedAt: undefined,
+    })
+    expect(beginUpdateDownload({ status: "downloading", version: "1.2.0", progressPercent: 2 })).toBeUndefined()
   })
 
   test("a staged download survives later feed errors", () => {

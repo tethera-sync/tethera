@@ -138,6 +138,7 @@ import { restoreArchivedVersion } from "./archive-restore"
 import {
   UPDATE_CHECK_INTERVAL_MS,
   UPDATE_STARTUP_DELAY_MS,
+  beginUpdateDownload,
   canDownloadUpdate,
   canInstallUpdate,
   clampProgressPercent,
@@ -243,7 +244,6 @@ const idleUpdateState: UpdateState = { status: "idle" }
 let updateCheckTimer: NodeJS.Timeout | null = null
 let lastUpdateProgressPercent: number | null = null
 let lastUpdateProgressAt: number | null = null
-let updateDownloadInFlight = false
 
 function currentAppVersion(): string {
   try {
@@ -3575,7 +3575,6 @@ async function requestUpdateCheck(source: "ipc" | "tray" | "startup" | "schedule
 
 async function requestUpdateDownload(): Promise<void> {
   if (!app.isPackaged) throw new Error("Automatic updates are only available in installed builds of Tethera.")
-  if (updateDownloadInFlight) throw new Error("An update download is already in progress.")
   if (!canDownloadUpdate(snapshot.update)) {
     throw new Error(
       snapshot.update.status === "downloaded"
@@ -3585,21 +3584,22 @@ async function requestUpdateDownload(): Promise<void> {
   }
   lastUpdateProgressPercent = null
   lastUpdateProgressAt = null
-  updateDownloadInFlight = true
+  const downloadingState = beginUpdateDownload(snapshot.update)
+  if (!downloadingState) throw new Error("Check for updates before downloading.")
+  setUpdateState(downloadingState)
   try {
     await autoUpdater.downloadUpdate()
   } catch (error) {
     console.error("[updater] download failed", error)
+    const message = formatUpdateError(error)
     setUpdateState({
       status: "error",
-      message: formatUpdateError(error),
+      message,
       version: updateVersionHint(),
       currentVersion: currentAppVersion(),
       lastCheckedAt: nowIso(),
     })
-    throw new Error(formatUpdateError(error))
-  } finally {
-    updateDownloadInFlight = false
+    throw new Error(message)
   }
 }
 
@@ -3612,7 +3612,8 @@ function requestUpdateInstall(): void {
     autoUpdater.quitAndInstall()
   } catch (error) {
     isQuitting = false
-    throw error
+    console.error("[updater] install failed", error)
+    throw new Error(formatUpdateError(error))
   }
 }
 
