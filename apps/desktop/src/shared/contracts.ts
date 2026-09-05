@@ -157,12 +157,52 @@ export type UpdateStatus =
   | "downloaded"
   | "error"
 
-export interface UpdateState {
-  status: UpdateStatus
-  version?: string
-  progressPercent?: number
-  message?: string
-}
+/**
+ * Discriminated update state shared over IPC snapshots.
+ *
+ * Each variant only carries the fields that are meaningful for that status so
+ * callers cannot render nonsense combinations (for example a `downloading`
+ * state without a percentage). `lastCheckedAt` is an ISO timestamp recording
+ * the most recent feed response; `currentVersion` echoes `app.getVersion()`
+ * so the renderer can state "You're on vX" without a separate IPC call.
+ */
+export type UpdateState =
+  | { status: "idle"; currentVersion?: string; lastCheckedAt?: string }
+  | { status: "checking"; currentVersion?: string; lastCheckedAt?: string }
+  | {
+      status: "available"
+      version: string
+      releaseNotes?: string
+      releaseDate?: string
+      currentVersion?: string
+      lastCheckedAt?: string
+    }
+  | { status: "not-available"; currentVersion?: string; lastCheckedAt?: string }
+  | {
+      status: "downloading"
+      version: string
+      progressPercent: number
+      bytesPerSecond?: number
+      transferredBytes?: number
+      totalBytes?: number
+      currentVersion?: string
+      lastCheckedAt?: string
+    }
+  | {
+      status: "downloaded"
+      version: string
+      releaseNotes?: string
+      releaseDate?: string
+      currentVersion?: string
+      lastCheckedAt?: string
+    }
+  | {
+      status: "error"
+      message: string
+      version?: string
+      currentVersion?: string
+      lastCheckedAt?: string
+    }
 
 export interface MappingPreviewItem {
   path: string
