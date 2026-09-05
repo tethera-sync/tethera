@@ -243,6 +243,7 @@ const idleUpdateState: UpdateState = { status: "idle" }
 let updateCheckTimer: NodeJS.Timeout | null = null
 let lastUpdateProgressPercent: number | null = null
 let lastUpdateProgressAt: number | null = null
+let updateDownloadInFlight = false
 
 function currentAppVersion(): string {
   try {
@@ -3574,6 +3575,7 @@ async function requestUpdateCheck(source: "ipc" | "tray" | "startup" | "schedule
 
 async function requestUpdateDownload(): Promise<void> {
   if (!app.isPackaged) throw new Error("Automatic updates are only available in installed builds of Tethera.")
+  if (updateDownloadInFlight) throw new Error("An update download is already in progress.")
   if (!canDownloadUpdate(snapshot.update)) {
     throw new Error(
       snapshot.update.status === "downloaded"
@@ -3583,6 +3585,7 @@ async function requestUpdateDownload(): Promise<void> {
   }
   lastUpdateProgressPercent = null
   lastUpdateProgressAt = null
+  updateDownloadInFlight = true
   try {
     await autoUpdater.downloadUpdate()
   } catch (error) {
@@ -3595,6 +3598,8 @@ async function requestUpdateDownload(): Promise<void> {
       lastCheckedAt: nowIso(),
     })
     throw new Error(formatUpdateError(error))
+  } finally {
+    updateDownloadInFlight = false
   }
 }
 
@@ -3602,8 +3607,13 @@ function requestUpdateInstall(): void {
   if (!canInstallUpdate(snapshot.update)) {
     throw new Error("No downloaded update is ready to install yet.")
   }
-  isQuitting = true
-  autoUpdater.quitAndInstall()
+  try {
+    isQuitting = true
+    autoUpdater.quitAndInstall()
+  } catch (error) {
+    isQuitting = false
+    throw error
+  }
 }
 
 function scheduleUpdateChecks(): void {
