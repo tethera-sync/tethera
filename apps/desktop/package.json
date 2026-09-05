@@ -13,6 +13,7 @@
 		"typecheck": "tsc --noEmit",
 		"electron:install": "install-electron --no",
 		"test": "bun test tests",
+		"test:electron:add-folder-dialog": "bun run tests/add-folder-dialog.electron.driver.ts",
 		"dist": "electron-vite build && electron-builder --config electron-builder.yml --publish=never",
 		"dist:mac": "electron-vite build && electron-builder --config electron-builder.yml --mac --publish=never",
 		"dist:win": "electron-vite build && electron-builder --config electron-builder.yml --win --publish=never",

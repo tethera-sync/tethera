@@ -30,6 +30,14 @@ No migration or configuration test may scan a mapped directory. Paths in these t
 
 ## Required pull-request checks
 
+The AddFolderDialog Electron interaction harness is intentionally opt-in and is not included in `bun run desktop:test`:
+
+```bash
+bun run --filter @tethera/desktop test:electron:add-folder-dialog
+```
+
+It builds the actual dialog and runs it in the Electron package executable. On Linux it requires a working display/session; when that is unavailable, the driver reports that limitation explicitly.
+
 Run from the repository root:
 
 ```bash
