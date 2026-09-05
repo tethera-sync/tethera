@@ -67,6 +67,7 @@ describe("update state guards", () => {
     const first = runUpdateDownload(state, download, setState)
     await Promise.resolve()
     expect(state.status).toBe("downloading")
+    expect(isUpdateBusy(state)).toBe(true)
     await expect(runUpdateDownload(state, download, setState)).rejects.toThrow("Check for updates")
     resolveDownload?.()
     await first

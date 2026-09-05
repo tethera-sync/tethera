@@ -64,7 +64,7 @@ export function canDownloadUpdate(state: UpdateState): boolean {
 }
 
 /** Claim an available update before awaiting electron-updater so other actions see the download as active. */
-export function beginUpdateDownload(
+function beginUpdateDownload(
   state: UpdateState,
 ): Extract<UpdateState, { status: "downloading" }> | undefined {
   if (state.status !== "available") return undefined
