@@ -12,7 +12,7 @@ import { Button } from "./ui/button"
 import { downloadReadout, formatLastChecked } from "@/lib/update-format"
 
 const shell =
-  "update-banner [display:flex] [min-height:48px] [flex:0_0_auto] [align-items:center] [gap:11px] [margin:10px_24px_0] [padding:11px_13px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_24%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--primary)_7%,_var(--surface))] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--primary)] [&>div]:[min-width:0] [&>div]:[flex:1] [&_strong]:[display:block] [&_span]:[display:block] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:650] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10.5px] [&_span]:[line-height:1.4] max-[760px]:[align-items:stretch] max-[760px]:[flex-direction:column] max-[760px]:[&>div:last-child]:[display:flex] max-[760px]:[&>div:last-child]:[width:100%]"
+  "update-banner [display:flex] [min-height:48px] [flex:0_0_auto] [align-items:center] [gap:11px] [margin:10px_24px_0] [padding:11px_13px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_24%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--primary)_7%,_var(--surface))] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--primary)] [&>div:first-of-type]:[min-width:0] [&>div:first-of-type]:[flex:1] [&_strong]:[display:block] [&_span]:[display:block] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:650] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10.5px] [&_span]:[line-height:1.4] max-[760px]:[align-items:stretch] max-[760px]:[flex-direction:column] max-[760px]:[&>div:last-child]:[display:flex] max-[760px]:[&>div:last-child]:[width:100%]"
 const successTone =
   "update-banner-success [border-color:color-mix(in_oklab,_var(--success)_38%,_var(--border))] [background:color-mix(in_oklab,_var(--success)_9%,_var(--surface))] [&>svg]:[color:var(--success)]"
 const errorTone =
@@ -93,7 +93,7 @@ export function UpdateBanner({ update }: { update: UpdateState }) {
             />
           </div>
         </div>
-        <div className="[font-variant-numeric:tabular-nums] [font-size:11.5px] [font-weight:650]">{percent}%</div>
+        <div className="shrink-0 [font-variant-numeric:tabular-nums] [font-size:11.5px] [font-weight:650]">{percent}%</div>
       </div>
     )
   }
@@ -126,7 +126,7 @@ export function UpdateBanner({ update }: { update: UpdateState }) {
           {line ? <span>{line}.</span> : null}
           {actionError ? <span className="[color:var(--destructive)]">{actionError}</span> : null}
         </div>
-        <div className="[display:flex] [align-items:center] [gap:8px]">
+        <div className="shrink-0 [display:flex] [align-items:center] [gap:8px]">
           <Button
             type="button"
             variant="outline"
@@ -154,7 +154,7 @@ export function UpdateBanner({ update }: { update: UpdateState }) {
           <ReleaseNotes notes={update.releaseNotes} />
           {actionError ? <span className="[color:var(--destructive)]">{actionError}</span> : null}
         </div>
-        <div className="[display:flex] [align-items:center] [gap:8px]">
+        <div className="shrink-0 [display:flex] [align-items:center] [gap:8px]">
           <Button type="button" variant="ghost" size="sm" onClick={dismiss}>
             Later
           </Button>
@@ -177,7 +177,7 @@ export function UpdateBanner({ update }: { update: UpdateState }) {
           <ReleaseNotes notes={update.releaseNotes} />
           {actionError ? <span className="[color:var(--destructive)]">{actionError}</span> : null}
         </div>
-        <div className="[display:flex] [align-items:center] [gap:8px]">
+        <div className="shrink-0 [display:flex] [align-items:center] [gap:8px]">
           <Button type="button" variant="outline" size="sm" onClick={dismiss}>
             On next launch
           </Button>
@@ -199,7 +199,7 @@ export function UpdateBanner({ update }: { update: UpdateState }) {
         </span>
         {actionError ? <span className="[color:var(--destructive)]">{actionError}</span> : null}
       </div>
-      <div className="[display:flex] [align-items:center] [gap:8px]">
+      <div className="shrink-0 [display:flex] [align-items:center] [gap:8px]">
         <Button type="button" variant="outline" size="sm" disabled={working === "check"} onClick={() => void run("check")}>
           <RefreshCwIcon className={working === "check" ? "animate-spin" : undefined} data-icon="inline-start" />
           {working === "check" ? "Retrying…" : "Retry"}

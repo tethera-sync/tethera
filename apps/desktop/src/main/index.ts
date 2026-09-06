@@ -3787,8 +3787,18 @@ function showMainWindow(): void {
 
 function createTray(): void {
   const iconPath = resolveResourcePath("tray.png")
-  const image = existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty()
-  tray = new Tray(image.resize({ width: 18, height: 18 }))
+  const source = existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty()
+  if (source.isEmpty()) {
+    console.error(`[tray] tray icon missing or unreadable at ${iconPath}; skipping tray creation`)
+    return
+  }
+  try {
+    tray = new Tray(source.resize({ width: 18, height: 18 }))
+  } catch (error) {
+    console.error("[tray] tray creation failed", error)
+    tray = null
+    return
+  }
   tray.setToolTip("Tethera")
   tray.on("click", showMainWindow)
   rebuildTrayMenu()

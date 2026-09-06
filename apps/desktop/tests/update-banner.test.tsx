@@ -23,6 +23,16 @@ describe("UpdateBanner", () => {
     expect(html).toContain("Check again")
   })
 
+  test("keeps actions trailing instead of splitting banner space with the text", () => {
+    const html = renderToStaticMarkup(
+      <UpdateBanner
+        update={{ status: "not-available", currentVersion: "0.1.1", lastCheckedAt: "2026-09-05T12:00:00Z" }}
+      />,
+    )
+    expect(html).toContain("[&amp;&gt;div:first-of-type]:[flex:1]")
+    expect(html).toContain('class="shrink-0 [display:flex] [align-items:center] [gap:8px]"')
+  })
+
   test("offers an explicit download with release notes", () => {
     const html = renderToStaticMarkup(
       <UpdateBanner

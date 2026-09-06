@@ -14,6 +14,10 @@ extraResources:
     to: engine
     filter:
       - "**/*"
+  - from: resources/tray.png
+    to: tray.png
+  - from: resources/icon.png
+    to: icon.png
 
 mac:
   category: public.app-category.utilities
