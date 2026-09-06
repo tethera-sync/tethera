@@ -305,10 +305,13 @@ export function isManifestPathIgnored(relativePath: string, patterns: string[]):
  *
  * The unicode flag keeps `?` and negated classes on full code points, as
  * Rust matches on `char`s. Returns `undefined` when the pattern cannot
- * compile (for example lone surrogates, which Rust's `str` can never
- * contain), so the caller skips the rule instead of throwing into the scan.
+ * compile, so the caller skips the rule instead of throwing into the scan.
  */
 function globToRegExp(pattern: string): RegExp | undefined {
+  // A lone surrogate compiles under the unicode flag and would match
+  // itself, but it can never equal a Rust `str` or a real filename, so it
+  // must not become a rule.
+  if (hasUnpairedSurrogate(pattern)) return undefined
   let source = ""
   let index = 0
   while (index < pattern.length) {
@@ -340,6 +343,23 @@ function globToRegExp(pattern: string): RegExp | undefined {
   } catch {
     return undefined
   }
+}
+
+/** Whether the value holds a UTF-16 surrogate without its partner. */
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        index += 1
+        continue
+      }
+      return true
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true
+  }
+  return false
 }
 
 async function inspectManifestFile(

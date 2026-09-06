@@ -1999,14 +1999,17 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       throw new Error("A replacement recovery issue must be repaired before this folder can synchronize.")
     }
     const observedAt = new Date().toISOString()
+    // One limit for the whole flow: rereading the setting after the awaited
+    // scans could validate against a ceiling the scans never used.
+    const scanLimit = currentScanLimit()
     const [localManifest, remoteManifest] = await Promise.all([
-      scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit() }),
+      scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit }),
       requirePeerSessions().request<FileManifest>(peer.id, {
         type: "continuous-sync-scan",
         folderId,
       }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS),
     ])
-    assertCompleteTransferManifest(localManifest, "This computer", currentScanLimit())
+    assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
     assertCompleteTransferManifest(remoteManifest, peer.name)
     const localObservation = observedFiles(localManifest)
     const remoteObservation = observedFiles(remoteManifest)
@@ -2452,8 +2455,11 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
   })
   broadcastSnapshot()
 
+  // One limit for the whole pass: rereading the setting after the awaited
+  // scans could validate against a ceiling the scans never used.
+  const scanLimit = currentScanLimit()
   const [localManifest, remoteManifest] = await Promise.all([
-    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit() }),
+    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit }),
     requirePeerSessions().request<FileManifest>(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
@@ -2462,7 +2468,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
       hashAllFiles: true,
     }, 5 * 60_000),
   ])
-  assertCompleteTransferManifest(localManifest, "This computer", currentScanLimit())
+  assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
   assertCompleteTransferManifest(remoteManifest, peer.name)
 
   const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode)
@@ -2514,8 +2520,11 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
 async function verifyInitialMergeQuiescent(folder: FolderSummary, peer: DeviceSummary): Promise<SyncSkip[]> {
   updateFolder(folder.id, { currentAction: "Verifying that neither folder changed during the merge…" })
   broadcastSnapshot()
+  // One limit for the whole check, as above: the scans and their validation
+  // must agree even if the setting changes mid-flight.
+  const scanLimit = currentScanLimit()
   const [localManifest, remoteManifest] = await Promise.all([
-    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit() }),
+    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit }),
     requirePeerSessions().request<FileManifest>(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
@@ -2524,7 +2533,7 @@ async function verifyInitialMergeQuiescent(folder: FolderSummary, peer: DeviceSu
       hashAllFiles: true,
     }, 5 * 60_000),
   ])
-  assertCompleteTransferManifest(localManifest, "This computer", currentScanLimit())
+  assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
   assertCompleteTransferManifest(remoteManifest, peer.name)
   const convergence = assessInitialMergeConvergence(localManifest, remoteManifest, folder.mode)
   if (!convergence.complete) {

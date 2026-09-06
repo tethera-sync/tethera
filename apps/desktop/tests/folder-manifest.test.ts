@@ -166,9 +166,11 @@ describe("folder mapping comparison", () => {
     const singleWildcard = folderManifestTestHelpers.createIgnoreMatcher(["?.txt"])
     expect(singleWildcard("😀.txt", false)).toBe(true)
     expect(singleWildcard("ab.txt", false)).toBe(false)
-    // A lone surrogate can never compile under the unicode flag; the rule is
-    // skipped instead of throwing into the scan.
-    const loneSurrogate = folderManifestTestHelpers.createIgnoreMatcher(["\ud800.txt"])
+    // A lone surrogate can never equal a Rust str or a real filename, so
+    // its rule is skipped: the pattern must not match even itself.
+    const lonePattern = "\ud800.txt"
+    const loneSurrogate = folderManifestTestHelpers.createIgnoreMatcher([lonePattern])
+    expect(loneSurrogate(lonePattern, false)).toBe(false)
     expect(loneSurrogate("a.txt", false)).toBe(false)
   })
 
