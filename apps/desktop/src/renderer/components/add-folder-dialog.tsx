@@ -45,6 +45,9 @@ interface AddFolderDialogProps {
   disabledReason?: string
 }
 
+/**
+ * Multi-step wizard dialog for creating a new folder mapping between local and paired devices, with path selection, sync rules configuration, and initial merge preview.
+ */
 export function AddFolderDialog({
   localDevice,
   pairedDevice,

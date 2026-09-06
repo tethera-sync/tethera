@@ -42,6 +42,9 @@ interface FolderPickerDialogProps {
   onSelect: (path: string) => void
 }
 
+/**
+ * Dialog for browsing and selecting folders on a device (local or remote), with navigation, search, hidden file toggle, and folder creation capabilities.
+ */
 export function FolderPickerDialog({
   open,
   onOpenChange,
