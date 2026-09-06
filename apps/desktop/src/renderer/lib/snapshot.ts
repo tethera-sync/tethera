@@ -1,4 +1,4 @@
-import type { AppSnapshot, DeviceSummary, FolderSummary, MappingStoreState } from "@shared/contracts"
+import type { AppSnapshot, DeviceSummary, FolderSummary, MappingStoreState, TetheraApi } from "@shared/contracts"
 import { pretty } from "./format"
 
 /** The device entry representing this computer, with a fallback while the snapshot loads. */
@@ -31,6 +31,8 @@ export function mappingMutationAvailability(state: MappingStoreState): { enabled
 
 /** Headline for the overview status card, prioritising the most actionable state. */
 export function overallHeadline(snapshot: AppSnapshot): string {
+  if (snapshot.engineStatus === "starting" || snapshot.mappingStore.status === "loading") return "Getting ready to sync"
+  if (snapshot.engineStatus !== "ready" || !mappingMutationAvailability(snapshot.mappingStore).enabled) return "Sync is unavailable"
   if (snapshot.paused) return "Everything is safely paused"
   if (getPairedDevices(snapshot).length === 0) return "Pair your second computer first"
   if (snapshot.route === "offline") return `${getPairedDevices(snapshot)[0]?.name ?? "The paired computer"} is offline`
@@ -43,9 +45,10 @@ export function overallHeadline(snapshot: AppSnapshot): string {
 
 /** Supporting copy for the overview status card. */
 export function overallDescription(snapshot: AppSnapshot): string {
+  if (snapshot.engineStatus === "starting" || snapshot.mappingStore.status === "loading") return "Loading your saved folders and checking that syncing can start safely."
+  if (snapshot.engineStatus !== "ready" || !mappingMutationAvailability(snapshot.mappingStore).enabled) return "Tethera cannot sync right now. Use Retry above, or open Settings to review the connection to your saved folder configuration."
   if (snapshot.paused) return "Folder changes will remain local until you resume syncing."
   if (getPairedDevices(snapshot).length === 0) return "Folder selection stays locked until both computers approve a secure pairing."
-  if (snapshot.engineStatus !== "ready") return "Your folder mappings are saved, but live scanning waits for the Rust engine."
   if (snapshot.route === "offline") {
     return snapshot.folders.length === 0
       ? "Bring the paired computer online before choosing the first folder."
@@ -65,4 +68,55 @@ export function folderStatusLabel(folder: FolderSummary): string {
   if (folder.status === "up-to-date" && folder.setupStatus === "active") return "Up to date"
   if (folder.status === "needs-attention" && folder.setupStatus === "ready-for-initial-sync") return "Ready for initial merge"
   return pretty(folder.status)
+}
+
+export interface SnapshotSubscription {
+  getSnapshot(): AppSnapshot
+  subscribe(listener: (snapshot: AppSnapshot) => void): () => void
+  loadInitial(): Promise<void>
+  beginAction(): number
+  applyActionResult(snapshot: AppSnapshot, revision: number): boolean
+}
+
+/**
+ * Keeps pushed snapshots authoritative over an older request that was already
+ * in flight when the renderer subscribed.
+ */
+export function createSnapshotSubscription(api: Pick<TetheraApi, "getSnapshot" | "subscribe">, fallback: AppSnapshot): SnapshotSubscription {
+  let current = fallback
+  let revision = 0
+  let activeListener: ((snapshot: AppSnapshot) => void) | null = null
+
+  function publish(snapshot: AppSnapshot) {
+    current = snapshot
+    revision += 1
+    activeListener?.(snapshot)
+  }
+
+  return {
+    getSnapshot: () => current,
+    subscribe(listener) {
+      activeListener = listener
+      const unsubscribe = api.subscribe((snapshot) => publish(snapshot))
+      return () => {
+        if (activeListener === listener) activeListener = null
+        unsubscribe()
+      }
+    },
+    async loadInitial() {
+      const requestRevision = revision
+      try {
+        const snapshot = await api.getSnapshot()
+        if (revision === requestRevision) publish(snapshot)
+      } catch (error: unknown) {
+        if (revision === requestRevision) throw error
+      }
+    },
+    beginAction: () => revision,
+    applyActionResult(snapshot, actionRevision) {
+      if (revision !== actionRevision) return false
+      publish(snapshot)
+      return true
+    },
+  }
 }

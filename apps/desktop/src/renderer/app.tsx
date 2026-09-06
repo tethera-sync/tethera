@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import {
   ChevronsLeftIcon,
   LaptopIcon,
@@ -22,7 +22,7 @@ import { StatusPill } from "@/components/ui/status-pill"
 import { cn } from "@/lib/utils"
 import { prettyPlatform, prettyRoute } from "@/lib/format"
 import { navItems, viewTitle, type View } from "@/lib/navigation"
-import { getLocalDevice, getPairedDevices, mappingMutationAvailability } from "@/lib/snapshot"
+import { createSnapshotSubscription, getLocalDevice, getPairedDevices, mappingMutationAvailability, type SnapshotSubscription } from "@/lib/snapshot"
 import { ActivityView } from "./views/activity"
 import { DevicesView } from "./views/devices"
 import { FoldersView } from "./views/folders"
@@ -60,33 +60,115 @@ const emptySnapshot: AppSnapshot = {
   update: { status: "idle" },
 }
 
+type AppAction =
+  | { kind: "pause"; paused: boolean }
+  | { kind: "theme"; theme: AppSettings["theme"] }
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback
+}
+
 export function App() {
-  const [snapshot, setSnapshot] = useState(emptySnapshot)
+  const subscriptionRef = useRef<SnapshotSubscription | null>(null)
+  if (!subscriptionRef.current) subscriptionRef.current = createSnapshotSubscription(window.folderSync, emptySnapshot)
+  const subscription = subscriptionRef.current
+  const [snapshot, setSnapshot] = useState(() => subscription.getSnapshot())
   const [view, setView] = useState<View>("overview")
   const [loading, setLoading] = useState(true)
+  const [snapshotError, setSnapshotError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [actionBusy, setActionBusy] = useState(false)
+  const [retryAction, setRetryAction] = useState<AppAction | null>(null)
+  const actionBusyRef = useRef(false)
+  const mountedRef = useRef(false)
+  const latestSnapshot = useRef(snapshot)
   const [rail, setRail] = useState(false)
   const [mappingApprovalOpen, setMappingApprovalOpen] = useState(false)
 
   useEffect(() => {
-    void window.folderSync
-      .getSnapshot()
-      .then(setSnapshot)
-      .finally(() => setLoading(false))
-    return window.folderSync.subscribe(setSnapshot)
-  }, [])
+    let mounted = true
+    mountedRef.current = true
+    const unsubscribe = subscription.subscribe((nextSnapshot) => {
+      if (!mounted) return
+      latestSnapshot.current = nextSnapshot
+      setSnapshot(nextSnapshot)
+      setSnapshotError(null)
+      setLoading(false)
+    })
+    void subscription.loadInitial().then(
+      () => {
+        if (mounted) setLoading(false)
+      },
+      (error: unknown) => {
+        if (!mounted) return
+        setLoading(false)
+        setSnapshotError(errorMessage(error, "Tethera could not load its current state."))
+      },
+    )
+    return () => {
+      mounted = false
+      mountedRef.current = false
+      unsubscribe()
+    }
+  }, [subscription])
 
   useEffect(() => {
     const root = document.documentElement
-    root.classList.remove("light", "dark")
-    if (snapshot.settings.theme === "system") {
-      root.classList.toggle("dark", window.matchMedia("(prefers-color-scheme: dark)").matches)
-    } else {
-      root.classList.add(snapshot.settings.theme)
+    const media = window.matchMedia("(prefers-color-scheme: dark)")
+    const applyTheme = () => {
+      root.classList.remove("light", "dark")
+      if (snapshot.settings.theme === "system") root.classList.toggle("dark", media.matches)
+      else root.classList.add(snapshot.settings.theme)
     }
+    applyTheme()
+    if (snapshot.settings.theme !== "system") return
+    media.addEventListener("change", applyTheme)
+    return () => media.removeEventListener("change", applyTheme)
   }, [snapshot.settings.theme])
 
-  async function togglePause() {
-    setSnapshot(snapshot.paused ? await window.folderSync.resumeAll() : await window.folderSync.pauseAll())
+  async function runAction(action: AppAction) {
+    if (!mountedRef.current || actionBusyRef.current) return
+    actionBusyRef.current = true
+    setActionBusy(true)
+    setRetryAction(action)
+    setActionError(null)
+    const revision = subscription.beginAction()
+    try {
+      const result = action.kind === "pause"
+        ? action.paused ? await window.folderSync.pauseAll() : await window.folderSync.resumeAll()
+        : await window.folderSync.updateSetting("theme", action.theme)
+      if (mountedRef.current) {
+        subscription.applyActionResult(result, revision)
+        setActionError(null)
+      }
+    } catch (error: unknown) {
+      if (mountedRef.current) {
+        setActionError(errorMessage(error, "That action failed. Retry to try again."))
+      }
+    } finally {
+      actionBusyRef.current = false
+      if (mountedRef.current) setActionBusy(false)
+    }
+  }
+
+  function togglePause() {
+    void runAction({ kind: "pause", paused: !latestSnapshot.current.paused })
+  }
+
+  function retryInitialLoad() {
+    if (!mountedRef.current) return
+    setSnapshotError(null)
+    setLoading(true)
+    void subscription.loadInitial().then(
+      () => {
+        if (mountedRef.current) setLoading(false)
+      },
+      (error: unknown) => {
+        if (!mountedRef.current) return
+        setLoading(false)
+        setSnapshotError(errorMessage(error, "Tethera could not load its current state."))
+      },
+    )
   }
 
   const localDevice = getLocalDevice(snapshot)
@@ -178,7 +260,7 @@ export function App() {
         </div>
 
         <div className="sidebar-footer [display:grid] [gap:8px] [margin-top:auto]">
-          <ThemeSwitcher theme={snapshot.settings.theme} />
+          <ThemeSwitcher theme={snapshot.settings.theme} disabled={actionBusy} onChange={(theme) => void runAction({ kind: "theme", theme })} />
           <div className="device-chip [display:flex] [align-items:center] [gap:9px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:8px_10px]">
             <div className="device-icon [display:grid] [width:29px] [height:29px] [flex:0_0_auto] [place-items:center] [border-radius:9px] [background:var(--secondary)] [color:var(--muted-foreground)] [&_svg]:[width:14px] [&_svg]:[height:14px]">
               <LaptopIcon />
@@ -196,16 +278,16 @@ export function App() {
           <h1>{viewTitle(view)}</h1>
           <div className="topbar-actions [display:flex] [align-items:center] [gap:8px]">
             <ConnectionPill route={snapshot.route} paused={snapshot.paused} />
-            <Button
+            {snapshot.folders.length > 0 ? <Button
               variant="outline"
               onClick={togglePause}
-              disabled={snapshot.folders.length === 0 || !mappingMutationsEnabled}
+              disabled={actionBusy || snapshot.folders.length === 0 || !mappingMutationsEnabled}
               title={!mappingMutationsEnabled ? mappingMutationReason : undefined}
             >
               {snapshot.paused ? <PlayIcon data-icon="inline-start" /> : <PauseIcon data-icon="inline-start" />}
               {snapshot.paused ? "Resume all" : "Pause all"}
-            </Button>
-            {pairedDevice ? (
+            </Button> : null}
+            {pairedDevice && view !== "folders" ? (
               <AddFolderDialog
                 localDevice={localDevice}
                 pairedDevice={pairedDevice}
@@ -217,29 +299,43 @@ export function App() {
                     : `${pairedDevice.name} must be online to browse and approve a mapping.`
                 }
               />
-            ) : (
+            ) : !pairedDevice && view !== "devices" ? (
               <Button onClick={() => setView("devices")}>
                 <Link2Icon data-icon="inline-start" />
                 Pair device
               </Button>
-            )}
+            ) : null}
           </div>
         </header>
 
         <div className="main-body [display:flex] [min-width:0] [min-height:0] [flex-direction:column]">
           <UpdateBanner update={snapshot.update} />
           <MappingStoreBanner state={snapshot.mappingStore} />
+          {snapshotError || actionError ? (
+            <div className="[display:flex] [align-items:center] [justify-content:space-between] [gap:12px] [border-bottom:1px_solid_var(--border)] [background:var(--destructive)] [padding:10px_24px] [color:var(--destructive-foreground)]" role="alert">
+              <span>{snapshotError ?? actionError}</span>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={loading || actionBusy}
+                onClick={() => snapshotError ? retryInitialLoad() : retryAction ? void runAction(retryAction) : undefined}
+              >
+                Retry
+              </Button>
+            </div>
+          ) : null}
 
           <div className="content-scroll [min-height:0] [flex:1] [overflow:auto] [padding:22px_24px_44px] max-[900px]:[padding-inline:16px]">
             {loading ? <LoadingScreen /> : null}
-            {!loading && view === "overview" ? <Overview snapshot={snapshot} onNavigate={setView} /> : null}
-            {!loading && view === "folders" ? <FoldersView snapshot={snapshot} onNavigate={setView} /> : null}
-            {!loading && view === "activity" ? <ActivityView activity={snapshot.activity} /> : null}
-            {!loading && view === "devices" ? (
+            {!loading && snapshotError ? <LoadingError /> : null}
+            {!loading && !snapshotError && view === "overview" ? <Overview snapshot={snapshot} onNavigate={setView} /> : null}
+            {!loading && !snapshotError && view === "folders" ? <FoldersView snapshot={snapshot} onNavigate={setView} /> : null}
+            {!loading && !snapshotError && view === "activity" ? <ActivityView activity={snapshot.activity} /> : null}
+            {!loading && !snapshotError && view === "devices" ? (
               <DevicesView snapshot={snapshot} onReviewMapping={() => setMappingApprovalOpen(true)} />
             ) : null}
-            {!loading && view === "history" ? <RecoveryView snapshot={snapshot} /> : null}
-            {!loading && view === "settings" ? <SettingsView snapshot={snapshot} /> : null}
+            {!loading && !snapshotError && view === "history" ? <RecoveryView snapshot={snapshot} /> : null}
+            {!loading && !snapshotError && view === "settings" ? <SettingsView snapshot={snapshot} /> : null}
           </div>
         </div>
       </main>
@@ -247,7 +343,15 @@ export function App() {
   )
 }
 
-function ThemeSwitcher({ theme }: { theme: AppSettings["theme"] }) {
+function ThemeSwitcher({
+  theme,
+  disabled,
+  onChange,
+}: {
+  theme: AppSettings["theme"]
+  disabled: boolean
+  onChange: (theme: AppSettings["theme"]) => void
+}) {
   const options = [
     { id: "system", label: "System theme", icon: MonitorIcon },
     { id: "light", label: "Light theme", icon: SunIcon },
@@ -269,7 +373,8 @@ function ThemeSwitcher({ theme }: { theme: AppSettings["theme"] }) {
               aria-label={option.label}
               aria-pressed={theme === option.id}
               title={option.label}
-              onClick={() => void window.folderSync.updateSetting("theme", option.id)}
+              disabled={disabled}
+              onClick={() => onChange(option.id)}
             >
               <Icon />
             </button>
@@ -301,6 +406,14 @@ function LoadingScreen() {
     <div className="loading-screen [display:grid] [min-height:400px] [place-items:center] [align-content:center] [gap:12px] [color:var(--muted-foreground)] [&_svg]:[width:21px] [&_svg]:[height:21px] [&_p]:[margin:0] [&_p]:[font-size:12px]">
       <RefreshCwIcon className="animate-spin" />
       <p>Loading Tethera…</p>
+    </div>
+  )
+}
+
+function LoadingError() {
+  return (
+    <div className="loading-screen [display:grid] [min-height:400px] [place-items:center] [align-content:center] [gap:12px] [color:var(--muted-foreground)]">
+      <p>Unable to load Tethera&apos;s current state.</p>
     </div>
   )
 }

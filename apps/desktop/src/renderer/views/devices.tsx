@@ -39,7 +39,7 @@ export function DevicesView({
           <Badge variant={pairedDevices.length > 0 ? "success" : "warning"}>
             {pairedDevices.length > 0 ? `${pairedDevices.length} paired` : "Not paired"}
           </Badge>
-          {pairedDevices.length === 0 ? <PairDeviceDialog snapshot={snapshot} /> : null}
+          <PairDeviceDialog snapshot={snapshot} />
         </div>
       </section>
 
