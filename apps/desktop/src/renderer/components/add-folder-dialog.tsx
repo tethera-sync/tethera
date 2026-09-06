@@ -180,7 +180,7 @@ export function AddFolderDialog({
           <PlusIcon data-icon="inline-start" />
           Add folder
         </DialogTrigger>
-        <DialogContent className="mapping-wizard-dialog [max-width:780px]" showCloseButton={!compare}>
+        <DialogContent className="mapping-wizard-dialog max-w-[780px]" showCloseButton={!compare}>
           <DialogHeader>
             <DialogTitle>Create a folder mapping</DialogTitle>
             <DialogDescription>
