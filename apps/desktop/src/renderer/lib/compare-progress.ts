@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react"
 import type { FolderPreviewProgress } from "@shared/contracts"
+import { formatBytes } from "./format"
 
 export type ComparePhase = FolderPreviewProgress["phase"]
 
@@ -38,6 +39,7 @@ export interface CompareTextOptions {
   /** "Waiting for Laptop…" */
   otherComputer: string
   scannedFiles?: number
+  activity?: FolderPreviewProgress["activity"]
   elapsed: string
 }
 
@@ -50,9 +52,16 @@ export function comparePhaseText(
   phase: ComparePhase | null,
   options: CompareTextOptions,
 ): { headline: string; detail: string } {
-  const { thisComputer, otherComputer, scannedFiles, elapsed } = options
+  const { thisComputer, otherComputer, scannedFiles, activity, elapsed } = options
   const elapsedSuffix = ` · ${elapsed} elapsed`
   if (phase === "scan-local") {
+    if (activity) {
+      const action = { listing: "Listing folders", inspecting: "Checking file metadata", hashing: "Reading file contents to compare", complete: "Local scan finished" }[activity.stage]
+      return {
+        headline: `${action} on ${thisComputer}${activity.stage === "complete" ? "." : "…"}`,
+        detail: `${activity.scannedFiles.toLocaleString("en-GB")} files checked · ${formatBytes(activity.hashedBytes)} hashed · ${activity.ignoredEntries.toLocaleString("en-GB")} excluded entries · ${activity.unreadableEntries.toLocaleString("en-GB")} unreadable. Nothing is copied${elapsedSuffix}.`,
+      }
+    }
     const count = scannedFiles === undefined ? "" : ` · ${scannedFiles.toLocaleString("en-GB")} files so far`
     return {
       headline: `Scanning folders on ${thisComputer}…`,
@@ -62,7 +71,7 @@ export function comparePhaseText(
   if (phase === "scan-remote") {
     return {
       headline: `Waiting for ${otherComputer}…`,
-      detail: `They are scanning their folder over the encrypted peer session${elapsedSuffix}.`,
+      detail: `They are listing files, applying ignore rules and checking contents over the encrypted peer session. Live file counts are unavailable from the other computer${elapsedSuffix}.`,
     }
   }
   if (phase === "compare") {
@@ -73,6 +82,6 @@ export function comparePhaseText(
   }
   return {
     headline: "Starting the comparison…",
-    detail: `Scanning both computers; large folders can take a few minutes${elapsedSuffix}.`,
+    detail: `Preparing a read-only comparison: list each folder, apply ignore rules, read file sizes and check contents. Large folders can take a few minutes${elapsedSuffix}.`,
   }
 }

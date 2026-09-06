@@ -12,7 +12,7 @@ import { Button } from "./ui/button"
 import { downloadReadout, formatLastChecked } from "@/lib/update-format"
 
 const shell =
-  "update-banner [display:flex] [min-height:48px] [flex:0_0_auto] [align-items:center] [gap:11px] [margin:10px_24px_0] [padding:11px_13px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_24%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--primary)_7%,_var(--surface))] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--primary)] [&>div:first-of-type]:[min-width:0] [&>div:first-of-type]:[flex:1] [&_strong]:[display:block] [&_span]:[display:block] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:650] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10.5px] [&_span]:[line-height:1.4] max-[760px]:[align-items:stretch] max-[760px]:[flex-direction:column] max-[760px]:[&>div:last-child]:[display:flex] max-[760px]:[&>div:last-child]:[width:100%]"
+  "update-banner [display:flex] [width:100%] [box-sizing:border-box] [min-height:48px] [flex:0_0_auto] [align-items:center] [gap:11px] [margin:10px_0_0] [padding:11px_13px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_24%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--primary)_7%,_var(--surface))] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--primary)] [&>div:first-of-type]:[min-width:0] [&>div:first-of-type]:[flex:1] [&_strong]:[display:block] [&_span]:[display:block] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:650] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10.5px] [&_span]:[line-height:1.4] max-[760px]:[align-items:stretch] max-[760px]:[flex-direction:column] max-[760px]:[&>div:last-child]:[display:flex] max-[760px]:[&>div:last-child]:[width:100%]"
 const successTone =
   "update-banner-success [border-color:color-mix(in_oklab,_var(--success)_38%,_var(--border))] [background:color-mix(in_oklab,_var(--success)_9%,_var(--surface))] [&>svg]:[color:var(--success)]"
 const errorTone =
@@ -73,27 +73,27 @@ export function UpdateBanner({ update }: { update: UpdateState }) {
     const readout = downloadReadout(update)
     const percent = Math.min(Math.max(Math.round(update.progressPercent), 0), 100)
     return (
-      <div className={shell} aria-live="off">
-        <DownloadIcon />
-        <div>
+      <div className={`${shell} update-banner-download [display:grid] [grid-template-columns:auto_minmax(0,_1fr)_auto] [grid-template-areas:'icon_copy_percent'_'progress_progress_progress'] [column-gap:11px] [row-gap:0]`} aria-live="off">
+        <DownloadIcon className="[grid-area:icon]" />
+        <div className="[grid-area:copy]">
           <strong>Downloading Tethera v{update.version}…</strong>
           <span>{readout} · Keep Tethera open until the download finishes.</span>
-          <div
-            className="update-progress [margin-top:8px] [height:5px] [overflow:hidden] [border-radius:999px] [background:var(--chart-track)]"
-            role="progressbar"
-            aria-label={`Downloading Tethera version ${update.version}`}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={percent}
-            aria-valuetext={readout}
-          >
-            <div
-              className="update-progress-fill [height:100%] [border-radius:999px] [background:linear-gradient(90deg,_color-mix(in_oklab,_var(--chart-1)_55%,_transparent),_var(--chart-1))] [transition:width_420ms_cubic-bezier(0.32,_0.72,_0,_1)]"
-              style={{ width: `${Math.max(percent, percent > 0 ? 2 : 0)}%` }}
-            />
-          </div>
         </div>
-        <div className="shrink-0 [font-variant-numeric:tabular-nums] [font-size:11.5px] [font-weight:650]">{percent}%</div>
+        <div className="[grid-area:percent] [font-variant-numeric:tabular-nums] [font-size:11.5px] [font-weight:650]">{percent}%</div>
+        <div
+          className="update-progress [grid-area:progress] [width:100%] [margin-top:8px] [height:5px] [overflow:hidden] [border-radius:999px] [background:var(--chart-track)]"
+          role="progressbar"
+          aria-label={`Downloading Tethera version ${update.version}`}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={percent}
+          aria-valuetext={readout}
+        >
+          <div
+            className="update-progress-fill [height:100%] [border-radius:999px] [background:linear-gradient(90deg,_color-mix(in_oklab,_var(--chart-1)_55%,_transparent),_var(--chart-1))] [transition:width_420ms_cubic-bezier(0.32,_0.72,_0,_1)]"
+            style={{ width: `${Math.max(percent, percent > 0 ? 2 : 0)}%` }}
+          />
+        </div>
       </div>
     )
   }

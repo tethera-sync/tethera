@@ -235,6 +235,15 @@ export interface FolderMappingPreview {
 
 export type FolderPreviewPhase = "scan-local" | "scan-remote" | "compare"
 
+export interface FolderScanActivity {
+  stage: "listing" | "inspecting" | "hashing" | "complete"
+  currentPath: string
+  scannedFiles: number
+  ignoredEntries: number
+  unreadableEntries: number
+  hashedBytes: number
+}
+
 /**
  * Transient progress for one folder-comparison operation. Emitted on the
  * `folders:preview-progress` channel, keyed by the client-generated
@@ -245,6 +254,7 @@ export interface FolderPreviewProgress {
   operationId: string
   phase: FolderPreviewPhase
   scannedFiles?: number
+  activity?: FolderScanActivity
 }
 
 export interface FolderMappingProposal {

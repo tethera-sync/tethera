@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto"
 import { lstat, open, opendir, realpath, stat } from "node:fs/promises"
 import path from "node:path"
-import type { FolderMappingPreview, MappingPreviewItem, SyncMode } from "../shared/contracts"
+import type { FolderMappingPreview, FolderScanActivity, MappingPreviewItem, SyncMode } from "../shared/contracts"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 
 export const DEFAULT_MAX_MANIFEST_FILES = 10_000
 const MAX_HASH_FILE_BYTES = 16 * 1024 * 1024
 const MAX_SAMPLE_ITEMS = 14
+const SCAN_ACTIVITY_INTERVAL_MS = 250
 
 export interface FileManifestEntry {
   path: string
@@ -39,14 +40,9 @@ export interface ScanFolderOptions {
    * A number must be a positive safe integer; anything else fails closed.
    */
   maxFiles?: number | null
-  /**
-   * Called as files accumulate so long scans can report progress. Invoked at
-   * most every 500 files to keep the overhead negligible next to filesystem I/O.
-   */
-  onProgress?: (scannedFiles: number) => void
+  /** Time-throttled local activity, including long hashes and scans of small folders. */
+  onActivity?: (activity: FolderScanActivity) => void
 }
-
-const SCAN_PROGRESS_INTERVAL = 500
 
 export async function scanFolder(
   rootPath: string,
@@ -64,9 +60,23 @@ export async function scanFolder(
   let unreadable = 0
   let truncated = false
   const maxFiles = resolveScanLimit(options.maxFiles)
+  let hashedBytes = 0
+  let lastActivityAt = -Infinity
+  function reportActivity(stage: FolderScanActivity["stage"], currentPath: string, force = false): void {
+    if (!options.onActivity) return
+    const now = performance.now()
+    if (!force && now - lastActivityAt < SCAN_ACTIVITY_INTERVAL_MS) return
+    lastActivityAt = now
+    try {
+      options.onActivity({ stage, currentPath, scannedFiles: files.length, ignoredEntries: ignored, unreadableEntries: unreadable, hashedBytes })
+    } catch {
+      // Advisory UI delivery must never change the scan result.
+    }
+  }
 
   async function visit(directoryPath: string, relativeDirectory: string): Promise<void> {
     if (truncated) return
+    reportActivity("listing", relativeDirectory)
     let directory: Awaited<ReturnType<typeof opendir>> | undefined
     try {
       directory = await opendir(directoryPath)
@@ -84,6 +94,7 @@ export async function scanFolder(
 
     for await (const entry of directory) {
       if (truncated) break
+      reportActivity("listing", relativeDirectory)
       const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name))
       if (isTetheraStagingPath(relativePath)) {
         ignored += 1
@@ -108,24 +119,20 @@ export async function scanFolder(
         break
       }
       try {
-        files.push(await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true))
+        reportActivity("inspecting", relativePath)
+        files.push(await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true, (bytesRead) => {
+          hashedBytes += bytesRead
+          reportActivity("hashing", relativePath)
+        }))
       } catch {
         unreadable += 1
         continue
-      }
-      if (files.length % SCAN_PROGRESS_INTERVAL === 0) {
-        // Progress is a best-effort UI update. A renderer can disappear while a
-        // file scan is completing; that must not classify the scanned file as unreadable.
-        try {
-          options.onProgress?.(files.length)
-        } catch {
-          // Ignore only progress callback failures; filesystem failures are handled above.
-        }
       }
     }
   }
 
   await visit(root, "")
+  reportActivity("complete", "", true)
   return { rootPath: root, files, ignored, unreadable, truncated }
 }
 
@@ -219,7 +226,9 @@ export function compareManifests(
 }
 
 function addSample(samples: MappingPreviewItem[], sample: MappingPreviewItem): void {
-  if (samples.length < MAX_SAMPLE_ITEMS) samples.push(sample)
+  samples.push(sample)
+  samples.sort((a, b) => (b.size ?? 0) - (a.size ?? 0) || a.path.localeCompare(b.path) || a.category.localeCompare(b.category))
+  if (samples.length > MAX_SAMPLE_ITEMS) samples.pop()
 }
 
 function normalizeRelative(relativePath: string): string {
@@ -367,6 +376,7 @@ async function inspectManifestFile(
   canonicalRoot: string,
   relativePath: string,
   hashAllFiles: boolean,
+  onHashBytes?: (bytesRead: number) => void,
 ): Promise<FileManifestEntry> {
   const absolutePath = resolveWithinRoot(rootPath, relativePath)
   const entry = await lstat(absolutePath)
@@ -390,6 +400,7 @@ async function inspectManifestFile(
         if (bytesRead === 0) throw new Error("The manifest file changed while it was read.")
         hash.update(buffer.subarray(0, bytesRead))
         offset += bytesRead
+        onHashBytes?.(bytesRead)
       }
       digest = hash.digest("hex")
     }

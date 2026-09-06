@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { folderManifestTestHelpers, isManifestPathIgnored, scanFolder } from "../src/main/folder-manifest"
 import { manifest } from "./helpers"
+import type { FolderScanActivity } from "../src/shared/contracts"
 
 describe("folder mapping comparison", () => {
   test("classifies identical, one-sided and different files", () => {
@@ -79,35 +80,6 @@ describe("folder mapping comparison", () => {
     }
   })
 
-  test("reports scan progress so comparisons can show what is happening", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-progress-test-"))
-    try {
-      for (let index = 0; index < 600; index += 1) {
-        await writeFile(path.join(root, `file-${index}.txt`), "data")
-      }
-      const seen: number[] = []
-      const result = await scanFolder(root, [], { onProgress: (scanned) => seen.push(scanned) })
-      expect(result.files).toHaveLength(600)
-      expect(seen).toEqual([500])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  test("does not mark a scanned file unreadable when progress delivery fails", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-progress-failure-test-"))
-    try {
-      for (let index = 0; index < 500; index += 1) {
-        await writeFile(path.join(root, `file-${index}.txt`), "data")
-      }
-      const result = await scanFolder(root, [], { onProgress: () => { throw new Error("renderer closed") } })
-      expect(result.files).toHaveLength(500)
-      expect(result.unreadable).toBe(0)
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
   test("never synchronizes reserved replacement recovery copies", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-recovery-test-"))
     try {
@@ -148,6 +120,28 @@ describe("folder mapping comparison", () => {
       const result = await scanFolder(root, ["build/**"])
       expect(result.files.map((entry) => entry.path)).toEqual(["keep.txt"])
       expect(result.ignored).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("prunes root and nested node_modules subtrees before applying the file ceiling", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-node-modules-prune-test-"))
+    try {
+      await mkdir(path.join(root, "node_modules"), { recursive: true })
+      await mkdir(path.join(root, "src", "node_modules"), { recursive: true })
+      for (let index = 0; index < 20; index += 1) {
+        await writeFile(path.join(root, "node_modules", `package-${index}.js`), "ignored")
+        await writeFile(path.join(root, "src", "node_modules", `package-${index}.js`), "ignored")
+      }
+      await writeFile(path.join(root, "keep-a.txt"), "a")
+      await writeFile(path.join(root, "keep-b.txt"), "b")
+
+      const result = await scanFolder(root, ["**/node_modules/**"], { maxFiles: 2 })
+
+      expect(result.files.map((entry) => entry.path).sort()).toEqual(["keep-a.txt", "keep-b.txt"])
+      expect(result.ignored).toBe(2)
+      expect(result.truncated).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -199,6 +193,98 @@ describe("folder mapping comparison", () => {
     try {
       await writeFile(path.join(root, "file.txt"), "data")
       await expect(scanFolder(root, [], { maxFiles: 0 })).rejects.toThrow("The scan limit is invalid.")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("keeps the 14 largest preview samples globally sorted with deterministic ties", () => {
+    const entries = Array.from({ length: 16 }, (_, index) => ({
+      path: `a-file-${index.toString().padStart(2, "0")}.txt`,
+      size: index + 1,
+      modifiedMs: 1,
+    }))
+    entries.push(
+      { path: "z-late-large.txt", size: 1_000, modifiedMs: 1 },
+      { path: "a-tie.txt", size: 42, modifiedMs: 1 },
+      { path: "b-tie.txt", size: 42, modifiedMs: 1 },
+    )
+
+    const preview = folderManifestTestHelpers.compareManifests(
+      manifest(entries),
+      manifest([]),
+      { mode: "two-way", localPlatform: "linux", remotePlatform: "linux" },
+    )
+
+    expect(preview.samples).toHaveLength(14)
+    expect(preview.samples[0]).toEqual({ path: "z-late-large.txt", category: "local-only", size: 1_000 })
+    expect(preview.samples.map((sample) => sample.path)).toEqual([
+      "z-late-large.txt",
+      "a-tie.txt",
+      "b-tie.txt",
+      "a-file-15.txt",
+      "a-file-14.txt",
+      "a-file-13.txt",
+      "a-file-12.txt",
+      "a-file-11.txt",
+      "a-file-10.txt",
+      "a-file-09.txt",
+      "a-file-08.txt",
+      "a-file-07.txt",
+      "a-file-06.txt",
+      "a-file-05.txt",
+    ])
+
+    const tiedPreview = folderManifestTestHelpers.compareManifests(
+      manifest([
+        { path: "b-tie.txt", size: 42, modifiedMs: 1 },
+        { path: "a-tie.txt", size: 42, modifiedMs: 1 },
+      ]),
+      manifest([]),
+      { mode: "two-way", localPlatform: "linux", remotePlatform: "linux" },
+    )
+    expect(tiedPreview.samples.map((sample) => sample.path)).toEqual(["a-tie.txt", "b-tie.txt"])
+  })
+
+  test("reports initial and final scan activity with accurate counters", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-activity-test-"))
+    try {
+      await writeFile(path.join(root, "one.txt"), "one")
+      await writeFile(path.join(root, "two.txt"), "two-two")
+      await writeFile(path.join(root, "skip.tmp"), "ignored")
+      const activities: FolderScanActivity[] = []
+      const result = await scanFolder(root, ["*.tmp"], {
+        hashAllFiles: true,
+        onActivity: (activity) => activities.push(activity),
+      })
+
+      expect(activities[0]).toMatchObject({ stage: "listing", scannedFiles: 0, ignoredEntries: 0, unreadableEntries: 0, hashedBytes: 0 })
+      expect(activities.at(-1)).toMatchObject({ stage: "complete", currentPath: "", scannedFiles: 2, ignoredEntries: 1, unreadableEntries: 0, hashedBytes: 10 })
+      expect(result.files).toHaveLength(2)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("reports listing and completion activity for an empty scan", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-empty-activity-test-"))
+    try {
+      const activities: FolderScanActivity[] = []
+      await scanFolder(root, [], { onActivity: (activity) => activities.push(activity) })
+      expect(activities.map((activity) => activity.stage)).toEqual(["listing", "complete"])
+      expect(activities.at(-1)).toMatchObject({ scannedFiles: 0, ignoredEntries: 0, unreadableEntries: 0, hashedBytes: 0 })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("ignores activity callback failures", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-activity-failure-test-"))
+    try {
+      await writeFile(path.join(root, "file.txt"), "data")
+      const result = await scanFolder(root, [], { hashAllFiles: true, onActivity: () => { throw new Error("renderer closed") } })
+      expect(result.files.map((entry) => entry.path)).toEqual(["file.txt"])
+      expect(result.unreadable).toBe(0)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

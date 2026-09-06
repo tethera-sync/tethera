@@ -3,7 +3,6 @@ import {
   ArrowLeftIcon,
   ArrowRightIcon,
   CheckCircle2Icon,
-  ComputerIcon,
   FileWarningIcon,
   FolderOpenIcon,
   PlusIcon,
@@ -13,6 +12,7 @@ import {
 import type {
   DeviceSummary,
   FolderMappingPreview,
+  FolderScanActivity,
   RequestFolderMappingInput,
   SyncMode,
 } from "@shared/contracts"
@@ -63,6 +63,7 @@ export function AddFolderDialog({
     kind: "preview" | "request"
     phase: ComparePhase | null
     scannedFiles?: number
+    activity?: FolderScanActivity
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const elapsed = formatElapsed(useElapsedSeconds(compare !== null))
@@ -111,7 +112,7 @@ export function AddFolderDialog({
       if (progress.operationId !== operationId) return
       setCompare((current) =>
         current?.operationId === operationId
-          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles }
+          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles, activity: progress.activity }
           : current,
       )
     })
@@ -195,20 +196,17 @@ export function AddFolderDialog({
 
           {step === "paths" ? (
             <div className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px]">
-              <div className="paired-path-summary [display:grid] [grid-template-columns:minmax(0,_1fr)_auto_minmax(0,_1fr)] [align-items:center] [gap:10px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface-sunken)] [padding:10px_12px] [&>div]:[display:flex] [&>div]:[min-width:0] [&>div]:[align-items:center] [&>div]:[gap:7px] [&>div_svg]:[width:15px] [&>div_svg]:[height:15px] [&>div_svg]:[color:var(--primary)] [&>div_span]:[overflow:hidden] [&>div_span]:[font-size:11px] [&>div_span]:[font-weight:600] [&>div_span]:[text-overflow:ellipsis] [&>div_span]:[white-space:nowrap] [&>span]:[color:var(--muted-foreground)] [&>span]:[font-size:12px]">
-                <div><ComputerIcon /><span>{localDevice.name}</span></div>
-                <span>↔</span>
-                <div><ComputerIcon /><span>{pairedDevice.name}</span></div>
-              </div>
               <Field label="Display name" hint="Optional; defaults to the source folder name.">
                 <input className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55]" value={name} onChange={(event: ChangeEvent<HTMLInputElement>) => setName(event.target.value)} placeholder="Projects" />
               </Field>
-              <Field label={`Folder on ${localDevice.name}`}>
-                <PathChooser value={localPath} placeholder="Choose a source folder" onBrowse={() => setPickerTarget("local")} />
-              </Field>
-              <Field label={`Folder on ${pairedDevice.name}`} hint="Remote browsing is encrypted and returns folder names only.">
-                <PathChooser value={remotePath} placeholder="Choose a destination folder" onBrowse={() => setPickerTarget("remote")} />
-              </Field>
+              <div className="mapping-path-fields [display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [gap:14px] max-[760px]:[grid-template-columns:minmax(0,_1fr)]">
+                <Field label={`Folder on ${localDevice.name}`}>
+                  <PathChooser value={localPath} placeholder="Choose a source folder" onBrowse={() => setPickerTarget("local")} />
+                </Field>
+                <Field label={`Folder on ${pairedDevice.name}`} hint="Remote browsing is encrypted and returns folder names only.">
+                  <PathChooser value={remotePath} placeholder="Choose a destination folder" onBrowse={() => setPickerTarget("remote")} />
+                </Field>
+              </div>
             </div>
           ) : null}
 
@@ -246,6 +244,7 @@ export function AddFolderDialog({
               thisComputer={localDevice.name}
               otherComputer={pairedDevice.name}
               scannedFiles={compare.scannedFiles}
+              activity={compare.activity}
               elapsed={elapsed}
             />
           ) : null}
@@ -330,6 +329,25 @@ function MappingPreviewView({ preview, localName, remoteName }: { preview: Folde
         <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&.danger]:[border-color:color-mix(in_oklab,_var(--danger)_36%,_var(--border))] [&.danger]:[background:color-mix(in_oklab,_var(--danger)_9%,_var(--surface))] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&.danger>svg]:[color:var(--danger)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5] danger"><FileWarningIcon /><div><strong>Resolve {warnings} cross-platform path problems</strong><span>Windows-invalid names or case-only collisions must be renamed before approval can be requested.</span></div></div>
       ) : null}
 
+      {warnings > 0 ? (
+        <details className="rounded-lg border border-[var(--border)] p-3 text-xs">
+          <summary className="cursor-pointer font-medium focus-visible:outline-2 focus-visible:outline-[var(--ring)]">Show filenames that need attention</summary>
+          <div className="mt-2 max-h-40 space-y-3 overflow-auto">
+            {[
+              { label: "Not supported on Windows", paths: preview.invalidWindowsNames },
+              { label: "Names differing only by case", paths: preview.caseCollisions },
+            ].filter((group) => group.paths.length > 0).map((group) => (
+              <div key={group.label}>
+                <p className="font-medium">{group.label}</p>
+                <ul className="mt-1 space-y-1">
+                  {group.paths.map((filePath) => <li key={filePath}><code className="[overflow-wrap:anywhere]">{filePath}</code></li>)}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+
       <div className="preview-transfer-row [display:grid] [grid-template-columns:1fr_auto_1fr] [align-items:center] [gap:12px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [padding:12px_14px] [background:color-mix(in_oklab,_var(--primary)_6%,_var(--surface))] [&>div]:[display:flex] [&>div]:[justify-content:space-between] [&>div]:[gap:12px] [&>div:last-child]:[flex-direction:row-reverse] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_strong]:[font-size:12px] [&>svg]:[width:16px] [&>svg]:[color:var(--primary)]">
         <div><span>Estimated to {remoteName}</span><strong>{formatBytes(preview.bytesToRemote)}</strong></div>
         <ArrowRightIcon />
@@ -337,7 +355,7 @@ function MappingPreviewView({ preview, localName, remoteName }: { preview: Folde
       </div>
 
       <div className="preview-details [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)]">
-        <div className="preview-details-heading [display:flex] [align-items:center] [justify-content:space-between] [padding:10px_12px] [border-bottom:1px_solid_var(--border)] [background:var(--surface)] [&_strong]:[font-size:11px]"><strong>Sample differences</strong><Badge variant={warnings ? "danger" : "neutral"}>{preview.samples.length} shown</Badge></div>
+        <div className="preview-details-heading [display:flex] [align-items:center] [justify-content:space-between] [padding:10px_12px] [border-bottom:1px_solid_var(--border)] [background:var(--surface)] [&_strong]:[font-size:11px]"><strong>Largest differences</strong><Badge variant={warnings ? "danger" : "neutral"}>{preview.samples.length} shown</Badge></div>
         {preview.samples.length === 0 ? <p className="preview-empty [padding:18px] [text-align:center] [color:var(--muted-foreground)] [font-size:11px]">Both folders currently contain the same files.</p> : (
           <div className="preview-file-list [max-height:190px] [overflow:auto] [&>div]:[display:grid] [&>div]:[grid-template-columns:auto_minmax(0,_1fr)_auto] [&>div]:[align-items:center] [&>div]:[gap:8px] [&>div]:[padding:8px_12px] [&>div]:[border-top:1px_solid_color-mix(in_oklab,_var(--border)_60%,_transparent)] [&>div:first-child]:[border-top:0] [&_code]:[overflow:hidden] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap] [&_code]:[font-size:10px] [&_small]:[color:var(--muted-foreground)] [&_small]:[font-size:9px]">
             {preview.samples.map((item) => (

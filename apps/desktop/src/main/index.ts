@@ -1116,9 +1116,9 @@ function previewsEqual(left: FolderMappingPreview, right: FolderMappingPreview):
   return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right))
 }
 
-function emitPreviewProgress(operationId: string | undefined, phase: FolderPreviewProgress["phase"], scannedFiles?: number): void {
+function emitPreviewProgress(operationId: string | undefined, phase: FolderPreviewProgress["phase"], scannedFiles?: number, activity?: FolderPreviewProgress["activity"]): void {
   if (!operationId || !mainWindow) return
-  const progress: FolderPreviewProgress = scannedFiles === undefined ? { operationId, phase } : { operationId, phase, scannedFiles }
+  const progress: FolderPreviewProgress = { operationId, phase, scannedFiles, activity }
   try {
     if (mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
     mainWindow.webContents.send("folders:preview-progress", progress)
@@ -1137,7 +1137,7 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
   emitPreviewProgress(operationId, "scan-local", 0)
   const localManifest = await scanFolder(localPath, input.ignorePatterns, {
     maxFiles: currentScanLimit(),
-    onProgress: (scannedFiles) => emitPreviewProgress(operationId, "scan-local", scannedFiles),
+    onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
   })
   emitPreviewProgress(operationId, "scan-remote")
   const remoteManifest = await requirePeerSessions().request<FileManifest>(peer.id, {
@@ -1237,7 +1237,7 @@ async function buildIncomingMappingPreview(
   emitPreviewProgress(operationId, "scan-local", 0)
   const responderManifest = await scanFolder(target, request.proposal.ignorePatterns, {
     maxFiles: currentScanLimit(),
-    onProgress: (scannedFiles) => emitPreviewProgress(operationId, "scan-local", scannedFiles),
+    onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
   })
   emitPreviewProgress(operationId, "compare")
   return compareManifests(initiatorManifest, responderManifest, {
@@ -2449,8 +2449,8 @@ async function recoverIncompleteReplacements(): Promise<void> {
 async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): Promise<InitialSyncPassResult> {
   updateFolder(folder.id, {
     status: "syncing",
-    currentAction: `Comparing full file contents with ${peer.name}…`,
-    progress: 0,
+    currentAction: `Starting a read-only scan on both computers: applying ignore rules and hashing file contents with ${peer.name}…`,
+    progress: undefined,
     bytesPerSecond: 0,
   })
   broadcastSnapshot()
@@ -2458,8 +2458,20 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
   // One limit for the whole pass: rereading the setting after the awaited
   // scans could validate against a ceiling the scans never used.
   const scanLimit = currentScanLimit()
+  let scanning = true
   const [localManifest, remoteManifest] = await Promise.all([
-    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit }),
+    scanFolder(folder.localPath, folder.ignorePatterns, {
+      hashAllFiles: true,
+      maxFiles: scanLimit,
+      onActivity: (activity) => {
+        if (!scanning) return
+        const action = { listing: "Listing", inspecting: "Checking", hashing: "Hashing", complete: "Local scan complete" }[activity.stage]
+        updateFolder(folder.id, {
+          currentAction: `${action}${activity.currentPath ? `: ${activity.currentPath}` : ""} · ${activity.scannedFiles.toLocaleString("en-GB")} files checked · ${activity.ignoredEntries.toLocaleString("en-GB")} excluded entries · ${activity.unreadableEntries.toLocaleString("en-GB")} unreadable. Comparing with ${peer.name} before copying.`,
+        })
+        broadcastSnapshot()
+      },
+    }),
     requirePeerSessions().request<FileManifest>(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
@@ -2467,7 +2479,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
       ignorePatterns: folder.ignorePatterns,
       hashAllFiles: true,
     }, 5 * 60_000),
-  ])
+  ]).finally(() => { scanning = false })
   assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
   assertCompleteTransferManifest(remoteManifest, peer.name)
 

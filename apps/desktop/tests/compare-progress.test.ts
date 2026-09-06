@@ -28,10 +28,23 @@ describe("comparePhaseText", () => {
     expect(text.detail).not.toContain("files so far")
   })
 
+  test("describes reported hashing activity and skipped entries", () => {
+    const text = comparePhaseText("scan-local", { ...options, activity: {
+      stage: "hashing", currentPath: "src/archive.zip", scannedFiles: 3,
+      ignoredEntries: 2, unreadableEntries: 1, hashedBytes: 2048,
+    } })
+    expect(text.headline).toContain("Reading file contents")
+    expect(text.detail).toContain("3 files checked")
+    expect(text.detail).toContain("2.0 KB hashed")
+    expect(text.detail).toContain("2 excluded entries")
+    expect(text.detail).toContain("1 unreadable")
+    expect(text.detail).not.toContain("%")
+  })
+
   test("covers the final compare and the pre-event state", () => {
     expect(comparePhaseText("compare", options).headline).toContain("Comparing")
     const starting = comparePhaseText(null, options)
     expect(starting.headline).toContain("Starting")
-    expect(starting.detail).toContain("large folders")
+    expect(starting.detail.toLowerCase()).toContain("large folders")
   })
 })
