@@ -28,8 +28,19 @@ import {
 } from "@/components/ui/dialog"
 import { cn } from "@/lib/utils"
 
-export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
-  const [open, setOpen] = useState(false)
+export function PairDeviceDialog({
+  snapshot,
+  open: controlledOpen,
+  onOpenChange,
+}: {
+  snapshot: AppSnapshot
+  /** Controlled open state. When omitted, the dialog owns its state and renders its own trigger. */
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+}) {
+  const [internalOpen, setInternalOpen] = useState(false)
+  const open = controlledOpen ?? internalOpen
+  const setOpen = onOpenChange ?? setInternalOpen
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const busyRef = useRef(false)
@@ -71,10 +82,12 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger render={<Button />}>
-        <Link2Icon data-icon="inline-start" />
-        Start pairing
-      </DialogTrigger>
+      {controlledOpen === undefined ? (
+        <DialogTrigger render={<Button />}>
+          <Link2Icon data-icon="inline-start" />
+          Start pairing
+        </DialogTrigger>
+      ) : null}
       <DialogContent className="pairing-dialog [width:min(760px,_calc(100vw_-_32px))] [max-width:760px] [max-height:min(860px,_calc(100vh_-_32px))] [overflow-y:auto]">
         <DialogHeader>
           <div className="pairing-dialog-heading [display:flex] [align-items:flex-start] [gap:12px]">

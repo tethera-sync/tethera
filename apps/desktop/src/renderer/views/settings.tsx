@@ -18,6 +18,8 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
   const retrySetting = useRef<{ key: keyof AppSettings; value: AppSettings[keyof AppSettings] } | null>(null)
 
   async function update<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
+    // All setting controls disable while `saving` is set, so this guard only
+    // covers re-entrant programmatic calls (e.g. double-invoked retries).
     if (pendingSetting.current) return
     pendingSetting.current = key
     retrySetting.current = { key, value }
@@ -58,7 +60,7 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
           <Switch
             aria-label="Keep syncing in the tray"
             checked={settings.closeToTray}
-            disabled={saving === "closeToTray"}
+            disabled={saving !== null}
             onCheckedChange={(checked: boolean) => void update("closeToTray", checked)}
           />
         </SettingRow>
@@ -66,7 +68,7 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
           <Switch
             aria-label="Launch after sign-in"
             checked={settings.launchAtLogin}
-            disabled={saving === "launchAtLogin"}
+            disabled={saving !== null}
             onCheckedChange={(checked: boolean) => void update("launchAtLogin", checked)}
           />
         </SettingRow>
@@ -74,7 +76,7 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
           <Switch
             aria-label="Start minimised"
             checked={settings.startMinimised}
-            disabled={saving === "startMinimised"}
+            disabled={saving !== null}
             onCheckedChange={(checked: boolean) => void update("startMinimised", checked)}
           />
         </SettingRow>
@@ -86,7 +88,7 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
             className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55] w-40"
             value={settings.theme}
             aria-label="Theme"
-            disabled={saving === "theme"}
+            disabled={saving !== null}
             onChange={(event: ChangeEvent<HTMLSelectElement>) => {
               const value = event.target.value
               if (value === "system" || value === "light" || value === "dark") void update("theme", value)

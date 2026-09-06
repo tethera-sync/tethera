@@ -312,16 +312,33 @@ export function App() {
           <UpdateBanner update={snapshot.update} />
           <MappingStoreBanner state={snapshot.mappingStore} />
           {snapshotError || actionError ? (
-            <div className="[display:flex] [align-items:center] [justify-content:space-between] [gap:12px] [border-bottom:1px_solid_var(--border)] [background:var(--destructive)] [padding:10px_24px] [color:var(--destructive-foreground)]" role="alert">
-              <span>{snapshotError ?? actionError}</span>
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={loading || actionBusy}
-                onClick={() => snapshotError ? retryInitialLoad() : retryAction ? void runAction(retryAction) : undefined}
-              >
-                Retry
-              </Button>
+            <div className="[display:grid] [gap:8px] [border-bottom:1px_solid_var(--border)] [background:var(--destructive)] [padding:10px_24px] [color:var(--destructive-foreground)]" role="alert">
+              {snapshotError ? (
+                <div className="[display:flex] [align-items:center] [justify-content:space-between] [gap:12px]">
+                  <span>{snapshotError}</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={loading || actionBusy}
+                    onClick={retryInitialLoad}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              ) : null}
+              {actionError ? (
+                <div className="[display:flex] [align-items:center] [justify-content:space-between] [gap:12px]">
+                  <span>{actionError}</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={loading || actionBusy || !retryAction}
+                    onClick={() => retryAction ? void runAction(retryAction) : undefined}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              ) : null}
             </div>
           ) : null}
 

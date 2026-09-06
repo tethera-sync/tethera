@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { renderToStaticMarkup } from "react-dom/server"
 import { Overview } from "../src/renderer/views/overview"
-import { overallHeadline } from "../src/renderer/lib/snapshot"
-import type { FolderSummary } from "../src/shared/contracts"
+import { overallHeadline, setupActionTarget } from "../src/renderer/lib/snapshot"
+import type { FolderSummary, IncomingMappingRequest, OutgoingMappingRequest } from "../src/shared/contracts"
 import { appSnapshot } from "./helpers"
 
 const folder: FolderSummary = {
@@ -33,6 +33,35 @@ describe("overview setup", () => {
 
   test("pending approval does not appear as completed setup", () => {
     expect(render(appSnapshot({ devices: [peer], folders: [{ ...folder, setupStatus: "pending-approval" }] }))).toContain("Review requests")
+  })
+
+  test("routes outgoing mapping requests to the folders view", () => {
+    const outgoing = (status: OutgoingMappingRequest["status"]) => ({
+      id: `out-${status}`,
+      toDeviceId: "test-peer",
+      toDeviceName: "Other computer",
+      proposal: { id: "proposal-1", name: "Documents" },
+      status,
+    }) as OutgoingMappingRequest
+    for (const status of ["pending", "approved-awaiting-delivery"] as const) {
+      const snapshot = appSnapshot({ devices: [peer], mappings: { incoming: [], outgoing: [outgoing(status)] } })
+      expect(setupActionTarget(snapshot)).toBe("folders")
+      expect(render(snapshot)).toContain("Review requests")
+    }
+  })
+
+  test("keeps pairing and incoming approvals on the devices view", () => {
+    expect(setupActionTarget(appSnapshot())).toBe("devices")
+    const incoming = {
+      id: "in-1",
+      fromDeviceId: "test-peer",
+      fromDeviceName: "Other computer",
+      proposal: { id: "proposal-1", name: "Documents" },
+      status: "pending",
+      selectedDestinationPath: "/tmp/tethera-test/incoming",
+    } as IncomingMappingRequest
+    expect(setupActionTarget(appSnapshot({ devices: [peer], mappings: { incoming: [incoming], outgoing: [] } }))).toBe("devices")
+    expect(setupActionTarget(appSnapshot({ devices: [peer], folders: [{ ...folder, setupStatus: "pending-approval" }] }))).toBe("devices")
   })
 
   test("unavailable engine or configuration cannot claim healthy sync", () => {

@@ -11,7 +11,7 @@ import { StatusPill } from "@/components/ui/status-pill"
 import { Button } from "@/components/ui/button"
 import { pretty, prettyRoute, statusTone } from "@/lib/format"
 import { formatRelative } from "@/lib/format"
-import { folderStatusLabel, getPairedDevices, overallDescription, overallHeadline } from "@/lib/snapshot"
+import { folderStatusLabel, getPairedDevices, hasIncomingApproval, hasOutgoingApproval, overallDescription, overallHeadline, setupActionTarget } from "@/lib/snapshot"
 import { ActivityRow } from "./activity"
 
 export function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate: (view: View) => void }) {
@@ -23,9 +23,7 @@ export function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNa
   const latestActivity = snapshot.activity.slice(0, 5)
   const paired = pairedDevices.length > 0
   const needsInitialMerge = snapshot.folders.some((folder) => folder.setupStatus === "ready-for-initial-sync")
-  const awaitingApproval = snapshot.mappings.outgoing.some((request) => request.status === "pending" || request.status === "approved-awaiting-delivery")
-    || snapshot.mappings.incoming.some((request) => request.status === "pending")
-    || snapshot.folders.some((folder) => folder.setupStatus === "pending-approval")
+  const awaitingApproval = hasOutgoingApproval(snapshot) || hasIncomingApproval(snapshot)
   const setupComplete = paired && totalFolders > 0 && !needsInitialMerge && !awaitingApproval
   const currentSetupStep = paired ? (totalFolders > 0 ? 3 : 2) : 1
 
@@ -117,7 +115,7 @@ export function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNa
                     ? "Open the folder and start its initial merge. Both computers need to be online."
                     : "Choose the folders you want to keep in sync."}
             </p>
-            <Button size="sm" onClick={() => onNavigate(!paired || awaitingApproval ? "devices" : "folders")}>
+            <Button size="sm" onClick={() => onNavigate(!paired || awaitingApproval ? setupActionTarget(snapshot) : "folders")}>
               {!paired ? "Set up pairing" : awaitingApproval ? "Review requests" : needsInitialMerge ? "Open initial merge" : "Choose folders"}
               <ArrowRightIcon data-icon="inline-end" />
             </Button>

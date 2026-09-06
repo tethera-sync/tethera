@@ -1,5 +1,6 @@
 import type { AppSnapshot, DeviceSummary, FolderSummary, MappingStoreState, TetheraApi } from "@shared/contracts"
 import { pretty } from "./format"
+import type { View } from "./navigation"
 
 /** The device entry representing this computer, with a fallback while the snapshot loads. */
 export function getLocalDevice(snapshot: AppSnapshot): DeviceSummary {
@@ -68,6 +69,28 @@ export function folderStatusLabel(folder: FolderSummary): string {
   if (folder.status === "up-to-date" && folder.setupStatus === "active") return "Up to date"
   if (folder.status === "needs-attention" && folder.setupStatus === "ready-for-initial-sync") return "Ready for initial merge"
   return pretty(folder.status)
+}
+
+/** Whether an incoming request needs review on the Devices view. */
+export function hasIncomingApproval(snapshot: AppSnapshot): boolean {
+  return (
+    snapshot.mappings.incoming.some((request) => request.status === "pending")
+    || snapshot.folders.some((folder) => folder.setupStatus === "pending-approval")
+  )
+}
+
+/** Whether an outgoing request needs review on the Folders view. */
+export function hasOutgoingApproval(snapshot: AppSnapshot): boolean {
+  return snapshot.mappings.outgoing.some(
+    (request) => request.status === "pending" || request.status === "approved-awaiting-delivery",
+  )
+}
+
+/** Destination for the setup panel's primary action. Outgoing mapping requests live on the Folders view; only pairing and incoming approvals live on Devices. */
+export function setupActionTarget(snapshot: AppSnapshot): View {
+  if (getPairedDevices(snapshot).length === 0) return "devices"
+  if (hasIncomingApproval(snapshot)) return "devices"
+  return "folders"
 }
 
 export interface SnapshotSubscription {

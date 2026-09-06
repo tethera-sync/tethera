@@ -50,6 +50,41 @@ describe("createSnapshotSubscription", () => {
     expect(store.getSnapshot()).toEqual(snapshot("pushed"))
   })
 
+  test("rejects an initial read failure when no snapshot was pushed", async () => {
+    const api = {
+      subscribe: () => () => undefined,
+      getSnapshot: () => Promise.reject(new Error("read failed")),
+    }
+    const store = createSnapshotSubscription(api, snapshot("fallback"))
+    store.subscribe(() => undefined)
+
+    await expect(store.loadInitial()).rejects.toThrow("read failed")
+    expect(store.getSnapshot()).toEqual(snapshot("fallback"))
+  })
+
+  test("a retried read publishes and applies a matching action result", async () => {
+    let attempt = 0
+    const api = {
+      subscribe: () => () => undefined,
+      getSnapshot: async () => {
+        attempt += 1
+        if (attempt === 1) throw new Error("read failed")
+        return snapshot("retried")
+      },
+    }
+    const store = createSnapshotSubscription(api, snapshot("fallback"))
+    const received: AppSnapshot[] = []
+    store.subscribe((value) => received.push(value))
+
+    await expect(store.loadInitial()).rejects.toThrow("read failed")
+    await store.loadInitial()
+
+    expect(store.getSnapshot()).toEqual(snapshot("retried"))
+    const revision = store.beginAction()
+    expect(store.applyActionResult(snapshot("action"), revision)).toBe(true)
+    expect(received).toEqual([snapshot("retried"), snapshot("action")])
+  })
+
   test("cleans up the real subscription and rejects stale action results", () => {
     let unsubscribeCalls = 0
     let listener: ((value: AppSnapshot) => void) | undefined
