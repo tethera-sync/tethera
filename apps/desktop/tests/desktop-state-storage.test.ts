@@ -16,6 +16,7 @@ function projection(theme: "system" | "dark" = "system"): PersistedDesktopProjec
       startMinimised: false,
       pauseOnMetered: true,
       theme,
+      maxScanFiles: 10_000,
     },
   }
 }

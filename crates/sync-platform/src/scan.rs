@@ -9,14 +9,15 @@
 //! This is a **preview** scanner, not the durable index. It builds one whole manifest in memory
 //! in a single pass and holds every entry there, so the ceilings below are deliberate guards
 //! against unbounded memory use rather than product limits. In particular it is **not** ready
-//! for the terabyte-scale mappings Tethera targets: at 10,000 files it stops early and reports
-//! `truncated`, and the caller gets a partial picture. Removing these ceilings needs the
-//! streaming, resumable, database-backed scan planned for the durable-index slice — see
-//! `docs/15-IMPLEMENTATION-STATUS.md`.
+//! for the terabyte-scale mappings Tethera targets: past the file ceiling (10,000 by default) it
+//! stops early and reports `truncated`, and the caller gets a partial picture. Removing these
+//! ceilings needs the streaming, resumable, database-backed scan planned for the durable-index
+//! slice — see `docs/15-IMPLEMENTATION-STATUS.md`.
 //!
 //! Both ceilings are temporary:
 //!
-//! - [`MAX_MANIFEST_FILES`] — stop after 10,000 files and set `truncated`.
+//! - [`DEFAULT_MAX_MANIFEST_FILES`] — stop after 10,000 files and set `truncated`, unless the
+//!   caller passes explicit [`ScanOptions`] otherwise.
 //! - [`MAX_HASH_FILE_BYTES`] — files over 16 MiB are listed with size and mtime but no digest,
 //!   so comparison falls back to the size/mtime heuristic for them.
 //!
@@ -49,8 +50,9 @@ use std::time::UNIX_EPOCH;
 
 use sync_core::manifest::{FileManifest, FileManifestEntry, IgnoreMatcher, normalize_relative};
 
-/// Temporary ceiling on manifest size; see the module docs.
-const MAX_MANIFEST_FILES: usize = 10_000;
+/// Default ceiling on manifest size; see the module docs. Callers that need a different ceiling
+/// pass explicit [`ScanOptions`]; callers that pass nothing get this, never an unbounded scan.
+pub const DEFAULT_MAX_MANIFEST_FILES: usize = 10_000;
 /// Temporary ceiling on the size of a file this scanner will hash; see the module docs.
 const MAX_HASH_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// Deepest directory nesting the walk will descend into, so a pathological (or adversarial)
@@ -59,8 +61,9 @@ const MAX_SCAN_DEPTH: usize = 64;
 
 /// Recursively scans `root`, skipping symlinks and anything matched by `ignore_patterns`, and
 /// `BLAKE3`-hashing every file up to 16 MiB by streaming it rather than reading it into memory.
-/// Stops (marking the manifest `truncated`) after 10,000 files rather than scanning an
-/// arbitrarily large tree unbounded.
+/// Stops (marking the manifest `truncated`) after [`DEFAULT_MAX_MANIFEST_FILES`] files rather
+/// than scanning an arbitrarily large tree unbounded; see [`ScanOptions`] for the explicit
+/// opt-in to a different ceiling.
 ///
 /// Read-only: this never writes to, moves or deletes anything under `root`. See the module docs
 /// for the full set of guarantees and for why the limits here are temporary.
@@ -73,6 +76,37 @@ const MAX_SCAN_DEPTH: usize = 64;
 /// tree — an unreadable subdirectory or file — are counted in
 /// `FileManifest::unreadable` and do not abort the scan.
 pub fn scan_folder(root: &Path, ignore_patterns: &[String]) -> io::Result<FileManifest> {
+    scan_folder_with_options(root, ignore_patterns, ScanOptions::default())
+}
+
+/// Scan ceiling configuration.
+///
+/// `max_files` caps how many files one scan collects before reporting `truncated`:
+/// `None` removes the ceiling for an explicitly opted-in unbounded scan. `Default` resolves to
+/// [`DEFAULT_MAX_MANIFEST_FILES`], so omitting the options never silently unbounds a scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanOptions {
+    pub max_files: Option<usize>,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            max_files: Some(DEFAULT_MAX_MANIFEST_FILES),
+        }
+    }
+}
+
+/// Scans `root` like [`scan_folder`] but with an explicit [`ScanOptions`] ceiling.
+///
+/// # Errors
+///
+/// Same failures as [`scan_folder`].
+pub fn scan_folder_with_options(
+    root: &Path,
+    ignore_patterns: &[String],
+    options: ScanOptions,
+) -> io::Result<FileManifest> {
     if !root.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotADirectory,
@@ -86,7 +120,7 @@ pub fn scan_folder(root: &Path, ignore_patterns: &[String]) -> io::Result<FileMa
             format!("refusing to scan with {invalid}"),
         )
     })?;
-    let mut state = ScanState::default();
+    let mut state = ScanState::new(options);
     visit(root, "", 0, &matcher, &mut state);
 
     Ok(FileManifest {
@@ -98,12 +132,29 @@ pub fn scan_folder(root: &Path, ignore_patterns: &[String]) -> io::Result<FileMa
     })
 }
 
-#[derive(Default)]
 struct ScanState {
     files: Vec<FileManifestEntry>,
     ignored: u32,
     unreadable: u32,
     truncated: bool,
+    max_files: Option<usize>,
+}
+
+impl ScanState {
+    fn new(options: ScanOptions) -> Self {
+        Self {
+            files: Vec::new(),
+            ignored: 0,
+            unreadable: 0,
+            truncated: false,
+            max_files: options.max_files,
+        }
+    }
+
+    /// Whether another file may be collected, or the ceiling has been reached.
+    fn has_capacity(&self) -> bool {
+        self.max_files.is_none_or(|max| self.files.len() < max)
+    }
 }
 
 fn visit(
@@ -173,7 +224,7 @@ fn visit_entry(
     if !file_type.is_file() {
         return;
     }
-    if state.files.len() >= MAX_MANIFEST_FILES {
+    if !state.has_capacity() {
         state.truncated = true;
         return;
     }
@@ -238,7 +289,7 @@ fn hash_file(path: &Path) -> io::Result<String> {
 mod tests {
     use std::fs;
 
-    use super::scan_folder;
+    use super::{DEFAULT_MAX_MANIFEST_FILES, ScanOptions, scan_folder, scan_folder_with_options};
 
     #[test]
     fn scans_nested_files_and_hashes_them_with_blake3() {
@@ -496,5 +547,32 @@ mod tests {
         assert_eq!(manifest.files.len(), 1);
         assert_eq!(manifest.files[0].digest, None);
         assert_eq!(manifest.files[0].size, big.len() as u64);
+    }
+
+    #[test]
+    fn omitting_the_options_keeps_the_default_ceiling() {
+        assert_eq!(
+            ScanOptions::default().max_files,
+            Some(DEFAULT_MAX_MANIFEST_FILES)
+        );
+    }
+
+    #[test]
+    fn honours_an_explicit_scan_ceiling_and_an_explicit_opt_out_of_it() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        for index in 0..5 {
+            fs::write(root.path().join(format!("file-{index}.txt")), b"data").expect("write file");
+        }
+
+        let limited =
+            scan_folder_with_options(root.path(), &[], ScanOptions { max_files: Some(3) })
+                .expect("scan folder");
+        assert_eq!(limited.files.len(), 3);
+        assert!(limited.truncated);
+
+        let unlimited = scan_folder_with_options(root.path(), &[], ScanOptions { max_files: None })
+            .expect("scan folder");
+        assert_eq!(unlimited.files.len(), 5);
+        assert!(!unlimited.truncated);
     }
 }

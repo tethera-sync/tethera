@@ -445,6 +445,7 @@ impl IgnoreMatcher {
         let rules = patterns
             .iter()
             .filter_map(|pattern| build_rule(pattern))
+            .flatten()
             .collect();
         Self { rules }
     }
@@ -460,8 +461,8 @@ impl IgnoreMatcher {
     pub fn try_new(patterns: &[String]) -> Result<Self, InvalidIgnorePattern> {
         let mut rules = Vec::with_capacity(patterns.len());
         for pattern in patterns {
-            if let Some(rule) = build_rule(pattern) {
-                rules.push(rule);
+            if let Some(pattern_rules) = build_rule(pattern) {
+                rules.extend(pattern_rules);
             } else if !ignorable_pattern(pattern) {
                 return Err(InvalidIgnorePattern {
                     pattern: pattern.clone(),
@@ -506,7 +507,14 @@ fn ignorable_pattern(pattern: &str) -> bool {
     normalized.is_empty() || normalized.starts_with('#')
 }
 
-fn build_rule(pattern: &str) -> Option<IgnoreRule> {
+/// Compiles one ignore-file line into its regex rule(s).
+///
+/// A pattern normally becomes exactly one [`IgnoreRule`]. A pattern ending in `/**` (e.g.
+/// `node_modules/**`) additionally emits a *derived* rule matching the directory itself: without
+/// it, the regex only matches paths *inside* the directory, so `scan_folder` would still open and
+/// walk a directory it was told to skip whole, matching every entry underneath one at a time
+/// instead of pruning the subtree.
+fn build_rule(pattern: &str) -> Option<Vec<IgnoreRule>> {
     let normalized = strip_leading_dot_slash(&pattern.trim().replace('\\', "/"));
     if normalized.is_empty() || normalized.starts_with('#') {
         return None;
@@ -520,34 +528,80 @@ fn build_rule(pattern: &str) -> Option<IgnoreRule> {
     if source.len() > MAX_IGNORE_PATTERN_LENGTH {
         return None;
     }
+    // Anchoring is decided from the *full* pattern, before `**` is parsed away: gitignore
+    // anchors any pattern containing a slash to the scan root, regardless of where the slash
+    // sits relative to a `**` segment.
     let basename_only = !source.contains('/');
     let regex = glob_to_regex(&source)?;
-    Some(IgnoreRule {
+    let mut rules = vec![IgnoreRule {
         directory_only,
         basename_only,
         regex,
-    })
+    }];
+
+    if let Some(prefix) = source.strip_suffix("/**") {
+        if !prefix.is_empty() {
+            let prefix_regex = glob_to_regex(prefix)?;
+            rules.push(IgnoreRule {
+                directory_only: true,
+                basename_only,
+                regex: prefix_regex,
+            });
+        }
+    }
+
+    Some(rules)
 }
 
+/// Compiles a gitignore-flavoured glob body (no trailing slash, already stripped) to an anchored,
+/// case-insensitive regex.
+///
+/// `**` is not a bare wildcard: gitignore gives it segment-crossing meaning that depends on where
+/// it sits in the pattern, so it is handled positionally rather than as "two stars in a row":
+///
+/// - a leading `**/` matches zero or more whole leading segments;
+/// - `/**/` in the middle matches zero or more whole segments between two literal segments;
+/// - a trailing `/**` matches a slash followed by anything;
+/// - anywhere else, `**` falls back to a plain `.*`.
+///
+/// A single `*` or `?` stays confined to one path segment (`[^/]*` / `[^/]`), matching gitignore
+/// and the pre-existing behaviour for non-`**` globs.
 fn glob_to_regex(pattern: &str) -> Option<Regex> {
     let chars: Vec<char> = pattern.chars().collect();
+    let length = chars.len();
     let mut source = String::new();
     let mut index = 0;
-    while index < chars.len() {
-        let character = chars[index];
-        if character == '*' && chars.get(index + 1) == Some(&'*') {
+    while index < length {
+        if index == 0 && starts_with_at(&chars, 0, &['*', '*', '/']) {
+            source.push_str("(?:.*/)?");
+            index += 3;
+        } else if starts_with_at(&chars, index, &['/', '*', '*', '/']) {
+            source.push_str("/(?:.*/)?");
+            index += 4;
+        } else if index + 3 == length && starts_with_at(&chars, index, &['/', '*', '*']) {
+            source.push_str("/.*");
+            index += 3;
+        } else if chars[index] == '*' && chars.get(index + 1) == Some(&'*') {
             source.push_str(".*");
-            index += 1;
-        } else if character == '*' {
+            index += 2;
+        } else if chars[index] == '*' {
             source.push_str("[^/]*");
-        } else if character == '?' {
+            index += 1;
+        } else if chars[index] == '?' {
             source.push_str("[^/]");
+            index += 1;
         } else {
-            source.push_str(&regex::escape(&character.to_string()));
+            source.push_str(&regex::escape(&chars[index].to_string()));
+            index += 1;
         }
-        index += 1;
     }
     Regex::new(&format!("(?i)^{source}$")).ok()
+}
+
+/// True when `chars[index..]` starts with exactly `expected`, without panicking when fewer than
+/// `expected.len()` characters remain.
+fn starts_with_at(chars: &[char], index: usize, expected: &[char]) -> bool {
+    chars.get(index..index + expected.len()) == Some(expected)
 }
 
 #[must_use]
@@ -668,6 +722,76 @@ mod tests {
         assert!(matcher.is_ignored("cache/file.tmp", false));
         assert!(matcher.is_ignored("build/assets/app.js", false));
         assert!(!matcher.is_ignored("src/app.ts", false));
+        // `build/**` must also prune the `build` directory itself, not just match paths
+        // underneath it — otherwise a scanner still opens and walks the excluded directory.
+        assert!(matcher.is_ignored("build", true));
+    }
+
+    /// Precise `**` semantics table: each pattern's directory-pruning and deep-path behaviour
+    /// against a root-level match, a nested match, and the paths underneath each. The `false`
+    /// results for deep paths under a bare-basename pattern are correct because a real scanner
+    /// prunes the whole directory and never queries anything underneath it.
+    #[test]
+    fn ignore_matcher_matches_the_double_star_semantics_table() {
+        let root_dir = ("node_modules", true);
+        let nested_dir = ("src/node_modules", true);
+        let root_deep_file = ("node_modules/pkg/index.js", false);
+        let nested_deep_file = ("src/node_modules/pkg/index.js", false);
+
+        let cases: &[(&str, [bool; 4])] = &[
+            ("node_modules", [true, true, false, false]),
+            ("node_modules/", [true, true, false, false]),
+            ("**/node_modules", [true, true, false, false]),
+            ("node_modules/**", [true, false, true, false]),
+            ("**/node_modules/**", [true, true, true, true]),
+        ];
+
+        for (pattern, expected) in cases {
+            let matcher = IgnoreMatcher::new(&[(*pattern).to_owned()]);
+            assert_eq!(
+                matcher.is_ignored(root_dir.0, root_dir.1),
+                expected[0],
+                "pattern {pattern:?} against {root_dir:?}"
+            );
+            assert_eq!(
+                matcher.is_ignored(nested_dir.0, nested_dir.1),
+                expected[1],
+                "pattern {pattern:?} against {nested_dir:?}"
+            );
+            assert_eq!(
+                matcher.is_ignored(root_deep_file.0, root_deep_file.1),
+                expected[2],
+                "pattern {pattern:?} against {root_deep_file:?}"
+            );
+            assert_eq!(
+                matcher.is_ignored(nested_deep_file.0, nested_deep_file.1),
+                expected[3],
+                "pattern {pattern:?} against {nested_deep_file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_matcher_confines_a_directory_glob_to_one_segment() {
+        let matcher = IgnoreMatcher::new(&["cache/*.tmp".to_owned()]);
+        assert!(matcher.is_ignored("cache/a.tmp", false));
+        assert!(!matcher.is_ignored("cache/sub/a.tmp", false));
+        assert!(!matcher.is_ignored("other/a.tmp", false));
+    }
+
+    #[test]
+    fn ignore_matcher_matches_a_basename_glob_at_any_depth() {
+        let matcher = IgnoreMatcher::new(&["*.tmp".to_owned()]);
+        assert!(matcher.is_ignored("a.tmp", false));
+        assert!(matcher.is_ignored("deep/dir/a.tmp", false));
+    }
+
+    #[test]
+    fn ignore_matcher_matches_double_star_between_literal_segments() {
+        let matcher = IgnoreMatcher::new(&["a/**/b".to_owned()]);
+        assert!(matcher.is_ignored("a/b", false));
+        assert!(matcher.is_ignored("a/x/y/b", false));
+        assert!(!matcher.is_ignored("a/c", false));
     }
 
     #[test]
@@ -688,6 +812,26 @@ mod tests {
         let matcher = IgnoreMatcher::new(&["*.tmp".to_owned(), "a".repeat(600)]);
         assert!(matcher.is_ignored("cache/file.tmp", false));
         assert!(!matcher.is_ignored("src/app.ts", false));
+    }
+
+    #[test]
+    fn lenient_construction_skips_an_oversized_multibyte_pattern() {
+        // 171 repetitions of U+754C are 513 UTF-8 bytes: over the envelope despite fitting in
+        // 171 characters, so the rule is skipped rather than half-applied.
+        let oversized = "界".repeat(171);
+        let matcher = IgnoreMatcher::new(std::slice::from_ref(&oversized));
+        assert!(!matcher.is_ignored(&oversized, false));
+        // 170 repetitions are 510 bytes: inside the envelope and still match.
+        let boundary = "界".repeat(170);
+        let matcher = IgnoreMatcher::new(std::slice::from_ref(&boundary));
+        assert!(matcher.is_ignored(&boundary, false));
+    }
+
+    #[test]
+    fn question_mark_matches_one_astral_code_point() {
+        let matcher = IgnoreMatcher::new(&["?.txt".to_owned()]);
+        assert!(matcher.is_ignored("😀.txt", false));
+        assert!(!matcher.is_ignored("ab.txt", false));
     }
 
     #[test]
