@@ -86,7 +86,7 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
         title="Scanning"
         description="Bound how much one folder scan collects on this computer before it reports a partial result."
       >
-        <ScanLimitRow settings={settings} update={update} disabled={saving !== null} />
+        <ScanLimitRow settings={settings} update={update} savingKey={saving} />
       </SettingsSection>
 
       <SettingsSection title="Appearance" description="The interface follows your system theme by default.">
@@ -177,17 +177,41 @@ function SettingRow({ title, description, children }: { title: string; descripti
 function ScanLimitRow({
   settings,
   update,
-  disabled,
+  savingKey,
 }: {
   settings: AppSettings
   update: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => Promise<void>
-  /** True while any setting is saving; keeps this row consistent with the other setting controls. */
-  disabled: boolean
+  /** Key currently saving, if any. Other keys disable this row; this row serialises its own intents locally. */
+  savingKey: keyof AppSettings | null
 }) {
   const unlimited = settings.maxScanFiles === null
   const [draft, setDraft] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const shown = draft ?? (unlimited ? "" : String(settings.maxScanFiles))
+  // A blur commit can still be saving when the No-limit switch is toggled
+  // (the toggle arrives without a prior blur). Both write maxScanFiles, so
+  // queue the latest intent instead of dropping it in update()'s guard.
+  const rowBusy = useRef(false)
+  const queuedValue = useRef<number | null | undefined>(undefined)
+  const peerSaving = savingKey !== null && savingKey !== "maxScanFiles"
+
+  async function saveRow(value: number | null): Promise<void> {
+    if (rowBusy.current) {
+      queuedValue.current = value
+      return
+    }
+    rowBusy.current = true
+    try {
+      await update("maxScanFiles", value)
+    } catch {
+      setError("That didn't work. Try again shortly.")
+    } finally {
+      rowBusy.current = false
+    }
+    const next = queuedValue.current
+    queuedValue.current = undefined
+    if (next !== undefined) await saveRow(next)
+  }
 
   async function commit(raw: string): Promise<void> {
     // The accepted envelope lives in main/ipc-validation.ts: a whole number
@@ -199,21 +223,13 @@ function ScanLimitRow({
     }
     setError(null)
     setDraft(null)
-    try {
-      await update("maxScanFiles", parsed)
-    } catch {
-      setError("That didn't work. Try again shortly.")
-    }
+    await saveRow(parsed)
   }
 
   async function setUnlimited(next: boolean): Promise<void> {
     setError(null)
     setDraft(null)
-    try {
-      await update("maxScanFiles", next ? null : 10_000)
-    } catch {
-      setError("That didn't work. Try again shortly.")
-    }
+    await saveRow(next ? null : 10_000)
   }
 
   return (
@@ -233,7 +249,7 @@ function ScanLimitRow({
           min={1000}
           max={1000000}
           step={1000}
-          disabled={disabled || unlimited}
+          disabled={peerSaving || unlimited}
           aria-label="Maximum files per scan"
           placeholder="No limit"
           value={shown}
@@ -244,7 +260,7 @@ function ScanLimitRow({
           }}
         />
         <label className="[display:flex] [align-items:center] [gap:6px] [font-size:10.5px] [color:var(--muted-foreground)]">
-          <Switch aria-label="No scan file limit" checked={unlimited} disabled={disabled} onCheckedChange={(checked: boolean) => void setUnlimited(checked)} />
+          <Switch aria-label="No scan file limit" checked={unlimited} disabled={peerSaving} onCheckedChange={(checked: boolean) => void setUnlimited(checked)} />
           No limit
         </label>
       </div>
