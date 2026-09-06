@@ -42,6 +42,9 @@ interface FolderPickerDialogProps {
   onSelect: (path: string) => void
 }
 
+/**
+ * Dialog for browsing and selecting folders on a device (local or remote), with navigation, search, hidden file toggle, and folder creation capabilities.
+ */
 export function FolderPickerDialog({
   open,
   onOpenChange,
@@ -159,7 +162,7 @@ export function FolderPickerDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="folder-picker-dialog [width:min(980px,_calc(100vw_-_36px))] [max-width:min(980px,_calc(100vw_-_36px))] [padding:20px]">
+      <DialogContent className="folder-picker-dialog w-[min(980px,calc(100vw-36px))] max-w-[980px] p-5">
         <DialogHeader>
           <div className="folder-picker-title-row [display:flex] [align-items:flex-start] [gap:12px]">
             <div className="folder-picker-device-icon [display:grid] [width:38px] [height:38px] [flex:0_0_auto] [place-items:center] [border-radius:11px] [background:color-mix(in_oklab,_var(--primary)_12%,_var(--surface-strong))] [color:var(--primary)] [&_svg]:[width:18px] [&_svg]:[height:18px]">
