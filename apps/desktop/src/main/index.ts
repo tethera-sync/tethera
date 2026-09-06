@@ -51,7 +51,7 @@ import {
   type EngineState,
   type MappingStoreHealth,
 } from "./engine-supervisor"
-import { compareManifests, isManifestPathIgnored, scanFolder, type FileManifest } from "./folder-manifest"
+import { compareManifests, DEFAULT_MAX_MANIFEST_FILES, isManifestPathIgnored, scanFolder, type FileManifest } from "./folder-manifest"
 import {
   assessInitialMergeConvergence,
   computeSyncPlan,
@@ -96,6 +96,7 @@ import { PeerSessionService, type PeerRequest, type PeerRequestContext } from ".
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import {
   applySettingUpdate,
+  normalizePersistedScanLimit,
   parseExactConflictChoice,
   parsePeerConflictCopy,
   parsePeerFileOperations,
@@ -265,6 +266,16 @@ const defaultSettings: AppSettings = {
   startMinimised: false,
   pauseOnMetered: true,
   theme: "system",
+  maxScanFiles: DEFAULT_MAX_MANIFEST_FILES,
+}
+
+/**
+ * The scan ceiling in force on this machine. Every local scan — including
+ * scans run on a peer's behalf — uses this value; a peer never supplies
+ * its own limit, so a paired device cannot dictate our memory allocation.
+ */
+function currentScanLimit(): number | null {
+  return snapshot.settings.maxScanFiles
 }
 
 function platform(): DeviceSummary["platform"] {
@@ -381,7 +392,11 @@ async function loadState(): Promise<void> {
         incoming: parsed.mappings?.incoming ?? [],
         outgoing: parsed.mappings?.outgoing ?? [],
       },
-      settings: { ...defaultSettings, ...(parsed.settings ?? {}) },
+      settings: {
+        ...defaultSettings,
+        ...(parsed.settings ?? {}),
+        maxScanFiles: normalizePersistedScanLimit((parsed.settings as Partial<AppSettings> | undefined)?.maxScanFiles),
+      },
       update: idleUpdateStateWithVersion(),
     }
   } else {
@@ -1121,6 +1136,7 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
   const localPath = path.resolve(input.localPath)
   emitPreviewProgress(operationId, "scan-local", 0)
   const localManifest = await scanFolder(localPath, input.ignorePatterns, {
+    maxFiles: currentScanLimit(),
     onProgress: (scannedFiles) => emitPreviewProgress(operationId, "scan-local", scannedFiles),
   })
   emitPreviewProgress(operationId, "scan-remote")
@@ -1220,6 +1236,7 @@ async function buildIncomingMappingPreview(
   }, 5 * 60_000)
   emitPreviewProgress(operationId, "scan-local", 0)
   const responderManifest = await scanFolder(target, request.proposal.ignorePatterns, {
+    maxFiles: currentScanLimit(),
     onProgress: (scannedFiles) => emitPreviewProgress(operationId, "scan-local", scannedFiles),
   })
   emitPreviewProgress(operationId, "compare")
@@ -1983,7 +2000,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     }
     const observedAt = new Date().toISOString()
     const [localManifest, remoteManifest] = await Promise.all([
-      scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true }),
+      scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit() }),
       requirePeerSessions().request<FileManifest>(peer.id, {
         type: "continuous-sync-scan",
         folderId,
@@ -2179,7 +2196,11 @@ function requireInitialSyncContext(folderId: string, expectedPeerId?: string): {
 
 function assertCompleteTransferManifest(manifest: FileManifest, computer: string): void {
   if (manifest.truncated) {
-    throw new Error(`${computer}'s folder exceeds the current 10,000-file safe scan limit. No incomplete merge was marked active.`)
+    const limit = currentScanLimit()
+    const ceiling = limit === null ? "the configured scan limit" : `the configured scan limit of ${limit.toLocaleString("en-GB")} files`
+    throw new Error(
+      `${computer}'s folder lists more than ${ceiling}. Raise the limit in Settings or add ignore rules, then retry. No incomplete merge was marked active.`,
+    )
   }
   if (manifest.unreadable > 0) {
     throw new Error(`${computer}'s folder has ${manifest.unreadable} unreadable item${manifest.unreadable === 1 ? "" : "s"}. Fix access and retry.`)
@@ -2419,7 +2440,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
   broadcastSnapshot()
 
   const [localManifest, remoteManifest] = await Promise.all([
-    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true }),
+    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit() }),
     requirePeerSessions().request<FileManifest>(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
@@ -2481,7 +2502,7 @@ async function verifyInitialMergeQuiescent(folder: FolderSummary, peer: DeviceSu
   updateFolder(folder.id, { currentAction: "Verifying that neither folder changed during the merge…" })
   broadcastSnapshot()
   const [localManifest, remoteManifest] = await Promise.all([
-    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true }),
+    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit() }),
     requirePeerSessions().request<FileManifest>(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
@@ -2825,7 +2846,9 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
   }
   if (request.type === "scan-manifest") {
     // The envelope our own UI enforces before sending a scan; anything else
-    // fails closed here instead of reaching the folder walker.
+    // fails closed here instead of reaching the folder walker. The ceiling
+    // always comes from this machine's setting — a peer-supplied limit is
+    // never accepted, so a paired device cannot dictate our memory use.
     const { path: requestedPath, ignorePatterns } = parsePeerScanManifest(request)
     const hashAllFiles = request.hashAllFiles === true
     if (hashAllFiles) {
@@ -2840,15 +2863,17 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       ) {
         throw new Error("A full-integrity scan must use the approved folder's sync rules.")
       }
-      return withPeerFileOperation(context, folderId, () => scanFolder(requestedPath, ignorePatterns, { hashAllFiles }))
+      return withPeerFileOperation(context, folderId, () =>
+        scanFolder(requestedPath, ignorePatterns, { hashAllFiles, maxFiles: currentScanLimit() }),
+      )
     }
-    return scanFolder(requestedPath, ignorePatterns, { hashAllFiles })
+    return scanFolder(requestedPath, ignorePatterns, { hashAllFiles, maxFiles: currentScanLimit() })
   }
   if (request.type === "continuous-sync-scan") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const folder = requireSharedActiveFolder(context, folderId)
     return withPeerFileOperation(context, folderId, () =>
-      scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true }),
+      scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit() }),
     )
   }
   if (request.type === "continuous-sync-get-operations") {

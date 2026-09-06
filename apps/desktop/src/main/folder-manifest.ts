@@ -4,7 +4,7 @@ import path from "node:path"
 import type { FolderMappingPreview, MappingPreviewItem, SyncMode } from "../shared/contracts"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 
-const MAX_MANIFEST_FILES = 10_000
+export const DEFAULT_MAX_MANIFEST_FILES = 10_000
 const MAX_HASH_FILE_BYTES = 16 * 1024 * 1024
 const MAX_SAMPLE_ITEMS = 14
 
@@ -33,6 +33,13 @@ export interface ScanFolderOptions {
   /** Hash every file for a transfer decision; preview scans retain the bounded fast path. */
   hashAllFiles?: boolean
   /**
+   * Ceiling on collected files before the manifest reports `truncated`.
+   * `undefined` (the default) resolves to `DEFAULT_MAX_MANIFEST_FILES`;
+   * `null` removes the ceiling for an explicitly opted-in unbounded scan.
+   * A number must be a positive safe integer; anything else fails closed.
+   */
+  maxFiles?: number | null
+  /**
    * Called as files accumulate so long scans can report progress. Invoked at
    * most every 500 files to keep the overhead negligible next to filesystem I/O.
    */
@@ -56,6 +63,7 @@ export async function scanFolder(
   let ignored = 0
   let unreadable = 0
   let truncated = false
+  const maxFiles = resolveScanLimit(options.maxFiles)
 
   async function visit(directoryPath: string, relativeDirectory: string): Promise<void> {
     if (truncated) return
@@ -95,7 +103,7 @@ export async function scanFolder(
         continue
       }
       if (!entry.isFile()) continue
-      if (files.length >= MAX_MANIFEST_FILES) {
+      if (files.length >= maxFiles) {
         truncated = true
         break
       }
@@ -218,19 +226,42 @@ function normalizeRelative(relativePath: string): string {
   return relativePath.replaceAll("\\", "/").replace(/^\.\//, "")
 }
 
+function resolveScanLimit(maxFiles: number | null | undefined): number {
+  if (maxFiles === undefined) return DEFAULT_MAX_MANIFEST_FILES
+  if (maxFiles === null) return Number.POSITIVE_INFINITY
+  if (!Number.isSafeInteger(maxFiles) || maxFiles < 1) throw new Error("The scan limit is invalid.")
+  return maxFiles
+}
+
+/**
+ * Compiles one ignore-file line into its regex rule(s), mirroring
+ * `sync-core::manifest::build_rule` so both scanners prune the same trees.
+ *
+ * A pattern normally becomes exactly one rule. A pattern ending in `/**`
+ * additionally emits a derived directory-only rule for the prefix itself:
+ * without it the main regex only matches paths *inside* the directory, so
+ * the walk would still open an excluded directory and count every entry
+ * underneath one at a time instead of pruning the subtree.
+ */
+function buildIgnoreRule(pattern: string): Array<{ directoryOnly: boolean; basenameOnly: boolean; regex: RegExp }> | undefined {
+  const normalized = pattern.trim().replaceAll("\\", "/").replace(/^\.\//, "")
+  if (!normalized || normalized.startsWith("#")) return undefined
+  const directoryOnly = normalized.endsWith("/")
+  const source = directoryOnly ? normalized.slice(0, -1) : normalized
+  if (!source || source.length > 512) return undefined
+  // Anchoring is decided from the full pattern, before `**` is parsed away:
+  // any pattern containing a slash is anchored to the scan root.
+  const basenameOnly = !source.includes("/")
+  const rules = [{ directoryOnly, basenameOnly, regex: globToRegExp(source) }]
+  if (source.endsWith("/**")) {
+    const prefix = source.slice(0, -3)
+    if (prefix) rules.push({ directoryOnly: true, basenameOnly, regex: globToRegExp(prefix) })
+  }
+  return rules
+}
+
 function createIgnoreMatcher(patterns: string[]): (relativePath: string, directory: boolean) => boolean {
-  const rules = patterns
-    .map((pattern) => pattern.trim().replaceAll("\\", "/").replace(/^\.\//, ""))
-    .filter((pattern) => pattern && !pattern.startsWith("#"))
-    .map((pattern) => {
-      const directoryOnly = pattern.endsWith("/")
-      const normalizedPattern = directoryOnly ? pattern.slice(0, -1) : pattern
-      return {
-        directoryOnly,
-        regex: globToRegExp(normalizedPattern),
-        basenameOnly: !normalizedPattern.includes("/"),
-      }
-    })
+  const rules = patterns.flatMap((pattern) => buildIgnoreRule(pattern) ?? [])
 
   return (relativePath, directory) => {
     const normalized = normalizeRelative(relativePath)
@@ -254,17 +285,43 @@ export function isManifestPathIgnored(relativePath: string, patterns: string[]):
   return false
 }
 
+/**
+ * Compiles a gitignore-flavoured glob body to an anchored case-insensitive
+ * regex, mirroring `sync-core::manifest::glob_to_regex`.
+ *
+ * A double star is positional, not a bare wildcard: a leading double star
+ * plus slash matches zero or more leading segments, a slash plus double
+ * star plus slash in the middle matches zero or more segments between two
+ * literals, a trailing slash plus double star matches a slash followed by
+ * anything, and any other double star falls back to `.*`. A single `*` or
+ * `?` stays within one segment.
+ */
 function globToRegExp(pattern: string): RegExp {
   let source = ""
-  for (let index = 0; index < pattern.length; index += 1) {
-    const character = pattern[index]
-    const next = pattern[index + 1]
-    if (character === "*" && next === "*") {
+  let index = 0
+  while (index < pattern.length) {
+    if (index === 0 && pattern.startsWith("**/", index)) {
+      source += "(?:.*/)?"
+      index += 3
+    } else if (pattern.startsWith("/**/", index)) {
+      source += "/(?:.*/)?"
+      index += 4
+    } else if (index + 3 === pattern.length && pattern.startsWith("/**", index)) {
+      source += "/.*"
+      index += 3
+    } else if (pattern.startsWith("**", index)) {
       source += ".*"
+      index += 2
+    } else if (pattern[index] === "*") {
+      source += "[^/]*"
       index += 1
-    } else if (character === "*") source += "[^/]*"
-    else if (character === "?") source += "[^/]"
-    else source += character.replace(/[|\\{}()[\]^$+?.]/g, "\\$&")
+    } else if (pattern[index] === "?") {
+      source += "[^/]"
+      index += 1
+    } else {
+      source += pattern[index]?.replace(/[|\\{}()[\]^$+?.]/g, "\\$&") ?? ""
+      index += 1
+    }
   }
   return new RegExp(`^${source}$`, "i")
 }

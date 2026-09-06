@@ -1,4 +1,4 @@
-import { useState, type ChangeEvent, type ReactNode } from "react"
+import { useState, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react"
 import { CheckCircle2Icon, DownloadIcon, RefreshCwIcon, RocketIcon } from "lucide-react"
 import type { AppSettings, AppSnapshot, UpdateState } from "@shared/contracts"
 import { Button } from "@/components/ui/button"
@@ -101,6 +101,13 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
         </SettingRow>
       </SettingsSection>
 
+      <SettingsSection
+        title="Scanning"
+        description="Bound how much one folder scan collects on this computer before it reports a partial result."
+      >
+        <ScanLimitRow settings={settings} update={update} />
+      </SettingsSection>
+
       <SettingsSection title="Appearance" description="The interface follows your system theme by default.">
         <SettingRow title="Theme" description="Change the desktop interface without affecting sync behaviour.">
           <select
@@ -139,6 +146,81 @@ function SettingRow({ title, description, children }: { title: string; descripti
       </div>
       <div className="shrink-0">{children}</div>
     </div>
+  )
+}
+
+function ScanLimitRow({
+  settings,
+  update,
+}: {
+  settings: AppSettings
+  update: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => Promise<void>
+}) {
+  const unlimited = settings.maxScanFiles === null
+  const [draft, setDraft] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const shown = draft ?? (unlimited ? "" : String(settings.maxScanFiles))
+
+  async function commit(raw: string): Promise<void> {
+    // The accepted envelope lives in main/ipc-validation.ts: a whole number
+    // between 1,000 and 1,000,000, or No limit.
+    const parsed = Number(raw)
+    if (!Number.isInteger(parsed) || parsed < 1_000 || parsed > 1_000_000) {
+      setError("Enter a whole number between 1,000 and 1,000,000, or switch on No limit.")
+      return
+    }
+    setError(null)
+    setDraft(null)
+    try {
+      await update("maxScanFiles", parsed)
+    } catch {
+      setError("That didn't work. Try again shortly.")
+    }
+  }
+
+  async function setUnlimited(next: boolean): Promise<void> {
+    setError(null)
+    setDraft(null)
+    try {
+      await update("maxScanFiles", next ? null : 10_000)
+    } catch {
+      setError("That didn't work. Try again shortly.")
+    }
+  }
+
+  return (
+    <SettingRow
+      title="Scan file limit"
+      description={
+        error ??
+        (unlimited
+          ? "Scans collect every file without stopping. Very large folders use more memory while they compare."
+          : "A scan stops and reports a partial result past this many files. Previews and transfers on this computer use it.")
+      }
+    >
+      <div className="[display:flex] [align-items:center] [gap:10px]">
+        <input
+          className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55] w-32"
+          type="number"
+          min={1000}
+          max={1000000}
+          step={1000}
+          disabled={unlimited}
+          aria-label="Maximum files per scan"
+          placeholder="No limit"
+          value={shown}
+          onChange={(event: ChangeEvent<HTMLInputElement>) => setDraft(event.target.value)}
+          onBlur={(event: ChangeEvent<HTMLInputElement>) => void commit(event.target.value)}
+          onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
+            if (event.key === "Enter") event.currentTarget.blur()
+          }}
+        />
+        <label className="[display:flex] [align-items:center] [gap:6px] [font-size:10.5px] [color:var(--muted-foreground)]">
+          <Switch aria-label="No scan file limit" checked={unlimited} onCheckedChange={(checked: boolean) => void setUnlimited(checked)} />
+          No limit
+        </label>
+      </div>
+    </SettingRow>
   )
 }
 

@@ -121,4 +121,65 @@ describe("folder mapping comparison", () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  test("double-star ignore patterns prune the same trees as the Rust matcher", () => {
+    const cases: Array<[string, [boolean, boolean, boolean, boolean]]> = [
+      ["node_modules", [true, true, false, false]],
+      ["node_modules/", [true, true, false, false]],
+      ["**/node_modules", [true, true, false, false]],
+      ["node_modules/**", [true, false, true, false]],
+      ["**/node_modules/**", [true, true, true, true]],
+    ]
+    for (const [pattern, expected] of cases) {
+      const matcher = folderManifestTestHelpers.createIgnoreMatcher([pattern])
+      expect(matcher("node_modules", true)).toBe(expected[0])
+      expect(matcher("src/node_modules", true)).toBe(expected[1])
+      expect(matcher("node_modules/pkg/index.js", false)).toBe(expected[2])
+      expect(matcher("src/node_modules/pkg/index.js", false)).toBe(expected[3])
+    }
+  })
+
+  test("a trailing double-star pattern prunes the directory itself instead of walking it", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-prune-test-"))
+    try {
+      await mkdir(path.join(root, "build"))
+      await writeFile(path.join(root, "build", "output.js"), "bundle")
+      await writeFile(path.join(root, "keep.txt"), "kept")
+      const result = await scanFolder(root, ["build/**"])
+      expect(result.files.map((entry) => entry.path)).toEqual(["keep.txt"])
+      expect(result.ignored).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("honours an explicit scan ceiling and an explicit opt-out of it", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-ceiling-test-"))
+    try {
+      for (let index = 0; index < 5; index += 1) {
+        await writeFile(path.join(root, `file-${index}.txt`), "data")
+      }
+      const limited = await scanFolder(root, [], { maxFiles: 3 })
+      expect(limited.files).toHaveLength(3)
+      expect(limited.truncated).toBe(true)
+      const unlimited = await scanFolder(root, [], { maxFiles: null })
+      expect(unlimited.files).toHaveLength(5)
+      expect(unlimited.truncated).toBe(false)
+      const byDefault = await scanFolder(root, [])
+      expect(byDefault.files).toHaveLength(5)
+      expect(byDefault.truncated).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("rejects a non-positive scan ceiling instead of silently truncating everything", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-ceiling-invalid-test-"))
+    try {
+      await writeFile(path.join(root, "file.txt"), "data")
+      await expect(scanFolder(root, [], { maxFiles: 0 })).rejects.toThrow("The scan limit is invalid.")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 })

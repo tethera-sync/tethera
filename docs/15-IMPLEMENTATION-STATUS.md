@@ -92,11 +92,11 @@ For a durable conflict where both files are present, the coordinator can inspect
 
 ## Clearly not implemented
 
-- Scan generations, incremental hashing, paging beyond 10,000 files, or production-scale performance work.
+- Scan generations, incremental hashing, paging beyond the configurable scan-file ceiling, or production-scale performance work.
 - Engine-owned filesystem watching/network transfer, resumable/content-defined chunking, or bandwidth scheduling.
 - File deletion or rename propagation, general archive browsing/retention, or resolving conflicts where either copy is missing.
 - NAT traversal, cloud services, accounts or telemetry.
-- Removal of the 10,000-file manifest ceiling.
+- Removal of the scan-file ceiling itself. It is now a global preference (1,000–1,000,000 files, or explicitly unlimited; 10,000 by default), but every scan is still a single in-memory pass.
 - Code-signed/notarised release builds.
 
 ## Recommended next pull request

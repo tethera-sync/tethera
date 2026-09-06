@@ -56,6 +56,7 @@ const emptySnapshot: AppSnapshot = {
     startMinimised: false,
     pauseOnMetered: true,
     theme: "system",
+    maxScanFiles: 10_000,
   },
   update: { status: "idle" },
 }
@@ -111,6 +112,7 @@ export function App() {
       <FolderMappingApprovalDialog
         request={pendingMapping}
         localDevice={localDevice}
+        scanLimit={snapshot.settings.maxScanFiles}
         mutationsEnabled={mappingMutationsEnabled}
         disabledReason={mappingMutationReason}
         open={mappingApprovalOpen}
@@ -209,6 +211,7 @@ export function App() {
               <AddFolderDialog
                 localDevice={localDevice}
                 pairedDevice={pairedDevice}
+                scanLimit={snapshot.settings.maxScanFiles}
                 onAdded={() => setView("folders")}
                 disabled={pairedDevice.status !== "online" || !mappingMutationsEnabled}
                 disabledReason={

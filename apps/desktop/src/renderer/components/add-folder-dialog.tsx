@@ -40,6 +40,7 @@ type Step = "paths" | "rules" | "preview"
 interface AddFolderDialogProps {
   localDevice: DeviceSummary
   pairedDevice: DeviceSummary
+  scanLimit: number | null
   onAdded: () => void
   disabled?: boolean
   disabledReason?: string
@@ -48,6 +49,7 @@ interface AddFolderDialogProps {
 export function AddFolderDialog({
   localDevice,
   pairedDevice,
+  scanLimit,
   onAdded,
   disabled = false,
   disabledReason,
@@ -233,7 +235,7 @@ export function AddFolderDialog({
           ) : null}
 
           {step === "preview" && preview ? (
-            <MappingPreviewView preview={preview} localName={localDevice.name} remoteName={pairedDevice.name} />
+            <MappingPreviewView preview={preview} localName={localDevice.name} remoteName={pairedDevice.name} scanLimit={scanLimit} />
           ) : null}
 
           {compare ? (
@@ -309,7 +311,7 @@ function WizardSteps({ step }: { step: Step }) {
   )
 }
 
-function MappingPreviewView({ preview, localName, remoteName }: { preview: FolderMappingPreview; localName: string; remoteName: string }) {
+function MappingPreviewView({ preview, localName, remoteName, scanLimit }: { preview: FolderMappingPreview; localName: string; remoteName: string; scanLimit: number | null }) {
   const warnings = preview.invalidWindowsNames.length + preview.caseCollisions.length
   return (
     <div className="mapping-preview [display:grid] [gap:14px] [margin-top:20px]">
@@ -321,7 +323,7 @@ function MappingPreviewView({ preview, localName, remoteName }: { preview: Folde
       </div>
 
       {preview.truncated ? (
-        <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&.danger]:[border-color:color-mix(in_oklab,_var(--danger)_36%,_var(--border))] [&.danger]:[background:color-mix(in_oklab,_var(--danger)_9%,_var(--surface))] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&.danger>svg]:[color:var(--danger)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5]"><FileWarningIcon /><div><strong>Preview limit reached</strong><span>The comparison sampled the first 10,000 files on one or both computers. No files have been changed.</span></div></div>
+        <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&.danger]:[border-color:color-mix(in_oklab,_var(--danger)_36%,_var(--border))] [&.danger]:[background:color-mix(in_oklab,_var(--danger)_9%,_var(--surface))] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&.danger>svg]:[color:var(--danger)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5]"><FileWarningIcon /><div><strong>Preview limit reached</strong><span>{truncatedDetail(scanLimit)}</span></div></div>
       ) : null}
       {warnings > 0 ? (
         <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&.danger]:[border-color:color-mix(in_oklab,_var(--danger)_36%,_var(--border))] [&.danger]:[background:color-mix(in_oklab,_var(--danger)_9%,_var(--surface))] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&.danger>svg]:[color:var(--danger)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5] danger"><FileWarningIcon /><div><strong>Resolve {warnings} cross-platform path problems</strong><span>Windows-invalid names or case-only collisions must be renamed before approval can be requested.</span></div></div>
@@ -363,6 +365,13 @@ function PathChooser({ value, placeholder, onBrowse }: { value: string; placehol
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return <label className="grid gap-2"><span className="text-sm font-medium">{label}</span>{children}{hint ? <span className="text-xs text-[var(--muted-foreground)]">{hint}</span> : null}</label>
+}
+
+function truncatedDetail(scanLimit: number | null): string {
+  if (scanLimit === null) {
+    return "The comparison sampled only part of one or both folders. Add ignore rules, then compare again. No files have been changed."
+  }
+  return `The comparison sampled the first ${scanLimit.toLocaleString("en-GB")} files on one or both computers. Raise the scan limit in Settings or add ignore rules, then compare again. No files have been changed.`
 }
 
 function previewCategory(category: FolderMappingPreview["samples"][number]["category"]): string {
