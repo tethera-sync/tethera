@@ -137,7 +137,6 @@ export function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; o
           <AddFolderDialog
             localDevice={localDevice}
             pairedDevice={pairedDevice}
-            scanLimit={snapshot.settings.maxScanFiles}
             onAdded={() => undefined}
             disabled={pairedDevice.status !== "online" || !mappingMutationsEnabled}
             disabledReason={

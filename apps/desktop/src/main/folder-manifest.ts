@@ -248,14 +248,21 @@ function buildIgnoreRule(pattern: string): Array<{ directoryOnly: boolean; basen
   if (!normalized || normalized.startsWith("#")) return undefined
   const directoryOnly = normalized.endsWith("/")
   const source = directoryOnly ? normalized.slice(0, -1) : normalized
-  if (!source || source.length > 512) return undefined
+  // The size envelope is UTF-8 bytes, mirroring Rust's `str::len`, not UTF-16 code units.
+  if (!source || Buffer.byteLength(source, "utf8") > 512) return undefined
   // Anchoring is decided from the full pattern, before `**` is parsed away:
   // any pattern containing a slash is anchored to the scan root.
   const basenameOnly = !source.includes("/")
-  const rules = [{ directoryOnly, basenameOnly, regex: globToRegExp(source) }]
+  const regex = globToRegExp(source)
+  if (!regex) return undefined
+  const rules = [{ directoryOnly, basenameOnly, regex }]
   if (source.endsWith("/**")) {
     const prefix = source.slice(0, -3)
-    if (prefix) rules.push({ directoryOnly: true, basenameOnly, regex: globToRegExp(prefix) })
+    if (prefix) {
+      const prefixRegex = globToRegExp(prefix)
+      if (!prefixRegex) return undefined
+      rules.push({ directoryOnly: true, basenameOnly, regex: prefixRegex })
+    }
   }
   return rules
 }
@@ -295,8 +302,13 @@ export function isManifestPathIgnored(relativePath: string, patterns: string[]):
  * literals, a trailing slash plus double star matches a slash followed by
  * anything, and any other double star falls back to `.*`. A single `*` or
  * `?` stays within one segment.
+ *
+ * The unicode flag keeps `?` and negated classes on full code points, as
+ * Rust matches on `char`s. Returns `undefined` when the pattern cannot
+ * compile (for example lone surrogates, which Rust's `str` can never
+ * contain), so the caller skips the rule instead of throwing into the scan.
  */
-function globToRegExp(pattern: string): RegExp {
+function globToRegExp(pattern: string): RegExp | undefined {
   let source = ""
   let index = 0
   while (index < pattern.length) {
@@ -323,7 +335,11 @@ function globToRegExp(pattern: string): RegExp {
       index += 1
     }
   }
-  return new RegExp(`^${source}$`, "i")
+  try {
+    return new RegExp(`^${source}$`, "iu")
+  } catch {
+    return undefined
+  }
 }
 
 async function inspectManifestFile(

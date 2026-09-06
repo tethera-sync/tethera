@@ -27,7 +27,6 @@ import { formatElapsed, useElapsedSeconds, type ComparePhase } from "@/lib/compa
 export function FolderMappingApprovalDialog({
   request,
   localDevice,
-  scanLimit,
   mutationsEnabled,
   disabledReason,
   open,
@@ -35,7 +34,6 @@ export function FolderMappingApprovalDialog({
 }: {
   request?: IncomingMappingRequest
   localDevice: DeviceSummary
-  scanLimit: number | null
   mutationsEnabled: boolean
   disabledReason: string
   open: boolean
@@ -170,7 +168,7 @@ export function FolderMappingApprovalDialog({
           </div>
 
           {proposal.preview.truncated ? (
-            <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [margin-top:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5]"><FileWarningIcon /><div><strong>Preview limit reached</strong><span>{approvalTruncatedDetail(scanLimit)}</span></div></div>
+            <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [margin-top:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5]"><FileWarningIcon /><div><strong>Preview limit reached</strong><span>The comparison sampled only part of one or both folders. Each computer applies its own scan limit — ask the sender to raise the limit on the computer with the larger folder, or add ignore rules, then refresh the comparison.</span></div></div>
           ) : null}
 
           {blockingWarnings > 0 ? (
@@ -223,13 +221,6 @@ export function FolderMappingApprovalDialog({
       />
     </>
   )
-}
-
-function approvalTruncatedDetail(scanLimit: number | null): string {
-  if (scanLimit === null) {
-    return "The comparison sampled only part of one or both folders. Ask the sender to add ignore rules, then refresh the comparison."
-  }
-  return `The comparison sampled the first ${scanLimit.toLocaleString("en-GB")} files on one or both computers. Ask the sender to raise the scan limit or add ignore rules, then refresh the comparison.`
 }
 
 function prettyMode(mode: string): string {

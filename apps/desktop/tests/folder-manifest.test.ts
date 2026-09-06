@@ -153,6 +153,25 @@ describe("folder mapping comparison", () => {
     }
   })
 
+  test("matches Rust on multibyte patterns: byte envelope and code-point wildcards", () => {
+    // 171 × U+754C is 513 UTF-8 bytes, so Rust rejects it while a UTF-16
+    // length check would accept it. The rule must be skipped, not throw.
+    const oversized = "界".repeat(171)
+    const oversizedMatcher = folderManifestTestHelpers.createIgnoreMatcher([oversized])
+    expect(oversizedMatcher(oversized, false)).toBe(false)
+    // 170 × U+754C is 510 bytes: inside the envelope, still matches itself.
+    const boundary = "界".repeat(170)
+    expect(folderManifestTestHelpers.createIgnoreMatcher([boundary])(boundary, false)).toBe(true)
+    // `?` matches one code point, so an astral character needs one `?`, not two.
+    const singleWildcard = folderManifestTestHelpers.createIgnoreMatcher(["?.txt"])
+    expect(singleWildcard("😀.txt", false)).toBe(true)
+    expect(singleWildcard("ab.txt", false)).toBe(false)
+    // A lone surrogate can never compile under the unicode flag; the rule is
+    // skipped instead of throwing into the scan.
+    const loneSurrogate = folderManifestTestHelpers.createIgnoreMatcher(["\ud800.txt"])
+    expect(loneSurrogate("a.txt", false)).toBe(false)
+  })
+
   test("honours an explicit scan ceiling and an explicit opt-out of it", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-ceiling-test-"))
     try {

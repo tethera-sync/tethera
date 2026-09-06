@@ -2006,7 +2006,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
         folderId,
       }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS),
     ])
-    assertCompleteTransferManifest(localManifest, "This computer")
+    assertCompleteTransferManifest(localManifest, "This computer", currentScanLimit())
     assertCompleteTransferManifest(remoteManifest, peer.name)
     const localObservation = observedFiles(localManifest)
     const remoteObservation = observedFiles(remoteManifest)
@@ -2194,10 +2194,23 @@ function requireInitialSyncContext(folderId: string, expectedPeerId?: string): {
   return { folder, peer }
 }
 
-function assertCompleteTransferManifest(manifest: FileManifest, computer: string): void {
+/**
+ * Fails closed on a truncated or unreadable transfer manifest. Local scans
+ * pass this machine's limit so the error can name the number; peer scans
+ * pass nothing — the peer's limit is its own business and is never supplied
+ * by (or requested from) the peer — so the error points at that computer's
+ * Settings instead of inventing a number.
+ */
+function assertCompleteTransferManifest(manifest: FileManifest, computer: string, originScanLimit?: number | null): void {
   if (manifest.truncated) {
-    const limit = currentScanLimit()
-    const ceiling = limit === null ? "the configured scan limit" : `the configured scan limit of ${limit.toLocaleString("en-GB")} files`
+    if (originScanLimit === undefined) {
+      throw new Error(
+        `${computer}'s folder exceeded its configured scan limit. Raise the limit in Settings on ${computer} or add ignore rules, then retry. No incomplete merge was marked active.`,
+      )
+    }
+    const ceiling = originScanLimit === null
+      ? "the configured scan limit"
+      : `the configured scan limit of ${originScanLimit.toLocaleString("en-GB")} files`
     throw new Error(
       `${computer}'s folder lists more than ${ceiling}. Raise the limit in Settings or add ignore rules, then retry. No incomplete merge was marked active.`,
     )
@@ -2449,7 +2462,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
       hashAllFiles: true,
     }, 5 * 60_000),
   ])
-  assertCompleteTransferManifest(localManifest, "This computer")
+  assertCompleteTransferManifest(localManifest, "This computer", currentScanLimit())
   assertCompleteTransferManifest(remoteManifest, peer.name)
 
   const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode)
@@ -2511,7 +2524,7 @@ async function verifyInitialMergeQuiescent(folder: FolderSummary, peer: DeviceSu
       hashAllFiles: true,
     }, 5 * 60_000),
   ])
-  assertCompleteTransferManifest(localManifest, "This computer")
+  assertCompleteTransferManifest(localManifest, "This computer", currentScanLimit())
   assertCompleteTransferManifest(remoteManifest, peer.name)
   const convergence = assessInitialMergeConvergence(localManifest, remoteManifest, folder.mode)
   if (!convergence.complete) {

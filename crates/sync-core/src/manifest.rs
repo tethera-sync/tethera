@@ -815,6 +815,26 @@ mod tests {
     }
 
     #[test]
+    fn lenient_construction_skips_an_oversized_multibyte_pattern() {
+        // 171 repetitions of U+754C are 513 UTF-8 bytes: over the envelope despite fitting in
+        // 171 characters, so the rule is skipped rather than half-applied.
+        let oversized = "界".repeat(171);
+        let matcher = IgnoreMatcher::new(std::slice::from_ref(&oversized));
+        assert!(!matcher.is_ignored(&oversized, false));
+        // 170 repetitions are 510 bytes: inside the envelope and still match.
+        let boundary = "界".repeat(170);
+        let matcher = IgnoreMatcher::new(std::slice::from_ref(&boundary));
+        assert!(matcher.is_ignored(&boundary, false));
+    }
+
+    #[test]
+    fn question_mark_matches_one_astral_code_point() {
+        let matcher = IgnoreMatcher::new(&["?.txt".to_owned()]);
+        assert!(matcher.is_ignored("😀.txt", false));
+        assert!(!matcher.is_ignored("ab.txt", false));
+    }
+
+    #[test]
     fn invalid_pattern_display_truncates_oversized_values() {
         let rendered = format!(
             "{}",
