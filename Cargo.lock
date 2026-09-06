@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "regex",
  "serde",
@@ -384,11 +384,11 @@ dependencies = [
 
 [[package]]
 name = "sync-crypto"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "sync-engine"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "sync-platform"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "blake3",
  "sync-core",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "sync-protocol"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "sync-storage"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rusqlite",
  "serde",
@@ -432,11 +432,11 @@ dependencies = [
 
 [[package]]
 name = "sync-testkit"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "sync-transport"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "tempfile"
