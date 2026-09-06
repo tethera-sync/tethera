@@ -28,16 +28,25 @@ import {
 } from "@/components/ui/dialog"
 import { cn } from "@/lib/utils"
 
+type PairDeviceDialogProps =
+  | {
+      snapshot: AppSnapshot
+      /** Uncontrolled use: the dialog owns its state and renders its own trigger. */
+      open?: undefined
+      onOpenChange?: undefined
+    }
+  | {
+      snapshot: AppSnapshot
+      /** Controlled use: both props are required so triggers and close actions always update the effective state. */
+      open: boolean
+      onOpenChange: (open: boolean) => void
+    }
+
 export function PairDeviceDialog({
   snapshot,
   open: controlledOpen,
   onOpenChange,
-}: {
-  snapshot: AppSnapshot
-  /** Controlled open state. When omitted, the dialog owns its state and renders its own trigger. */
-  open?: boolean
-  onOpenChange?: (open: boolean) => void
-}) {
+}: PairDeviceDialogProps) {
   const [internalOpen, setInternalOpen] = useState(false)
   const open = controlledOpen ?? internalOpen
   const setOpen = onOpenChange ?? setInternalOpen
