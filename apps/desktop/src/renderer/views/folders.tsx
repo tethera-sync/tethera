@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useMemo, useRef, useState } from "react"
 import {
   ArrowRightIcon,
   CircleAlertIcon,
@@ -171,6 +171,8 @@ export function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; o
                 <FolderCard
                   key={folder.id}
                   folder={folder}
+                  globallyPaused={snapshot.paused}
+                  remoteDevice={folder.remoteDeviceId ? snapshot.devices.find((device) => device.id === folder.remoteDeviceId) : undefined}
                   mutationsEnabled={mappingMutationsEnabled}
                   disabledReason={mappingMutationReason}
                   onReviewRecovery={() => onNavigate("history")}
@@ -186,43 +188,68 @@ export function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; o
 
 function FolderCard({
   folder,
+  globallyPaused,
+  remoteDevice,
   mutationsEnabled,
   disabledReason,
   onReviewRecovery,
 }: {
   folder: FolderSummary
+  globallyPaused: boolean
+  remoteDevice?: AppSnapshot["devices"][number]
   mutationsEnabled: boolean
   disabledReason: string
   onReviewRecovery: () => void
 }) {
-  const [busy, setBusy] = useState(false)
-  const [syncing, setSyncing] = useState(false)
+  type PendingAction = "pause" | "resume" | "remove" | "sync" | "reveal"
+  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const pendingActionRef = useRef<PendingAction | null>(null)
   const paused = folder.paused || folder.status === "paused"
 
-  async function setPaused() {
-    setBusy(true)
+  async function runAction(action: PendingAction, operation: () => Promise<unknown>, fallback: string) {
+    if (pendingActionRef.current) return
+    pendingActionRef.current = action
+    setPendingAction(action)
+    setActionError(null)
     try {
-      await window.folderSync.setFolderPaused(folder.id, !paused)
+      await operation()
+    } catch (caught) {
+      setActionError(caught instanceof Error && caught.message ? caught.message : fallback)
     } finally {
-      setBusy(false)
+      pendingActionRef.current = null
+      setPendingAction(null)
     }
+  }
+
+  async function setPaused() {
+    await runAction(paused ? "resume" : "pause", () => window.folderSync.setFolderPaused(folder.id, !paused), `Unable to ${paused ? "resume" : "pause"} this folder.`)
   }
 
   async function remove() {
+    if (pendingActionRef.current) return
     const confirmed = window.confirm(
       `Remove “${folder.name}” from Tethera? Files on both computers will be left untouched.`,
     )
-    if (confirmed) await window.folderSync.removeFolder(folder.id)
+    if (confirmed) {
+      await runAction("remove", () => window.folderSync.removeFolder(folder.id), "Unable to remove this folder mapping.")
+    }
   }
 
   async function startSync() {
-    setSyncing(true)
-    try {
-      await window.folderSync.startInitialSync(folder.id)
-    } finally {
-      setSyncing(false)
-    }
+    await runAction("sync", () => window.folderSync.startInitialSync(folder.id), "Unable to start the initial merge.")
   }
+
+  const pending = pendingAction !== null
+  const initialSyncBlockedReason = paused
+    ? "Resume this folder before starting the initial merge."
+    : globallyPaused
+      ? "Resume all syncing before starting the initial merge."
+      : !remoteDevice
+        ? "The paired computer for this folder is unavailable."
+        : remoteDevice.status !== "online"
+          ? `${remoteDevice.name} must be online before starting the initial merge.`
+          : undefined
 
   return (
     <article className="folder-card [position:relative] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--surface)] [box-shadow:var(--elevation-card)]">
@@ -242,7 +269,12 @@ function FolderCard({
       </div>
 
       <div className="path-map [display:grid] [grid-template-columns:minmax(0,_1fr)_24px_minmax(0,_1fr)] [align-items:center] [gap:8px] [border-block:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [background:var(--surface-sunken)] [padding:12px_15px]">
-        <PathBlock label="This computer" path={folder.localPath} onReveal={() => window.folderSync.revealPath(folder.localPath)} />
+        <PathBlock
+          label="This computer"
+          path={folder.localPath}
+          onReveal={() => runAction("reveal", () => window.folderSync.revealPath(folder.localPath), "Unable to reveal this folder.")}
+          revealDisabled={pending}
+        />
         <div className="path-arrow [display:grid] [place-items:center] [color:var(--primary)] [&_svg]:[width:14px] [&_svg]:[height:14px]">
           <ArrowRightIcon />
         </div>
@@ -266,6 +298,12 @@ function FolderCard({
         </div>
       ) : null}
 
+      {actionError ? (
+        <div className="folder-action-error [margin:12px_15px_0] [border-radius:8px] [background:color-mix(in_oklab,_var(--danger)_10%,_var(--surface))] [padding:8px_10px] [color:var(--danger)] [font-size:10px]" role="alert">
+          {actionError} Try the action again.
+        </div>
+      ) : null}
+
       <div className="folder-stats [display:grid] [grid-template-columns:repeat(3,_1fr)] [gap:1px] [margin-top:13px] [background:color-mix(in_oklab,_var(--border)_70%,_transparent)] [&>div]:[background:var(--surface)] [&>div]:[padding:12px_15px] [&_span]:[display:block] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9.5px] [&_span]:[font-weight:550] [&_strong]:[display:block] [&_strong]:[margin-top:3px] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:620] [&_strong]:[font-variant-numeric:tabular-nums]">
         <div>
           <span>Files</span>
@@ -280,17 +318,22 @@ function FolderCard({
           <strong>{folder.lastSyncedAt ? formatRelative(folder.lastSyncedAt) : "Never"}</strong>
         </div>
       </div>
+      {folder.setupStatus === "ready-for-initial-sync" && initialSyncBlockedReason ? (
+        <div className="folder-sync-blocked [padding:0_15px_10px] [color:var(--muted-foreground)] [font-size:10px]" role="status">
+          {initialSyncBlockedReason}
+        </div>
+      ) : null}
 
       <div className="folder-card-footer [display:flex] [align-items:center] [gap:6px] [border-top:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [padding:10px_12px]">
         {folder.setupStatus === "ready-for-initial-sync" ? (
           <Button
             size="sm"
             onClick={startSync}
-            disabled={!mutationsEnabled || syncing || paused || folder.status === "syncing"}
-            title={!mutationsEnabled ? disabledReason : undefined}
+            disabled={!mutationsEnabled || pending || paused || folder.status === "syncing" || initialSyncBlockedReason !== undefined}
+            title={!mutationsEnabled ? disabledReason : initialSyncBlockedReason}
           >
             <RefreshCwIcon data-icon="inline-start" />
-            {folder.status === "syncing" ? "Merging…" : "Start initial merge"}
+            {pendingAction === "sync" ? "Starting…" : folder.status === "syncing" ? "Merging…" : "Start initial merge"}
           </Button>
         ) : null}
         {(folder.conflictCount ?? 0) + (folder.recoveryIssueCount ?? 0) > 0 ? (
@@ -302,19 +345,19 @@ function FolderCard({
           size="sm"
           variant="outline"
           onClick={setPaused}
-          disabled={!mutationsEnabled || busy}
+          disabled={!mutationsEnabled || pending}
           title={!mutationsEnabled ? disabledReason : undefined}
         >
           {paused ? <PlayIcon data-icon="inline-start" /> : <PauseIcon data-icon="inline-start" />}
-          {paused ? "Resume" : "Pause"}
+          {pendingAction === "resume" ? "Resuming…" : pendingAction === "pause" ? "Pausing…" : paused ? "Resume" : "Pause"}
         </Button>
         <Button
           className="ml-auto"
           size="icon-sm"
           variant="ghost"
-          aria-label={`Remove ${folder.name}`}
+          aria-label={pendingAction === "remove" ? `Removing ${folder.name}` : `Remove ${folder.name}`}
           onClick={remove}
-          disabled={!mutationsEnabled}
+          disabled={!mutationsEnabled || pending}
           title={!mutationsEnabled ? disabledReason : undefined}
         >
           <Trash2Icon />
@@ -324,14 +367,14 @@ function FolderCard({
   )
 }
 
-function PathBlock({ label, path, onReveal }: { label: string; path: string; onReveal?: () => void }) {
+function PathBlock({ label, path, onReveal, revealDisabled }: { label: string; path: string; onReveal?: () => void; revealDisabled?: boolean }) {
   return (
     <div className="path-block [min-width:0] [&>span]:[display:block] [&>span]:[margin-bottom:4px] [&>span]:[color:var(--muted-foreground)] [&>span]:[font-size:9px] [&>span]:[font-weight:700] [&>span]:[letter-spacing:0.07em] [&>span]:[text-transform:uppercase] [&>div]:[display:flex] [&>div]:[min-width:0] [&>div]:[align-items:center] [&>div]:[gap:5px] [&_code]:[overflow:hidden] [&_code]:[min-width:0] [&_code]:[color:var(--foreground)] [&_code]:[font-family:ui-monospace,_SFMono-Regular,_Menlo,_monospace] [&_code]:[font-size:10.5px] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap] [&_button]:[display:grid] [&_button]:[width:20px] [&_button]:[height:20px] [&_button]:[flex:0_0_auto] [&_button]:[place-items:center] [&_button]:[border:0] [&_button]:[border-radius:5px] [&_button]:[background:transparent] [&_button]:[color:var(--muted-foreground)] [&_button:hover]:[background:var(--accent)] [&_button:hover]:[color:var(--foreground)] [&_button_svg]:[width:11px] [&_button_svg]:[height:11px]">
       <span>{label}</span>
       <div>
         <code title={path}>{path}</code>
         {onReveal ? (
-          <button type="button" aria-label={`Reveal ${path}`} onClick={onReveal}>
+          <button type="button" aria-label={`Reveal ${path}`} onClick={onReveal} disabled={revealDisabled}>
             <ExternalLinkIcon />
           </button>
         ) : null}

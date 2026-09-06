@@ -25,6 +25,9 @@ export function DevicesView({
   onReviewMapping(): void
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
+  // One shared pairing dialog for every entry point below, so concurrent
+  // pairing actions share a single busy lock and error state.
+  const [pairingOpen, setPairingOpen] = useState(false)
   const localDevice = getLocalDevice(snapshot)
   const pairedDevices = getPairedDevices(snapshot)
 
@@ -39,7 +42,7 @@ export function DevicesView({
           <Badge variant={pairedDevices.length > 0 ? "success" : "warning"}>
             {pairedDevices.length > 0 ? `${pairedDevices.length} paired` : "Not paired"}
           </Badge>
-          {pairedDevices.length === 0 ? <PairDeviceDialog snapshot={snapshot} /> : null}
+          <PairingButton onOpen={() => setPairingOpen(true)} />
         </div>
       </section>
 
@@ -52,7 +55,7 @@ export function DevicesView({
               <small>Open “Start pairing” to compare the code and approve the request.</small>
             </span>
           </div>
-          <PairDeviceDialog snapshot={snapshot} />
+          <PairingButton onOpen={() => setPairingOpen(true)} />
         </section>
       ) : null}
 
@@ -117,7 +120,7 @@ export function DevicesView({
             <strong>No paired computer</strong>
             <span>Keep Tethera open on both computers, then compare and approve the one-time code.</span>
             <div className="pair-device-actions [display:flex] [flex-wrap:wrap] [justify-content:center] [gap:8px] [margin-top:8px]">
-              <PairDeviceDialog snapshot={snapshot} />
+              <PairingButton onOpen={() => setPairingOpen(true)} />
               <Button variant="outline" onClick={() => setPickerOpen(true)}>
                 <FolderOpenIcon data-icon="inline-start" />
                 Preview folder browser
@@ -135,6 +138,16 @@ export function DevicesView({
         description="This preview only browses this computer and does not create a sync mapping."
         onSelect={() => setPickerOpen(false)}
       />
+      <PairDeviceDialog snapshot={snapshot} open={pairingOpen} onOpenChange={setPairingOpen} />
     </div>
+  )
+}
+
+function PairingButton({ onOpen }: { onOpen(): void }) {
+  return (
+    <Button onClick={onOpen}>
+      <Link2Icon data-icon="inline-start" />
+      Start pairing
+    </Button>
   )
 }
