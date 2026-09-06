@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   CheckCircle2Icon,
   Clock3Icon,
@@ -28,10 +28,31 @@ import {
 } from "@/components/ui/dialog"
 import { cn } from "@/lib/utils"
 
-export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
-  const [open, setOpen] = useState(false)
+type PairDeviceDialogProps =
+  | {
+      snapshot: AppSnapshot
+      /** Uncontrolled use: the dialog owns its state and renders its own trigger. */
+      open?: undefined
+      onOpenChange?: undefined
+    }
+  | {
+      snapshot: AppSnapshot
+      /** Controlled use: both props are required so triggers and close actions always update the effective state. */
+      open: boolean
+      onOpenChange: (open: boolean) => void
+    }
+
+export function PairDeviceDialog({
+  snapshot,
+  open: controlledOpen,
+  onOpenChange,
+}: PairDeviceDialogProps) {
+  const [internalOpen, setInternalOpen] = useState(false)
+  const open = controlledOpen ?? internalOpen
+  const setOpen = onOpenChange ?? setInternalOpen
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const busyRef = useRef(false)
   const [clockTick, setClockTick] = useState(0)
   const pairing = snapshot.pairing
 
@@ -51,6 +72,8 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
   }, [pairing.acceptingPairingUntil, pairing.acceptingPairing, open, clockTick])
 
   async function run(action: string, operation: () => Promise<unknown>) {
+    if (busyRef.current) return
+    busyRef.current = true
     setBusyAction(action)
     setError(null)
     try {
@@ -58,6 +81,7 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Unable to complete the pairing action.")
     } finally {
+      busyRef.current = false
       setBusyAction(null)
     }
   }
@@ -67,10 +91,12 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger render={<Button />}>
-        <Link2Icon data-icon="inline-start" />
-        Start pairing
-      </DialogTrigger>
+      {controlledOpen === undefined ? (
+        <DialogTrigger render={<Button />}>
+          <Link2Icon data-icon="inline-start" />
+          Start pairing
+        </DialogTrigger>
+      ) : null}
       <DialogContent className="pairing-dialog [width:min(760px,_calc(100vw_-_32px))] [max-width:760px] [max-height:min(860px,_calc(100vh_-_32px))] [overflow-y:auto]">
         <DialogHeader>
           <div className="pairing-dialog-heading [display:flex] [align-items:flex-start] [gap:12px]">
@@ -109,7 +135,7 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
           </div>
           <Button
             variant={pairing.acceptingPairing ? "outline" : "default"}
-            disabled={busyAction === "visibility"}
+            disabled={Boolean(busyAction)}
             onClick={() => run("visibility", () => window.folderSync.setPairingAvailable(!pairing.acceptingPairing))}
           >
             {busyAction === "visibility" ? <LoaderCircleIcon className="animate-spin" data-icon="inline-start" /> : <WifiIcon data-icon="inline-start" />}
@@ -137,17 +163,17 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
                     <div className="pairing-request-actions [display:flex] [justify-content:flex-end] [gap:8px] [margin-top:12px]">
                       <Button
                         variant="outline"
-                        disabled={busyAction === `reject:${request.id}`}
+                        disabled={Boolean(busyAction)}
                         onClick={() => run(`reject:${request.id}`, () => window.folderSync.rejectPairing(request.id))}
                       >
                         Reject
                       </Button>
                       <Button
-                        disabled={busyAction === `approve:${request.id}`}
+                        disabled={Boolean(busyAction)}
                         onClick={() => run(`approve:${request.id}`, () => window.folderSync.approvePairing(request.id))}
                       >
                         <ShieldCheckIcon data-icon="inline-start" />
-                        Codes match — approve
+                        {busyAction === "approve:" + request.id ? "Approving…" : "Codes match — approve"}
                       </Button>
                     </div>
                   )}
@@ -171,10 +197,10 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
               ) : null}
               {outgoing.status === "confirm-code" ? (
                 <div className="pairing-request-actions [display:flex] [justify-content:flex-end] [gap:8px] [margin-top:12px]">
-                  <Button variant="outline" onClick={() => run("cancel", () => window.folderSync.cancelPairing(outgoing.id))}>Cancel</Button>
-                  <Button onClick={() => run("confirm", () => window.folderSync.confirmPairing(outgoing.id))}>
+                  <Button variant="outline" disabled={Boolean(busyAction)} onClick={() => run("cancel", () => window.folderSync.cancelPairing(outgoing.id))}>Cancel</Button>
+                  <Button disabled={Boolean(busyAction)} onClick={() => run("confirm", () => window.folderSync.confirmPairing(outgoing.id))}>
                     <ShieldCheckIcon data-icon="inline-start" />
-                    Codes match — continue
+                    {busyAction === "confirm" ? "Confirming…" : "Codes match — continue"}
                   </Button>
                 </div>
               ) : null}
@@ -198,7 +224,7 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
                 variant="ghost"
                 size="sm"
                 onClick={() => run("refresh", () => window.folderSync.getSnapshot())}
-                disabled={busyAction === "refresh"}
+                disabled={Boolean(busyAction)}
               >
                 <RefreshCwIcon className={busyAction === "refresh" ? "animate-spin" : undefined} data-icon="inline-start" />
                 Refresh
@@ -225,14 +251,14 @@ export function PairDeviceDialog({ snapshot }: { snapshot: AppSnapshot }) {
                 <ShieldQuestionIcon />
                 <div>
                   <strong>No computers are available yet</strong>
-                  <span>Open Tethera on the other computer and choose “Allow pairing for 5 minutes”.</span>
+                  <span>Keep both computers on the same LAN or Tailscale network. Open Tethera on the other computer, choose “Allow pairing for 5 minutes”, and keep this dialog open.</span>
                 </div>
               </div>
             )}
           </section>
         )}
 
-        {error ? <div className="pairing-error [display:flex] [align-items:flex-start] [gap:8px] [margin-top:12px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_35%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_9%,_var(--surface))] [padding:9px_11px] [color:var(--destructive)] [font-size:10.5px] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex:0_0_auto]"><XCircleIcon /><span>{error}</span></div> : null}
+        {error ? <div className="pairing-error [display:flex] [align-items:flex-start] [gap:8px] [margin-top:12px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_35%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_9%,_var(--surface))] [padding:9px_11px] [color:var(--destructive)] [font-size:10.5px] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex:0_0_auto]" role="alert"><XCircleIcon /><span>{error} Try the same action again.</span></div> : null}
 
         <DialogFooter>
           <Button variant="outline" onClick={() => setOpen(false)}>Close</Button>
