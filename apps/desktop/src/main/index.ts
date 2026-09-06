@@ -3769,7 +3769,10 @@ function createWindow(): void {
     if (!snapshot.settings.startMinimised) mainWindow?.show()
   })
   mainWindow.on("close", (event: Electron.Event) => {
-    if (!isQuitting && snapshot.settings.closeToTray) {
+    // Only hide to the tray when a live tray instance exists to reopen the
+    // window. When tray creation was skipped or failed, closing must destroy
+    // the window so the app can quit instead of stranding a hidden window.
+    if (!isQuitting && snapshot.settings.closeToTray && tray) {
       event.preventDefault()
       mainWindow?.hide()
     }
@@ -3875,7 +3878,8 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
 
 app.on("before-quit", () => { isQuitting = true })
 app.on("window-all-closed", () => {
-  if (process.platform === "darwin" || snapshot?.settings.closeToTray) return
+  // Staying alive with no window is only useful when the tray can reopen it.
+  if (process.platform === "darwin" || (snapshot?.settings.closeToTray && tray)) return
   app.quit()
 })
 app.on("will-quit", () => {

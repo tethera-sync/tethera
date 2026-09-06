@@ -9,7 +9,13 @@ describe("packaging resources", () => {
     const configPath = new URL("../electron-builder.yml", import.meta.url)
     const config = await Bun.file(configPath).text()
     const extraResources = config.slice(config.indexOf("extraResources:"))
-    expect(extraResources).toContain("resources/tray.png")
-    expect(extraResources).toContain("resources/icon.png")
+    // Assert exact source-to-destination pairs: the runtime resolver reads
+    // process.resourcesPath/tray.png and process.resourcesPath/icon.png, so a
+    // name appearing anywhere else (or copied to another destination) must fail.
+    const pairs = [...extraResources.matchAll(/-\s*from:\s*(\S+)\s*\n\s*to:\s*(\S+)/g)].map(
+      (match) => `${match[1]} -> ${match[2]}`,
+    )
+    expect(pairs).toContain("resources/tray.png -> tray.png")
+    expect(pairs).toContain("resources/icon.png -> icon.png")
   })
 })
