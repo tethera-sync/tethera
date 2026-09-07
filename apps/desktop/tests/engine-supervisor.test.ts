@@ -147,7 +147,9 @@ describe("engine mapping-store health contract", () => {
       })
       await ready
       const unavailable = waitForUnavailable(supervisor)
-      await expect(supervisor.request("after-engine-exit", undefined, 2_000)).rejects.toThrow()
+      await expect(supervisor.request("after-engine-exit", undefined, 2_000)).rejects.toThrow(
+        "Rust engine stopped with code 1.",
+      )
       await unavailable
     } finally {
       await supervisor.stop()
