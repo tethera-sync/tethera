@@ -115,20 +115,19 @@ export class EngineSupervisor extends EventEmitter {
       if (message) console.error(`[sync-engine] ${message}`)
     })
 
+    child.stdin.once("error", (error: Error) => {
+      this.#handleChildTermination(child, `Rust engine input failed: ${error.message}`, error, true)
+    })
+
     child.once("error", (error: Error) => {
-      if (this.#child !== child) return
-      this.#setState({ status: "unavailable", message: error.message })
+      this.#handleChildTermination(child, error.message, error, true)
     })
 
     child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
-      if (this.#child !== child) return
       const message = `Rust engine stopped${code === null ? "" : ` with code ${code}`}${
         signal ? ` (${signal})` : ""
       }.`
-      this.#rejectPending(new Error(message))
-      this.#child = null
-      this.#sessionToken = null
-      if (!this.#intentionalStops.has(child)) this.#setState({ status: "unavailable", message })
+      this.#handleChildTermination(child, message)
     })
 
     void this.request<{ name: string; version: string; protocol: string; mappingStore?: unknown }>("health")
@@ -172,7 +171,17 @@ export class EngineSupervisor extends EventEmitter {
         timeout,
       })
 
-      this.#child?.stdin.write(`${body}\n`)
+      const child = this.#child
+      if (!child) {
+        clearTimeout(timeout)
+        this.#pending.delete(id)
+        reject(new Error("Rust sync engine stopped while sending the request."))
+        return
+      }
+      child.stdin.write(`${body}\n`, "utf8", (error?: Error | null) => {
+        if (!error) return
+        this.#handleChildTermination(child, `Unable to send Rust engine request: ${method}`, error, true)
+      })
     })
   }
 
@@ -250,6 +259,20 @@ export class EngineSupervisor extends EventEmitter {
       pending.reject(error)
     }
     this.#pending.clear()
+  }
+
+  #handleChildTermination(
+    child: ChildProcessWithoutNullStreams,
+    message: string,
+    cause?: unknown,
+    terminate = false,
+  ): void {
+    if (this.#child !== child) return
+    this.#rejectPending(new Error(message, cause === undefined ? undefined : { cause }))
+    this.#child = null
+    this.#sessionToken = null
+    if (terminate && child.exitCode === null && child.signalCode === null) child.kill()
+    if (!this.#intentionalStops.has(child)) this.#setState({ status: "unavailable", message })
   }
 
   #setState(state: EngineState): void {
