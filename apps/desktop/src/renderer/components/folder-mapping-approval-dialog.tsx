@@ -76,7 +76,6 @@ export function FolderMappingApprovalDialog({
   async function refreshDestination(nextPath: string) {
     if (!request || working) return
     const operationId = crypto.randomUUID()
-    setDestinationPath(nextPath)
     setCompare({ operationId, kind: "refresh", phase: null })
     setError(null)
     const stopTracking = trackCompareProgress(operationId)

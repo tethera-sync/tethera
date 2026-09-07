@@ -350,7 +350,7 @@ export function App() {
             {!loading && !snapshotError && view === "folders" ? <FoldersView snapshot={snapshot} onNavigate={setView} /> : null}
             {!loading && !snapshotError && view === "activity" ? <ActivityView activity={snapshot.activity} /> : null}
             {!loading && !snapshotError && view === "devices" ? (
-              <DevicesView snapshot={snapshot} onReviewMapping={() => setMappingApprovalOpen(true)} />
+              <DevicesView snapshot={snapshot} onReviewMapping={() => setMappingApprovalOpen(true)} onRefresh={() => subscription.loadInitial()} />
             ) : null}
             {!loading && !snapshotError && view === "history" ? <RecoveryView snapshot={snapshot} /> : null}
             {!loading && !snapshotError && view === "settings" ? <SettingsView snapshot={snapshot} /> : null}
