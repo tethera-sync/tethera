@@ -516,15 +516,27 @@ impl MappingStore {
     pub fn archived_versions(
         &self,
         mapping_id: &str,
+        limit: Option<u32>,
     ) -> Result<Vec<ReplacementJournalEntry>, MappingStoreError> {
         check_identifier("mappingId", mapping_id)?;
+        let limit = match limit {
+            Some(0) => {
+                return Err(MappingStoreError::Invalid(
+                    "limit must be greater than zero".to_owned(),
+                ));
+            }
+            Some(limit) => i64::from(limit),
+            None => -1,
+        };
+        // SQLite treats a negative LIMIT as "no upper bound", so one query covers both cases.
         let query = format!(
             "SELECT {JOURNAL_COLUMNS} FROM file_replacement_journal
              WHERE mapping_id = ?1 AND archive_digest IS NOT NULL
-             ORDER BY created_at DESC, id DESC"
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2"
         );
         let mut statement = self.connection.prepare(&query)?;
-        let rows = statement.query_map(params![mapping_id], entry_from_row)?;
+        let rows = statement.query_map(params![mapping_id, limit], entry_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1062,20 +1074,20 @@ mod tests {
         store
     }
 
-    fn file(digest: char) -> ObservedFile {
+    fn file(path: &str, digest: char) -> ObservedFile {
         ObservedFile {
-            path: "notes.txt".to_owned(),
+            path: path.to_owned(),
             size: 4,
             digest: digest.to_string().repeat(64),
         }
     }
 
-    fn reconcile(store: &MappingStore, local: char, remote: char) -> ReconcileResult {
+    fn reconcile(store: &MappingStore, path: &str, local: char, remote: char) -> ReconcileResult {
         store
             .reconcile_files(&ReconcileRequest {
                 mapping_id: "mapping-1".to_owned(),
-                local: vec![file(local)],
-                remote: vec![file(remote)],
+                local: vec![file(path, local)],
+                remote: vec![file(path, remote)],
                 mode: "two-way".to_owned(),
                 observed_at: NOW.to_owned(),
                 queue_operations: true,
@@ -1084,23 +1096,53 @@ mod tests {
     }
 
     fn planned_replacement(store: &MappingStore, id: &str) -> ReplacementJournalEntry {
-        reconcile(store, 'a', 'a');
-        let plan = reconcile(store, 'a', 'b');
+        planned_replacement_at(store, id, "notes.txt", NOW)
+    }
+
+    fn planned_replacement_at(
+        store: &MappingStore,
+        id: &str,
+        path: &str,
+        created_at: &str,
+    ) -> ReplacementJournalEntry {
+        reconcile(store, path, 'a', 'a');
+        let plan = reconcile(store, path, 'a', 'b');
         let operation = &plan.operations[0];
         store
             .prepare_replacement(&PrepareReplacementRequest {
                 id: id.to_owned(),
                 mapping_id: "mapping-1".to_owned(),
-                path: "notes.txt".to_owned(),
+                path: path.to_owned(),
                 sync_operation_id: Some(operation.id),
                 old_digest: "a".repeat(64),
                 old_size: 4,
                 replacement_digest: "b".repeat(64),
                 replacement_size: 4,
                 local_root: "/tmp/a".to_owned(),
-                created_at: NOW.to_owned(),
+                created_at: created_at.to_owned(),
             })
             .expect("prepare replacement")
+    }
+
+    /// Drives one replacement through the whole durable lifecycle to `completed`, which is the
+    /// state real archive history is read from. Each entry must finish before the next one is
+    /// planned, because an unfinished replacement deliberately blocks further reconciliation.
+    fn archived_version(
+        store: &MappingStore,
+        id: &str,
+        path: &str,
+        created_at: &str,
+    ) -> ReplacementJournalEntry {
+        let planned = planned_replacement_at(store, id, path, created_at);
+        let operation_id = planned.sync_operation_id.expect("planned sync operation");
+        archive_old(store, &planned);
+        store
+            .mark_replacement_installed(id, LATER)
+            .expect("mark installed");
+        store
+            .complete_file_operation(operation_id, &"b".repeat(64), 4, LATER, Some(id))
+            .expect("complete replacement");
+        store.replacement_entry(id).expect("archived version")
     }
 
     fn archive_old(
@@ -1427,7 +1469,53 @@ mod tests {
         store
             .remove_local("mapping-1", "a-device", None, 1, LATER)
             .expect("remove mapping");
-        let versions = store.archived_versions("mapping-1").expect("history");
+        let versions = store.archived_versions("mapping-1", None).expect("history");
         assert_eq!(versions, vec![entry]);
+    }
+
+    #[test]
+    fn archived_versions_supports_bounded_reads_in_created_at_then_id_order() {
+        let store = active_store(None);
+
+        let first = archived_version(
+            &store,
+            "replacement-1",
+            "notes-1.txt",
+            "2026-08-11T10:00:00Z",
+        );
+        let second = archived_version(
+            &store,
+            "replacement-2",
+            "notes-2.txt",
+            "2026-08-11T10:01:00Z",
+        );
+        let third = archived_version(
+            &store,
+            "replacement-3",
+            "notes-3.txt",
+            "2026-08-11T10:01:00Z",
+        );
+
+        let limited = store
+            .archived_versions("mapping-1", Some(2))
+            .expect("limited history");
+        assert_eq!(limited, vec![third.clone(), second.clone()]);
+
+        let all = store
+            .archived_versions("mapping-1", None)
+            .expect("full history");
+        assert_eq!(all, vec![third, second, first]);
+    }
+
+    #[test]
+    fn archived_versions_rejects_zero_limit() {
+        let store = active_store(None);
+        let error = store
+            .archived_versions("mapping-1", Some(0))
+            .expect_err("zero limit must be rejected");
+        assert!(matches!(
+            error,
+            MappingStoreError::Invalid(message) if message == "limit must be greater than zero"
+        ));
     }
 }

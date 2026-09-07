@@ -42,6 +42,13 @@ const pathString = z
   .max(MAX_SCAN_PATH_LENGTH)
   .refine((value) => !value.includes("\0"), "The path is invalid.")
 
+const archiveHistoryRequestSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .refine((value) => !value.includes("\0"), "Choose a valid folder.")
+
 const ignorePattern = z
   .string()
   .max(MAX_IGNORE_PATTERN_LENGTH)
@@ -55,6 +62,12 @@ export const revealPathSchema = pathString
 export function parseRevealPath(value: unknown): string {
   const parsed = revealPathSchema.safeParse(value)
   if (!parsed.success) throw new Error("The selected path is invalid.")
+  return parsed.data
+}
+
+export function parseArchiveHistoryRequest(input: unknown): string {
+  const parsed = archiveHistoryRequestSchema.safeParse(input)
+  if (!parsed.success) throw new Error("Choose a valid folder.")
   return parsed.data
 }
 

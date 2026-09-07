@@ -901,6 +901,13 @@ struct ArchiveEntryTimeParams {
     occurred_at: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveListVersionsParams {
+    id: String,
+    limit: Option<u32>,
+}
+
 fn handle_archive_mark_installed(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
     let params: ArchiveEntryTimeParams = match parse_params(request.params, "archive.markInstalled")
     {
@@ -938,15 +945,23 @@ fn handle_archive_list_incomplete(request: RpcRequest, mapping_store: &MappingSt
 }
 
 fn handle_archive_list_versions(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
-    let id = match mapping_id(request.params, "archive.listVersions") {
-        Ok(id) => id,
-        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
-    };
+    let params: ArchiveListVersionsParams =
+        match parse_params(request.params, "archive.listVersions") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    if let Err(error) = check_identifier("id", &params.id) {
+        return error_response_with_code(
+            request.id,
+            "INVALID_PARAMS",
+            format!("Invalid params for archive.listVersions: {error}"),
+        );
+    }
     let store = match archive_store(&request.id, mapping_store) {
         Ok(store) => store,
         Err(response) => return response,
     };
-    match store.archived_versions(&id) {
+    match store.archived_versions(&params.id, params.limit) {
         Ok(entries) => success_response(request.id, entries),
         Err(error) => store_error_response(request.id, "Failed to list archived versions", &error),
     }
@@ -2105,6 +2120,31 @@ mod tests {
                 response["ok"], false,
                 "mapping.get should reject params {params}"
             );
+        }
+    }
+
+    #[test]
+    fn archive_list_versions_accepts_optional_limits_and_rejects_invalid_params() {
+        let store = ready_store();
+        for params in [r#"{"id":"mapping-1"}"#, r#"{"id":"mapping-1","limit":1}"#] {
+            let response = handle_line(&request("archive.listVersions", params), "correct", &store);
+            assert_eq!(response["ok"], true, "params {params} should be accepted");
+        }
+
+        for params in [
+            r#"{"id":"   "}"#,
+            r#"{"id":123}"#,
+            r"{}",
+            r#"{"identifier":"mapping-1"}"#,
+            r#"{"id":"mapping-1","limit":0}"#,
+            r#"{"id":"mapping-1","extra":"unexpected"}"#,
+        ] {
+            let response = handle_line(&request("archive.listVersions", params), "correct", &store);
+            assert_eq!(
+                response["ok"], false,
+                "archive.listVersions should reject params {params}"
+            );
+            assert_eq!(response["errorCode"], "INVALID_PARAMS");
         }
     }
 

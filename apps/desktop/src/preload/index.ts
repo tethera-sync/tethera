@@ -20,6 +20,7 @@ const api: TetheraApi = {
   getSnapshot: () => ipcRenderer.invoke("app:get-snapshot"),
   retryMappingStore: () => ipcRenderer.invoke("mapping-store:retry"),
   restoreArchivedVersion: (entryId: string) => ipcRenderer.invoke("archive:restore", entryId),
+  listArchivedVersions: (mappingId: string) => ipcRenderer.invoke("archive:list-versions", mappingId),
   getRecoveryState: () => ipcRenderer.invoke("recovery:get-state"),
   inspectFileConflict: (input: ConflictInspectionInput) => ipcRenderer.invoke("recovery:inspect-conflict", input),
   resolveFileConflict: (input: ResolveFileConflictInput) => ipcRenderer.invoke("recovery:resolve-conflict", input),

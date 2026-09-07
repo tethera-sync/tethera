@@ -4,6 +4,7 @@ import {
   MAX_IGNORE_PATTERN_LENGTH,
   MAX_IGNORE_PATTERNS,
   normalizePersistedScanLimit,
+  parseArchiveHistoryRequest,
   parseConflictCopyExpectation,
   parseExactConflictChoice,
   parsePeerConflictCopy,
@@ -51,6 +52,20 @@ describe("reveal-path validation", () => {
     expect(() => parseRevealPath(42)).toThrow("The selected path is invalid.")
     expect(() => parseRevealPath("a".repeat(4097))).toThrow("The selected path is invalid.")
     expect(() => parseRevealPath("/tmp/bad\0path")).toThrow("The selected path is invalid.")
+  })
+})
+
+describe("archive-history request validation", () => {
+  test("accepts and trims a valid mapping id", () => {
+    expect(parseArchiveHistoryRequest(" mapping-1 ")).toBe("mapping-1")
+  })
+
+  test("rejects empty, whitespace, mistyped, and missing ids", () => {
+    expect(() => parseArchiveHistoryRequest("")).toThrow("Choose a valid folder.")
+    expect(() => parseArchiveHistoryRequest("   ")).toThrow("Choose a valid folder.")
+    expect(() => parseArchiveHistoryRequest(1)).toThrow("Choose a valid folder.")
+    expect(() => parseArchiveHistoryRequest(null)).toThrow("Choose a valid folder.")
+    expect(() => parseArchiveHistoryRequest(undefined)).toThrow("Choose a valid folder.")
   })
 })
 

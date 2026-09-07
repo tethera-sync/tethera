@@ -97,6 +97,7 @@ import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import {
   applySettingUpdate,
   normalizePersistedScanLimit,
+  parseArchiveHistoryRequest,
   parseExactConflictChoice,
   parsePeerConflictCopy,
   parsePeerFileOperations,
@@ -129,6 +130,7 @@ import {
   type ExactConflictChoice,
   type ReconcileFilesResult,
 } from "./continuous-sync"
+import { listArchivedVersions } from "./archive-history"
 import {
   recoverStagedArchiveObject,
   removePublishedArchiveStage,
@@ -3424,6 +3426,21 @@ function registerIpc(): void {
     } finally {
       archiveRestoreInFlight.delete(folder.id)
     }
+  })
+  ipcMain.handle("archive:list-versions", async (event, mappingId: unknown) => {
+    requireTrustedMainRenderer(event)
+    const requestedMappingId = parseArchiveHistoryRequest(mappingId)
+    if (engine.state.status !== "ready" || snapshot.mappingStore.status !== "ready") {
+      throw new Error("Version history is unavailable until the mapping database is ready.")
+    }
+    const folder = snapshot.folders.find((candidate) => candidate.id === requestedMappingId)
+    if (!folder) {
+      throw new Error("The archived version history's folder mapping is no longer active.")
+    }
+    if (folder.setupStatus !== "active") {
+      throw new Error("The archived version history is only available for active folders.")
+    }
+    return listArchivedVersions(engine, folder.id, folder.name)
   })
   ipcMain.handle("app:pause-all", () => setAllPaused(true))
   ipcMain.handle("app:resume-all", () => setAllPaused(false))
