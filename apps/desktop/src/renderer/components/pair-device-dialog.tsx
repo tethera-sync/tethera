@@ -31,12 +31,14 @@ import { cn } from "@/lib/utils"
 type PairDeviceDialogProps =
   | {
       snapshot: AppSnapshot
+      onRefresh: () => Promise<void>
       /** Uncontrolled use: the dialog owns its state and renders its own trigger. */
       open?: undefined
       onOpenChange?: undefined
     }
   | {
       snapshot: AppSnapshot
+      onRefresh: () => Promise<void>
       /** Controlled use: both props are required so triggers and close actions always update the effective state. */
       open: boolean
       onOpenChange: (open: boolean) => void
@@ -44,6 +46,7 @@ type PairDeviceDialogProps =
 
 export function PairDeviceDialog({
   snapshot,
+  onRefresh,
   open: controlledOpen,
   onOpenChange,
 }: PairDeviceDialogProps) {
@@ -223,7 +226,7 @@ export function PairDeviceDialog({
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => run("refresh", () => window.folderSync.getSnapshot())}
+                onClick={() => run("refresh", onRefresh)}
                 disabled={Boolean(busyAction)}
               >
                 <RefreshCwIcon className={busyAction === "refresh" ? "animate-spin" : undefined} data-icon="inline-start" />

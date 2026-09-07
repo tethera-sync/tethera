@@ -20,9 +20,11 @@ import { getLocalDevice, getPairedDevices } from "@/lib/snapshot"
 export function DevicesView({
   snapshot,
   onReviewMapping,
+  onRefresh,
 }: {
   snapshot: AppSnapshot
   onReviewMapping(): void
+  onRefresh(): Promise<void>
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
   // One shared pairing dialog for every entry point below, so concurrent
@@ -138,7 +140,7 @@ export function DevicesView({
         description="This preview only browses this computer and does not create a sync mapping."
         onSelect={() => setPickerOpen(false)}
       />
-      <PairDeviceDialog snapshot={snapshot} open={pairingOpen} onOpenChange={setPairingOpen} />
+      <PairDeviceDialog snapshot={snapshot} onRefresh={onRefresh} open={pairingOpen} onOpenChange={setPairingOpen} />
     </div>
   )
 }
