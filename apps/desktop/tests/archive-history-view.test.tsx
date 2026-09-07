@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import { renderToStaticMarkup } from "react-dom/server"
-import type { AppSnapshot, ArchivedVersion } from "../src/shared/contracts"
+import type { AppSnapshot, ArchiveHistory, ArchivedVersion, TetheraApi } from "../src/shared/contracts"
 import {
   ArchiveHistoryContent,
   ArchiveHistoryView,
   ArchiveMessage,
   ArchiveVersionRow,
+  loadArchiveHistory,
   submitVersionRestore,
   type ArchiveHistoryRequestState,
 } from "../src/renderer/components/archive-history-view"
@@ -217,6 +218,18 @@ describe("ArchiveHistoryView", () => {
     expect(html).toContain("Try again")
   })
 
+  test("offers each active folder for history browsing from the container", () => {
+    const html = renderToStaticMarkup(
+      <ArchiveHistoryView
+        snapshot={appSnapshot({ folders: [activeFolder("folder-1", "Documents"), activeFolder("folder-2", "Photos")] })}
+      />,
+    )
+
+    expect(html).toContain("Documents")
+    expect(html).toContain("Photos")
+    expect(html).toContain("Loading archived versions")
+  })
+
   test("submitVersionRestore reports success and failure directly", async () => {
     const restored = await submitVersionRestore(async (entryId) => {
       expect(entryId).toBe("version-1")
@@ -229,5 +242,84 @@ describe("ArchiveHistoryView", () => {
 
     expect(restored).toEqual({ status: "restored" })
     expect(failed).toEqual({ status: "failed", message: "Restore failed." })
+  })
+
+  test("submitVersionRestore invokes restore exactly once with the selected archive", async () => {
+    const seen: string[] = []
+    const outcome = await submitVersionRestore(async (entryId) => {
+      seen.push(entryId)
+      return undefined
+    }, "version-9")
+
+    expect(outcome).toEqual({ status: "restored" })
+    expect(seen).toEqual(["version-9"])
+  })
+})
+
+describe("loadArchiveHistory", () => {
+  type FolderSyncMock = Pick<TetheraApi, "listArchivedVersions" | "restoreArchivedVersion">
+
+  function history(mappingId: string): ArchiveHistory {
+    return { mappingId, folderName: "Documents", versions: [], truncated: false }
+  }
+
+  function deferred<T>(): {
+    promise: Promise<T>
+    resolve: (value: T) => void
+    reject: (error: unknown) => void
+  } {
+    let resolve!: (value: T) => void
+    let reject!: (error: unknown) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  test("passes the selected folder id to listArchivedVersions", async () => {
+    const seen: string[] = []
+    const folderSync: FolderSyncMock = {
+      listArchivedVersions: async (mappingId) => {
+        seen.push(mappingId)
+        return history(mappingId)
+      },
+      restoreArchivedVersion: async () => appSnapshot(),
+    }
+
+    const outcome = await loadArchiveHistory("folder-2", () => true, folderSync.listArchivedVersions)
+
+    expect(seen).toEqual(["folder-2"])
+    expect(outcome).toEqual({ status: "ready", data: history("folder-2") })
+  })
+
+  test("ignores a stale archive result when the selection changes first", async () => {
+    const gate = deferred<ArchiveHistory>()
+    let current = true
+    const pending = loadArchiveHistory("folder-1", () => current, () => gate.promise)
+
+    current = false
+    gate.resolve(history("folder-1"))
+
+    expect(await pending).toBeUndefined()
+  })
+
+  test("ignores a stale archive failure when the selection changes first", async () => {
+    const gate = deferred<ArchiveHistory>()
+    let current = true
+    const pending = loadArchiveHistory("folder-1", () => current, () => gate.promise)
+
+    current = false
+    gate.reject(new Error("Archive history could not be loaded."))
+
+    expect(await pending).toBeUndefined()
+  })
+
+  test("reports a current load failure without throwing", async () => {
+    const outcome = await loadArchiveHistory("folder-1", () => true, async () => {
+      throw new Error("The archive index is unavailable.")
+    })
+
+    expect(outcome).toEqual({ status: "error", message: "The archive index is unavailable." })
   })
 })

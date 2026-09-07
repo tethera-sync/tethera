@@ -21,6 +21,30 @@ export type ArchiveHistoryRequestState =
 
 export type RestoreVersionOutcome = { status: "restored" } | { status: "failed"; message: string }
 
+export type ArchiveHistoryLoadOutcome =
+  | { status: "ready"; data: ArchiveHistory }
+  | { status: "error"; message: string }
+
+/**
+ * Loads one folder's archive history and reports the outcome only when the
+ * caller is still current. A result that arrives after the selection moved on
+ * resolves to `undefined` so a stale response can never overwrite fresh state.
+ */
+export async function loadArchiveHistory(
+  folderId: string,
+  isCurrent: () => boolean,
+  list: (folderId: string) => Promise<ArchiveHistory>,
+): Promise<ArchiveHistoryLoadOutcome | undefined> {
+  try {
+    const data = await list(folderId)
+    if (!isCurrent()) return undefined
+    return { status: "ready", data }
+  } catch (error) {
+    if (!isCurrent()) return undefined
+    return { status: "error", message: errorMessage(error, "Archive history could not be loaded.") }
+  }
+}
+
 export function ArchiveHistoryView({ snapshot }: { snapshot: AppSnapshot }) {
   const activeFolders = snapshot.folders.filter((folder) => folder.setupStatus === "active")
   const activeFolderToken = activeFolders.map((folder) => folder.id).join("\0")
@@ -56,22 +80,24 @@ export function ArchiveHistoryView({ snapshot }: { snapshot: AppSnapshot }) {
     if (!folderId) return
     const generation = refreshGeneration.current + 1
     refreshGeneration.current = generation
+    const isCurrent = (): boolean => generation === refreshGeneration.current
     setRefreshing(true)
     setRequest((current) => {
       if (options?.replace || current.status !== "ready") return { status: "loading" }
       return { ...current, refreshError: undefined }
     })
-    try {
-      const data = await window.folderSync.listArchivedVersions(folderId)
-      if (generation === refreshGeneration.current) setRequest({ status: "ready", data })
-    } catch (error) {
-      if (generation === refreshGeneration.current) {
-        const message = errorMessage(error, "Archive history could not be loaded.")
-        setRequest((current) => (current.status === "ready" ? { ...current, refreshError: message } : { status: "error", message }))
-      }
-    } finally {
-      if (generation === refreshGeneration.current) setRefreshing(false)
+    const outcome = await loadArchiveHistory(folderId, isCurrent, (id) => window.folderSync.listArchivedVersions(id))
+    if (!isCurrent() || !outcome) return
+    if (outcome.status === "ready") {
+      setRequest({ status: "ready", data: outcome.data })
+    } else {
+      setRequest((current) => (
+        current.status === "ready"
+          ? { ...current, refreshError: outcome.message }
+          : { status: "error", message: outcome.message }
+      ))
     }
+    setRefreshing(false)
   }, [selectedFolderId])
 
   useEffect(() => {
