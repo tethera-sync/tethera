@@ -8,7 +8,7 @@ import {
   ShieldCheckIcon,
   XIcon,
 } from "lucide-react"
-import type { DeviceSummary, IncomingMappingRequest } from "@shared/contracts"
+import type { DeviceSummary, FolderScanActivity, IncomingMappingRequest } from "@shared/contracts"
 import { CompareStatus } from "@/components/compare-status"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { Badge } from "@/components/ui/badge"
@@ -46,6 +46,7 @@ export function FolderMappingApprovalDialog({
     kind: "refresh" | "verify"
     phase: ComparePhase | null
     scannedFiles?: number
+    activity?: FolderScanActivity
   } | null>(null)
   const [action, setAction] = useState<"approve" | "reject" | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -66,7 +67,7 @@ export function FolderMappingApprovalDialog({
       if (progress.operationId !== operationId) return
       setCompare((current) =>
         current?.operationId === operationId
-          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles }
+          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles, activity: progress.activity }
           : current,
       )
     })
@@ -187,6 +188,7 @@ export function FolderMappingApprovalDialog({
               thisComputer={localDevice.name}
               otherComputer={request.fromDeviceName}
               scannedFiles={compare.scannedFiles}
+              activity={compare.activity}
               elapsed={elapsed}
             />
           ) : null}

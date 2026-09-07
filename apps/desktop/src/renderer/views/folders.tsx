@@ -166,11 +166,12 @@ export function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; o
               />
             </section>
           ) : (
-            <section className="folder-grid [display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [align-items:start] [gap:14px] max-[1100px]:[grid-template-columns:1fr]">
+            <section className="folder-grid [display:grid] [grid-template-columns:minmax(0,_1fr)] [align-items:start] [gap:14px]">
               {folders.map((folder) => (
                 <FolderCard
                   key={folder.id}
                   folder={folder}
+                  localDeviceName={localDevice.name}
                   globallyPaused={snapshot.paused}
                   remoteDevice={folder.remoteDeviceId ? snapshot.devices.find((device) => device.id === folder.remoteDeviceId) : undefined}
                   mutationsEnabled={mappingMutationsEnabled}
@@ -188,6 +189,7 @@ export function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; o
 
 function FolderCard({
   folder,
+  localDeviceName,
   globallyPaused,
   remoteDevice,
   mutationsEnabled,
@@ -195,6 +197,7 @@ function FolderCard({
   onReviewRecovery,
 }: {
   folder: FolderSummary
+  localDeviceName: string
   globallyPaused: boolean
   remoteDevice?: AppSnapshot["devices"][number]
   mutationsEnabled: boolean
@@ -268,9 +271,9 @@ function FolderCard({
         </div>
       </div>
 
-      <div className="path-map [display:grid] [grid-template-columns:minmax(0,_1fr)_24px_minmax(0,_1fr)] [align-items:center] [gap:8px] [border-block:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [background:var(--surface-sunken)] [padding:12px_15px]">
+      <div className="path-map [display:grid] [grid-template-columns:minmax(0,_1fr)_28px_minmax(0,_1fr)] [align-items:center] [gap:10px] [border-block:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [background:var(--surface-sunken)] [padding:12px_15px] max-[600px]:[grid-template-columns:minmax(0,_1fr)_24px_minmax(0,_1fr)] max-[480px]:[grid-template-columns:minmax(0,_1fr)] max-[480px]:[gap:8px] max-[480px]:[&>.path-arrow]:[transform:rotate(90deg)]">
         <PathBlock
-          label="This computer"
+          label={localDeviceName}
           path={folder.localPath}
           onReveal={() => runAction("reveal", () => window.folderSync.revealPath(folder.localPath), "Unable to reveal this folder.")}
           revealDisabled={pending}
@@ -278,7 +281,7 @@ function FolderCard({
         <div className="path-arrow [display:grid] [place-items:center] [color:var(--primary)] [&_svg]:[width:14px] [&_svg]:[height:14px]">
           <ArrowRightIcon />
         </div>
-        <PathBlock label="Paired computer" path={folder.remotePath} />
+        <PathBlock label={remoteDevice?.name ?? "Paired computer"} path={folder.remotePath} />
       </div>
 
       {folder.progress !== undefined ? (
@@ -292,7 +295,7 @@ function FolderCard({
       ) : null}
 
       {folder.currentAction && folder.progress === undefined ? (
-        <div className="folder-action-note [display:flex] [align-items:center] [gap:8px] [margin:12px_15px_0] [border-radius:8px] [background:color-mix(in_oklab,_var(--primary)_9%,_var(--surface))] [padding:8px_10px] [color:var(--muted-foreground)] [font-size:10px] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[color:var(--primary)]" role={folder.status === "needs-attention" ? "alert" : undefined}>
+        <div className="folder-action-note [display:flex] [align-items:flex-start] [gap:8px] [margin:12px_15px_0] [border-radius:8px] [background:color-mix(in_oklab,_var(--primary)_9%,_var(--surface))] [padding:8px_10px] [color:var(--muted-foreground)] [font-size:10px] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[flex:0_0_auto] [&_svg]:[margin-top:1px] [&_svg]:[color:var(--primary)] [&>span]:[min-width:0] [&>span]:[overflow-wrap:anywhere]" role={folder.status === "needs-attention" ? "alert" : undefined}>
           {folder.status === "needs-attention" ? <CircleAlertIcon /> : <ShieldCheckIcon />}
           <span>{folder.currentAction}</span>
         </div>
@@ -369,7 +372,7 @@ function FolderCard({
 
 function PathBlock({ label, path, onReveal, revealDisabled }: { label: string; path: string; onReveal?: () => void; revealDisabled?: boolean }) {
   return (
-    <div className="path-block [min-width:0] [&>span]:[display:block] [&>span]:[margin-bottom:4px] [&>span]:[color:var(--muted-foreground)] [&>span]:[font-size:9px] [&>span]:[font-weight:700] [&>span]:[letter-spacing:0.07em] [&>span]:[text-transform:uppercase] [&>div]:[display:flex] [&>div]:[min-width:0] [&>div]:[align-items:center] [&>div]:[gap:5px] [&_code]:[overflow:hidden] [&_code]:[min-width:0] [&_code]:[color:var(--foreground)] [&_code]:[font-family:ui-monospace,_SFMono-Regular,_Menlo,_monospace] [&_code]:[font-size:10.5px] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap] [&_button]:[display:grid] [&_button]:[width:20px] [&_button]:[height:20px] [&_button]:[flex:0_0_auto] [&_button]:[place-items:center] [&_button]:[border:0] [&_button]:[border-radius:5px] [&_button]:[background:transparent] [&_button]:[color:var(--muted-foreground)] [&_button:hover]:[background:var(--accent)] [&_button:hover]:[color:var(--foreground)] [&_button_svg]:[width:11px] [&_button_svg]:[height:11px]">
+    <div className="path-block [min-width:0] [&>span]:[display:block] [&>span]:[overflow:hidden] [&>span]:[margin-bottom:4px] [&>span]:[color:var(--muted-foreground)] [&>span]:[font-size:9px] [&>span]:[font-weight:700] [&>span]:[letter-spacing:0.04em] [&>span]:[text-overflow:ellipsis] [&>span]:[text-transform:uppercase] [&>span]:[white-space:nowrap] [&>div]:[display:flex] [&>div]:[min-width:0] [&>div]:[align-items:center] [&>div]:[gap:5px] [&_code]:[overflow:hidden] [&_code]:[min-width:0] [&_code]:[color:var(--foreground)] [&_code]:[font-family:ui-monospace,_SFMono-Regular,_Menlo,_monospace] [&_code]:[font-size:10.5px] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap] [&_button]:[display:grid] [&_button]:[width:20px] [&_button]:[height:20px] [&_button]:[flex:0_0_auto] [&_button]:[place-items:center] [&_button]:[border:0] [&_button]:[border-radius:5px] [&_button]:[background:transparent] [&_button]:[color:var(--muted-foreground)] [&_button:hover]:[background:var(--accent)] [&_button:hover]:[color:var(--foreground)] [&_button_svg]:[width:11px] [&_button_svg]:[height:11px]">
       <span>{label}</span>
       <div>
         <code title={path}>{path}</code>
