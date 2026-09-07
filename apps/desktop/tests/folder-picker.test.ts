@@ -25,4 +25,15 @@ describe("folder picker breadcrumbs", () => {
       { label: "folder", path: "\\\\server\\share\\folder\\" },
     ])
   })
+
+  test("covers UNC boundaries and separator normalisation", () => {
+    expect(buildBreadcrumbs("\\\\server", "\\")).toEqual([{ label: "\\\\server", path: "\\\\server" }])
+    expect(buildBreadcrumbs("\\\\server\\share", "\\")).toEqual([
+      { label: "\\\\server\\share", path: "\\\\server\\share\\" },
+    ])
+    expect(buildBreadcrumbs("//server/share/folder", "\\")).toEqual([
+      { label: "\\\\server\\share", path: "\\\\server\\share\\" },
+      { label: "folder", path: "\\\\server\\share\\folder\\" },
+    ])
+  })
 })
