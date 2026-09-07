@@ -70,7 +70,8 @@ Renderer access remains `renderer -> preload -> Electron main -> authenticated R
 - `mapping.upsert` and `mapping.remove`;
 - `mapping.applyRemote` and `mapping.acknowledgeDelivery`; and
 - `mapping.getMigrationStatus`, `mapping.importLegacy` and `mapping.recordMigrationFailure`.
-- `fileSync.reconcile`, `fileSync.getState`, `fileSync.resolveConflict`, `fileSync.authorizeApply`, `fileSync.complete`, `fileSync.applyVerified` and `fileSync.fail`.
+- `fileSync.reconcile`, `fileSync.getState`, `fileSync.resolveConflict`, `fileSync.authorizeApply`, `fileSync.complete`, `fileSync.applyVerified` and `fileSync.fail`; and
+- the read-only `archive.listVersions`, which is mapping-scoped and takes an optional positive `limit`.
 
 The RPC exposes no SQL, no arbitrary file operation and no identity private key.
 
@@ -86,7 +87,7 @@ After activation, the lower participant device ID is the deterministic coordinat
 
 Existing destinations are replaced only if their digest still matches the planner's expected destination digest. The new file is staged and verified beside the destination. The exact destination entry is then moved to a reserved same-directory displaced path, copied into `userData/version-archive/objects/sha256/<prefix>/<digest>`, fsynced, re-hashed, and recorded as `archived` in SQLite before the new file is installed with an atomic no-replace link. A path created concurrently in the installation or rollback window is never overwritten. Sync completion and the journal's `completed` transition commit together. Deterministic archive staging can be verified and published after restart, and every journal entry is bound to the canonical local root that created it. The reserved displaced inode is retained and ignored by scans because POSIX permits late writes through an already-open handle; a future retention policy may remove it only under an explicit safety rule. The external content-addressed object remains the authoritative archived version. New destinations use the same atomic no-replace link.
 
-Startup processes incomplete replacement rows before watchers resume. An unchanged old live digest aborts work safely; the exact planned replacement plus a verified archive rolls forward; missing/corrupt archive content becomes `integrity-failed`; every ambiguous observation becomes `recovery-required`. Restore uses the same pipeline and archives a current live file before replacing it. A minimal Electron API exposes the engine-backed restore primitive; replacement failures are visible in Recovery, while general archive browsing remains unimplemented.
+Startup processes incomplete replacement rows before watchers resume. An unchanged old live digest aborts work safely; the exact planned replacement plus a verified archive rolls forward; missing/corrupt archive content becomes `integrity-failed`; every ambiguous observation becomes `recovery-required`. Restore uses the same pipeline and archives a current live file before replacing it. A minimal Electron API exposes the engine-backed restore primitive, and replacement failures are visible in Recovery. Archived versions for one active folder can now be browsed and restored from the Recovery screen. The engine read is bounded to the most recent versions and reports when older history exists beyond that page. Main projects each journal row into a renderer-safe summary that deliberately omits archive roots, object keys and digests, so the renderer can identify a version by path, time, size and availability without learning where the archive lives. Retention is still not implemented: nothing prunes, expires or deletes an archive object or a journal row.
 
 The first observation of a legacy/imported active mapping never assumes a one-sided file is new. Simultaneous modifications, one- or two-sided deletions, direction-blocked changes, and paths without a verified baseline become durable conflicts; files are not deleted and the folder/activity UI identifies affected paths. Legacy initial-merge conflict outcomes are promoted into the authoritative SQLite projection before their stale JSON copy is retired.
 
@@ -96,14 +97,14 @@ For a durable conflict where both files are present, the coordinator can inspect
 
 - Scan generations, incremental hashing, paging beyond the configurable scan-file ceiling, or production-scale performance work.
 - Engine-owned filesystem watching/network transfer, resumable/content-defined chunking, or bandwidth scheduling.
-- File deletion or rename propagation, general archive browsing/retention, or resolving conflicts where either copy is missing.
+- File deletion or rename propagation, archive retention/pruning, or resolving conflicts where either copy is missing.
 - NAT traversal, cloud services, accounts or telemetry.
 - Removal of the scan-file ceiling itself. It is now a global preference (1,000–1,000,000 files, or explicitly unlimited; 10,000 by default), but every scan is still a single in-memory pass.
 - Code-signed/notarised release builds.
 
 ## Recommended next pull request
 
-The next milestone should add a focused archive-history browser and retention policy over the existing content-addressed objects and replacement journal. Deletion and rename propagation should remain disabled until archive recovery and cross-platform interruption tests prove the lifecycle safe.
+The next milestone should add the archive retention policy over the browser that now exists: an explicit age/count/size budget, a pruning pass that can never delete an object still referenced by an unfinished, recovery-required or integrity-failed journal entry, and tests for interrupted pruning. Deletion and rename propagation should remain disabled until archive recovery and cross-platform interruption tests prove the lifecycle safe.
 
 ## LAN ports
 

@@ -19,10 +19,10 @@ Still outstanding in M1: scan generations/paging, incremental hashing at scale, 
 ## M2 LAN technical MVP
 Identity/pairing, LAN discovery, encrypted mutual session, folder mapping, previewed initial merge, whole-file transfer, atomic journalled commit, two-way sync, history/archive.
 
-Pairing, authenticated Electron peer sessions, mapping approval, mapping-configuration reconciliation, a coordinated additive initial merge, and safe continuous file updates are implemented. Transfers are chunked and verified; replacements require the destination's last observed digest and use an atomic verified commit. Replaced content has a local content-addressed archive and restart-safe journal, and exact two-copy conflicts can be resolved explicitly through that path. Engine-owned networking, resumable chunks, deletion/rename propagation, and general archive browsing/retention are not implemented.
+Pairing, authenticated Electron peer sessions, mapping approval, mapping-configuration reconciliation, a coordinated additive initial merge, and safe continuous file updates are implemented. Transfers are chunked and verified; replacements require the destination's last observed digest and use an atomic verified commit. Replaced content has a local content-addressed archive and restart-safe journal, and exact two-copy conflicts can be resolved explicitly through that path. Archived versions can be browsed and restored per folder through a bounded read-only engine query. Engine-owned networking, resumable chunks, deletion/rename propagation, and archive retention are not implemented.
 
 ## M3 Correctness hardening
-Logical revisions, missing-copy/deletion conflicts, rename, open files, cross-platform incompatibilities, general history browsing, retention, removal workflow, and property/fault tests. Two-copy conflict selection, one-way enforcement, and the archive-backed restore primitive are implemented foundations rather than complete lifecycle UX.
+Logical revisions, missing-copy/deletion conflicts, rename, open files, cross-platform incompatibilities, retention, removal workflow, and property/fault tests. Two-copy conflict selection, one-way enforcement, the archive-backed restore primitive, and per-folder archive-history browsing are implemented foundations rather than complete lifecycle UX.
 
 ## M4 Remote/performance
 Tailscale route selection, resume, content-defined chunks, bandwidth/metered controls, paged inventories and profiling toward 1 TB collections.
@@ -38,4 +38,4 @@ More devices, native NAT/relay, optional self-hosted rendezvous, other OSes, at-
 
 ## Recommended next pull request
 
-The next milestone should add focused archive-history browsing and retention over the implemented replacement journal and restore primitive. Deletion and rename propagation should remain disabled until archive recovery and interruption behavior are proven safe end to end.
+Archive-history browsing now exists over the implemented replacement journal and restore primitive. The next milestone should add the retention policy: an explicit budget, a pruning pass that cannot remove an object still referenced by unfinished or recovery-required journal state, and interrupted-pruning tests. Deletion and rename propagation should remain disabled until archive recovery and interruption behavior are proven safe end to end.

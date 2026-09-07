@@ -338,6 +338,25 @@ export interface RecoveryState {
   issues: RecoveryIssue[]
 }
 
+export interface ArchivedVersion {
+  entryId: string
+  path: string
+  archivedAt: string
+  replacedSize: number
+  replacementSize: number
+  origin: "sync" | "restore"
+  availability: "available" | "missing" | "corrupt"
+  restorable: boolean
+  unavailableReason?: string
+}
+
+export interface ArchiveHistory {
+  mappingId: string
+  folderName: string
+  versions: ArchivedVersion[]
+  truncated: boolean
+}
+
 export interface ConflictInspectionInput {
   mappingId: string
   path: string
@@ -457,6 +476,7 @@ export interface TetheraApi {
   getSnapshot(): Promise<AppSnapshot>
   retryMappingStore(): Promise<AppSnapshot>
   restoreArchivedVersion(entryId: string): Promise<AppSnapshot>
+  listArchivedVersions(mappingId: string): Promise<ArchiveHistory>
   getRecoveryState(): Promise<RecoveryState>
   inspectFileConflict(input: ConflictInspectionInput): Promise<ConflictInspection>
   resolveFileConflict(input: ResolveFileConflictInput): Promise<AppSnapshot>

@@ -14,6 +14,7 @@ import type { AppSettings, AppSnapshot, ConnectionRoute } from "@shared/contract
 import tetheraMark from "@/assets/tethera-mark.svg"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { FolderMappingApprovalDialog } from "@/components/folder-mapping-approval-dialog"
+import { ArchiveHistoryView } from "@/components/archive-history-view"
 import { MappingStoreBanner } from "@/components/mapping-store-banner"
 import { UpdateBanner } from "@/components/update-banner"
 import { RecoveryView } from "@/components/recovery-view"
@@ -352,7 +353,12 @@ export function App() {
             {!loading && !snapshotError && view === "devices" ? (
               <DevicesView snapshot={snapshot} onReviewMapping={() => setMappingApprovalOpen(true)} onRefresh={() => subscription.loadInitial()} />
             ) : null}
-            {!loading && !snapshotError && view === "history" ? <RecoveryView snapshot={snapshot} /> : null}
+            {!loading && !snapshotError && view === "history" ? (
+              <>
+                <RecoveryView snapshot={snapshot} />
+                <ArchiveHistoryView snapshot={snapshot} />
+              </>
+            ) : null}
             {!loading && !snapshotError && view === "settings" ? <SettingsView snapshot={snapshot} /> : null}
           </div>
         </div>
