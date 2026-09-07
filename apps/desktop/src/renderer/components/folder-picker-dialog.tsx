@@ -382,7 +382,7 @@ function locationIcon(location: DirectoryLocation) {
   return ComputerIcon
 }
 
-function buildBreadcrumbs(currentPath: string, separator: "/" | "\\"): Array<{ label: string; path: string }> {
+export function buildBreadcrumbs(currentPath: string, separator: "/" | "\\"): Array<{ label: string; path: string }> {
   if (separator === "/") {
     const parts = currentPath.split("/").filter(Boolean)
     const crumbs = [{ label: "Computer", path: "/" }]
@@ -397,6 +397,17 @@ function buildBreadcrumbs(currentPath: string, separator: "/" | "\\"): Array<{ l
   const normalized = currentPath.replaceAll("/", "\\")
   const parts = normalized.split("\\").filter(Boolean)
   if (parts.length === 0) return [{ label: normalized, path: normalized }]
+
+  if (normalized.startsWith("\\\\")) {
+    if (parts.length < 2) return [{ label: normalized, path: normalized }]
+    let cumulative = `\\\\${parts[0]}\\${parts[1]}\\`
+    const crumbs = [{ label: cumulative.slice(0, -1), path: cumulative }]
+    for (const part of parts.slice(2)) {
+      cumulative = `${cumulative}${part}\\`
+      crumbs.push({ label: part, path: cumulative })
+    }
+    return crumbs
+  }
 
   const root = `${parts[0]}\\`
   const crumbs = [{ label: parts[0], path: root }]
