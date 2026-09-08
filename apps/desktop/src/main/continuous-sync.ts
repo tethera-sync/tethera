@@ -11,6 +11,20 @@ const FALLBACK_SCAN_MS = 5 * 60_000
 const MAX_WATCH_DIRECTORIES = 10_000
 const MAX_WATCH_DEPTH = 128
 
+/** Thrown by {@link collectWatchDirectories} when the tree has too many directories to watch individually. */
+class WatchDirectoryLimitExceededError extends Error {}
+
+/** Thrown by {@link collectWatchDirectories} when the tree is nested deeper than the watcher will follow. */
+class WatchDepthExceededError extends Error {}
+
+export type WatchDegradationReason =
+  | { kind: "watch-limit-exceeded"; message: string }
+  | { kind: "watch-depth-exceeded"; message: string }
+  | { kind: "watcher-rejected"; directory: string; message: string }
+
+/** Reports a change in whether {@link FolderChangeMonitor} is watching the full tree natively. */
+export type WatchHealthReport = { status: "degraded"; reason: WatchDegradationReason } | { status: "recovered" }
+
 export interface ObservedFile {
   path: string
   size: number
@@ -185,16 +199,25 @@ export class FolderChangeMonitor {
   readonly #rootPath: string
   readonly #ignorePatterns: string[]
   readonly #onChange: () => void
+  readonly #onWatchHealth?: (report: WatchHealthReport) => void
   readonly #watchers = new Map<string, FSWatcher>()
   #debounce: NodeJS.Timeout | null = null
   #fallback: NodeJS.Timeout | null = null
   #stopped = false
   #refreshing: Promise<void> | null = null
+  /** The currently reported degradation, so an unchanged condition is not re-reported. `null` while watching normally. */
+  #degradedKey: string | null = null
 
-  constructor(rootPath: string, ignorePatterns: string[], onChange: () => void) {
+  constructor(
+    rootPath: string,
+    ignorePatterns: string[],
+    onChange: () => void,
+    onWatchHealth?: (report: WatchHealthReport) => void,
+  ) {
     this.#rootPath = path.resolve(rootPath)
     this.#ignorePatterns = [...ignorePatterns]
     this.#onChange = onChange
+    this.#onWatchHealth = onWatchHealth
   }
 
   async start(): Promise<void> {
@@ -220,9 +243,44 @@ export class FolderChangeMonitor {
     if (this.#debounce) clearTimeout(this.#debounce)
     this.#debounce = setTimeout(() => {
       this.#debounce = null
-      if (refreshDirectories) void this.#refreshWatchers().catch(() => undefined)
+      if (refreshDirectories) {
+        void this.#refreshWatchers()
+          .then(() => this.#reportRecovered())
+          .catch((error: unknown) => this.#reportRefreshFailure(error))
+      }
       this.#onChange()
     }, CHANGE_DEBOUNCE_MS)
+  }
+
+  #reportDegraded(reason: WatchDegradationReason): void {
+    // One refresh over a large tree can hit the same condition for thousands of
+    // directories (an exhausted OS watch-descriptor limit rejects every one), so
+    // only a change in condition is reported rather than every occurrence.
+    const key = reason.kind === "watcher-rejected" ? `${reason.kind}:${reason.directory}` : reason.kind
+    if (this.#degradedKey === key) return
+    this.#degradedKey = key
+    this.#onWatchHealth?.({ status: "degraded", reason })
+  }
+
+  #reportRecovered(): void {
+    if (this.#degradedKey === null) return
+    this.#degradedKey = null
+    this.#onWatchHealth?.({ status: "recovered" })
+  }
+
+  #reportRefreshFailure(error: unknown): void {
+    if (error instanceof WatchDepthExceededError) {
+      this.#reportDegraded({ kind: "watch-depth-exceeded", message: error.message })
+      return
+    }
+    if (error instanceof WatchDirectoryLimitExceededError) {
+      this.#reportDegraded({ kind: "watch-limit-exceeded", message: error.message })
+      return
+    }
+    // Not a known degraded-watch condition (e.g. the root vanished mid-scan);
+    // surface it for diagnosis instead of swallowing it, since `start()`'s
+    // own directory check is what normally catches an unavailable root.
+    console.warn(`[continuous-sync] Unable to refresh watchers for ${this.#rootPath}`, error)
   }
 
   async #refreshWatchers(): Promise<void> {
@@ -253,7 +311,15 @@ export class FolderChangeMonitor {
           this.#schedule(false)
         })
         this.#watchers.set(directory, watcher)
-      } catch {
+      } catch (error) {
+        // e.g. ENOSPC once the OS's native watch-descriptor limit is exhausted
+        // (common on large trees). The directory is left unwatched; report it
+        // rather than silently losing coverage of that subtree.
+        this.#reportDegraded({
+          kind: "watcher-rejected",
+          directory,
+          message: error instanceof Error ? error.message : String(error),
+        })
         this.#schedule(false)
       }
     }
@@ -265,9 +331,13 @@ async function collectWatchDirectories(rootPath: string, ignorePatterns: string[
   const directories: string[] = []
 
   async function visit(directoryPath: string, relativeDirectory: string, depth: number): Promise<void> {
-    if (depth > MAX_WATCH_DEPTH) throw new Error(`The synchronized folder exceeds the ${MAX_WATCH_DEPTH}-level watch limit.`)
+    if (depth > MAX_WATCH_DEPTH) {
+      throw new WatchDepthExceededError(`The synchronized folder exceeds the ${MAX_WATCH_DEPTH}-level watch limit.`)
+    }
     if (directories.length >= MAX_WATCH_DIRECTORIES) {
-      throw new Error(`The synchronized folder exceeds the ${MAX_WATCH_DIRECTORIES.toLocaleString("en-US")}-directory watch limit.`)
+      throw new WatchDirectoryLimitExceededError(
+        `The synchronized folder exceeds the ${MAX_WATCH_DIRECTORIES.toLocaleString("en-US")}-directory watch limit.`,
+      )
     }
     const canonicalDirectory = await realpath(directoryPath)
     const relativeCanonical = path.relative(canonicalRoot, canonicalDirectory)

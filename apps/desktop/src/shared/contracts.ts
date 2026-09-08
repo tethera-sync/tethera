@@ -78,6 +78,8 @@ export interface FolderSummary {
   ignorePatterns: string[]
   historyDays?: number
   historyMaxBytes?: number
+  /** Files larger than this are excluded from sync. `null` and absent both mean no limit. */
+  maxFileBytes?: number | null
   conflictCount?: number
   recoveryIssueCount?: number
 }
@@ -269,6 +271,7 @@ export interface FolderMappingProposal {
   ignorePatterns: string[]
   historyDays: number
   historyMaxBytes: number
+  maxFileBytes: number | null
   preview: FolderMappingPreview
   createdAt: string
 }
@@ -415,6 +418,8 @@ export interface AddFolderInput {
   ignorePatterns: string[]
   historyDays: number
   historyMaxBytes: number
+  /** Files larger than this are excluded from sync. `null` means no limit. */
+  maxFileBytes: number | null
 }
 
 export interface PreviewFolderMappingInput extends AddFolderInput {}

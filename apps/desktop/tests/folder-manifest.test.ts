@@ -80,6 +80,58 @@ describe("folder mapping comparison", () => {
     }
   })
 
+  test("excludes files above the per-folder size limit without hashing them", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-size-test-"))
+    try {
+      await writeFile(path.join(root, "small.bin"), "x".repeat(1_000))
+      await writeFile(path.join(root, "exactly-at-limit.bin"), "x".repeat(2_048))
+      await writeFile(path.join(root, "oversize.bin"), "x".repeat(4_096))
+
+      const limited = await scanFolder(root, [], { hashAllFiles: true, maxFileBytes: 2_048 })
+      expect(limited.files.map((entry) => entry.path).sort()).toEqual(["exactly-at-limit.bin", "small.bin"])
+      // Excluded by a rule, exactly like an ignore pattern: not an unreadable file.
+      expect(limited.ignored).toBe(1)
+      expect(limited.unreadable).toBe(0)
+      expect(limited.truncated).toBe(false)
+
+      const unlimited = await scanFolder(root, [], { hashAllFiles: true })
+      expect(unlimited.files).toHaveLength(3)
+      expect(unlimited.ignored).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("oversize files do not consume the scan file ceiling", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-ceiling-test-"))
+    try {
+      await writeFile(path.join(root, "a-keep.bin"), "x".repeat(10))
+      await writeFile(path.join(root, "b-huge.bin"), "x".repeat(4_096))
+      await writeFile(path.join(root, "c-huge.bin"), "x".repeat(4_096))
+
+      // Only one file is collectable, so a ceiling of one must not report a
+      // truncated scan: nothing was omitted for ceiling reasons, and a
+      // truncated manifest would block the merge entirely.
+      const result = await scanFolder(root, [], { maxFiles: 1, maxFileBytes: 1_024 })
+      expect(result.files.map((entry) => entry.path)).toEqual(["a-keep.bin"])
+      expect(result.ignored).toBe(2)
+      expect(result.truncated).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("an invalid size limit fails closed instead of syncing everything", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-badlimit-test-"))
+    try {
+      await writeFile(path.join(root, "report.txt"), "content")
+      await expect(scanFolder(root, [], { maxFileBytes: 0 })).rejects.toThrow("The file size limit is invalid.")
+      await expect(scanFolder(root, [], { maxFileBytes: 1.5 })).rejects.toThrow("The file size limit is invalid.")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test("never synchronizes reserved replacement recovery copies", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-recovery-test-"))
     try {

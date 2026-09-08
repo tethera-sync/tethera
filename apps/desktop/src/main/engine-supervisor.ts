@@ -27,9 +27,13 @@ type RpcResponse = {
 }
 
 type PendingRequest = {
+  method: string
+  timeoutMs: number
   resolve: (value: unknown) => void
   reject: (reason: Error) => void
-  timeout: NodeJS.Timeout
+  // Only the head-of-queue request (see #armHeadTimer) has a live timer; a
+  // request still waiting behind it is untimed until it becomes the head.
+  timer: NodeJS.Timeout | null
 }
 
 export interface EngineLaunchOptions {
@@ -160,21 +164,21 @@ export class EngineSupervisor extends EventEmitter {
     const body = JSON.stringify({ id, method, params, sessionToken: this.#sessionToken })
 
     return await new Promise<T>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.#pending.delete(id)
-        reject(new Error(`Rust engine request timed out: ${method}`))
-      }, timeoutMs)
-
       this.#pending.set(id, {
+        method,
+        timeoutMs,
         resolve: (value) => resolve(value as T),
         reject,
-        timeout,
+        timer: null,
       })
+      this.#armHeadTimer()
 
       const child = this.#child
       if (!child) {
-        clearTimeout(timeout)
+        const pending = this.#pending.get(id)
+        if (pending?.timer) clearTimeout(pending.timer)
         this.#pending.delete(id)
+        this.#armHeadTimer()
         reject(new Error("Rust sync engine stopped while sending the request."))
         return
       }
@@ -244,18 +248,50 @@ export class EngineSupervisor extends EventEmitter {
     }
 
     const pending = this.#pending.get(response.id)
-    if (!pending) return
+    if (!pending) {
+      // The engine already answered a request we stopped waiting for (it timed
+      // out while queued behind a slow head, or was dropped on termination).
+      console.warn(`[sync-engine] Received a response for an unknown or already-settled request: ${response.id}`)
+      return
+    }
 
-    clearTimeout(pending.timeout)
+    if (pending.timer) clearTimeout(pending.timer)
     this.#pending.delete(response.id)
 
     if (response.ok) pending.resolve(response.result)
     else pending.reject(new EngineRpcError(response.error ?? "Unknown Rust engine error.", response.errorCode ?? "RPC_ERROR"))
+
+    // The response we just settled may have been the head of the queue;
+    // promote and time the next request if so.
+    this.#armHeadTimer()
+  }
+
+  /**
+   * The Rust engine is a single-threaded, strictly serial FIFO loop (see
+   * crates/sync-engine/src/main.rs): it fully handles one request — including
+   * SQLite writes — before reading the next line. A request still waiting in
+   * line has not started being served, so giving it its own enqueue-time
+   * timer would fail it for sitting behind a slow-but-healthy request. Only
+   * the head of the queue (the oldest pending entry — a Map preserves
+   * insertion order) gets a live timeout budget; when it settles, the next
+   * entry becomes the head and is armed with its own budget in turn.
+   */
+  #armHeadTimer(): void {
+    const head = this.#pending.entries().next()
+    if (head.done) return
+    const [headId, headRequest] = head.value
+    if (headRequest.timer) return
+
+    headRequest.timer = setTimeout(() => {
+      this.#pending.delete(headId)
+      headRequest.reject(new Error(`Rust engine request timed out: ${headRequest.method}`))
+      this.#armHeadTimer()
+    }, headRequest.timeoutMs)
   }
 
   #rejectPending(error: Error): void {
     for (const pending of this.#pending.values()) {
-      clearTimeout(pending.timeout)
+      if (pending.timer) clearTimeout(pending.timer)
       pending.reject(error)
     }
     this.#pending.clear()

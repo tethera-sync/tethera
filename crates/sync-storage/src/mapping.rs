@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Schema version this build reads and writes. Version 1 is intentionally left unchanged below.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 200;
@@ -30,6 +30,8 @@ const MAX_PREVIEW_ITEMS: usize = 10_000;
 const MAX_PREVIEW_SERIALIZED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HISTORY_DAYS: i64 = 3_650;
 const MAX_HISTORY_BYTES: i64 = 1 << 50;
+const MIN_FILE_SIZE_LIMIT_BYTES: i64 = 1_024;
+const MAX_FILE_SIZE_LIMIT_BYTES: i64 = 1 << 40; // 1 TiB
 const MAX_MIGRATION_ERROR_LENGTH: usize = 1_000;
 const VALID_MODES: [&str; 3] = ["two-way", "send-only", "receive-only"];
 const VALID_SETUP_STATUSES: [&str; 3] = ["pending-approval", "ready-for-initial-sync", "active"];
@@ -47,6 +49,7 @@ const ACTIVE_SELECT_COLUMNS: &str = "SELECT
             mapping.responder_device_id, mapping.responder_device_name,
             mapping.initiator_path, mapping.responder_path, mapping.mode,
             mapping.ignore_patterns, mapping.history_days, mapping.history_max_bytes,
+            mapping.max_file_bytes,
             mapping.setup_status, mapping.preview, mapping.created_at, mapping.updated_at,
             revision.paused, revision.revision, revision.event_id, revision.author_device_id,
             EXISTS (
@@ -72,6 +75,8 @@ pub struct MappingConfiguration {
     pub ignore_patterns: Vec<String>,
     pub history_days: i64,
     pub history_max_bytes: i64,
+    #[serde(default)]
+    pub max_file_bytes: Option<i64>,
     pub setup_status: String,
     pub paused: bool,
     pub preview: Option<MappingPreview>,
@@ -133,6 +138,13 @@ impl MappingConfiguration {
                 "historyMaxBytes must be between 0 and {MAX_HISTORY_BYTES}, got {}",
                 self.history_max_bytes
             )));
+        }
+        if let Some(limit) = self.max_file_bytes {
+            if !(MIN_FILE_SIZE_LIMIT_BYTES..=MAX_FILE_SIZE_LIMIT_BYTES).contains(&limit) {
+                return Err(MappingStoreError::Invalid(format!(
+                    "maxFileBytes must be between {MIN_FILE_SIZE_LIMIT_BYTES} and {MAX_FILE_SIZE_LIMIT_BYTES} when set, got {limit}"
+                )));
+            }
         }
         if self.ignore_patterns.len() > MAX_IGNORE_PATTERNS {
             return Err(MappingStoreError::Invalid(format!(
@@ -731,7 +743,22 @@ impl MappingStore {
         }
         if current < 4 {
             self.migrate_v3_to_v4()?;
+            current = 4;
         }
+        if current < 5 {
+            self.migrate_v4_to_v5()?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v4_to_v5(&self) -> Result<(), MappingStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "ALTER TABLE folder_mappings ADD COLUMN max_file_bytes INTEGER;
+            PRAGMA user_version = 5;",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1782,9 +1809,9 @@ fn write_mapping_row(
             id, name, initiator_device_id, initiator_device_name,
             responder_device_id, responder_device_name,
             initiator_path, responder_path, mode, ignore_patterns,
-            history_days, history_max_bytes, setup_status, pending_delivery,
+            history_days, history_max_bytes, max_file_bytes, setup_status, pending_delivery,
             preview, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             initiator_device_id = excluded.initiator_device_id,
@@ -1797,6 +1824,7 @@ fn write_mapping_row(
             ignore_patterns = excluded.ignore_patterns,
             history_days = excluded.history_days,
             history_max_bytes = excluded.history_max_bytes,
+            max_file_bytes = excluded.max_file_bytes,
             setup_status = excluded.setup_status,
             pending_delivery = excluded.pending_delivery,
             preview = excluded.preview,
@@ -1814,6 +1842,7 @@ fn write_mapping_row(
             ignore_patterns,
             mapping.history_days,
             mapping.history_max_bytes,
+            mapping.max_file_bytes,
             mapping.setup_status,
             pending_delivery,
             preview,
@@ -2084,6 +2113,10 @@ struct RawV1MappingRow {
     ignore_patterns: String,
     history_days: i64,
     history_max_bytes: i64,
+    // Only populated by `RawActiveRow::from_row`, which reads the current (post-v5) schema.
+    // `V1_SELECT_COLUMNS` reads the historical pre-v5 table shape during the v1-to-v2 migration,
+    // where this column never existed, so `RawV1MappingRow::from_row` always sets this to `None`.
+    max_file_bytes: Option<i64>,
     setup_status: String,
     pending_delivery: bool,
     preview: Option<String>,
@@ -2106,6 +2139,7 @@ impl RawV1MappingRow {
             ignore_patterns: row.get(9)?,
             history_days: row.get(10)?,
             history_max_bytes: row.get(11)?,
+            max_file_bytes: None,
             setup_status: row.get(12)?,
             pending_delivery: row.get(13)?,
             preview: row.get(14)?,
@@ -2145,6 +2179,7 @@ impl RawV1MappingRow {
             ignore_patterns,
             history_days: self.history_days,
             history_max_bytes: self.history_max_bytes,
+            max_file_bytes: self.max_file_bytes,
             setup_status: self.setup_status,
             paused: false,
             preview,
@@ -2179,17 +2214,18 @@ impl RawActiveRow {
                 ignore_patterns: row.get(9)?,
                 history_days: row.get(10)?,
                 history_max_bytes: row.get(11)?,
-                setup_status: row.get(12)?,
+                max_file_bytes: row.get(12)?,
+                setup_status: row.get(13)?,
                 pending_delivery: false,
-                preview: row.get(13)?,
-                created_at: row.get(14)?,
-                updated_at: row.get(15)?,
+                preview: row.get(14)?,
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
             },
-            paused: row.get(16)?,
-            revision: row.get(17)?,
-            event_id: row.get(18)?,
-            author_device_id: row.get(19)?,
-            pending_delivery: row.get(20)?,
+            paused: row.get(17)?,
+            revision: row.get(18)?,
+            event_id: row.get(19)?,
+            author_device_id: row.get(20)?,
+            pending_delivery: row.get(21)?,
         })
     }
 
@@ -2263,6 +2299,7 @@ mod tests {
             ignore_patterns: vec!["node_modules/".to_owned(), "*.tmp".to_owned()],
             history_days: 30,
             history_max_bytes: 5_000_000_000,
+            max_file_bytes: None,
             setup_status: "ready-for-initial-sync".to_owned(),
             paused: false,
             preview: None,
@@ -2410,6 +2447,7 @@ mod tests {
             .execute_batch(
                 "DROP TABLE file_replacement_journal;
                  DROP TABLE archive_objects;
+                 ALTER TABLE folder_mappings DROP COLUMN max_file_bytes;
                  PRAGMA user_version = 3;",
             )
             .expect("downgrade representative schema to v3");
@@ -2436,6 +2474,132 @@ mod tests {
             .expect("journal table count");
         assert_eq!(mapping_count, 1);
         assert_eq!(journal_table_count, 1);
+    }
+
+    #[test]
+    fn migrates_schema_v4_to_v5_without_rewriting_existing_mapping_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("mappings.sqlite3");
+        let original = sample("existing-v4-mapping");
+        seed_v1(&path, std::slice::from_ref(&original));
+        drop(MappingStore::open(&path).expect("create representative current schema"));
+
+        let connection = rusqlite::Connection::open(&path).expect("open representative v4");
+        connection
+            .execute_batch(
+                "ALTER TABLE folder_mappings DROP COLUMN max_file_bytes;
+                 PRAGMA user_version = 4;",
+            )
+            .expect("downgrade representative schema to v4");
+        drop(connection);
+
+        let reopened = MappingStore::open(&path).expect("migrate v4 to v5");
+        assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
+
+        let mapping_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM folder_mappings WHERE id = 'existing-v4-mapping'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mapping count");
+        assert_eq!(mapping_count, 1);
+
+        // Legacy import status is untouched by this migration, so `get`/`list` still refuse to
+        // read until the one-time import completes; read the migrated row directly instead.
+        let (max_file_bytes, initiator_path, responder_path, name): (
+            Option<i64>,
+            String,
+            String,
+            String,
+        ) = reopened
+            .connection
+            .query_row(
+                "SELECT max_file_bytes, initiator_path, responder_path, name
+                 FROM folder_mappings WHERE id = 'existing-v4-mapping'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("migrated row");
+        assert_eq!(max_file_bytes, None);
+        assert_eq!(initiator_path, original.initiator_path);
+        assert_eq!(responder_path, original.responder_path);
+        assert_eq!(name, original.name);
+    }
+
+    #[test]
+    fn schema_migration_v4_to_v5_is_idempotent() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("mappings.sqlite3");
+        seed_v1(&path, &[sample("mapping-1")]);
+        drop(MappingStore::open(&path).expect("create representative current schema"));
+
+        let connection = rusqlite::Connection::open(&path).expect("open representative v4");
+        connection
+            .execute_batch(
+                "ALTER TABLE folder_mappings DROP COLUMN max_file_bytes;
+                 PRAGMA user_version = 4;",
+            )
+            .expect("downgrade representative schema to v4");
+        drop(connection);
+
+        drop(MappingStore::open(&path).expect("first v4-to-v5 migration"));
+        let reopened = MappingStore::open(&path).expect("second open of already-migrated v5 db");
+        assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
+        assert!(
+            super::revision_from(&reopened.connection, "mapping-1")
+                .expect("revision")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn max_file_bytes_round_trips_through_upsert_and_read() {
+        let store = ready_store();
+        let mut mapping = sample("with-limit");
+        mapping.max_file_bytes = Some(50 * 1024 * 1024);
+        let created = store
+            .upsert_local(&mapping, "linux-box", None, None, NOW)
+            .expect("create mapping with limit");
+        assert_eq!(created.mapping.max_file_bytes, Some(50 * 1024 * 1024));
+
+        let fetched = store.get("with-limit").expect("get").expect("present");
+        assert_eq!(fetched.mapping.max_file_bytes, Some(50 * 1024 * 1024));
+
+        let mut unlimited = fetched.mapping.clone();
+        unlimited.max_file_bytes = None;
+        let updated = store
+            .upsert_local(&unlimited, "linux-box", None, Some(fetched.revision), LATER)
+            .expect("clear limit");
+        assert_eq!(updated.mapping.max_file_bytes, None);
+
+        let refetched = store.get("with-limit").expect("get").expect("present");
+        assert_eq!(refetched.mapping.max_file_bytes, None);
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_max_file_bytes() {
+        let mut mapping = sample("bounds-invalid");
+        for invalid in [0_i64, 1_023, (1_i64 << 40) + 1] {
+            mapping.max_file_bytes = Some(invalid);
+            assert!(
+                matches!(mapping.validate(), Err(MappingStoreError::Invalid(_))),
+                "expected {invalid} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_max_file_bytes_bounds_and_none() {
+        let mut mapping = sample("bounds-valid");
+        for valid in [None, Some(1_024_i64), Some(1_i64 << 40)] {
+            mapping.max_file_bytes = valid;
+            assert!(
+                mapping.validate().is_ok(),
+                "expected {valid:?} to be accepted"
+            );
+        }
     }
 
     #[test]

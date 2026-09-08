@@ -10,6 +10,7 @@ import {
   observedFiles,
   replayableOperations,
   type FileSyncConflict,
+  type WatchHealthReport,
 } from "../src/main/continuous-sync"
 
 describe("continuous sync helpers", () => {
@@ -119,6 +120,43 @@ test("FolderChangeMonitor reports nested filesystem changes", async () => {
       changed,
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("watch event timed out")), 5_000)),
     ])
+  } finally {
+    monitor.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("FolderChangeMonitor reports a watch-depth degradation instead of silently losing coverage", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "tethera-watch-depth-"))
+  const reports: WatchHealthReport[] = []
+  const monitor = new FolderChangeMonitor(root, [], () => {}, (report) => {
+    reports.push(report)
+  })
+  try {
+    await monitor.start()
+
+    // collectWatchDirectories rejects a tree nested past MAX_WATCH_DEPTH (128).
+    // Creating one this deep forces the next directory-refresh (triggered by
+    // the "rename" event for the new top-level entry) to hit that limit.
+    const segments = Array.from({ length: 140 }, (_, index) => `d${index}`)
+    await mkdir(path.join(root, ...segments), { recursive: true })
+
+    const report = await new Promise<WatchHealthReport>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("watch degradation was not reported in time")), 5_000)
+      const interval = setInterval(() => {
+        const first = reports[0]
+        if (!first) return
+        clearInterval(interval)
+        clearTimeout(timeout)
+        resolve(first)
+      }, 50)
+    })
+
+    expect(report.status).toBe("degraded")
+    if (report.status === "degraded") {
+      expect(report.reason.kind).toBe("watch-depth-exceeded")
+      expect(report.reason.message).toContain("watch limit")
+    }
   } finally {
     monitor.close()
     await rm(root, { recursive: true, force: true })

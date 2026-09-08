@@ -1059,6 +1059,7 @@ mod tests {
                     ignore_patterns: Vec::new(),
                     history_days: 30,
                     history_max_bytes: 1 << 30,
+                    max_file_bytes: None,
                     setup_status: "active".to_owned(),
                     paused: false,
                     preview: None,

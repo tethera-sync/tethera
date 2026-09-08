@@ -40,6 +40,13 @@ export interface ScanFolderOptions {
    * A number must be a positive safe integer; anything else fails closed.
    */
   maxFiles?: number | null
+  /**
+   * Per-file size ceiling. A file larger than this is excluded from the
+   * manifest and counted as `ignored`, exactly like an ignore-pattern match,
+   * so it is never previewed, transferred, or served to a peer.
+   * `undefined` and `null` both mean no limit.
+   */
+  maxFileBytes?: number | null
   /** Time-throttled local activity, including long hashes and scans of small folders. */
   onActivity?: (activity: FolderScanActivity) => void
 }
@@ -60,6 +67,7 @@ export async function scanFolder(
   let unreadable = 0
   let truncated = false
   const maxFiles = resolveScanLimit(options.maxFiles)
+  const maxFileBytes = resolveFileSizeLimit(options.maxFileBytes)
   let hashedBytes = 0
   let lastActivityAt = -Infinity
   function reportActivity(stage: FolderScanActivity["stage"], currentPath: string, force = false): void {
@@ -114,16 +122,24 @@ export async function scanFolder(
         continue
       }
       if (!entry.isFile()) continue
-      if (files.length >= maxFiles) {
-        truncated = true
-        break
-      }
       try {
         reportActivity("inspecting", relativePath)
-        files.push(await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true, (bytesRead) => {
+        const inspection = await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true, maxFileBytes, (bytesRead) => {
           hashedBytes += bytesRead
           reportActivity("hashing", relativePath)
-        }))
+        })
+        // Oversize files are excluded like an ignore-pattern match, so they must not
+        // consume the file ceiling: counting them would report `truncated` for a scan
+        // that actually omitted nothing, and a truncated scan blocks the merge entirely.
+        if (inspection.outcome === "excluded-oversize") {
+          ignored += 1
+          continue
+        }
+        if (files.length >= maxFiles) {
+          truncated = true
+          break
+        }
+        files.push(inspection.entry)
       } catch {
         unreadable += 1
         continue
@@ -233,6 +249,20 @@ function addSample(samples: MappingPreviewItem[], sample: MappingPreviewItem): v
 
 function normalizeRelative(relativePath: string): string {
   return relativePath.replaceAll("\\", "/").replace(/^\.\//, "")
+}
+
+/**
+ * Normalises a per-file size ceiling to a comparable number of bytes.
+ * `undefined` and `null` both mean no limit. A number must be a positive safe
+ * integer; anything else fails closed rather than silently syncing everything.
+ *
+ * Shared with the peer file-request boundary so a file the scanner excluded can
+ * never be served on a direct request.
+ */
+export function resolveFileSizeLimit(maxFileBytes: number | null | undefined): number {
+  if (maxFileBytes === undefined || maxFileBytes === null) return Number.POSITIVE_INFINITY
+  if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1) throw new Error("The file size limit is invalid.")
+  return maxFileBytes
 }
 
 function resolveScanLimit(maxFiles: number | null | undefined): number {
@@ -371,18 +401,25 @@ function hasUnpairedSurrogate(value: string): boolean {
   return false
 }
 
+type ManifestFileInspection =
+  | { outcome: "collected"; entry: FileManifestEntry }
+  | { outcome: "excluded-oversize" }
+
 async function inspectManifestFile(
   rootPath: string,
   canonicalRoot: string,
   relativePath: string,
   hashAllFiles: boolean,
+  maxFileBytes: number,
   onHashBytes?: (bytesRead: number) => void,
-): Promise<FileManifestEntry> {
+): Promise<ManifestFileInspection> {
   const absolutePath = resolveWithinRoot(rootPath, relativePath)
   const entry = await lstat(absolutePath)
   if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("The manifest path is not a regular file.")
   const canonicalFile = await realpath(absolutePath)
   if (!isCanonicalPathInside(canonicalRoot, canonicalFile)) throw new Error("The manifest file escapes the folder root.")
+  // Excluded before the file is opened, so an oversize file is never read or hashed.
+  if (entry.size > maxFileBytes) return { outcome: "excluded-oversize" }
 
   const handle = await open(absolutePath, "r")
   try {
@@ -390,6 +427,9 @@ async function inspectManifestFile(
     if (!initial.isFile() || initial.dev !== entry.dev || initial.ino !== entry.ino) {
       throw new Error("The manifest file changed while it was opened.")
     }
+    // Re-checked against the opened handle: a file that grew past the cap between
+    // the lstat above and this open must not slip into the manifest.
+    if (initial.size > maxFileBytes) return { outcome: "excluded-oversize" }
     let digest: string | undefined
     if (hashAllFiles || initial.size <= MAX_HASH_FILE_BYTES) {
       const hash = createHash("sha256")
@@ -408,7 +448,7 @@ async function inspectManifestFile(
     if (initial.size !== after.size || initial.mtimeMs !== after.mtimeMs) {
       throw new Error("The manifest file changed while it was read.")
     }
-    return { path: relativePath, size: initial.size, modifiedMs: initial.mtimeMs, digest }
+    return { outcome: "collected", entry: { path: relativePath, size: initial.size, modifiedMs: initial.mtimeMs, digest } }
   } finally {
     await handle.close()
   }
