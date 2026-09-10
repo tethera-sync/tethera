@@ -17,6 +17,16 @@ class WatchDirectoryLimitExceededError extends Error {}
 /** Thrown by {@link collectWatchDirectories} when the tree is nested deeper than the watcher will follow. */
 class WatchDepthExceededError extends Error {}
 
+// Bun 1.3's `Dir.close()` returns void while Node and newer Bun return a
+// promise, so never assume `.catch` exists on its result.
+async function closeDirQuietly(directory: { close: () => unknown }): Promise<void> {
+  try {
+    await directory.close()
+  } catch {
+    // Best-effort cleanup; traversal errors already propagate.
+  }
+}
+
 export type WatchDegradationReason =
   | { kind: "watch-limit-exceeded"; message: string }
   | { kind: "watch-depth-exceeded"; message: string }
@@ -375,7 +385,7 @@ export async function collectWatchDirectories(rootPath: string, ignorePatterns: 
         await visit(path.join(directoryPath, entry.name), relativePath, depth + 1)
       }
     } finally {
-      await directory.close().catch(() => undefined)
+      await closeDirQuietly(directory)
     }
   }
 

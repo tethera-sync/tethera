@@ -17,6 +17,16 @@ export const SCAN_BATCH_MAX_ENTRIES = 1_000
 /** Bounds the in-memory directory frontier; traversal fails explicitly beyond it. */
 export const MAX_SCAN_FRONTIER_DIRECTORIES = 10_000
 
+// Bun 1.3's `Dir.close()` returns void while Node and newer Bun return a
+// promise, so never assume `.catch` exists on its result.
+async function closeDirQuietly(directory: { close: () => unknown }): Promise<void> {
+  try {
+    await directory.close()
+  } catch {
+    // Best-effort cleanup; traversal errors already propagate.
+  }
+}
+
 export interface GenerationEntry {
   path: string
   size: number
@@ -246,7 +256,7 @@ export async function* streamRelativeFilePaths(
         if (next) frontier.push(next)
       }
     } finally {
-      await directory.close().catch(() => undefined)
+      await closeDirQuietly(directory)
     }
   }
 }
