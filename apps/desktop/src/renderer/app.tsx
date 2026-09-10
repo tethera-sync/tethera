@@ -16,10 +16,11 @@ import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { FolderMappingApprovalDialog } from "@/components/folder-mapping-approval-dialog"
 import { ArchiveHistoryView } from "@/components/archive-history-view"
 import { MappingStoreBanner } from "@/components/mapping-store-banner"
-import { UpdateBanner } from "@/components/update-banner"
+import { DeviceUpdateIndicator } from "@/components/device-update-indicator"
 import { RecoveryView } from "@/components/recovery-view"
 import { Button } from "@/components/ui/button"
 import { StatusPill } from "@/components/ui/status-pill"
+import { TooltipProvider } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 import { prettyPlatform, prettyRoute } from "@/lib/format"
 import { navItems, viewTitle, type View } from "@/lib/navigation"
@@ -191,6 +192,7 @@ export function App() {
   }, [pendingMapping?.id])
 
   return (
+    <TooltipProvider>
     <div className="app-shell [display:grid] [grid-template-columns:232px_minmax(0,_1fr)] [height:100vh] [background:var(--background)] [transition:grid-template-columns_180ms_ease] [&[data-rail='true']]:[grid-template-columns:72px_minmax(0,_1fr)] [&[data-rail='true']_.rail-toggle_svg]:[transform:rotate(180deg)] [&[data-rail='true']_.brand-text]:[display:none] [&[data-rail='true']_.nav-item>span:first-of-type]:[display:none] [&[data-rail='true']_.theme-switcher>span]:[display:none] [&[data-rail='true']_.device-chip>div:last-child]:[display:none] [&[data-rail='true']_.brand]:[justify-content:center] [&[data-rail='true']_.brand]:[padding:0] [&[data-rail='true']_.sidebar]:[align-items:stretch] [&[data-rail='true']_.sidebar]:[padding-inline:10px] [&[data-rail='true']_.nav-item]:[justify-content:center] [&[data-rail='true']_.nav-item]:[padding:0] [&[data-rail='true']_.nav-count]:[position:absolute] [&[data-rail='true']_.nav-count]:[top:3px] [&[data-rail='true']_.nav-count]:[right:3px] [&[data-rail='true']_.nav-count]:[min-width:0] [&[data-rail='true']_.nav-count]:[padding:2px_4px] [&[data-rail='true']_.nav-count]:[font-size:8px] [&[data-rail='true']_.theme-options]:[grid-template-columns:1fr] [&[data-rail='true']_.device-chip]:[justify-content:center] [&[data-rail='true']_.device-chip]:[padding-inline:0] max-[900px]:[grid-template-columns:72px_minmax(0,_1fr)]" data-rail={rail}>
       <FolderMappingApprovalDialog
         request={pendingMapping}
@@ -263,14 +265,17 @@ export function App() {
 
         <div className="sidebar-footer [display:grid] [gap:8px] [margin-top:auto]">
           <ThemeSwitcher theme={snapshot.settings.theme} disabled={actionBusy} onChange={(theme) => void runAction({ kind: "theme", theme })} />
-          <div className="device-chip [display:flex] [align-items:center] [gap:9px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:8px_10px]">
-            <div className="device-icon [display:grid] [width:29px] [height:29px] [flex:0_0_auto] [place-items:center] [border-radius:9px] [background:var(--secondary)] [color:var(--muted-foreground)] [&_svg]:[width:14px] [&_svg]:[height:14px]">
-              <LaptopIcon />
+          <div className="[display:flex] [align-items:center] [gap:8px]">
+            <div className="device-chip [display:flex] [min-width:0] [flex:1] [align-items:center] [gap:9px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:8px_10px]">
+              <div className="device-icon [display:grid] [width:29px] [height:29px] [flex:0_0_auto] [place-items:center] [border-radius:9px] [background:var(--secondary)] [color:var(--muted-foreground)] [&_svg]:[width:14px] [&_svg]:[height:14px]">
+                <LaptopIcon />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-xs font-semibold">{localDevice.name}</p>
+                <p className="truncate text-[10px] text-[var(--muted-foreground)]">{prettyPlatform(localDevice.platform)}</p>
+              </div>
             </div>
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-xs font-semibold">{localDevice.name}</p>
-              <p className="truncate text-[10px] text-[var(--muted-foreground)]">{prettyPlatform(localDevice.platform)}</p>
-            </div>
+            <DeviceUpdateIndicator update={snapshot.update} />
           </div>
         </div>
       </aside>
@@ -311,7 +316,6 @@ export function App() {
         </header>
 
         <div className="main-body [display:flex] [min-width:0] [min-height:0] [flex-direction:column]">
-          <UpdateBanner update={snapshot.update} />
           <MappingStoreBanner state={snapshot.mappingStore} />
           {snapshotError || actionError ? (
             <div className="[display:grid] [gap:8px] [border-bottom:1px_solid_var(--border)] [background:var(--destructive)] [padding:10px_24px] [color:var(--destructive-foreground)]" role="alert">
@@ -364,6 +368,7 @@ export function App() {
         </div>
       </main>
     </div>
+    </TooltipProvider>
   )
 }
 
