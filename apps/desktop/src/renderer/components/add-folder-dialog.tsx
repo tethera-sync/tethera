@@ -104,6 +104,7 @@ export function AddFolderDialog({
       ignorePatterns,
       historyDays: Math.max(1, historyDays),
       historyMaxBytes: Math.max(1, historyMaxGb) * 1024 ** 3,
+      maxFileBytes: null,
     }
   }
 
