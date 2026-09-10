@@ -16,7 +16,7 @@ import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { FolderMappingApprovalDialog } from "@/components/folder-mapping-approval-dialog"
 import { ArchiveHistoryView } from "@/components/archive-history-view"
 import { MappingStoreBanner } from "@/components/mapping-store-banner"
-import { UpdateBanner } from "@/components/update-banner"
+import { SidebarUpdatePill } from "@/components/sidebar-update-pill"
 import { RecoveryView } from "@/components/recovery-view"
 import { Button } from "@/components/ui/button"
 import { StatusPill } from "@/components/ui/status-pill"
@@ -191,7 +191,7 @@ export function App() {
   }, [pendingMapping?.id])
 
   return (
-    <div className="app-shell [display:grid] [grid-template-columns:232px_minmax(0,_1fr)] [height:100vh] [background:var(--background)] [transition:grid-template-columns_180ms_ease] [&[data-rail='true']]:[grid-template-columns:72px_minmax(0,_1fr)] [&[data-rail='true']_.rail-toggle_svg]:[transform:rotate(180deg)] [&[data-rail='true']_.brand-text]:[display:none] [&[data-rail='true']_.nav-item>span:first-of-type]:[display:none] [&[data-rail='true']_.theme-switcher>span]:[display:none] [&[data-rail='true']_.device-chip>div:last-child]:[display:none] [&[data-rail='true']_.brand]:[justify-content:center] [&[data-rail='true']_.brand]:[padding:0] [&[data-rail='true']_.sidebar]:[align-items:stretch] [&[data-rail='true']_.sidebar]:[padding-inline:10px] [&[data-rail='true']_.nav-item]:[justify-content:center] [&[data-rail='true']_.nav-item]:[padding:0] [&[data-rail='true']_.nav-count]:[position:absolute] [&[data-rail='true']_.nav-count]:[top:3px] [&[data-rail='true']_.nav-count]:[right:3px] [&[data-rail='true']_.nav-count]:[min-width:0] [&[data-rail='true']_.nav-count]:[padding:2px_4px] [&[data-rail='true']_.nav-count]:[font-size:8px] [&[data-rail='true']_.theme-options]:[grid-template-columns:1fr] [&[data-rail='true']_.device-chip]:[justify-content:center] [&[data-rail='true']_.device-chip]:[padding-inline:0] max-[900px]:[grid-template-columns:72px_minmax(0,_1fr)]" data-rail={rail}>
+    <div className="app-shell [display:grid] [grid-template-columns:232px_minmax(0,_1fr)] [height:100vh] [background:var(--background)] [transition:grid-template-columns_180ms_ease] [&[data-rail='true']]:[grid-template-columns:72px_minmax(0,_1fr)] [&[data-rail='true']_.rail-toggle_svg]:[transform:rotate(180deg)] [&[data-rail='true']_.brand-text]:[display:none] [&[data-rail='true']_.nav-item>span:first-of-type]:[display:none] [&[data-rail='true']_.theme-switcher>span]:[display:none] [&[data-rail='true']_.device-chip>div:last-child]:[display:none] [&[data-rail='true']_.brand]:[justify-content:center] [&[data-rail='true']_.brand]:[padding:0] [&[data-rail='true']_.sidebar]:[align-items:stretch] [&[data-rail='true']_.sidebar]:[padding-inline:10px] [&[data-rail='true']_.nav-item]:[justify-content:center] [&[data-rail='true']_.nav-item]:[padding:0] [&[data-rail='true']_.nav-count]:[position:absolute] [&[data-rail='true']_.nav-count]:[top:3px] [&[data-rail='true']_.nav-count]:[right:3px] [&[data-rail='true']_.nav-count]:[min-width:0] [&[data-rail='true']_.nav-count]:[padding:2px_4px] [&[data-rail='true']_.nav-count]:[font-size:8px] [&[data-rail='true']_.theme-options]:[grid-template-columns:1fr] [&[data-rail='true']_.device-chip]:[justify-content:center] [&[data-rail='true']_.device-chip]:[padding-inline:0] [&[data-rail='true']_.update-pill-label]:[display:none] [&[data-rail='true']_.update-pill-dismiss]:[display:none] [&[data-rail='true']_.update-pill-main]:[justify-content:center] [&[data-rail='true']_.update-pill-main]:[padding:0] max-[900px]:[grid-template-columns:72px_minmax(0,_1fr)]" data-rail={rail}>
       <FolderMappingApprovalDialog
         request={pendingMapping}
         localDevice={localDevice}
@@ -262,6 +262,7 @@ export function App() {
         </div>
 
         <div className="sidebar-footer [display:grid] [gap:8px] [margin-top:auto]">
+          <SidebarUpdatePill update={snapshot.update} />
           <ThemeSwitcher theme={snapshot.settings.theme} disabled={actionBusy} onChange={(theme) => void runAction({ kind: "theme", theme })} />
           <div className="device-chip [display:flex] [align-items:center] [gap:9px] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:8px_10px]">
             <div className="device-icon [display:grid] [width:29px] [height:29px] [flex:0_0_auto] [place-items:center] [border-radius:9px] [background:var(--secondary)] [color:var(--muted-foreground)] [&_svg]:[width:14px] [&_svg]:[height:14px]">
@@ -311,7 +312,6 @@ export function App() {
         </header>
 
         <div className="main-body [display:flex] [min-width:0] [min-height:0] [flex-direction:column]">
-          <UpdateBanner update={snapshot.update} />
           <MappingStoreBanner state={snapshot.mappingStore} />
           {snapshotError || actionError ? (
             <div className="[display:grid] [gap:8px] [border-bottom:1px_solid_var(--border)] [background:var(--destructive)] [padding:10px_24px] [color:var(--destructive-foreground)]" role="alert">
