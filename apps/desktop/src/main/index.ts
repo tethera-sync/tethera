@@ -1184,6 +1184,7 @@ async function requestFolderMapping(input: RequestFolderMappingInput, progressOp
     ignorePatterns: input.ignorePatterns,
     historyDays: input.historyDays,
     historyMaxBytes: input.historyMaxBytes,
+    maxFileBytes: input.maxFileBytes ?? null,
     preview: authoritativePreview,
     createdAt: new Date().toISOString(),
   }

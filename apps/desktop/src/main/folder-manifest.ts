@@ -9,6 +9,18 @@ const MAX_HASH_FILE_BYTES = 16 * 1024 * 1024
 const MAX_SAMPLE_ITEMS = 14
 const SCAN_ACTIVITY_INTERVAL_MS = 250
 
+// Bun 1.3's `Dir.close()` returns void while Node and newer Bun return a
+// promise, so never assume `.catch` exists on its result. `await` accepts
+// both shapes, keeping cleanup safe on every supported runtime.
+async function closeDirQuietly(directory: { close: () => unknown } | undefined): Promise<void> {
+  if (!directory) return
+  try {
+    await directory.close()
+  } catch {
+    // Best-effort cleanup; the scan result already records the outcome.
+  }
+}
+
 export interface FileManifestEntry {
   path: string
   size: number
@@ -95,7 +107,7 @@ export async function scanFolder(
         return
       }
     } catch {
-      await directory?.close().catch(() => undefined)
+      await closeDirQuietly(directory)
       unreadable += 1
       return
     }
