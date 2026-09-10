@@ -3078,7 +3078,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       if (context.signal.aborted) throw new ScanCancelledError()
       const page = await engine.request<{ entries: Array<{ path: string; size: number; digest?: string }>; nextCursor?: string }>(
         "scanGeneration.readPage",
-        { generationId, cursor, limit },
+        { mappingId: folderId, generationId, cursor, limit },
       )
       // Bound the served page even if the engine contract widens later.
       if (page.entries.length > SCAN_PAGE_MAX_ENTRIES) throw new Error("The staged scan page exceeds the supported bound.")

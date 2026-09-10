@@ -862,6 +862,7 @@ fn handle_scan_generation_abort(request: RpcRequest, mapping_store: &MappingStor
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScanGenerationReadPageParams {
+    mapping_id: String,
     generation_id: String,
     cursor: Option<String>,
     limit: Option<i64>,
@@ -881,6 +882,7 @@ fn handle_scan_generation_read_page(
         Err(failure) => return rpc_failure_response(request.id, failure),
     };
     match store.read_generation_page(
+        &params.mapping_id,
         &params.generation_id,
         params.cursor.as_deref(),
         params.limit.unwrap_or(200),
@@ -1895,6 +1897,76 @@ mod tests {
         );
         assert_eq!(response["result"]["initialized"], true);
         assert_eq!(response["result"]["operations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn scan_generation_pages_are_readable_only_through_their_owning_mapping() {
+        let store = ready_store();
+        let mut upsert: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("mapping json");
+        upsert["mapping"]["setupStatus"] = serde_json::json!("active");
+        let response = handle_line(
+            &request("mapping.upsert", &upsert.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["ok"], true);
+        for (method, params) in [
+            (
+                "scanGeneration.begin",
+                r#"{"generationId":"gen-1","mappingId":"mapping-1","participantDeviceId":"linux-box","mappingRevision":1,"root":"/tmp/a","ignorePatterns":[],"hashMode":"full-sha256"}"#,
+            ),
+            (
+                "scanGeneration.append",
+                r#"{"generationId":"gen-1","sequence":0,"entries":[{"path":"a.txt","size":4,"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+            ),
+            (
+                "scanGeneration.seal",
+                r#"{"generationId":"gen-1","expectedCount":1}"#,
+            ),
+        ] {
+            let response = handle_line(&request(method, params), "correct", &store);
+            assert_eq!(response["ok"], true, "{method} failed: {response}");
+        }
+
+        let owned = handle_line(
+            &request(
+                "scanGeneration.readPage",
+                r#"{"mappingId":"mapping-1","generationId":"gen-1"}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(owned["ok"], true);
+        assert_eq!(owned["result"]["entries"][0]["path"], "a.txt");
+
+        let unscoped = handle_line(
+            &request("scanGeneration.readPage", r#"{"generationId":"gen-1"}"#),
+            "correct",
+            &store,
+        );
+        assert_eq!(unscoped["errorCode"], "INVALID_PARAMS");
+
+        // A foreign mapping must be indistinguishable from a missing generation.
+        let foreign = handle_line(
+            &request(
+                "scanGeneration.readPage",
+                r#"{"mappingId":"mapping-2","generationId":"gen-1"}"#,
+            ),
+            "correct",
+            &store,
+        );
+        let missing = handle_line(
+            &request(
+                "scanGeneration.readPage",
+                r#"{"mappingId":"mapping-2","generationId":"gen-missing"}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(foreign["errorCode"], "MAPPING_NOT_FOUND");
+        assert_eq!(missing["errorCode"], "MAPPING_NOT_FOUND");
+        assert_eq!(foreign["result"], serde_json::Value::Null);
     }
 
     #[test]
