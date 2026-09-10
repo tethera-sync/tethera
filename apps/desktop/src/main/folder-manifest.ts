@@ -15,6 +15,14 @@ const SCAN_ACTIVITY_INTERVAL_MS = 250
 const HASH_BUFFER_BYTES = 512 * 1024
 export { MAX_LEGACY_MANIFEST_ENCODED_BYTES }
 const MAX_MANIFEST_PATH_BYTES = 4096
+/**
+ * Bounded fan-out for concurrent `inspectManifestFile` calls within one scan.
+ * The scan coordinator admits up to 4 concurrent scans, so this keeps the
+ * worst case at 4 * 16 = 64 in-flight file operations and 4 * 16 * 512KiB =
+ * 32 MiB of hash scratch buffers, instead of growing unboundedly with scan
+ * count or directory size.
+ */
+export const SCAN_FILE_CONCURRENCY = 16
 
 export class ScanCancelledError extends Error {
   constructor(message = "The folder scan was cancelled.") {
@@ -97,6 +105,85 @@ export interface ScanFolderOptions {
   signal?: AbortSignal | null
 }
 
+/** One walk observation, yielded in exactly the order the sequential walk encountered it. */
+type ScanRecord =
+  | { kind: "ignored" }
+  | { kind: "unreadable" }
+  | { kind: "file"; relativePath: string }
+
+type InspectionSettlement =
+  | { ok: true; inspection: ManifestFileInspection }
+  | { ok: false; error: unknown }
+
+type PendingScanRecord =
+  | { kind: "ignored" }
+  | { kind: "unreadable" }
+  | { kind: "file"; settled: Promise<InspectionSettlement> }
+
+interface ScanWalkContext {
+  canonicalRoot: string
+  matcher: (relativePath: string, directory: boolean) => boolean
+  signal: AbortSignal | null
+  onListing: (relativeDirectory: string) => void
+}
+
+/** Caps queued ignored/unreadable records so a slow file cannot let the walk run arbitrarily far ahead. */
+const MAX_PENDING_SCAN_RECORDS = SCAN_FILE_CONCURRENCY * 8
+
+/**
+ * Depth-first walk yielding one record per entry. Traversal order, containment
+ * checks and skip rules are those of the original recursive scan; counting is
+ * left to the consumer so counters advance at the same logical point.
+ */
+async function* walkScanRecords(directoryPath: string, relativeDirectory: string, context: ScanWalkContext): AsyncGenerator<ScanRecord, void, void> {
+  const { canonicalRoot, matcher, signal, onListing } = context
+  throwIfScanCancelled(signal)
+  onListing(relativeDirectory)
+  let directory: Awaited<ReturnType<typeof opendir>> | undefined
+  try {
+    directory = await opendir(directoryPath)
+    throwIfScanCancelled(signal)
+    const canonicalDirectory = await realpath(directoryPath)
+    if (!isCanonicalPathInside(canonicalRoot, canonicalDirectory)) {
+      await closeDirQuietly(directory)
+      yield { kind: "unreadable" }
+      return
+    }
+  } catch (error) {
+    if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
+    await closeDirQuietly(directory)
+    yield { kind: "unreadable" }
+    return
+  }
+
+  try {
+    for await (const entry of directory) {
+      throwIfScanCancelled(signal)
+      onListing(relativeDirectory)
+      const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name))
+      if (isTetheraStagingPath(relativePath) || matcher(relativePath, entry.isDirectory()) || entry.isSymbolicLink()) {
+        yield { kind: "ignored" }
+        continue
+      }
+      if (entry.isDirectory()) {
+        yield* walkScanRecords(path.join(directoryPath, entry.name), relativePath, context)
+        continue
+      }
+      if (entry.isFile()) yield { kind: "file", relativePath }
+    }
+  } finally {
+    await closeDirQuietly(directory)
+  }
+}
+
+/**
+ * Scans a folder, inspecting up to `SCAN_FILE_CONCURRENCY` files at once.
+ *
+ * Per-file work is dominated by syscall latency (lstat, realpath, open, stat,
+ * read), so overlapping it is where scan throughput comes from. Results are
+ * committed strictly in walk order, which keeps `files` ordering, every
+ * counter, and the truncation point identical to a sequential scan.
+ */
 export async function scanFolder(
   rootPath: string,
   ignorePatterns: string[],
@@ -114,15 +201,13 @@ export async function scanFolder(
   let truncated = false
   const maxFiles = resolveScanLimit(options.maxFiles)
   const maxFileBytes = resolveFileSizeLimit(options.maxFileBytes)
+  const hashAllFiles = options.hashAllFiles === true
   const signal = options.signal ?? null
   throwIfScanCancelled(signal)
-  // One lazy buffer per scan, reused sequentially across files. Empty files
-  // never allocate it; concurrent scans each own their buffer.
-  let hashBuffer: Buffer | undefined
-  function hashScratch(): Buffer {
-    if (!hashBuffer) hashBuffer = Buffer.allocUnsafe(HASH_BUFFER_BYTES)
-    return hashBuffer
-  }
+  // Each in-flight inspection borrows a slot and lazily allocates that slot's
+  // scratch buffer, so peak scratch memory is bounded by the concurrency and
+  // scans of empty files never allocate.
+  const freeSlots: Array<{ buffer?: Buffer }> = Array.from({ length: SCAN_FILE_CONCURRENCY }, () => ({}))
   let hashedBytes = 0
   let lastActivityAt = -Infinity
   function reportActivity(stage: FolderScanActivity["stage"], currentPath: string, force = false): void {
@@ -137,90 +222,78 @@ export async function scanFolder(
     }
   }
 
-  async function visit(directoryPath: string, relativeDirectory: string): Promise<void> {
-    throwIfScanCancelled(signal)
-    if (truncated) return
-    reportActivity("listing", relativeDirectory)
-    let directory: Awaited<ReturnType<typeof opendir>> | undefined
-    try {
-      directory = await opendir(directoryPath)
-      throwIfScanCancelled(signal)
-      const canonicalDirectory = await realpath(directoryPath)
-      if (!isCanonicalPathInside(canonicalRoot, canonicalDirectory)) {
-        await closeDirQuietly(directory)
-        directory = undefined
-        unreadable += 1
-        return
-      }
-    } catch (error) {
-      if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
-      await closeDirQuietly(directory)
-      directory = undefined
-      unreadable += 1
-      return
-    }
-
-    try {
-      for await (const entry of directory) {
-        throwIfScanCancelled(signal)
-        if (truncated) break
-        reportActivity("listing", relativeDirectory)
-        const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name))
-        if (isTetheraStagingPath(relativePath)) {
-          ignored += 1
-          continue
-        }
-        if (matcher(relativePath, entry.isDirectory())) {
-          ignored += 1
-          continue
-        }
-        const absolutePath = path.join(directoryPath, entry.name)
-        if (entry.isSymbolicLink()) {
-          ignored += 1
-          continue
-        }
-        if (entry.isDirectory()) {
-          await visit(absolutePath, relativePath)
-          continue
-        }
-        if (!entry.isFile()) continue
-        try {
-          reportActivity("inspecting", relativePath)
-          throwIfScanCancelled(signal)
-          const inspection = await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true, maxFileBytes, (bytesRead) => {
-            hashedBytes += bytesRead
-            reportActivity("hashing", relativePath)
-          }, signal, hashScratch)
-          throwIfScanCancelled(signal)
-          // Oversize files are excluded like an ignore-pattern match, so they must not
-          // consume the file ceiling: counting them would report `truncated` for a scan
-          // that actually omitted nothing, and a truncated scan blocks the merge entirely.
-          if (inspection.outcome === "excluded-oversize") {
-            ignored += 1
-            continue
-          }
-          if (files.length >= maxFiles) {
-            truncated = true
-            break
-          }
-          files.push(inspection.entry)
-        } catch (error) {
-          // Cancellation must escape instead of counting the file as unreadable.
-          if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
-          unreadable += 1
-          continue
-        }
-      }
-    } finally {
-      await closeDirQuietly(directory)
-    }
+  function inspect(relativePath: string): Promise<InspectionSettlement> {
+    // A free slot always exists: at most SCAN_FILE_CONCURRENCY files are pending.
+    const slot = freeSlots.pop() ?? {}
+    reportActivity("inspecting", relativePath)
+    return inspectManifestFile(root, canonicalRoot, relativePath, hashAllFiles, maxFileBytes, (bytesRead) => {
+      hashedBytes += bytesRead
+      reportActivity("hashing", relativePath)
+    }, signal, () => (slot.buffer ??= Buffer.allocUnsafe(HASH_BUFFER_BYTES)))
+      // Settled rather than rejected, so an inspection abandoned by truncation
+      // or cancellation can never surface as an unhandled rejection.
+      .then((inspection): InspectionSettlement => ({ ok: true, inspection }), (error: unknown): InspectionSettlement => ({ ok: false, error }))
+      .finally(() => freeSlots.push(slot))
   }
 
+  const records = walkScanRecords(root, "", { canonicalRoot, matcher, signal, onListing: (directory) => reportActivity("listing", directory) })
+  const pending: PendingScanRecord[] = []
+  let pendingFiles = 0
+  let walkDone = false
   try {
-    await visit(root, "")
+    for (;;) {
+      while (!walkDone && pendingFiles < SCAN_FILE_CONCURRENCY && pending.length < MAX_PENDING_SCAN_RECORDS) {
+        const next = await records.next()
+        if (next.done) {
+          walkDone = true
+          break
+        }
+        const record = next.value
+        if (record.kind === "file") {
+          pending.push({ kind: "file", settled: inspect(record.relativePath) })
+          pendingFiles += 1
+        } else {
+          pending.push(record)
+        }
+      }
+
+      const head = pending.shift()
+      if (!head) break
+      if (head.kind === "ignored") {
+        ignored += 1
+        continue
+      }
+      if (head.kind === "unreadable") {
+        unreadable += 1
+        continue
+      }
+      pendingFiles -= 1
+      const settlement = await head.settled
+      throwIfScanCancelled(signal)
+      if (!settlement.ok) {
+        // Cancellation must escape instead of counting the file as unreadable.
+        if (isScanCancelled(settlement.error) || signal?.aborted) throw new ScanCancelledError()
+        unreadable += 1
+        continue
+      }
+      // Oversize files are excluded like an ignore-pattern match, so they must not
+      // consume the file ceiling: counting them would report `truncated` for a scan
+      // that actually omitted nothing, and a truncated scan blocks the merge entirely.
+      if (settlement.inspection.outcome === "excluded-oversize") {
+        ignored += 1
+        continue
+      }
+      if (files.length >= maxFiles) {
+        truncated = true
+        break
+      }
+      files.push(settlement.inspection.entry)
+    }
   } finally {
-    // Release the per-scan scratch promptly; the manifest retains only entries.
-    hashBuffer = undefined
+    // Close any directories the suspended walk still holds, then let abandoned
+    // inspections finish so no file handle outlives the scan's admission slot.
+    await records.return(undefined)
+    await Promise.all(pending.flatMap((record) => (record.kind === "file" ? [record.settled] : [])))
   }
   throwIfScanCancelled(signal)
   reportActivity("complete", "", true)
@@ -526,7 +599,7 @@ async function inspectManifestFile(
           onHashBytes?.(bytesRead)
         }
       } else {
-        // Empty files hash without touching the shared scratch buffer.
+        // Empty files hash without borrowing the slot's scratch buffer.
         hash.update(Buffer.alloc(0))
       }
       digest = hash.digest("hex")
