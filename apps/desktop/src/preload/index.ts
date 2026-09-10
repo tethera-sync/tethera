@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron"
+import { unwrapFolderComparisonResult, type FolderComparisonResult } from "../shared/folder-comparison-result"
 import type {
   AddFolderInput,
   AppSettingKey,
@@ -9,6 +10,7 @@ import type {
   CreateDirectoryInput,
   ConflictInspectionInput,
   FolderPreviewProgress,
+  FolderMappingPreview,
   TetheraApi,
   PreviewFolderMappingInput,
   RequestFolderMappingInput,
@@ -30,13 +32,14 @@ const api: TetheraApi = {
   browseDirectory: (input: BrowseDirectoryInput) => ipcRenderer.invoke("filesystem:browse-directory", input),
   createDirectory: (input: CreateDirectoryInput) => ipcRenderer.invoke("filesystem:create-directory", input),
   previewFolderMapping: (input: PreviewFolderMappingInput, progressOperationId?: string) =>
-    ipcRenderer.invoke("folders:preview-mapping", input, progressOperationId),
+    invokeComparison<FolderMappingPreview>("folders:preview-mapping", input, progressOperationId),
+  cancelFolderPreview: (progressOperationId: string) => ipcRenderer.invoke("folders:cancel-preview", progressOperationId),
   requestFolderMapping: (input: RequestFolderMappingInput, progressOperationId?: string) =>
-    ipcRenderer.invoke("folders:request-mapping", input, progressOperationId),
+    invokeComparison<AppSnapshot>("folders:request-mapping", input, progressOperationId),
   refreshIncomingMappingPreview: (input: RefreshIncomingMappingPreviewInput, progressOperationId?: string) =>
-    ipcRenderer.invoke("folders:refresh-incoming-preview", input, progressOperationId),
+    invokeComparison<AppSnapshot>("folders:refresh-incoming-preview", input, progressOperationId),
   approveFolderMapping: (input: ApproveFolderMappingInput, progressOperationId?: string) =>
-    ipcRenderer.invoke("folders:approve-mapping", input, progressOperationId),
+    invokeComparison<AppSnapshot>("folders:approve-mapping", input, progressOperationId),
   rejectFolderMapping: (requestId: string) => ipcRenderer.invoke("folders:reject-mapping", requestId),
   startInitialSync: (folderId: string) => ipcRenderer.invoke("folders:start-initial-sync", folderId),
   addFolder: (input: AddFolderInput) => ipcRenderer.invoke("folders:add", input),
@@ -68,3 +71,12 @@ const api: TetheraApi = {
 }
 
 contextBridge.exposeInMainWorld("folderSync", api)
+
+async function invokeComparison<T>(
+  channel: "folders:preview-mapping" | "folders:request-mapping" | "folders:refresh-incoming-preview" | "folders:approve-mapping",
+  input: PreviewFolderMappingInput | RequestFolderMappingInput | RefreshIncomingMappingPreviewInput | ApproveFolderMappingInput,
+  progressOperationId?: string,
+): Promise<T> {
+  const result: FolderComparisonResult<T> = await ipcRenderer.invoke(channel, input, progressOperationId)
+  return unwrapFolderComparisonResult(result)
+}

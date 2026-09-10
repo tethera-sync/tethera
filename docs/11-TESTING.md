@@ -24,6 +24,8 @@ Continuous-sync tests cover watcher delivery, full-digest observation conversion
 
 ## Migration and restart integration
 
+Preview transport regressions use authenticated loopback peers to cover active-handler disconnect/cancellation, progress extending the idle wait, hard scan deadlines, terminal-response validation, progress sequence/size limits, and the existing 8 MiB response flush. Preview client tests cover capability negotiation, older-peer fallback, cancellation, and preserved comparison errors across IPC. These synthetic tests do not prove a physical Linux-to-Windows comparison.
+
 The integration gate creates a temporary legacy state, launches the real Rust engine, imports the mappings, restarts the engine, and confirms the import is not duplicated. It then removes a mapping, restarts again, presents an older active event, and verifies the tombstone prevents resurrection. A sentinel beneath a path-shaped fixture must remain byte-for-byte unchanged throughout.
 
 No migration or configuration test may scan a mapped directory. Paths in these tests are opaque configuration values.

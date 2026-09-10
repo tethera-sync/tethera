@@ -41,6 +41,17 @@ describe("comparePhaseText", () => {
     expect(text.detail).not.toContain("%")
   })
 
+  test("shows reported remote activity without exposing its path", () => {
+    const text = comparePhaseText("scan-remote", { ...options, activity: {
+      stage: "inspecting", currentPath: "private/remote-secret.txt", scannedFiles: 12,
+      ignoredEntries: 4, unreadableEntries: 0, hashedBytes: 4096,
+    } })
+    expect(text.headline).toContain("Checking file metadata on Laptop")
+    expect(text.detail).toContain("12 files checked")
+    expect(text.detail).toContain("4.0 KB hashed")
+    expect(text.detail).not.toContain("remote-secret")
+  })
+
   test("covers the final compare and the pre-event state", () => {
     expect(comparePhaseText("compare", options).headline).toContain("Comparing")
     const starting = comparePhaseText(null, options)
