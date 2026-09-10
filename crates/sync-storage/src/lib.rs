@@ -1,6 +1,7 @@
 //! `SQLite`, journal and archive interfaces.
 #![forbid(unsafe_code)]
 
+pub mod digest_cache;
 pub mod file_sync;
 pub mod mapping;
 pub mod scan_generations;

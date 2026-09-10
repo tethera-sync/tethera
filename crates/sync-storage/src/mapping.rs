@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Schema version this build reads and writes. Version 1 is intentionally left unchanged below.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 200;
@@ -751,7 +751,33 @@ impl MappingStore {
         }
         if current < 6 {
             self.migrate_v5_to_v6()?;
+            current = 6;
         }
+        if current < 7 {
+            self.migrate_v6_to_v7()?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v6_to_v7(&self) -> Result<(), MappingStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS scan_digest_cache (
+                mapping_id TEXT NOT NULL REFERENCES folder_mappings(id) ON DELETE CASCADE,
+                relative_path TEXT NOT NULL,
+                device TEXT NOT NULL,
+                inode TEXT NOT NULL,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                modified_ns TEXT NOT NULL,
+                changed_ns TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                sweep_id TEXT NOT NULL,
+                PRIMARY KEY (mapping_id, relative_path)
+            ) WITHOUT ROWID;
+            PRAGMA user_version = 7;",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2633,6 +2659,53 @@ mod tests {
             )
             .expect("generation tables");
         assert_eq!(generation_tables, 2);
+    }
+
+    #[test]
+    fn migrates_schema_v6_to_v7_without_rewriting_existing_mapping_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("mappings.sqlite3");
+        let original = sample("existing-v6-mapping");
+        seed_v1(&path, std::slice::from_ref(&original));
+        drop(MappingStore::open(&path).expect("create representative current schema"));
+
+        let connection = rusqlite::Connection::open(&path).expect("open representative v6");
+        connection
+            .execute_batch(
+                "DROP TABLE IF EXISTS scan_digest_cache;
+                 PRAGMA user_version = 6;",
+            )
+            .expect("downgrade representative schema to v6");
+        drop(connection);
+
+        let reopened = MappingStore::open(&path).expect("migrate v6 to v7");
+        assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
+        let mapping_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM folder_mappings WHERE id = 'existing-v6-mapping'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mapping count");
+        assert_eq!(mapping_count, 1);
+        let cache_table: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'scan_digest_cache'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cache table");
+        assert_eq!(cache_table, 1);
+
+        // Reopening an already-migrated database is idempotent.
+        drop(reopened);
+        let reopened_again = MappingStore::open(&path).expect("reopen migrated database");
+        assert_eq!(
+            reopened_again.schema_version().expect("version"),
+            SCHEMA_VERSION
+        );
     }
 
     #[test]

@@ -52,7 +52,7 @@ import {
   type MappingStoreHealth,
 } from "./engine-supervisor"
 import {
-  compareManifests, DEFAULT_MAX_MANIFEST_FILES, isManifestPathIgnored, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, type FileManifest,
+  compareManifests, DEFAULT_MAX_MANIFEST_FILES, isManifestPathIgnored, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, type FileManifest, type ScanDigestCache,
 } from "./folder-manifest"
 import { globalScanCoordinator } from "./scan-coordinator"
 import { runPairedScans } from "./paired-scan"
@@ -139,6 +139,7 @@ import {
   type ReconcileFilesResult,
 } from "./continuous-sync"
 import { listArchivedVersions } from "./archive-history"
+import { DigestCacheVerifier, EngineScanDigestCache } from "./digest-cache"
 import {
   recoverStagedArchiveObject,
   removePublishedArchiveStage,
@@ -322,7 +323,7 @@ function runLocalScan(
   key: string,
   rootPath: string,
   ignorePatterns: string[],
-  options: { hashAllFiles?: boolean; maxFiles?: number | null; onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void; folderId?: string },
+  options: { hashAllFiles?: boolean; maxFiles?: number | null; onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void; folderId?: string; digestCache?: ScanDigestCache },
   signal: AbortSignal | null,
 ): Promise<FileManifest> {
   const controller = new AbortController()
@@ -341,12 +342,35 @@ function runLocalScan(
       maxFiles: options.maxFiles,
       onActivity: options.onActivity,
       signal: effective,
+      digestCache: options.digestCache,
     })
   }, controller.signal).finally(() => {
     shutdownScanController.signal.removeEventListener("abort", forwardShutdown)
     signal?.removeEventListener("abort", forwardOuter)
     untrack()
   })
+}
+
+const digestCacheVerifier = new DigestCacheVerifier()
+
+/**
+ * Full-integrity scan of an active folder that reuses the digests of files
+ * whose exact identity is unchanged since an earlier sweep.
+ */
+async function runCachedFolderScan(
+  key: string,
+  folder: Pick<FolderSummary, "id" | "localPath" | "ignorePatterns">,
+  maxFiles: number | null,
+  signal: AbortSignal | null,
+): Promise<FileManifest> {
+  const startedAt = Date.now()
+  const deep = digestCacheVerifier.requiresDeepSweep(folder.id, startedAt)
+  const digestCache = new EngineScanDigestCache(engine, folder.id, { deep })
+  const manifest = await runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache }, signal)
+  const complete = !manifest.truncated
+  await digestCache.finish({ complete })
+  if (deep && complete) digestCacheVerifier.completedDeepSweep(folder.id, startedAt)
+  return manifest
 }
 
 function requestPeerManifest(peerId: string, payload: PeerRequest, timeoutMs: number, signal: AbortSignal): Promise<FileManifest> {
@@ -2119,7 +2143,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     // scans could validate against a ceiling the scans never used.
     const scanLimit = currentScanLimit()
     const { local: localManifest, peer: remoteManifest } = await runPairedScans(
-      (signal) => runLocalScan(`continuous:${folderId}`, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit, folderId }, signal),
+      (signal) => runCachedFolderScan(`continuous:${folderId}`, folder, scanLimit, signal),
       (signal) => requestPeerManifest(peer.id, {
         type: "continuous-sync-scan",
         folderId,
@@ -3059,7 +3083,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const folder = requireSharedActiveFolder(context, folderId)
     return withPeerFileOperation(context, folderId, async () => {
-      const manifest = await runLocalScan(`inbound:${folderId}`, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit(), folderId }, context.signal)
+      const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, currentScanLimit(), context.signal)
       assertLegacyManifestSendable(manifest, "This computer")
       return manifest
     })

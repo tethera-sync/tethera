@@ -1555,7 +1555,9 @@ pub(crate) fn validate_timestamp(field: &str, value: &str) -> Result<(), Mapping
     Ok(())
 }
 
-fn require_active_mapping(
+/// Fails unless the mapping exists and is active: a missing mapping is
+/// `NotFound`, one in any other setup state is `Invalid`.
+pub(crate) fn require_active_mapping(
     transaction: &Transaction<'_>,
     mapping_id: &str,
 ) -> Result<(), MappingStoreError> {
@@ -1569,7 +1571,7 @@ fn require_active_mapping(
     match setup_status.as_deref() {
         Some("active") => Ok(()),
         Some(_) => Err(MappingStoreError::Invalid(
-            "continuous reconciliation requires an active mapping".to_owned(),
+            "this operation requires an active mapping".to_owned(),
         )),
         None => Err(MappingStoreError::NotFound(mapping_id.to_owned())),
     }

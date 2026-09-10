@@ -1,8 +1,17 @@
 import { describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, opendir, rm, truncate, writeFile } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { lstat, mkdir, mkdtemp, opendir, rm, truncate, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { folderManifestTestHelpers, isManifestPathIgnored, SCAN_FILE_CONCURRENCY, scanFolder } from "../src/main/folder-manifest"
+import {
+  folderManifestTestHelpers,
+  isManifestPathIgnored,
+  SCAN_FILE_CONCURRENCY,
+  scanFolder,
+  type CachedFileDigest,
+  type FileIdentity,
+  type ScanDigestCache,
+} from "../src/main/folder-manifest"
 import { manifest } from "./helpers"
 import type { FolderScanActivity } from "../src/shared/contracts"
 
@@ -402,6 +411,141 @@ describe("concurrent scan parity", () => {
       const sizeLimited = await scanFolder(root, [], { hashAllFiles: true, maxFiles: limit, maxFileBytes: 1024 * 1024 })
       expect(sizeLimited.truncated).toBe(true)
       expect(sizeLimited.files.map((entry) => entry.path)).toEqual(withoutLarge.slice(0, limit))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+function sha256(content: string): string {
+  return createHash("sha256").update(content).digest("hex")
+}
+
+async function identityOf(filePath: string): Promise<FileIdentity> {
+  const stats = await lstat(filePath, { bigint: true })
+  return {
+    device: stats.dev.toString(),
+    inode: stats.ino.toString(),
+    size: Number(stats.size),
+    modifiedNs: stats.mtimeNs.toString(),
+    changedNs: stats.ctimeNs.toString(),
+  }
+}
+
+function fakeDigestCache(seed: ReadonlyMap<string, CachedFileDigest> = new Map()) {
+  const lookups: string[][] = []
+  const recorded = new Map<string, CachedFileDigest>()
+  const cache: ScanDigestCache = {
+    async lookup(relativePaths) {
+      lookups.push(relativePaths)
+      return new Map(relativePaths.flatMap((relativePath) => {
+        const entry = seed.get(relativePath)
+        return entry ? [[relativePath, entry] as const] : []
+      }))
+    },
+    record(relativePath, entry) {
+      recorded.set(relativePath, entry)
+    },
+  }
+  return { cache, lookups, recorded }
+}
+
+describe("scan digest cache", () => {
+  test("uses a cached digest without reading a file whose identity is unchanged", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-hit-test-"))
+    try {
+      const filePath = path.join(root, "kept.txt")
+      await writeFile(filePath, "real content")
+      // A digest that the bytes on disk cannot produce proves the file was not read.
+      const cachedDigest = "f".repeat(64)
+      const { cache } = fakeDigestCache(new Map([["kept.txt", { ...(await identityOf(filePath)), digest: cachedDigest }]]))
+      const result = await scanFolder(root, [], { hashAllFiles: true, digestCache: cache })
+      expect(result.files.map((entry) => entry.digest)).toEqual([cachedDigest])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("hashes a file again once any identity value differs", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-miss-test-"))
+    try {
+      await writeFile(path.join(root, "moved.txt"), "moved")
+      await writeFile(path.join(root, "rewritten.txt"), "before")
+      const stale = "f".repeat(64)
+      const seed = new Map<string, CachedFileDigest>([
+        ["moved.txt", { ...(await identityOf(path.join(root, "moved.txt"))), inode: "1", digest: stale }],
+        ["rewritten.txt", { ...(await identityOf(path.join(root, "rewritten.txt"))), digest: stale }],
+      ])
+      // Same length, different bytes: only timestamps betray the rewrite.
+      await writeFile(path.join(root, "rewritten.txt"), "after!")
+      const { cache } = fakeDigestCache(seed)
+      const result = await scanFolder(root, [], { hashAllFiles: true, digestCache: cache })
+      const digests = new Map(result.files.map((entry) => [entry.path, entry.digest]))
+      expect(digests.get("moved.txt")).toBe(sha256("moved"))
+      expect(digests.get("rewritten.txt")).toBe(sha256("after!"))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("preview scans never take digests from the cache", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-preview-test-"))
+    try {
+      const filePath = path.join(root, "preview.txt")
+      await writeFile(filePath, "preview content")
+      const { cache, lookups } = fakeDigestCache(new Map([["preview.txt", { ...(await identityOf(filePath)), digest: "f".repeat(64) }]]))
+      const result = await scanFolder(root, [], { digestCache: cache })
+      expect(result.files.map((entry) => entry.digest)).toEqual([sha256("preview content")])
+      expect(lookups).toHaveLength(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a correct cache produces exactly the manifest an uncached scan does", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-parity-test-"))
+    try {
+      await buildMixedTree(root)
+      const uncached = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null })
+      const seed = new Map<string, CachedFileDigest>()
+      for (const entry of uncached.files) {
+        seed.set(entry.path, { ...(await identityOf(path.join(root, entry.path))), digest: entry.digest ?? "" })
+      }
+      const { cache } = fakeDigestCache(seed)
+      const cached = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null, digestCache: cache })
+      expect(cached).toEqual(uncached)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("looks every file up exactly once, in batches rather than one round trip per file", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-batch-test-"))
+    try {
+      const fileCount = 600
+      await Promise.all(Array.from({ length: fileCount }, (_, index) => writeFile(path.join(root, `file-${index}.txt`), `${index}`)))
+      const { cache, lookups } = fakeDigestCache()
+      await scanFolder(root, [], { hashAllFiles: true, maxFiles: null, digestCache: cache })
+      const looked = lookups.flat()
+      expect(looked).toHaveLength(fileCount)
+      expect(new Set(looked).size).toBe(fileCount)
+      expect(lookups.length).toBeLessThan(fileCount / 10)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("records only files whose timestamps have settled past the coarse-clock window", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-settle-test-"))
+    try {
+      await writeFile(path.join(root, "settled.txt"), "settled")
+      // Deliberately real time: the rule under test is about wall-clock distance.
+      await Bun.sleep(2_100)
+      await writeFile(path.join(root, "fresh.txt"), "fresh")
+      const { cache, recorded } = fakeDigestCache()
+      await scanFolder(root, [], { hashAllFiles: true, digestCache: cache })
+      expect([...recorded.keys()]).toEqual(["settled.txt"])
+      expect(recorded.get("settled.txt")).toEqual({ ...(await identityOf(path.join(root, "settled.txt"))), digest: sha256("settled") })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
