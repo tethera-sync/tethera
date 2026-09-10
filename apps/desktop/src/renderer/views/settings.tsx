@@ -1,7 +1,6 @@
 import { useRef, useState, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react"
 import { CheckCircle2Icon, DownloadIcon, RefreshCwIcon, RocketIcon } from "lucide-react"
 import type { AppSettings, AppSnapshot, UpdateState } from "@shared/contracts"
-import { MAX_SYNCABLE_FILES_PER_SIDE } from "@shared/sync-capacity"
 import { Button } from "@/components/ui/button"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Input } from "@/components/ui/input"
@@ -178,13 +177,10 @@ function SettingRow({ title, description, children }: { title: string; descripti
   )
 }
 
-/** The scan limit governs previews on this computer only; sync itself still fails closed at the engine's per-side ceiling, so the row must not imply a higher limit enables a larger sync. */
-function scanLimitDescription(unlimited: boolean, exceedsSyncCapacity: boolean): string {
-  const scanning = unlimited
+function scanLimitDescription(unlimited: boolean): string {
+  return unlimited
     ? "Scans collect every file without stopping. Very large folders use more memory while they compare."
     : "A scan stops and reports a partial result past this many files. Previews and transfers on this computer use it."
-  const capacity = `Syncing still fails above ${MAX_SYNCABLE_FILES_PER_SIDE.toLocaleString("en-GB")} files on either computer, so a higher limit here only makes previews longer.`
-  return exceedsSyncCapacity ? `${scanning} ${capacity} This setting is above that limit.` : `${scanning} ${capacity}`
 }
 
 function ScanLimitRow({
@@ -198,7 +194,6 @@ function ScanLimitRow({
   savingKey: keyof AppSettings | null
 }) {
   const unlimited = settings.maxScanFiles === null
-  const exceedsSyncCapacity = unlimited || (settings.maxScanFiles !== null && settings.maxScanFiles > MAX_SYNCABLE_FILES_PER_SIDE)
   const [draft, setDraft] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const shown = draft ?? (unlimited ? "" : String(settings.maxScanFiles))
@@ -249,7 +244,7 @@ function ScanLimitRow({
   return (
     <SettingRow
       title="Scan file limit"
-      description={error ?? scanLimitDescription(unlimited, exceedsSyncCapacity)}
+      description={error ?? scanLimitDescription(unlimited)}
     >
       <div className="[display:flex] [align-items:center] [gap:10px]">
         <Input

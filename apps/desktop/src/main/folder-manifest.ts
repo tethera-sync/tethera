@@ -2,7 +2,10 @@ import { createHash } from "node:crypto"
 import { lstat, open, opendir, realpath, stat } from "node:fs/promises"
 import path from "node:path"
 import type { FolderMappingPreview, FolderScanActivity, MappingPreviewItem, SyncMode } from "../shared/contracts"
-import { MAX_SYNCABLE_FILES_PER_SIDE as MAX_LEGACY_OBSERVATION_FILES } from "../shared/sync-capacity"
+import {
+  estimateManifestEncodedBytes as estimateEncodedBytesForFiles,
+  MAX_LEGACY_MANIFEST_ENCODED_BYTES,
+} from "../shared/sync-capacity"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 
 export const DEFAULT_MAX_MANIFEST_FILES = 10_000
@@ -10,9 +13,7 @@ const MAX_HASH_FILE_BYTES = 16 * 1024 * 1024
 const MAX_SAMPLE_ITEMS = 14
 const SCAN_ACTIVITY_INTERVAL_MS = 250
 const HASH_BUFFER_BYTES = 512 * 1024
-/** Conservative ceiling for one legacy full-manifest peer frame, reserving room for JSON escaping, UTF-8, encryption/base64 and envelope overhead below the 16 MiB wire cap. */
-export const MAX_LEGACY_MANIFEST_ENCODED_BYTES = 12 * 1024 * 1024
-export { MAX_LEGACY_OBSERVATION_FILES }
+export { MAX_LEGACY_MANIFEST_ENCODED_BYTES }
 const MAX_MANIFEST_PATH_BYTES = 4096
 
 export class ScanCancelledError extends Error {
@@ -629,27 +630,12 @@ export function parsePeerManifest(value: unknown): FileManifest {
   return { rootPath: candidate.rootPath, files, ignored, unreadable, truncated: candidate.truncated === true }
 }
 
-/**
- * Estimates the encrypted wire size of a legacy full-manifest response without
- * serializing it: per-entry UTF-8 path bytes plus JSON/envelope overhead,
- * expanded for base64 ciphertext. Used to fail closed before serialization.
- */
+/** Thin manifest-shaped wrapper over the shared estimator; see `../shared/sync-capacity` for the estimate itself. */
 export function estimateManifestEncodedBytes(manifest: FileManifest): number {
-  let bytes = 256
-  for (const entry of manifest.files) {
-    bytes += Buffer.byteLength(entry.path, "utf8") * 2 + 128
-    if (entry.digest) bytes += 64
-  }
-  // AES-GCM ciphertext base64 expansion plus the secure-frame envelope.
-  return Math.ceil(bytes * 1.37) + 512
+  return estimateEncodedBytesForFiles(manifest.files)
 }
 
 export function assertManifestWithinLegacyByteBudget(manifest: FileManifest, computer: string): void {
-  if (manifest.files.length > MAX_LEGACY_OBSERVATION_FILES) {
-    throw new Error(
-      `${computer}'s folder lists ${manifest.files.length.toLocaleString("en-GB")} files, above the supported legacy limit of ${MAX_LEGACY_OBSERVATION_FILES.toLocaleString("en-GB")} per side. Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
-    )
-  }
   const estimated = estimateManifestEncodedBytes(manifest)
   if (estimated > MAX_LEGACY_MANIFEST_ENCODED_BYTES) {
     throw new Error(

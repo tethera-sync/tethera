@@ -16,7 +16,6 @@ import type {
   RequestFolderMappingInput,
   SyncMode,
 } from "@shared/contracts"
-import { MAX_SYNCABLE_FILES_PER_SIDE } from "@shared/sync-capacity"
 import { CompareStatus } from "@/components/compare-status"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { Badge } from "@/components/ui/badge"
@@ -298,7 +297,7 @@ export function AddFolderDialog({
               <Field>
                 <FieldLabel>Ignore patterns</FieldLabel>
                 <Textarea className="min-h-36 resize-y font-mono text-xs" value={patterns} onChange={(event: ChangeEvent<HTMLTextAreaElement>) => { setPatterns(event.target.value); setPreview(null) }} />
-                <FieldDescription>{`One glob-style pattern per line. Subfolders sync recursively unless ignored. Syncing only completes while each folder stays under ${MAX_SYNCABLE_FILES_PER_SIDE.toLocaleString("en-GB")} files, so exclude large generated folders.`}</FieldDescription>
+                <FieldDescription>One glob-style pattern per line. Subfolders sync recursively unless ignored. Exclude large generated folders to keep scans and previews fast.</FieldDescription>
               </Field>
             </fieldset>
           ) : null}

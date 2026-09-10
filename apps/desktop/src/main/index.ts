@@ -52,7 +52,7 @@ import {
   type MappingStoreHealth,
 } from "./engine-supervisor"
 import {
-  compareManifests, DEFAULT_MAX_MANIFEST_FILES, isManifestPathIgnored, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, estimateManifestEncodedBytes, type FileManifest,
+  compareManifests, DEFAULT_MAX_MANIFEST_FILES, isManifestPathIgnored, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, type FileManifest,
 } from "./folder-manifest"
 import { globalScanCoordinator } from "./scan-coordinator"
 import { runPairedScans } from "./paired-scan"
@@ -104,8 +104,6 @@ import { folderComparisonResult } from "../shared/folder-comparison-result"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import {
   applySettingUpdate,
-  assertLegacyEncodedBudget,
-  assertLegacyObservationCapacity,
   normalizePersistedScanLimit,
   parseArchiveHistoryRequest,
   parseExactConflictChoice,
@@ -355,11 +353,9 @@ function requestPeerManifest(peerId: string, payload: PeerRequest, timeoutMs: nu
   return requirePeerSessions().request<unknown>(peerId, payload, timeoutMs, { signal }).then((raw) => parsePeerManifest(raw))
 }
 
-/** Fails closed before legacy reconcile/send: count cap plus encoded-byte budget. */
+/** Fails closed before legacy reconcile/send: the encoded-byte budget for one legacy full-manifest peer frame. */
 function assertLegacyManifestSendable(manifest: FileManifest, computer: string): void {
-  assertLegacyObservationCapacity(manifest.files.length, manifest.files.length, computer)
   assertManifestWithinLegacyByteBudget(manifest, computer)
-  assertLegacyEncodedBudget(estimateManifestEncodedBytes(manifest), computer)
 }
 
 function platform(): DeviceSummary["platform"] {
@@ -2124,7 +2120,6 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     assertCompleteTransferManifest(remoteManifest, peer.name)
     assertLegacyManifestSendable(localManifest, "This computer")
     assertLegacyManifestSendable(remoteManifest, peer.name)
-    assertLegacyObservationCapacity(localManifest.files.length, remoteManifest.files.length)
     const localObservation = observedFiles(localManifest)
     const remoteObservation = observedFiles(remoteManifest)
 

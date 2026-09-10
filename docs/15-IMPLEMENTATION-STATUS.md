@@ -8,7 +8,7 @@ This document separates implemented behaviour from planned behaviour so the prod
 - Persistent Ed25519 device identity, signed LAN presence, two-sided pairing and pinned trusted peers.
 - Short-lived authenticated encrypted peer requests using ephemeral X25519, HKDF, AES-256-GCM and the paired Ed25519 identity.
 - Custom local and trusted-peer folder selection, mapping proposal/approval and a bounded development initial comparison.
-- Capability-negotiated remote preview progress: active scans can continue beyond five minutes while reporting bounded authenticated counters, with a five-minute idle timeout and thirty-minute maximum scan duration. Preview dialogs support cancellation, disconnected requests abort cooperative scan work, and older peers retain the single-response fallback. This does not remove the legacy full-manifest file/byte limits.
+- Capability-negotiated remote preview progress: active scans can continue beyond five minutes while reporting bounded authenticated counters, with a five-minute idle timeout and thirty-minute maximum scan duration. Preview dialogs support cancellation, disconnected requests abort cooperative scan work, and older peers retain the single-response fallback. This does not remove the legacy full-manifest encoded-byte budget.
 - An explicitly initiated, direction-aware additive initial merge coordinated across both computers. Missing files transfer in 512 KiB encrypted requests with a full SHA-256 check and an atomic no-replace destination commit. Same-path differences are left untouched and surfaced.
 - Automatic post-merge reconciliation. Both participants debounce native directory watches, the non-coordinator reports changes over the authenticated peer session, a five-minute full scan covers missed/coalesced notifications, and one deterministic mapping participant coordinates each cycle.
 - Rust/SQLite verified-file baselines, durable retry operations, and explicit non-destructive conflicts. Only a one-sided change from a common digest may replace an existing file.
@@ -102,7 +102,7 @@ For a durable conflict where both files are present, the coordinator can inspect
 - Engine-owned filesystem watching/network transfer, resumable/content-defined chunking, or bandwidth scheduling.
 - File deletion or rename propagation, archive retention/pruning, or resolving conflicts where either copy is missing.
 - NAT traversal, cloud services, accounts or telemetry.
-- Removal of the scan-file ceiling itself. It is now a global preference (1,000–1,000,000 files, or explicitly unlimited; 10,000 by default), but every legacy scan is still a single in-memory pass with cooperative cancellation, bounded admission (4 active, 16 queued), per-scan hash-buffer reuse, and pre-send byte budgets.
+- Removal of the scan-file ceiling itself. It is now a global preference (1,000–1,000,000 files, or explicitly unlimited; 10,000 by default) with no separate fixed per-side file-count cap gating legacy sync beneath it; every legacy scan is still a single in-memory pass with cooperative cancellation, bounded admission (4 active, 16 queued), per-scan hash-buffer reuse, and the legacy full-manifest encoded-byte budget as the one remaining sync-side ceiling.
 - Code-signed/notarised release builds.
 
 ## Recommended next pull request
