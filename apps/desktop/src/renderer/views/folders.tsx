@@ -22,7 +22,7 @@ import { Button } from "@/components/ui/button"
 import { Meter } from "@/components/ui/meter"
 import { StatusPill } from "@/components/ui/status-pill"
 import { formatRate, formatRelative, pretty, prettyMode, statusTone } from "@/lib/format"
-import { folderStatusLabel, getLocalDevice, getPairedDevices, mappingMutationAvailability } from "@/lib/snapshot"
+import { folderStatusLabel, getLocalDevice, getPairedDevices, mappingMutationAvailability, preferredPairedDevice } from "@/lib/snapshot"
 
 type FolderFilter = "all" | "active" | "paused" | "attention"
 
@@ -36,7 +36,8 @@ const folderFilters: Array<{ id: FolderFilter; label: string }> = [
 export function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNavigate: (view: View) => void }) {
   const [filter, setFilter] = useState<FolderFilter>("all")
   const localDevice = getLocalDevice(snapshot)
-  const pairedDevice = getPairedDevices(snapshot)[0]
+  const pairedDevices = getPairedDevices(snapshot)
+  const pairedDevice = preferredPairedDevice(snapshot)
   const { enabled: mappingMutationsEnabled, reason: mappingMutationReason } = mappingMutationAvailability(
     snapshot.mappingStore,
   )
@@ -56,17 +57,20 @@ export function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; o
           <p>Each mapping connects one folder here with one folder on the paired computer.</p>
         </div>
         {snapshot.folders.length > 0 ? (
-          <div className="segmented [display:inline-flex] [gap:2px] [border:1px_solid_var(--border)] [border-radius:10px] [background:var(--surface-sunken)] [padding:3px] [&_button]:[height:28px] [&_button]:[border:0] [&_button]:[border-radius:7px] [&_button]:[background:transparent] [&_button]:[padding:0_12px] [&_button]:[color:var(--muted-foreground)] [&_button]:[font-size:11.5px] [&_button]:[font-weight:600] [&_button]:[transition:140ms_ease] [&_button:hover]:[color:var(--foreground)] [&_button[data-active='true']]:[background:var(--surface-strong)] [&_button[data-active='true']]:[color:var(--foreground)] [&_button[data-active='true']]:[box-shadow:0_1px_3px_oklch(0_0_0_/_0.2)]" role="group" aria-label="Filter folders">
+          <div className="segmented [display:inline-flex] [gap:2px] [border:1px_solid_var(--border)] [border-radius:10px] [background:var(--surface-sunken)] [padding:3px] [&_button]:[color:var(--muted-foreground)] [&_button]:[transition:140ms_ease] [&_button:hover]:[color:var(--foreground)] [&_button[data-active='true']]:[background:var(--surface-strong)] [&_button[data-active='true']]:[color:var(--foreground)] [&_button[data-active='true']]:[box-shadow:0_1px_3px_oklch(0_0_0_/_0.2)]" role="group" aria-label="Filter folders">
             {folderFilters.map((option) => (
-              <button
+              <Button
+                variant="ghost"
+                size="sm"
                 key={option.id}
                 type="button"
+                className="rounded-[7px] border-0 bg-transparent px-3 text-[11.5px] font-semibold"
                 data-active={filter === option.id}
                 aria-pressed={filter === option.id}
                 onClick={() => setFilter(option.id)}
               >
                 {option.label}
-              </button>
+              </Button>
             ))}
           </div>
         ) : (
@@ -136,14 +140,10 @@ export function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; o
           </p>
           <AddFolderDialog
             localDevice={localDevice}
-            pairedDevice={pairedDevice}
+            pairedDevices={pairedDevices}
             onAdded={() => undefined}
-            disabled={pairedDevice.status !== "online" || !mappingMutationsEnabled}
-            disabledReason={
-              !mappingMutationsEnabled
-                ? mappingMutationReason
-                : `${pairedDevice.name} must be online to browse and approve a mapping.`
-            }
+            disabled={!mappingMutationsEnabled}
+            disabledReason={mappingMutationReason}
           />
         </section>
       ) : snapshot.folders.length > 0 ? (
@@ -372,14 +372,14 @@ function FolderCard({
 
 function PathBlock({ label, path, onReveal, revealDisabled }: { label: string; path: string; onReveal?: () => void; revealDisabled?: boolean }) {
   return (
-    <div className="path-block [min-width:0] [&>span]:[display:block] [&>span]:[overflow:hidden] [&>span]:[margin-bottom:4px] [&>span]:[color:var(--muted-foreground)] [&>span]:[font-size:9px] [&>span]:[font-weight:700] [&>span]:[letter-spacing:0.04em] [&>span]:[text-overflow:ellipsis] [&>span]:[text-transform:uppercase] [&>span]:[white-space:nowrap] [&>div]:[display:flex] [&>div]:[min-width:0] [&>div]:[align-items:center] [&>div]:[gap:5px] [&_code]:[overflow:hidden] [&_code]:[min-width:0] [&_code]:[color:var(--foreground)] [&_code]:[font-family:ui-monospace,_SFMono-Regular,_Menlo,_monospace] [&_code]:[font-size:10.5px] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap] [&_button]:[display:grid] [&_button]:[width:20px] [&_button]:[height:20px] [&_button]:[flex:0_0_auto] [&_button]:[place-items:center] [&_button]:[border:0] [&_button]:[border-radius:5px] [&_button]:[background:transparent] [&_button]:[color:var(--muted-foreground)] [&_button:hover]:[background:var(--accent)] [&_button:hover]:[color:var(--foreground)] [&_button_svg]:[width:11px] [&_button_svg]:[height:11px]">
+    <div className="path-block [min-width:0] [&>span]:[display:block] [&>span]:[overflow:hidden] [&>span]:[margin-bottom:4px] [&>span]:[color:var(--muted-foreground)] [&>span]:[font-size:9px] [&>span]:[font-weight:700] [&>span]:[letter-spacing:0.04em] [&>span]:[text-overflow:ellipsis] [&>span]:[text-transform:uppercase] [&>span]:[white-space:nowrap] [&>div]:[display:flex] [&>div]:[min-width:0] [&>div]:[align-items:center] [&>div]:[gap:5px] [&_code]:[overflow:hidden] [&_code]:[min-width:0] [&_code]:[color:var(--foreground)] [&_code]:[font-family:ui-monospace,_SFMono-Regular,_Menlo,_monospace] [&_code]:[font-size:10.5px] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap] [&_button]:[color:var(--muted-foreground)] [&_button:hover]:[background:var(--accent)] [&_button:hover]:[color:var(--foreground)] [&_button_svg]:[width:11px] [&_button_svg]:[height:11px]">
       <span>{label}</span>
       <div>
         <code title={path}>{path}</code>
         {onReveal ? (
-          <button type="button" aria-label={`Reveal ${path}`} onClick={onReveal} disabled={revealDisabled}>
+          <Button variant="ghost" size="icon-xs" className="size-5 shrink-0 rounded-[5px] border-0 bg-transparent" type="button" aria-label={`Reveal ${path}`} onClick={onReveal} disabled={revealDisabled}>
             <ExternalLinkIcon />
-          </button>
+          </Button>
         ) : null}
       </div>
     </div>

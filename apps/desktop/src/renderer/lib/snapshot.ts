@@ -22,6 +22,12 @@ export function getPairedDevices(snapshot: AppSnapshot): DeviceSummary[] {
   )
 }
 
+/** The paired computer a new mapping should target by default. An offline peer cannot browse or approve, so an online peer wins over an earlier offline one. */
+export function preferredPairedDevice(snapshot: AppSnapshot): DeviceSummary | undefined {
+  const pairedDevices = getPairedDevices(snapshot)
+  return pairedDevices.find((device) => device.status === "online") ?? pairedDevices[0]
+}
+
 /** Whether mapping mutations are durably safe right now, with the reason to show when they are not. */
 export function mappingMutationAvailability(state: MappingStoreState): { enabled: boolean; reason: string } {
   return {
@@ -36,7 +42,7 @@ export function overallHeadline(snapshot: AppSnapshot): string {
   if (snapshot.engineStatus !== "ready" || !mappingMutationAvailability(snapshot.mappingStore).enabled) return "Sync is unavailable"
   if (snapshot.paused) return "Everything is safely paused"
   if (getPairedDevices(snapshot).length === 0) return "Pair your second computer first"
-  if (snapshot.route === "offline") return `${getPairedDevices(snapshot)[0]?.name ?? "The paired computer"} is offline`
+  if (snapshot.route === "offline") return `${preferredPairedDevice(snapshot)?.name ?? "The paired computer"} is offline`
   if (snapshot.folders.some((folder) => folder.setupStatus === "ready-for-initial-sync")) return "Ready for the initial merge"
   if (snapshot.status === "needs-attention") return "A folder needs your attention"
   if (snapshot.status === "syncing") return "Synchronizing folder changes"

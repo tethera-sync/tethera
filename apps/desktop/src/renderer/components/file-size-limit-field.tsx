@@ -1,8 +1,10 @@
 import { useId, useState, type ChangeEvent, type KeyboardEvent } from "react"
 import { AlertCircleIcon } from "lucide-react"
 import { BYTE_UNITS, BYTE_UNIT_MULTIPLIERS, isByteUnit, splitBytes, toBytes, type ByteUnit } from "@/lib/byte-size"
+import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
+import { Input } from "@/components/ui/input"
 
 const MIN_BYTES = BYTE_UNIT_MULTIPLIERS.KB // 1 KB
 const MAX_BYTES = BYTE_UNIT_MULTIPLIERS.TB // 1 TB
@@ -89,7 +91,7 @@ export function FileSizeLimitField({ value, onChange, disabled = false }: FileSi
           Maximum file size
         </label>
         <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)]">
-          <input
+          <Input
             id={inputId}
             className="[min-width:0] [flex:1] [border:0] [background:transparent] [padding:9px_10px] [outline:none] [color:var(--foreground)] [font-size:12.5px]"
             type="number"
@@ -138,10 +140,10 @@ export function FileSizeLimitField({ value, onChange, disabled = false }: FileSi
         </label>
       </div>
       {error !== null ? (
-        <p id={errorId} role="alert" className="[display:flex] [align-items:center] [gap:5px] [font-size:11px] [color:var(--destructive)]">
+        <Alert variant="destructive" id={errorId} className="[display:flex] [align-items:center] [gap:5px] [border:0] [padding:0] [font-size:11px] [color:var(--destructive)]">
           <AlertCircleIcon className="size-3.5 shrink-0" aria-hidden="true" />
-          {error}
-        </p>
+          <AlertDescription className="[font-size:11px] [color:var(--destructive)]">{error}</AlertDescription>
+        </Alert>
       ) : null}
     </div>
   )

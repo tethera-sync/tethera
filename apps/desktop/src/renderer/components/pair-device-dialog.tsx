@@ -208,12 +208,13 @@ export function PairDeviceDialog({
                 </div>
               ) : null}
               {outgoing.status === "waiting-for-approval" || outgoing.status === "waiting-for-peer" ? (
-                <div className="pairing-waiting-row [display:flex] [align-items:center] [justify-content:center] [gap:8px] [margin-top:12px] [color:var(--muted-foreground)] [font-size:10.5px] [&_svg]:[width:15px] [&_svg]:[height:15px]"><LoaderCircleIcon className="animate-spin" /><span>{outgoing.message}</span></div>
+                <div className="pairing-waiting-row [display:flex] [align-items:center] [justify-content:center] [gap:8px] [margin-top:12px] [color:var(--muted-foreground)] [font-size:10.5px] [&_svg]:[width:15px] [&_svg]:[height:15px]"><LoaderCircleIcon className="animate-spin" /><span>{outgoing.message ?? pairingStatusDescription(outgoing.status)}</span></div>
               ) : null}
               {terminalOutgoing ? (
                 <div className="pairing-request-actions [display:flex] [justify-content:flex-end] [gap:8px] [margin-top:12px]">
-                  <Button variant="outline" onClick={() => run("dismiss", () => window.folderSync.cancelPairing(outgoing.id))}>
-                    {outgoing.status === "paired" ? "Done" : "Close"}
+                  <Button variant="outline" disabled={Boolean(busyAction)} onClick={() => run("dismiss", () => window.folderSync.cancelPairing(outgoing.id))}>
+                    {busyAction === "dismiss" ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : null}
+                    {busyAction === "dismiss" ? "Closing…" : outgoing.status === "paired" ? "Done" : "Close"}
                   </Button>
                 </div>
               ) : null}

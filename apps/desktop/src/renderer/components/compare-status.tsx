@@ -38,7 +38,7 @@ export function CompareStatus({
           {purpose === "verify" ? "Verifying both folders before approval. " : ""}
           {text.detail}
         </span>
-        {phase === "scan-local" && activity?.currentPath ? <code className="block truncate text-xs" title={activity.currentPath}>{activity.currentPath}</code> : null}
+        {(phase === "scan-local" || phase === "scan-remote") && activity?.currentPath ? <code className="block truncate text-xs" title={activity.currentPath}>{activity.currentPath}</code> : null}
       </div>
     </div>
   )

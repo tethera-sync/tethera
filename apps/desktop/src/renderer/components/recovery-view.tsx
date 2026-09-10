@@ -18,6 +18,8 @@ import type {
 } from "@shared/contracts"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import {
   Dialog,
   DialogContent,
@@ -124,10 +126,10 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
       ) : null}
 
       {request.status === "ready" && request.refreshError ? (
-        <div className="flex items-center justify-between gap-4 rounded-lg border border-[color-mix(in_oklab,var(--danger)_34%,var(--border))] bg-[color-mix(in_oklab,var(--danger)_9%,var(--surface))] px-4 py-3 text-xs text-[var(--danger)]" role="alert">
-          <span>{request.refreshError} The last loaded recovery state remains visible.</span>
+        <Alert variant="destructive" className="flex items-center justify-between gap-4 rounded-lg border border-[color-mix(in_oklab,var(--danger)_34%,var(--border))] bg-[color-mix(in_oklab,var(--danger)_9%,var(--surface))] px-4 py-3 text-xs text-[var(--danger)]">
+          <AlertDescription>{request.refreshError} The last loaded recovery state remains visible.</AlertDescription>
           <Button size="sm" variant="outline" onClick={() => void refresh()}>Try again</Button>
-        </div>
+        </Alert>
       ) : null}
 
       {request.status === "ready" && request.data.issues.length > 0 ? (
@@ -334,21 +336,25 @@ function ConflictResolutionDialog({
         ) : null}
 
         {activeInspectionError ? (
-          <div className="mt-5 rounded-lg border border-[color-mix(in_oklab,var(--danger)_34%,var(--border))] bg-[color-mix(in_oklab,var(--danger)_9%,var(--surface))] p-3 text-xs text-[var(--danger)]" role="alert">
-            <p className="m-0 leading-5">{activeInspectionError}</p>
+          <Alert variant="destructive" className="mt-5 rounded-lg border border-[color-mix(in_oklab,var(--danger)_34%,var(--border))] bg-[color-mix(in_oklab,var(--danger)_9%,var(--surface))] p-3 text-xs text-[var(--danger)]">
+            <AlertDescription className="m-0 leading-5">{activeInspectionError}</AlertDescription>
             <Button className="mt-3" variant="outline" size="sm" onClick={() => void inspect()}>Try again</Button>
-          </div>
+          </Alert>
         ) : null}
 
         {activeInspection ? (
           <>
-            <div className="mt-5 grid grid-cols-2 gap-3 max-[760px]:grid-cols-1" role="radiogroup" aria-label="Version to keep">
+            <RadioGroup
+              value={winnerDeviceId ?? ""}
+              onValueChange={(value: unknown) => setWinnerDeviceId(String(value))}
+              className="mt-5 grid grid-cols-2 gap-3 max-[760px]:grid-cols-1"
+              aria-label="Version to keep"
+            >
               <ConflictCopyCard
                 copy={activeInspection.local}
                 selected={winnerDeviceId === activeInspection.local.deviceId}
                 disabled={!copyAllowed(activeInspection.local, "local", mode) || submitting}
                 reason={copyDisabledReason(activeInspection.local, "local", mode)}
-                onSelect={() => setWinnerDeviceId(activeInspection.local.deviceId)}
                 onReveal={async () => {
                   try {
                     await window.folderSync.revealConflictFile(activeInspection.conflict)
@@ -362,9 +368,8 @@ function ConflictResolutionDialog({
                 selected={winnerDeviceId === activeInspection.remote.deviceId}
                 disabled={!copyAllowed(activeInspection.remote, "remote", mode) || submitting}
                 reason={copyDisabledReason(activeInspection.remote, "remote", mode)}
-                onSelect={() => setWinnerDeviceId(activeInspection.remote.deviceId)}
               />
-            </div>
+            </RadioGroup>
             <div className="mt-4 flex items-start gap-2 rounded-lg bg-[var(--secondary)] p-3 text-[10.5px] leading-4 text-[var(--muted-foreground)]">
               <ArchiveRestoreIcon className="mt-0.5 size-4 shrink-0" />
               <span>The other copy is verified and archived on the computer being changed before the selected version is installed.</span>
@@ -373,7 +378,9 @@ function ConflictResolutionDialog({
         ) : null}
 
         {submitError ? (
-          <p className="mt-4 rounded-lg border border-[color-mix(in_oklab,var(--danger)_34%,var(--border))] bg-[color-mix(in_oklab,var(--danger)_9%,var(--surface))] p-3 text-xs text-[var(--danger)]" role="alert">{submitError}</p>
+          <Alert variant="destructive" className="mt-4 rounded-lg border border-[color-mix(in_oklab,var(--danger)_34%,var(--border))] bg-[color-mix(in_oklab,var(--danger)_9%,var(--surface))] p-3 text-xs text-[var(--danger)]">
+            <AlertDescription>{submitError}</AlertDescription>
+          </Alert>
         ) : null}
 
         <DialogFooter>
@@ -393,17 +400,27 @@ function ConflictCopyCard({
   selected,
   disabled,
   reason,
-  onSelect,
   onReveal,
 }: {
   copy: ConflictCopyInspection
   selected: boolean
   disabled: boolean
   reason?: string
-  onSelect: () => void
   onReveal?: () => Promise<void>
 }) {
   const reasonId = useId()
+  const [revealing, setRevealing] = useState(false)
+
+  async function reveal() {
+    if (!onReveal || revealing) return
+    setRevealing(true)
+    try {
+      await onReveal()
+    } finally {
+      setRevealing(false)
+    }
+  }
+
   return (
     <div className={cn(
       "rounded-xl border bg-[var(--surface)] p-4 transition-[border-color,box-shadow,opacity]",
@@ -412,15 +429,11 @@ function ConflictCopyCard({
     )}>
       <label className={cn("block", disabled ? "cursor-not-allowed" : "cursor-pointer")}>
         <span className="flex items-start gap-3">
-          <input
-            type="radio"
-            name="conflict-version"
+          <RadioGroupItem
             value={copy.deviceId}
-            checked={selected}
             disabled={disabled}
             aria-describedby={reason ? reasonId : undefined}
-            onChange={onSelect}
-            className="mt-0.5 accent-[var(--primary)]"
+            className="mt-0.5"
           />
           <span className="min-w-0 flex-1">
             <strong className="block truncate text-xs">{copy.deviceName}</strong>
@@ -440,8 +453,9 @@ function ConflictCopyCard({
       ) : null}
       {reason ? <p id={reasonId} className="mt-3 text-[10px] leading-4 text-[var(--muted-foreground)]">{reason}</p> : null}
       {onReveal && copy.present ? (
-        <Button className="mt-3" variant="outline" size="sm" onClick={() => void onReveal()}>
-          <FolderOpenIcon data-icon="inline-start" />Show in folder
+        <Button className="mt-3" variant="outline" size="sm" disabled={revealing} onClick={() => void reveal()}>
+          {revealing ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <FolderOpenIcon data-icon="inline-start" />}
+          {revealing ? "Showing…" : "Show in folder"}
         </Button>
       ) : null}
     </div>

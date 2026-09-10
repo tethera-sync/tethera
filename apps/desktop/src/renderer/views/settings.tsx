@@ -1,7 +1,11 @@
 import { useRef, useState, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react"
 import { CheckCircle2Icon, DownloadIcon, RefreshCwIcon, RocketIcon } from "lucide-react"
 import type { AppSettings, AppSnapshot, UpdateState } from "@shared/contracts"
+import { MAX_SYNCABLE_FILES_PER_SIDE } from "@shared/sync-capacity"
 import { Button } from "@/components/ui/button"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Input } from "@/components/ui/input"
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { StatusPill } from "@/components/ui/status-pill"
 import { Switch } from "@/components/ui/switch"
 import { pretty } from "@/lib/format"
@@ -91,8 +95,8 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
 
       <SettingsSection title="Appearance" description="The interface follows your system theme by default.">
         <SettingRow title="Theme" description="Change the desktop interface without affecting sync behaviour.">
-          <select
-            className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55] w-40"
+          <NativeSelect
+            className="w-40"
             value={settings.theme}
             aria-label="Theme"
             disabled={saving !== null}
@@ -101,10 +105,10 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
               if (value === "system" || value === "light" || value === "dark") void update("theme", value)
             }}
           >
-            <option value="system">System</option>
-            <option value="light">Light</option>
-            <option value="dark">Dark</option>
-          </select>
+            <NativeSelectOption value="system">System</NativeSelectOption>
+            <NativeSelectOption value="light">Light</NativeSelectOption>
+            <NativeSelectOption value="dark">Dark</NativeSelectOption>
+          </NativeSelect>
         </SettingRow>
       </SettingsSection>
 
@@ -127,7 +131,7 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
             <StatusPill tone="success"><CheckCircle2Icon className="size-3" /> Ready</StatusPill>
           ) : (
             <Button size="sm" variant="outline" disabled={mappingRetrying || mappingStore.status === "loading"} onClick={() => void retryMappingStore()}>
-              <RefreshCwIcon className={mappingStore.status === "loading" ? "animate-spin" : undefined} data-icon="inline-start" />
+              <RefreshCwIcon className={mappingRetrying || mappingStore.status === "loading" ? "animate-spin" : undefined} data-icon="inline-start" />
               {mappingRetrying || mappingStore.status === "loading" ? "Retrying…" : "Retry"}
             </Button>
           )}
@@ -144,8 +148,8 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
           </details>
         </div>
       </SettingsSection>
-      {mappingError ? <div role="alert" className="[border:1px_solid_var(--destructive)] [border-radius:9px] [padding:12px_16px] [color:var(--destructive)]">{mappingError} <Button size="sm" variant="outline" disabled={mappingRetrying} onClick={() => void retryMappingStore()}>Retry</Button></div> : null}
-      {settingsError ? <div role="alert" className="[border:1px_solid_var(--destructive)] [border-radius:9px] [padding:12px_16px] [color:var(--destructive)]">{settingsError} <Button size="sm" variant="outline" onClick={() => { const retry = retrySetting.current; if (retry) void update(retry.key, retry.value) }}>Retry</Button></div> : null}
+      {mappingError ? <Alert variant="destructive" className="[border:1px_solid_var(--destructive)] [border-radius:9px] [padding:12px_16px] [color:var(--destructive)]"><AlertDescription>{mappingError} <Button size="sm" variant="outline" disabled={mappingRetrying} onClick={() => void retryMappingStore()}><RefreshCwIcon className={mappingRetrying ? "animate-spin" : undefined} data-icon="inline-start" />{mappingRetrying ? "Retrying…" : "Retry"}</Button></AlertDescription></Alert> : null}
+      {settingsError ? <Alert variant="destructive" className="[border:1px_solid_var(--destructive)] [border-radius:9px] [padding:12px_16px] [color:var(--destructive)]"><AlertDescription>{settingsError} <Button size="sm" variant="outline" disabled={saving !== null} onClick={() => { const retry = retrySetting.current; if (retry) void update(retry.key, retry.value) }}><RefreshCwIcon className={saving !== null ? "animate-spin" : undefined} data-icon="inline-start" />{saving !== null ? "Saving…" : "Retry"}</Button></AlertDescription></Alert> : null}
     </div>
   )
 }
@@ -174,6 +178,15 @@ function SettingRow({ title, description, children }: { title: string; descripti
   )
 }
 
+/** The scan limit governs previews on this computer only; sync itself still fails closed at the engine's per-side ceiling, so the row must not imply a higher limit enables a larger sync. */
+function scanLimitDescription(unlimited: boolean, exceedsSyncCapacity: boolean): string {
+  const scanning = unlimited
+    ? "Scans collect every file without stopping. Very large folders use more memory while they compare."
+    : "A scan stops and reports a partial result past this many files. Previews and transfers on this computer use it."
+  const capacity = `Syncing still fails above ${MAX_SYNCABLE_FILES_PER_SIDE.toLocaleString("en-GB")} files on either computer, so a higher limit here only makes previews longer.`
+  return exceedsSyncCapacity ? `${scanning} ${capacity} This setting is above that limit.` : `${scanning} ${capacity}`
+}
+
 function ScanLimitRow({
   settings,
   update,
@@ -185,6 +198,7 @@ function ScanLimitRow({
   savingKey: keyof AppSettings | null
 }) {
   const unlimited = settings.maxScanFiles === null
+  const exceedsSyncCapacity = unlimited || (settings.maxScanFiles !== null && settings.maxScanFiles > MAX_SYNCABLE_FILES_PER_SIDE)
   const [draft, setDraft] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const shown = draft ?? (unlimited ? "" : String(settings.maxScanFiles))
@@ -235,16 +249,11 @@ function ScanLimitRow({
   return (
     <SettingRow
       title="Scan file limit"
-      description={
-        error ??
-        (unlimited
-          ? "Scans collect every file without stopping. Very large folders use more memory while they compare."
-          : "A scan stops and reports a partial result past this many files. Previews and transfers on this computer use it.")
-      }
+      description={error ?? scanLimitDescription(unlimited, exceedsSyncCapacity)}
     >
       <div className="[display:flex] [align-items:center] [gap:10px]">
-        <input
-          className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55] w-32"
+        <Input
+          className="w-32"
           type="number"
           min={1000}
           max={1000000}

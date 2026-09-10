@@ -2,6 +2,7 @@ import { createHash } from "node:crypto"
 import { lstat, open, opendir, realpath, stat } from "node:fs/promises"
 import path from "node:path"
 import type { FolderMappingPreview, FolderScanActivity, MappingPreviewItem, SyncMode } from "../shared/contracts"
+import { MAX_SYNCABLE_FILES_PER_SIDE as MAX_LEGACY_OBSERVATION_FILES } from "../shared/sync-capacity"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 
 export const DEFAULT_MAX_MANIFEST_FILES = 10_000
@@ -11,8 +12,7 @@ const SCAN_ACTIVITY_INTERVAL_MS = 250
 const HASH_BUFFER_BYTES = 512 * 1024
 /** Conservative ceiling for one legacy full-manifest peer frame, reserving room for JSON escaping, UTF-8, encryption/base64 and envelope overhead below the 16 MiB wire cap. */
 export const MAX_LEGACY_MANIFEST_ENCODED_BYTES = 12 * 1024 * 1024
-/** Mirrors the Rust reconciliation ceiling so callers can fail closed before invoking the engine. */
-export const MAX_LEGACY_OBSERVATION_FILES = 10_000
+export { MAX_LEGACY_OBSERVATION_FILES }
 const MAX_MANIFEST_PATH_BYTES = 4096
 
 export class ScanCancelledError extends Error {

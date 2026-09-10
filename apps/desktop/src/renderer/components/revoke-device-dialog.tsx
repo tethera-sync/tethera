@@ -2,6 +2,7 @@ import { useState } from "react"
 import { ShieldXIcon, Trash2Icon } from "lucide-react"
 import type { DeviceSummary } from "@shared/contracts"
 import { Button } from "@/components/ui/button"
+import { Alert, AlertDescription } from "@/components/ui/alert"
 import {
   Dialog,
   DialogContent,
@@ -59,7 +60,7 @@ export function RevokeDeviceDialog({ device }: { device: DeviceSummary }) {
           This does not delete files on either computer. Pair the devices again to restore trust.
         </p>
 
-        {error ? <p className="pairing-error [display:flex] [align-items:flex-start] [gap:8px] [margin-top:12px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_35%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_9%,_var(--surface))] [padding:9px_11px] [color:var(--destructive)] [font-size:10.5px] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex:0_0_auto]">{error}</p> : null}
+        {error ? <Alert variant="destructive" className="mt-3"><AlertDescription>{error}</AlertDescription></Alert> : null}
 
         <DialogFooter>
           <Button variant="outline" onClick={() => setOpen(false)} disabled={busy}>Cancel</Button>

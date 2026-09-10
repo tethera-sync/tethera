@@ -3,6 +3,9 @@ import { ArchiveRestoreIcon, CircleAlertIcon, RefreshCwIcon } from "lucide-react
 import type { AppSnapshot, ArchiveHistory, ArchivedVersion, FolderSummary } from "@shared/contracts"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import {
   Dialog,
   DialogContent,
@@ -141,27 +144,27 @@ export function ArchiveHistoryView({ snapshot }: { snapshot: AppSnapshot }) {
       ) : (
         <>
           <section className="flex items-end justify-between gap-4 rounded-[var(--radius-card)] border border-[var(--border)] bg-[var(--surface)] p-4 max-[760px]:flex-col max-[760px]:items-stretch">
-            <div className="min-w-0">
-              <label className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--muted-foreground)]" htmlFor={folderSelectId}>
+            <Field className="min-w-0 gap-0">
+              <FieldLabel className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--muted-foreground)]" htmlFor={folderSelectId}>
                 Folder
-              </label>
-              <select
+              </FieldLabel>
+              <NativeSelect
                 id={folderSelectId}
-                className="mt-2 h-9 min-w-[240px] rounded-[7px] border border-[var(--border)] bg-[var(--surface-strong)] px-3 text-sm text-[var(--foreground)] outline-none transition focus-visible:ring-2 focus-visible:ring-[color-mix(in_oklab,var(--ring)_45%,transparent)] max-[760px]:w-full"
+                className="mt-2 min-w-[240px] max-[760px]:w-full"
                 value={selectedFolderId ?? ""}
                 onChange={(event) => setSelectedFolderId(event.target.value)}
                 aria-describedby={folderHelpId}
               >
                 {activeFolders.map((folder) => (
-                  <option key={folder.id} value={folder.id}>
+                  <NativeSelectOption key={folder.id} value={folder.id}>
                     {folder.name}
-                  </option>
+                  </NativeSelectOption>
                 ))}
-              </select>
-              <p id={folderHelpId} className="mt-2 text-[10.5px] leading-4 text-[var(--muted-foreground)]">
+              </NativeSelect>
+              <FieldDescription id={folderHelpId} className="mt-2 text-[10.5px] leading-4 text-[var(--muted-foreground)]">
                 {selectedFolder ? `${selectedFolder.name} is active and ready for history browsing.` : "Choose one of the active folders."}
-              </p>
-            </div>
+              </FieldDescription>
+            </Field>
           </section>
           <ArchiveHistoryContent
             request={request}
@@ -233,15 +236,14 @@ export function ArchiveHistoryContent({
       </p>
 
       {request.refreshError ? (
-        <div
+        <Alert variant="destructive"
           className="flex items-center justify-between gap-4 rounded-lg border border-[color-mix(in_oklab,var(--danger)_34%,var(--border))] bg-[color-mix(in_oklab,var(--danger)_9%,var(--surface))] px-4 py-3 text-xs text-[var(--danger)]"
-          role="alert"
         >
-          <span>{request.refreshError} The last loaded archive history remains visible.</span>
+          <AlertDescription>{request.refreshError} The last loaded archive history remains visible.</AlertDescription>
           <Button size="sm" variant="outline" onClick={onRetry} disabled={isRefreshing}>
             Try again
           </Button>
-        </div>
+        </Alert>
       ) : null}
 
       {request.data.truncated ? (
@@ -455,9 +457,11 @@ function ArchiveRestoreDialog({
         ) : null}
 
         {submitError ? (
-          <p className="mt-4 rounded-lg border border-[color-mix(in_oklab,var(--danger)_34%,var(--border))] bg-[color-mix(in_oklab,var(--danger)_9%,var(--surface))] p-3 text-xs text-[var(--danger)]" role="alert">
+          <Alert variant="destructive" className="mt-4 rounded-lg border border-[color-mix(in_oklab,var(--danger)_34%,var(--border))] bg-[color-mix(in_oklab,var(--danger)_9%,var(--surface))] p-3 text-xs text-[var(--danger)]">
+            <AlertDescription>
             {submitError}
-          </p>
+            </AlertDescription>
+          </Alert>
         ) : null}
 
         <DialogFooter>

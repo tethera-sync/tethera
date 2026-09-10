@@ -14,6 +14,7 @@ import { DEFAULT_MAX_MANIFEST_FILES, type FileManifest } from "./folder-manifest
 import type { InitialSyncPassResult } from "./initial-sync"
 import { isTetheraStagingPath } from "./path-safety"
 import type { PeerRequest } from "./peer-session-service"
+import { MAX_SYNCABLE_FILES_PER_SIDE as MAX_LEGACY_OBSERVATION_FILES } from "../shared/sync-capacity"
 
 /**
  * Runtime validators for the renderer/IPC and peer/message boundaries.
@@ -35,8 +36,7 @@ export const MAX_IGNORE_PATTERN_LENGTH = 512
  */
 export const MIN_SCAN_FILES = 1_000
 export const MAX_SCAN_FILES = 1_000_000
-/** Legacy full-observation ceiling enforced by the Rust engine per side. Sync fails closed above it. */
-export const MAX_LEGACY_OBSERVATION_FILES = 10_000
+export { MAX_LEGACY_OBSERVATION_FILES }
 /** Encrypted peer frame ceiling; legacy manifests reserve headroom below it. */
 export const MAX_PEER_FRAME_BYTES = 16 * 1024 * 1024
 export const MAX_LEGACY_MANIFEST_ENCODED_BYTES = 12 * 1024 * 1024
