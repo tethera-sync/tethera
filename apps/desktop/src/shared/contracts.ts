@@ -491,6 +491,7 @@ export interface TetheraApi {
   browseDirectory(input: BrowseDirectoryInput): Promise<DirectoryListing>
   createDirectory(input: CreateDirectoryInput): Promise<DirectoryListing>
   previewFolderMapping(input: PreviewFolderMappingInput, progressOperationId?: string): Promise<FolderMappingPreview>
+  cancelFolderPreview(progressOperationId: string): Promise<void>
   requestFolderMapping(input: RequestFolderMappingInput, progressOperationId?: string): Promise<AppSnapshot>
   refreshIncomingMappingPreview(input: RefreshIncomingMappingPreviewInput, progressOperationId?: string): Promise<AppSnapshot>
   approveFolderMapping(input: ApproveFolderMappingInput, progressOperationId?: string): Promise<AppSnapshot>

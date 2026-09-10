@@ -1,4 +1,4 @@
-import { useMemo, useState, type ChangeEvent, type ReactNode } from "react"
+import { useMemo, useState, type ChangeEvent } from "react"
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
@@ -16,10 +16,12 @@ import type {
   RequestFolderMappingInput,
   SyncMode,
 } from "@shared/contracts"
+import { MAX_SYNCABLE_FILES_PER_SIDE } from "@shared/sync-capacity"
 import { CompareStatus } from "@/components/compare-status"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import {
   Dialog,
   DialogContent,
@@ -29,6 +31,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog"
+import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
+import { Input } from "@/components/ui/input"
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
+import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import { formatBytes } from "@/lib/format"
 import { formatElapsed, useElapsedSeconds, type ComparePhase } from "@/lib/compare-progress"
@@ -39,7 +45,7 @@ type Step = "paths" | "rules" | "preview"
 
 interface AddFolderDialogProps {
   localDevice: DeviceSummary
-  pairedDevice: DeviceSummary
+  pairedDevices: DeviceSummary[]
   onAdded: () => void
   disabled?: boolean
   disabledReason?: string
@@ -50,11 +56,22 @@ interface AddFolderDialogProps {
  */
 export function AddFolderDialog({
   localDevice,
-  pairedDevice,
+  pairedDevices,
   onAdded,
   disabled = false,
   disabledReason,
 }: AddFolderDialogProps) {
+  const defaultDevice = pairedDevices.find((device) => device.status === "online") ?? pairedDevices[0]
+  const [selectedDeviceId, setSelectedDeviceId] = useState(() => defaultDevice?.id ?? "")
+  const targetDevice = pairedDevices.find((device) => device.id === selectedDeviceId) ?? defaultDevice
+  const hasOnlineDevice = pairedDevices.some((device) => device.status === "online")
+  const triggerDisabled = disabled || !hasOnlineDevice
+  const onlyPairedDevice = pairedDevices.length === 1 ? pairedDevices[0] : undefined
+  const triggerDisabledReason = disabled
+    ? disabledReason
+    : onlyPairedDevice
+      ? `${onlyPairedDevice.name} must be online to browse and approve a mapping.`
+      : "No paired computer is online. Bring one online before adding a folder."
   const [open, setOpen] = useState(false)
   const [step, setStep] = useState<Step>("paths")
   const [pickerTarget, setPickerTarget] = useState<PickerTarget>(null)
@@ -75,6 +92,7 @@ export function AddFolderDialog({
   const [historyDays, setHistoryDays] = useState(30)
   const [historyMaxGb, setHistoryMaxGb] = useState(10)
   const [preview, setPreview] = useState<FolderMappingPreview | null>(null)
+  const [cancelRequested, setCancelRequested] = useState(false)
 
   const ignorePatterns = useMemo(
     () => patterns.split("\n").map((pattern) => pattern.trim()).filter(Boolean),
@@ -95,11 +113,12 @@ export function AddFolderDialog({
   }
 
   function mappingInput(): Omit<RequestFolderMappingInput, "preview"> {
+    if (!targetDevice) throw new Error("Select a paired computer before continuing.")
     return {
       name: name.trim(),
       localPath: localPath.trim(),
       remotePath: remotePath.trim(),
-      remoteDeviceId: pairedDevice.id,
+      remoteDeviceId: targetDevice.id,
       mode,
       ignorePatterns,
       historyDays: Math.max(1, historyDays),
@@ -120,8 +139,9 @@ export function AddFolderDialog({
   }
 
   async function buildPreview() {
-    if (!canContinue || compare) return
+    if (!canContinue || !targetDevice || targetDevice.status !== "online" || compare) return
     const operationId = crypto.randomUUID()
+    setCancelRequested(false)
     setCompare({ operationId, kind: "preview", phase: null })
     setError(null)
     const stopTracking = trackCompareProgress(operationId)
@@ -134,12 +154,14 @@ export function AddFolderDialog({
     } finally {
       stopTracking()
       setCompare(null)
+      setCancelRequested(false)
     }
   }
 
   async function requestApproval() {
-    if (!preview || hasBlockingWarnings || compare) return
+    if (!preview || !targetDevice || targetDevice.status !== "online" || hasBlockingWarnings || compare) return
     const operationId = crypto.randomUUID()
+    setCancelRequested(false)
     setCompare({ operationId, kind: "request", phase: null })
     setError(null)
     const stopTracking = trackCompareProgress(operationId)
@@ -153,6 +175,19 @@ export function AddFolderDialog({
     } finally {
       stopTracking()
       setCompare(null)
+      setCancelRequested(false)
+    }
+  }
+
+  async function cancelComparison() {
+    const operationId = compare?.operationId
+    if (!operationId || cancelRequested) return
+    setCancelRequested(true)
+    try {
+      await window.folderSync.cancelFolderPreview(operationId)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to cancel the comparison.")
+      setCancelRequested(false)
     }
   }
 
@@ -167,6 +202,7 @@ export function AddFolderDialog({
     setHistoryMaxGb(10)
     setPreview(null)
     setPickerTarget(null)
+    setSelectedDeviceId(defaultDevice?.id ?? "")
     setError(null)
   }
 
@@ -181,7 +217,7 @@ export function AddFolderDialog({
           if (!nextOpen) setPickerTarget(null)
         }}
       >
-        <DialogTrigger render={<Button disabled={disabled} title={disabled ? disabledReason : undefined} />}>
+        <DialogTrigger render={<Button disabled={triggerDisabled} title={triggerDisabled ? triggerDisabledReason : undefined} />}>
           <PlusIcon data-icon="inline-start" />
           Add folder
         </DialogTrigger>
@@ -197,45 +233,78 @@ export function AddFolderDialog({
 
           {step === "paths" ? (
             <div className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px]">
-              <Field label="Display name" hint="Optional; defaults to the source folder name.">
-                <input className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55]" value={name} onChange={(event: ChangeEvent<HTMLInputElement>) => setName(event.target.value)} placeholder="Projects" />
+              <Field>
+                <FieldLabel>Display name</FieldLabel>
+                <Input value={name} onChange={(event: ChangeEvent<HTMLInputElement>) => setName(event.target.value)} placeholder="Projects" />
+                <FieldDescription>Optional; defaults to the source folder name.</FieldDescription>
               </Field>
+              {pairedDevices.length > 1 ? (
+                <Field>
+                  <FieldLabel>Computer to sync with</FieldLabel>
+                  <NativeSelect
+                    className="w-full"
+                    value={targetDevice?.id ?? ""}
+                    disabled={compare !== null}
+                    onChange={(event: ChangeEvent<HTMLSelectElement>) => {
+                      setSelectedDeviceId(event.target.value)
+                      setRemotePath("")
+                      setPreview(null)
+                      setError(null)
+                    }}
+                  >
+                    {pairedDevices.map((device) => (
+                      <NativeSelectOption key={device.id} value={device.id}>{device.status === "offline" ? `${device.name} (offline)` : device.name}</NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                </Field>
+              ) : null}
               <div className="mapping-path-fields [display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [gap:14px] max-[760px]:[grid-template-columns:minmax(0,_1fr)]">
-                <Field label={`Folder on ${localDevice.name}`}>
+                <Field>
+                  <FieldLabel>{`Folder on ${localDevice.name}`}</FieldLabel>
                   <PathChooser value={localPath} placeholder="Choose a source folder" onBrowse={() => setPickerTarget("local")} />
                 </Field>
-                <Field label={`Folder on ${pairedDevice.name}`} hint="Remote browsing is encrypted and returns folder names only.">
+                {targetDevice ? <Field>
+                  <FieldLabel>{`Folder on ${targetDevice.name}`}</FieldLabel>
                   <PathChooser value={remotePath} placeholder="Choose a destination folder" onBrowse={() => setPickerTarget("remote")} />
-                </Field>
+                  <FieldDescription>Remote browsing is encrypted and returns folder names only.</FieldDescription>
+                </Field> : null}
               </div>
             </div>
           ) : null}
 
           {step === "rules" ? (
             <fieldset disabled={compare !== null} className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px] [border:0] [padding:0] [min-width:0]">
-              <Field label="Sync direction">
-                <select className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55]" value={mode} onChange={(event: ChangeEvent<HTMLSelectElement>) => { setMode(event.target.value as SyncMode); setPreview(null) }}>
-                  <option value="two-way">Two-way sync</option>
-                  <option value="send-only">Send from this computer only</option>
-                  <option value="receive-only">Receive to this computer only</option>
-                </select>
+              <Field>
+                <FieldLabel>Sync direction</FieldLabel>
+                <NativeSelect className="w-full" value={mode} onChange={(event: ChangeEvent<HTMLSelectElement>) => { setMode(event.target.value as SyncMode); setPreview(null) }}>
+                  <NativeSelectOption value="two-way">Two-way sync</NativeSelectOption>
+                  <NativeSelectOption value="send-only">Send from this computer only</NativeSelectOption>
+                  <NativeSelectOption value="receive-only">Receive to this computer only</NativeSelectOption>
+                </NativeSelect>
               </Field>
               <div className="mapping-settings-grid [display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [gap:14px] max-[760px]:[grid-template-columns:1fr]">
-                <Field label="Keep versions for" hint="Oldest versions are removed first.">
-                  <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_input]:[min-width:0] [&_input]:[flex:1] [&_input]:[border:0] [&_input]:[background:transparent] [&_input]:[padding:9px_10px] [&_input]:[outline:none] [&_input]:[color:var(--foreground)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><input type="number" min={1} max={3650} value={historyDays} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryDays(Number(event.target.value))} /><span>days</span></div>
+                <Field>
+                  <FieldLabel>Keep versions for</FieldLabel>
+                  <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><Input className="min-w-0 flex-1 border-0 bg-transparent px-2.5 py-[9px] outline-none" type="number" min={1} max={3650} value={historyDays} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryDays(Number(event.target.value))} /><span>days</span></div>
+                  <FieldDescription>Saved with the folder; not enforced yet.</FieldDescription>
                 </Field>
-                <Field label="History storage cap" hint="Per folder, on each computer.">
-                  <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_input]:[min-width:0] [&_input]:[flex:1] [&_input]:[border:0] [&_input]:[background:transparent] [&_input]:[padding:9px_10px] [&_input]:[outline:none] [&_input]:[color:var(--foreground)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><input type="number" min={1} max={4096} value={historyMaxGb} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryMaxGb(Number(event.target.value))} /><span>GB</span></div>
+                <Field>
+                  <FieldLabel>History storage cap</FieldLabel>
+                  <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><Input className="min-w-0 flex-1 border-0 bg-transparent px-2.5 py-[9px] outline-none" type="number" min={1} max={4096} value={historyMaxGb} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryMaxGb(Number(event.target.value))} /><span>GB</span></div>
+                  <FieldDescription>Per folder, on each computer; not enforced yet.</FieldDescription>
                 </Field>
               </div>
-              <Field label="Ignore patterns" hint="One glob-style pattern per line. Subfolders sync recursively unless ignored.">
-                <textarea className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55] min-h-36 resize-y font-mono text-xs" value={patterns} onChange={(event: ChangeEvent<HTMLTextAreaElement>) => { setPatterns(event.target.value); setPreview(null) }} />
+              <p className="text-xs text-[var(--muted-foreground)]">Tethera keeps every replaced version for now. Both values are saved with the folder for a future cleanup policy; nothing is pruned or deleted yet, so history disk use is not limited today.</p>
+              <Field>
+                <FieldLabel>Ignore patterns</FieldLabel>
+                <Textarea className="min-h-36 resize-y font-mono text-xs" value={patterns} onChange={(event: ChangeEvent<HTMLTextAreaElement>) => { setPatterns(event.target.value); setPreview(null) }} />
+                <FieldDescription>{`One glob-style pattern per line. Subfolders sync recursively unless ignored. Syncing only completes while each folder stays under ${MAX_SYNCABLE_FILES_PER_SIDE.toLocaleString("en-GB")} files, so exclude large generated folders.`}</FieldDescription>
               </Field>
             </fieldset>
           ) : null}
 
           {step === "preview" && preview ? (
-            <MappingPreviewView preview={preview} localName={localDevice.name} remoteName={pairedDevice.name} />
+            targetDevice ? <MappingPreviewView preview={preview} localName={localDevice.name} remoteName={targetDevice.name} /> : null
           ) : null}
 
           {compare ? (
@@ -243,16 +312,18 @@ export function AddFolderDialog({
               phase={compare.phase}
               purpose={compare.kind === "request" ? "verify" : "review"}
               thisComputer={localDevice.name}
-              otherComputer={pairedDevice.name}
+              otherComputer={targetDevice?.name ?? "paired computer"}
               scannedFiles={compare.scannedFiles}
               activity={compare.activity}
               elapsed={elapsed}
             />
           ) : null}
 
-          {error ? <p className="mapping-error [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_34%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_10%,_var(--surface))] [padding:10px_12px] [color:var(--destructive)] [font-size:12px]">{error}</p> : null}
+          {error ? <Alert variant="destructive" className="mt-[14px]"><AlertDescription>{error}</AlertDescription></Alert> : null}
+          {targetDevice && targetDevice.status !== "online" ? <Alert variant="destructive" className="mt-[14px]"><AlertDescription>{targetDevice.name} is offline. Choose an online computer to browse and approve this mapping.</AlertDescription></Alert> : null}
 
           <DialogFooter>
+            {compare && (compare.phase === "scan-local" || compare.phase === "scan-remote") ? <Button variant="outline" disabled={cancelRequested} onClick={() => void cancelComparison()}>{cancelRequested ? "Cancelling…" : "Cancel comparison"}</Button> : null}
             <Button variant="outline" disabled={compare !== null} onClick={() => {
               if (step === "paths") setOpen(false)
               else setStep(step === "preview" ? "rules" : "paths")
@@ -263,13 +334,13 @@ export function AddFolderDialog({
               <Button disabled={!canContinue} onClick={() => setStep("rules")}>Rules and history<ArrowRightIcon data-icon="inline-end" /></Button>
             ) : null}
             {step === "rules" ? (
-              <Button disabled={!canContinue || compare !== null} onClick={() => void buildPreview()}>
+              <Button disabled={!canContinue || !targetDevice || targetDevice.status !== "online" || compare !== null} onClick={() => void buildPreview()}>
                 {compare ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <CheckCircle2Icon data-icon="inline-start" />}
                 {compare ? "Comparing folders…" : "Review initial merge"}
               </Button>
             ) : null}
             {step === "preview" ? (
-              <Button disabled={compare !== null || hasBlockingWarnings} onClick={() => void requestApproval()}>
+              <Button disabled={!targetDevice || targetDevice.status !== "online" || compare !== null || hasBlockingWarnings} onClick={() => void requestApproval()}>
                 {compare ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <SendIcon data-icon="inline-start" />}
                 {compare ? "Verifying & sending…" : "Request approval"}
               </Button>
@@ -286,15 +357,15 @@ export function AddFolderDialog({
         title="Choose the source folder"
         onSelect={chooseLocalPath}
       />
-      <FolderPickerDialog
+      {targetDevice ? <FolderPickerDialog
         open={pickerTarget === "remote"}
         onOpenChange={(pickerOpen) => setPickerTarget(pickerOpen ? "remote" : null)}
-        device={pairedDevice}
+        device={targetDevice}
         initialPath={remotePath || undefined}
         title="Choose the destination folder"
-        description={`Securely browsing folders on ${pairedDevice.name}. Creating folders remotely is disabled until approval.`}
+        description={`Securely browsing folders on ${targetDevice.name}. Creating folders remotely is disabled until approval.`}
         onSelect={chooseRemotePath}
-      />
+      /> : null}
     </>
   )
 }
@@ -324,10 +395,10 @@ function MappingPreviewView({ preview, localName, remoteName }: { preview: Folde
       </div>
 
       {preview.truncated ? (
-        <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&.danger]:[border-color:color-mix(in_oklab,_var(--danger)_36%,_var(--border))] [&.danger]:[background:color-mix(in_oklab,_var(--danger)_9%,_var(--surface))] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&.danger>svg]:[color:var(--danger)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5]"><FileWarningIcon /><div><strong>Preview limit reached</strong><span>The comparison sampled only part of one or both folders. Each computer applies its own scan limit, and the preview does not say which side stopped first. Check Settings on both computers, or add ignore rules, then compare again. No files have been changed.</span></div></div>
+        <Alert><FileWarningIcon /><AlertTitle>Preview limit reached</AlertTitle><AlertDescription>The comparison sampled only part of one or both folders. Each computer applies its own scan limit, and the preview does not say which side stopped first. Check Settings on both computers, or add ignore rules, then compare again. No files have been changed.</AlertDescription></Alert>
       ) : null}
       {warnings > 0 ? (
-        <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&.danger]:[border-color:color-mix(in_oklab,_var(--danger)_36%,_var(--border))] [&.danger]:[background:color-mix(in_oklab,_var(--danger)_9%,_var(--surface))] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&.danger>svg]:[color:var(--danger)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5] danger"><FileWarningIcon /><div><strong>Resolve {warnings} cross-platform path problems</strong><span>Windows-invalid names or case-only collisions must be renamed before approval can be requested.</span></div></div>
+        <Alert variant="destructive"><FileWarningIcon /><AlertTitle>Resolve {warnings} cross-platform path problems</AlertTitle><AlertDescription>Windows-invalid names or case-only collisions must be renamed before approval can be requested.</AlertDescription></Alert>
       ) : null}
 
       {warnings > 0 ? (
@@ -377,14 +448,10 @@ function PreviewMetric({ label, value, detail }: { label: string; value: number;
 function PathChooser({ value, placeholder, onBrowse }: { value: string; placeholder: string; onBrowse: () => void }) {
   return (
     <div className="flex gap-2">
-      <input className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55] min-w-0 flex-1" value={value} readOnly placeholder={placeholder} title={value} />
+      <Input className="min-w-0 flex-1" value={value} readOnly placeholder={placeholder} title={value} />
       <Button variant="outline" onClick={onBrowse}><FolderOpenIcon data-icon="inline-start" />Browse</Button>
     </div>
   )
-}
-
-function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
-  return <label className="grid gap-2"><span className="text-sm font-medium">{label}</span>{children}{hint ? <span className="text-xs text-[var(--muted-foreground)]">{hint}</span> : null}</label>
 }
 
 function previewCategory(category: FolderMappingPreview["samples"][number]["category"]): string {

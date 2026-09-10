@@ -136,14 +136,15 @@ export function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNa
                     : "All configured folders are accounted for."}
               </p>
             </div>
-            <button
+            <Button
+              variant="ghost"
               type="button"
-              className="card-link [display:inline-flex] [align-items:center] [gap:5px] [border:0] [border-radius:7px] [background:transparent] [padding:4px_6px] [color:var(--muted-foreground)] [font-size:11px] [font-weight:600] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:13px] [&_svg]:[height:13px]"
+              className="card-link inline-flex items-center [gap:5px] rounded-[7px] border-0 bg-transparent px-[6px] py-1 [color:var(--muted-foreground)] text-[11px] font-semibold [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:13px] [&_svg]:[height:13px]"
               onClick={() => onNavigate("folders")}
             >
               Open folders
               <ArrowRightIcon />
-            </button>
+            </Button>
           </div>
           {totalFolders === 0 ? (
             <div className="flex min-h-32 items-center gap-3 px-4 py-5">
@@ -182,14 +183,15 @@ export function Overview({ snapshot, onNavigate }: { snapshot: AppSnapshot; onNa
               <p className="mt-1 text-xs text-[var(--muted-foreground)]">Stored locally on this computer.</p>
             </div>
             {latestActivity.length > 0 ? (
-              <button
+              <Button
+                variant="ghost"
                 type="button"
-                className="card-link [display:inline-flex] [align-items:center] [gap:5px] [border:0] [border-radius:7px] [background:transparent] [padding:4px_6px] [color:var(--muted-foreground)] [font-size:11px] [font-weight:600] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:13px] [&_svg]:[height:13px]"
+                className="card-link inline-flex items-center [gap:5px] rounded-[7px] border-0 bg-transparent px-[6px] py-1 [color:var(--muted-foreground)] text-[11px] font-semibold [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:13px] [&_svg]:[height:13px]"
                 onClick={() => onNavigate("activity")}
               >
                 View all
                 <ArrowRightIcon />
-              </button>
+              </Button>
             ) : null}
           </div>
           {latestActivity.length === 0 ? (

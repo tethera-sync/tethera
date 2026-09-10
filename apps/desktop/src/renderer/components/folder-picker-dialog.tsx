@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react"
+import { useEffect, useId, useMemo, useRef, useState, type ChangeEvent } from "react"
 import {
   ArrowLeftIcon,
   ChevronRightIcon,
@@ -22,6 +22,7 @@ import type {
   DirectoryLocation,
 } from "@shared/contracts"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import {
   Dialog,
   DialogContent,
@@ -61,6 +62,7 @@ export function FolderPickerDialog({
   const [error, setError] = useState<string | null>(null)
   const [creatingFolder, setCreatingFolder] = useState(false)
   const [newFolderName, setNewFolderName] = useState("")
+  const newFolderInputId = useId()
   const requestGenerationRef = useRef(0)
   const createInFlightRef = useRef(false)
   const folderListRef = useRef<HTMLDivElement>(null)
@@ -185,16 +187,17 @@ export function FolderPickerDialog({
                 const Icon = locationIcon(location)
                 const active = listing?.currentPath === location.path
                 return (
-                  <button
+                  <Button
+                    variant="ghost"
                     key={location.id}
                     type="button"
-                    className={cn("folder-location [display:flex] [width:100%] [height:34px] [align-items:center] [gap:9px] [border:0] [border-radius:8px] [background:transparent] [padding:0_9px] [color:var(--muted-foreground)] [font-size:11.5px] [text-align:left] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:15px] [&_svg]:[height:15px] [&_svg]:[flex:0_0_auto] [&_span]:[overflow:hidden] [&_span]:[text-overflow:ellipsis] [&_span]:[white-space:nowrap]", active && "folder-location-active [background:color-mix(in_oklab,_var(--primary)_13%,_transparent)] [color:var(--primary)]")}
+                    className={cn("folder-location flex w-full h-[34px] items-center [gap:9px] rounded-[8px] border-0 bg-transparent px-[9px] py-0 [color:var(--muted-foreground)] text-[11.5px] text-left [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:15px] [&_svg]:[height:15px] [&_svg]:[flex:0_0_auto] [&_span]:[overflow:hidden] [&_span]:[text-overflow:ellipsis] [&_span]:[white-space:nowrap]", active && "folder-location-active [background:color-mix(in_oklab,_var(--primary)_13%,_transparent)] [color:var(--primary)]")}
                     disabled={loading}
                     onClick={() => void loadDirectory(location.path, includeHidden, true)}
                   >
                     <Icon />
                     <span title={location.path}>{location.label}</span>
-                  </button>
+                  </Button>
                 )
               })}
             </div>
@@ -214,11 +217,11 @@ export function FolderPickerDialog({
 
               <div className="folder-breadcrumbs [display:flex] [min-width:0] [flex:1] [align-items:center] [overflow-x:auto] [scrollbar-width:none] [&::-webkit-scrollbar]:[display:none]" aria-label="Current folder path">
                 {breadcrumbs.map((crumb, index) => (
-                  <div key={crumb.path} className="folder-breadcrumb-segment [display:flex] [flex:0_0_auto] [align-items:center] [&>svg]:[width:13px] [&>svg]:[height:13px] [&>svg]:[color:var(--muted-foreground)] [&_button]:[max-width:150px] [&_button]:[overflow:hidden] [&_button]:[border:0] [&_button]:[border-radius:6px] [&_button]:[background:transparent] [&_button]:[padding:5px_7px] [&_button]:[font-size:11px] [&_button]:[font-weight:550] [&_button]:[text-overflow:ellipsis] [&_button]:[white-space:nowrap] [&_button:hover]:[background:var(--accent)]">
+                  <div key={crumb.path} className="folder-breadcrumb-segment [display:flex] [flex:0_0_auto] [align-items:center] [&>svg]:[width:13px] [&>svg]:[height:13px] [&>svg]:[color:var(--muted-foreground)] [&_button]:[max-width:150px] [&_button]:[overflow:hidden] [&_button]:[text-overflow:ellipsis] [&_button]:[white-space:nowrap] [&_button:hover]:[background:var(--accent)]">
                     {index > 0 ? <ChevronRightIcon /> : null}
-                    <button type="button" title={crumb.path} disabled={loading} onClick={() => void loadDirectory(crumb.path, includeHidden, true)}>
+                    <Button variant="ghost" size="xs" className="rounded-[6px] border-0 bg-transparent px-[7px] py-[5px] text-[11px] font-[550]" type="button" title={crumb.path} disabled={loading} onClick={() => void loadDirectory(crumb.path, includeHidden, true)}>
                       {crumb.label}
-                    </button>
+                    </Button>
                   </div>
                 ))}
               </div>
@@ -237,7 +240,9 @@ export function FolderPickerDialog({
             <div className="folder-picker-actions [display:flex] [align-items:center] [gap:8px] [border-bottom:1px_solid_var(--border)] [padding:9px_11px] [background:color-mix(in_oklab,_var(--surface)_45%,_transparent)] max-[760px]:[flex-wrap:wrap]">
               <label className="folder-search [display:flex] [min-width:180px] [flex:1] [align-items:center] [gap:8px] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [padding:0_10px] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[color:var(--muted-foreground)] [&_input]:[width:100%] [&_input]:[height:32px] [&_input]:[border:0] [&_input]:[outline:0] [&_input]:[background:transparent] [&_input]:[font-size:11.5px] [&_input]:[color:var(--foreground)] max-[760px]:[min-width:100%]">
                 <SearchIcon />
-                <input
+                <Input
+                  aria-label="Search folders"
+                  className="w-full border-0 bg-transparent outline-none"
                   value={query}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => setQuery(event.target.value)}
                   placeholder="Filter folders in this location"
@@ -256,11 +261,13 @@ export function FolderPickerDialog({
             </div>
 
             {creatingFolder ? (
-              <div className="new-folder-row [display:flex] [align-items:center] [gap:8px] [border-bottom:1px_solid_var(--border)] [background:color-mix(in_oklab,_var(--primary)_6%,_var(--surface))] [padding:8px_11px] [&>svg]:[width:16px] [&>svg]:[height:16px] [&>svg]:[color:var(--primary)] [&_.field-control]:[height:33px]">
+              <div className="new-folder-row [display:flex] [align-items:center] [gap:8px] [border-bottom:1px_solid_var(--border)] [background:color-mix(in_oklab,_var(--primary)_6%,_var(--surface))] [padding:8px_11px] [&>svg]:[width:16px] [&>svg]:[height:16px] [&>svg]:[color:var(--primary)]">
                 <FolderPlusIcon />
-                <input
+                <label htmlFor={newFolderInputId} className="sr-only">New folder name</label>
+                <Input
+                  id={newFolderInputId}
                   autoFocus
-                  className="field-control [width:100%] [height:38px] [border:1px_solid_var(--input)] [border-radius:9px] [outline:none] [background:var(--surface-sunken)] [padding:0_11px] [color:var(--foreground)] [font-size:12.5px] [transition:140ms_ease] [&:focus]:[border-color:color-mix(in_oklab,_var(--ring)_65%,_var(--border))] [&:focus]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [textarea&]:[height:auto] [textarea&]:[padding-block:10px] [textarea&]:[line-height:1.55]"
+                  className="min-w-0 flex-1"
                   disabled={loading}
                   value={newFolderName}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => setNewFolderName(event.target.value)}
@@ -330,10 +337,11 @@ export function FolderPickerDialog({
 
               {!error
                 ? visibleEntries.map((entry) => (
-                    <button
+                    <Button
+                      variant="ghost"
                       key={entry.path}
                       type="button"
-                      className="folder-picker-entry [display:grid] [width:100%] [grid-template-columns:auto_minmax(0,_1fr)_auto] [align-items:center] [gap:10px] [border:1px_solid_transparent] [border-radius:10px] [background:transparent] [padding:8px_9px] [text-align:left] [&:hover]:[background:var(--accent)] [&_strong]:[display:block] [&_strong]:[overflow:hidden] [&_strong]:[font-size:11.5px] [&_strong]:[text-overflow:ellipsis] [&_strong]:[white-space:nowrap] [&_span]:[display:block] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9.5px] [&>svg]:[width:14px] [&>svg]:[height:14px] [&>svg]:[color:var(--muted-foreground)]"
+                      className="folder-picker-entry grid w-full h-auto [grid-template-columns:auto_minmax(0,_1fr)_auto] items-center [gap:10px] border border-transparent rounded-[10px] bg-transparent px-[9px] py-2 text-left [&:hover]:[background:var(--accent)] [&_strong]:[display:block] [&_strong]:[overflow:hidden] [&_strong]:[font-size:11.5px] [&_strong]:[text-overflow:ellipsis] [&_strong]:[white-space:nowrap] [&_span]:[display:block] [&_span]:[margin-top:2px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9.5px] [&>svg]:[width:14px] [&>svg]:[height:14px] [&>svg]:[color:var(--muted-foreground)]"
                       disabled={loading}
                       onClick={() => void loadDirectory(entry.path, includeHidden, true)}
                     >
@@ -345,7 +353,7 @@ export function FolderPickerDialog({
                         <span>{entry.kind === "symlink" ? "Linked folder" : "Folder"}</span>
                       </div>
                       <ChevronRightIcon />
-                    </button>
+                    </Button>
                   ))
                 : null}
             </div>

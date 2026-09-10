@@ -98,6 +98,9 @@ import {
 } from "./desktop-state-storage"
 import { PairingService } from "./pairing-service"
 import { PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
+import { requestPeerPreview } from "./peer-preview"
+import { PEER_SCAN_PROGRESS_CAPABILITY } from "./peer-scan-progress"
+import { folderComparisonResult } from "../shared/folder-comparison-result"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import {
   applySettingUpdate,
@@ -325,6 +328,7 @@ function runLocalScan(
   signal: AbortSignal | null,
 ): Promise<FileManifest> {
   const controller = new AbortController()
+  if (signal?.aborted || shutdownScanController.signal.aborted) controller.abort()
   const forwardShutdown = (): void => controller.abort()
   const forwardOuter = (): void => controller.abort()
   shutdownScanController.signal.addEventListener("abort", forwardShutdown, { once: true })
@@ -1230,11 +1234,10 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
     }, controller.signal)
     if (controller.signal.aborted) throw new ScanCancelledError()
     emitPreviewProgress(operationId, "scan-remote")
-    const remoteManifest = await requestPeerManifest(peer.id, {
-      type: "scan-manifest",
+    const remoteManifest = await requestPeerPreview(requirePeerSessions(), peer, {
       path: input.remotePath,
       ignorePatterns: input.ignorePatterns,
-    }, 5 * 60_000, controller.signal)
+    }, controller.signal, (progress) => emitPreviewProgress(operationId, "scan-remote", progress.scannedFiles, { ...progress, currentPath: "" }))
     if (controller.signal.aborted) throw new ScanCancelledError()
     emitPreviewProgress(operationId, "compare")
     // Truncated previews stay explicit partial results; sync paths fail closed elsewhere.
@@ -1332,11 +1335,10 @@ async function buildIncomingMappingPreview(
     const targetStat = await stat(target)
     if (!targetStat.isDirectory()) throw new Error("The selected destination is not a folder.")
     emitPreviewProgress(operationId, "scan-remote")
-    const initiatorManifest = await requestPeerManifest(peer.id, {
-      type: "scan-manifest",
+    const initiatorManifest = await requestPeerPreview(requirePeerSessions(), peer, {
       path: request.proposal.initiatorPath,
       ignorePatterns: request.proposal.ignorePatterns,
-    }, 5 * 60_000, controller.signal)
+    }, controller.signal, (progress) => emitPreviewProgress(operationId, "scan-remote", progress.scannedFiles, { ...progress, currentPath: "" }))
     if (controller.signal.aborted) throw new ScanCancelledError()
     emitPreviewProgress(operationId, "scan-local", 0)
     const responderManifest = await runLocalScan(`incoming:${target}`, target, request.proposal.ignorePatterns, {
@@ -3035,7 +3037,13 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
         return manifest
       })
     }
-    const manifest = await runLocalScan("inbound:preview", requestedPath, ignorePatterns, { hashAllFiles, maxFiles: currentScanLimit() }, context.signal)
+    const manifest = await runLocalScan("inbound:preview", requestedPath, ignorePatterns, {
+      hashAllFiles,
+      maxFiles: currentScanLimit(),
+      onActivity: context.reportProgress ? ({ stage, scannedFiles, ignoredEntries, unreadableEntries, hashedBytes }) => {
+        context.reportProgress?.({ stage, scannedFiles, ignoredEntries, unreadableEntries, hashedBytes })
+      } : undefined,
+    }, context.signal)
     assertLegacyManifestSendable(manifest, "This computer")
     return manifest
   }
@@ -3049,7 +3057,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     })
   }
   if (request.type === "scan-capabilities") {
-    return { capabilities: [SCAN_GENERATION_CAPABILITY] }
+    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY] }
   }
   if (request.type === "scan-generation-read-page") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -3594,19 +3602,25 @@ function registerIpc(): void {
   ipcMain.handle("filesystem:create-directory", (_event, input: CreateDirectoryInput) => createLocalDirectory(input))
   ipcMain.handle("folders:preview-mapping", (event, input: PreviewFolderMappingInput, progressOperationId: unknown) => {
     requireTrustedMainRenderer(event)
-    return previewFolderMapping(input, progressOperationId)
+    return folderComparisonResult(() => previewFolderMapping(input, progressOperationId))
   })
   ipcMain.handle("folders:request-mapping", (event, input: RequestFolderMappingInput, progressOperationId: unknown) => {
     requireTrustedMainRenderer(event)
-    return requestFolderMapping(input, progressOperationId)
+    return folderComparisonResult(() => requestFolderMapping(input, progressOperationId))
   })
   ipcMain.handle("folders:refresh-incoming-preview", (event, input: RefreshIncomingMappingPreviewInput, progressOperationId: unknown) => {
     requireTrustedMainRenderer(event)
-    return refreshIncomingMappingPreview(input, progressOperationId)
+    return folderComparisonResult(() => refreshIncomingMappingPreview(input, progressOperationId))
   })
   ipcMain.handle("folders:approve-mapping", (event, input: ApproveFolderMappingInput, progressOperationId: unknown) => {
     requireTrustedMainRenderer(event)
-    return approveFolderMapping(input, progressOperationId)
+    return folderComparisonResult(() => approveFolderMapping(input, progressOperationId))
+  })
+  ipcMain.handle("folders:cancel-preview", (event, progressOperationId: unknown) => {
+    requireTrustedMainRenderer(event)
+    const operationId = parsePreviewProgressToken(progressOperationId)
+    if (!operationId) throw new Error("Choose an active comparison to cancel.")
+    previewScanControllers.get(operationId)?.abort()
   })
   ipcMain.handle("folders:reject-mapping", (_event, requestId: string) => rejectFolderMapping(requestId))
   ipcMain.handle("folders:start-initial-sync", (_event, folderId: string) => startInitialSync(folderId))

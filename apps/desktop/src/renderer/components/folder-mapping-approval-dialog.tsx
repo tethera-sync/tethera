@@ -13,6 +13,7 @@ import { CompareStatus } from "@/components/compare-status"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import {
   Dialog,
   DialogContent,
@@ -50,6 +51,7 @@ export function FolderMappingApprovalDialog({
   } | null>(null)
   const [action, setAction] = useState<"approve" | "reject" | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [cancelRequested, setCancelRequested] = useState(false)
   const working = compare !== null || action !== null
   const elapsed = formatElapsed(useElapsedSeconds(compare !== null))
 
@@ -76,6 +78,7 @@ export function FolderMappingApprovalDialog({
   async function refreshDestination(nextPath: string) {
     if (!request || working) return
     const operationId = crypto.randomUUID()
+    setCancelRequested(false)
     setCompare({ operationId, kind: "refresh", phase: null })
     setError(null)
     const stopTracking = trackCompareProgress(operationId)
@@ -86,12 +89,14 @@ export function FolderMappingApprovalDialog({
     } finally {
       stopTracking()
       setCompare(null)
+      setCancelRequested(false)
     }
   }
 
   async function approve() {
     if (!request || !destinationPath || working || blockingWarnings > 0) return
     const operationId = crypto.randomUUID()
+    setCancelRequested(false)
     setAction("approve")
     setCompare({ operationId, kind: "verify", phase: null })
     setError(null)
@@ -104,6 +109,19 @@ export function FolderMappingApprovalDialog({
       stopTracking()
       setCompare(null)
       setAction(null)
+      setCancelRequested(false)
+    }
+  }
+
+  async function cancelComparison() {
+    const operationId = compare?.operationId
+    if (!operationId || cancelRequested) return
+    setCancelRequested(true)
+    try {
+      await window.folderSync.cancelFolderPreview(operationId)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to cancel the comparison.")
+      setCancelRequested(false)
     }
   }
 
@@ -122,8 +140,15 @@ export function FolderMappingApprovalDialog({
 
   return (
     <>
-      <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="mapping-approval-dialog [max-width:720px]" showCloseButton={false}>
+      <Dialog
+        open={open}
+        disablePointerDismissal={working}
+        onOpenChange={(nextOpen: boolean) => {
+          if (!nextOpen && working) return
+          onOpenChange(nextOpen)
+        }}
+      >
+        <DialogContent className="mapping-approval-dialog [max-width:720px]" showCloseButton={!working}>
           <DialogHeader>
             <div className="mapping-approval-heading [display:flex] [align-items:flex-start] [gap:12px]">
               <div className="mapping-approval-icon [display:grid] [place-items:center] [width:42px] [height:42px] [flex:0_0_auto] [border:1px_solid_color-mix(in_oklab,_var(--primary)_33%,_var(--border))] [border-radius:12px] [background:color-mix(in_oklab,_var(--primary)_10%,_var(--surface))] [color:var(--primary)] [&_svg]:[width:20px] [&_svg]:[height:20px]"><ShieldCheckIcon /></div>
@@ -160,6 +185,8 @@ export function FolderMappingApprovalDialog({
             <div><span>Storage cap</span><strong>{formatBytes(proposal.historyMaxBytes)}</strong></div>
           </div>
 
+          <p className="[margin-top:8px] [color:var(--muted-foreground)] [font-size:10px] [line-height:1.5]">Version history and storage cap are recorded with the mapping. Tethera does not prune saved versions yet, so neither value limits disk use on this computer today.</p>
+
           <div className="approval-preview-line [display:grid] [grid-template-columns:repeat(4,_1fr)] [gap:1px] [overflow:hidden] [margin-top:10px] [border:1px_solid_var(--border)] [border-radius:9px] [background:var(--border)] [&>div]:[display:grid] [&>div]:[gap:2px] [&>div]:[background:var(--surface)] [&>div]:[padding:9px_10px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:8.5px] [&_strong]:[font-size:13px] [&_strong]:[font-variant-numeric:tabular-nums] max-[760px]:[grid-template-columns:repeat(2,_minmax(0,_1fr))]">
             <div><span>Only on their computer</span><strong>{proposal.preview.localOnlyFiles}</strong></div>
             <div><span>Only on this computer</span><strong>{proposal.preview.remoteOnlyFiles}</strong></div>
@@ -168,16 +195,16 @@ export function FolderMappingApprovalDialog({
           </div>
 
           {proposal.preview.truncated ? (
-            <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [margin-top:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5]"><FileWarningIcon /><div><strong>Preview limit reached</strong><span>The comparison sampled only part of one or both folders. Each computer applies its own scan limit, and the preview does not say which side stopped first. Check Settings on both computers, or add ignore rules, then refresh the comparison.</span></div></div>
+            <Alert className="mt-[10px]"><FileWarningIcon /><AlertTitle>Preview limit reached</AlertTitle><AlertDescription>The comparison sampled only part of one or both folders. Each computer applies its own scan limit, and the preview does not say which side stopped first. Check Settings on both computers, or add ignore rules, then refresh the comparison.</AlertDescription></Alert>
           ) : null}
 
           {blockingWarnings > 0 ? (
-            <div className="mapping-warning [display:flex] [align-items:flex-start] [gap:10px] [border:1px_solid_color-mix(in_oklab,_var(--warning)_32%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--warning)_9%,_var(--surface))] [padding:11px_12px] [&.danger]:[border-color:color-mix(in_oklab,_var(--danger)_36%,_var(--border))] [&.danger]:[background:color-mix(in_oklab,_var(--danger)_9%,_var(--surface))] [&>svg]:[width:18px] [&>svg]:[height:18px] [&>svg]:[flex:0_0_auto] [&>svg]:[color:var(--warning)] [&.danger>svg]:[color:var(--danger)] [&_div]:[display:grid] [&_div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5] danger"><FileWarningIcon /><div><strong>Approval blocked</strong><span>Rename {blockingWarnings} Windows-invalid or case-colliding paths first.</span></div></div>
+            <Alert variant="destructive"><FileWarningIcon /><AlertTitle>Approval blocked</AlertTitle><AlertDescription>Rename {blockingWarnings} Windows-invalid or case-colliding paths first.</AlertDescription></Alert>
           ) : (
             <div className="approval-safety [display:flex] [align-items:flex-start] [gap:8px] [margin-top:12px] [color:var(--muted-foreground)] [font-size:10px] [line-height:1.5] [&_svg]:[width:15px] [&_svg]:[height:15px] [&_svg]:[flex:0_0_auto] [&_svg]:[color:var(--success)]"><CheckCircle2Icon /><span>Approval only commits configuration. One computer must then start the initial merge; Tethera coordinates both directions without overwriting same-path differences.</span></div>
           )}
 
-          {!mutationsEnabled ? <p className="mapping-error [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_34%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_10%,_var(--surface))] [padding:10px_12px] [color:var(--destructive)] [font-size:12px]">{disabledReason}</p> : null}
+          {!mutationsEnabled ? <Alert variant="destructive" className="mt-[14px]"><AlertDescription>{disabledReason}</AlertDescription></Alert> : null}
           {request.message ? <p className="approval-status-note [margin:0] [border:1px_solid_var(--border)] [border-radius:10px] [background:color-mix(in_oklab,_var(--surface-sunken)_80%,_transparent)] [padding:10px_12px] [color:var(--muted-foreground)] [font-size:11.5px] [line-height:1.45]">{request.message}</p> : null}
 
           {compare ? (
@@ -192,9 +219,10 @@ export function FolderMappingApprovalDialog({
             />
           ) : null}
 
-          {error ? <p className="mapping-error [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--destructive)_34%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--destructive)_10%,_var(--surface))] [padding:10px_12px] [color:var(--destructive)] [font-size:12px]">{error}</p> : null}
+          {error ? <Alert variant="destructive" className="mt-[14px]"><AlertDescription>{error}</AlertDescription></Alert> : null}
 
           <DialogFooter>
+            {compare && (compare.phase === "scan-local" || compare.phase === "scan-remote") ? <Button variant="outline" disabled={cancelRequested} onClick={() => void cancelComparison()}>{cancelRequested ? "Cancelling…" : "Cancel comparison"}</Button> : null}
             <Button variant="outline" disabled={working} onClick={() => void reject()}>
               {action === "reject" ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <XIcon data-icon="inline-start" />}
               {action === "reject" ? "Rejecting…" : "Reject"}

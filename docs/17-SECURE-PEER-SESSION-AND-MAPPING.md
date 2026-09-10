@@ -44,6 +44,12 @@ Remote browsing returns folder names, paths, link/directory type and hidden stat
 
 Before approval, each computer scans its selected folder with the same ignore rules.
 
+Before requesting a preview scan, the initiator negotiates `scan-progress-v1` through `scan-capabilities`. Supporting peers opt in with `scan-manifest.reportProgress: true`; only these requests receive intermediate encrypted response frames containing `{ progress, sequence }` before the terminal `{ ok, result/error }` response. Frames use the same authenticated request correlation, response direction and independent random IVs. Sequence numbers start at one and must be contiguous. Progress contains only stage and nonnegative safe-integer file/byte counters, never paths or contents. Envelopes are limited to 4 KiB and 8,000 messages, with sends throttled to four per second and dropped while the socket is backpressured. They are advisory and cannot authorize a mapping or replace a manifest.
+
+The secure welcome has a ten-second timeout. Preview scans retain a five-minute idle limit; valid progress renews that wait, allowing an active slow scan to finish without hitting the old fixed five-minute response limit. A receiver-owned thirty-minute scan deadline includes queue wait and work, with at most fifteen seconds for the terminal response flush. Progress cannot extend that absolute limit. Disconnect or preview cancellation aborts queued/active cooperative scans; an OS filesystem operation already in progress may need to return before its slot can be released. The dialog offers cancellation while scanning, keeps the selected paths after failure, and displays remote activity when available.
+
+Older version-4 peers that lack this capability retain the single-response five-minute preview request. Both installations must be updated for progress-aware comparisons. A peer that predates capability discovery is recognized only by its exact unsupported-operation error; malformed capability responses and transport failures do not trigger fallback. No protocol-version bump is needed because intermediate frames require explicit opt-in after capability discovery.
+
 - Files up to 16 MiB are SHA-256 hashed in this development slice.
 - Larger files use size and close timestamp equality for the preview only.
 - The preview is capped at the scanning computer's configured scan-file limit (10,000 files by default) per side.

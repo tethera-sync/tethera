@@ -24,7 +24,7 @@ import { TooltipProvider } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 import { prettyPlatform, prettyRoute } from "@/lib/format"
 import { navItems, viewTitle, type View } from "@/lib/navigation"
-import { createSnapshotSubscription, getLocalDevice, getPairedDevices, mappingMutationAvailability, type SnapshotSubscription } from "@/lib/snapshot"
+import { createSnapshotSubscription, getLocalDevice, getPairedDevices, mappingMutationAvailability, preferredPairedDevice, type SnapshotSubscription } from "@/lib/snapshot"
 import { ActivityView } from "./views/activity"
 import { DevicesView } from "./views/devices"
 import { FoldersView } from "./views/folders"
@@ -175,7 +175,8 @@ export function App() {
   }
 
   const localDevice = getLocalDevice(snapshot)
-  const pairedDevice = getPairedDevices(snapshot)[0]
+  const pairedDevices = getPairedDevices(snapshot)
+  const pairedDevice = preferredPairedDevice(snapshot)
   const pendingMapping = snapshot.mappings.incoming.find((request) => request.status === "pending")
   const attentionCount = snapshot.folders.filter((folder) => folder.status === "needs-attention").length
   const recoveryCount = snapshot.folders.reduce(
@@ -211,15 +212,17 @@ export function App() {
           <div className="brand-text [display:flex] [min-width:0] [flex:1] [align-items:center]">
             <p className="brand-name [margin:0] [font-size:15px] [font-weight:680] [letter-spacing:-0.025em]">Tethera</p>
           </div>
-          <button
+          <Button
+            variant="ghost"
+            size="icon-sm"
             type="button"
-            className="rail-toggle [display:grid] [width:26px] [height:26px] [flex:0_0_auto] [place-items:center] [border:0] [border-radius:7px] [background:transparent] [color:var(--muted-foreground)] [transition:140ms_ease] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:15px] [&_svg]:[height:15px] [&_svg]:[transition:transform_220ms_cubic-bezier(0.32,_0.72,_0,_1)]"
+            className="rail-toggle h-[26px] w-[26px] flex-[0_0_auto] rounded-[7px] border-0 bg-transparent [color:var(--muted-foreground)] [transition:140ms_ease] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:15px] [&_svg]:[height:15px] [&_svg]:[transition:transform_220ms_cubic-bezier(0.32,_0.72,_0,_1)]"
             onClick={() => setRail((previous) => !previous)}
             aria-label={rail ? "Expand sidebar" : "Collapse sidebar"}
             aria-pressed={rail}
           >
             <ChevronsLeftIcon />
-          </button>
+          </Button>
         </div>
 
         <div className="nav-scroll [min-height:0] [flex:1] [overflow-y:auto] [scrollbar-width:none] [&::-webkit-scrollbar]:[display:none]">
@@ -229,10 +232,11 @@ export function App() {
                   const Icon = item.icon
                   const active = view === item.id
                   return (
-                    <button
+                    <Button
+                      variant="ghost"
                       key={item.id}
                       type="button"
-                      className={cn("nav-item [position:relative] [display:flex] [width:100%] [height:38px] [align-items:center] [gap:10px] [border:0] [border-radius:8px] [background:transparent] [padding:0_10px] [color:var(--muted-foreground)] [font-size:12.5px] [font-weight:550] [text-align:left] [transition:background_140ms_ease,_color_140ms_ease] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex:0_0_auto] [&>span:first-of-type]:[overflow:hidden] [&>span:first-of-type]:[flex:1] [&>span:first-of-type]:[text-overflow:ellipsis] [&>span:first-of-type]:[white-space:nowrap]", active && "nav-item-active [background:color-mix(in_oklab,_var(--primary)_11%,_var(--surface))] [color:var(--foreground)] [&::before]:[content:''] [&::before]:[position:absolute] [&::before]:[inset-block:9px] [&::before]:[left:-12px] [&::before]:[width:3px] [&::before]:[border-radius:0_3px_3px_0] [&::before]:[background:var(--primary)] [&_svg]:[color:var(--primary)]")}
+                      className={cn("nav-item [position:relative] flex w-full h-[38px] items-center [gap:10px] rounded-[8px] border-0 bg-transparent px-[10px] py-0 [color:var(--muted-foreground)] text-[12.5px] font-[550] text-left [transition:background_140ms_ease,_color_140ms_ease] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:16px] [&_svg]:[height:16px] [&_svg]:[flex:0_0_auto] [&>span:first-of-type]:[overflow:hidden] [&>span:first-of-type]:[flex:1] [&>span:first-of-type]:[text-overflow:ellipsis] [&>span:first-of-type]:[white-space:nowrap]", active && "nav-item-active [background:color-mix(in_oklab,_var(--primary)_11%,_var(--surface))] [color:var(--foreground)] [&::before]:[content:''] [&::before]:[position:absolute] [&::before]:[inset-block:9px] [&::before]:[left:-12px] [&::before]:[width:3px] [&::before]:[border-radius:0_3px_3px_0] [&::before]:[background:var(--primary)] [&_svg]:[color:var(--primary)]")}
                       onClick={() => setView(item.id)}
                       aria-current={active ? "page" : undefined}
                       title={rail ? item.label : undefined}
@@ -256,7 +260,7 @@ export function App() {
                       {item.id === "devices" && pendingApprovals > 0 ? (
                         <span className="nav-dot [width:6px] [height:6px] [border-radius:999px] [background:var(--warning)] [box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--warning)_22%,_transparent)]" role="img" aria-label={`${pendingApprovals} approvals waiting`} />
                       ) : null}
-                    </button>
+                    </Button>
                   )
                 })}
             </div>
@@ -294,17 +298,13 @@ export function App() {
               {snapshot.paused ? <PlayIcon data-icon="inline-start" /> : <PauseIcon data-icon="inline-start" />}
               {snapshot.paused ? "Resume all" : "Pause all"}
             </Button> : null}
-            {pairedDevice && view !== "folders" ? (
+            {pairedDevices.length > 0 && view !== "folders" ? (
               <AddFolderDialog
                 localDevice={localDevice}
-                pairedDevice={pairedDevice}
+                pairedDevices={pairedDevices}
                 onAdded={() => setView("folders")}
-                disabled={pairedDevice.status !== "online" || !mappingMutationsEnabled}
-                disabledReason={
-                  !mappingMutationsEnabled
-                    ? mappingMutationReason
-                    : `${pairedDevice.name} must be online to browse and approve a mapping.`
-                }
+                disabled={!mappingMutationsEnabled}
+                disabledReason={mappingMutationReason}
               />
             ) : !pairedDevice && view !== "devices" ? (
               <Button onClick={() => setView("devices")}>
@@ -394,10 +394,12 @@ function ThemeSwitcher({
         {options.map((option) => {
           const Icon = option.icon
           return (
-            <button
+            <Button
+              variant="ghost"
+              size="icon-sm"
               key={option.id}
               type="button"
-              className="theme-option [display:grid] [height:26px] [place-items:center] [border:0] [border-radius:6px] [background:transparent] [color:var(--muted-foreground)] [transition:140ms_ease] [&_svg]:[width:14px] [&_svg]:[height:14px] [&:hover]:[color:var(--foreground)] [&[data-active='true']]:[background:var(--surface-strong)] [&[data-active='true']]:[color:var(--primary)] [&[data-active='true']]:[box-shadow:0_1px_3px_oklch(0_0_0_/_0.18)]"
+              className="theme-option h-[26px] w-full rounded-[6px] border-0 bg-transparent [color:var(--muted-foreground)] [transition:140ms_ease] [&_svg]:[width:14px] [&_svg]:[height:14px] [&:hover]:[color:var(--foreground)] [&[data-active='true']]:[background:var(--surface-strong)] [&[data-active='true']]:[color:var(--primary)] [&[data-active='true']]:[box-shadow:0_1px_3px_oklch(0_0_0_/_0.18)]"
               data-active={theme === option.id}
               aria-label={option.label}
               aria-pressed={theme === option.id}
@@ -406,7 +408,7 @@ function ThemeSwitcher({
               onClick={() => onChange(option.id)}
             >
               <Icon />
-            </button>
+            </Button>
           )
         })}
       </div>

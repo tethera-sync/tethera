@@ -1,9 +1,42 @@
 import { describe, expect, test } from "bun:test"
 import type { AppSnapshot } from "../src/shared/contracts"
-import { createSnapshotSubscription } from "../src/renderer/lib/snapshot"
+import { createSnapshotSubscription, preferredPairedDevice } from "../src/renderer/lib/snapshot"
 import { appSnapshot } from "./helpers"
 
 const snapshot = (engineMessage: string) => appSnapshot({ engineMessage })
+
+const device = (id: string, name: string, status: "this-device" | "online" | "offline") => ({
+  id,
+  name,
+  platform: "linux" as const,
+  status,
+  route: status === "online" ? "lan-direct" as const : "offline" as const,
+})
+
+describe("preferredPairedDevice", () => {
+  test("prefers an online peer listed after an offline peer", () => {
+    const offline = device("offline", "Offline computer", "offline")
+    const online = device("online", "Online computer", "online")
+
+    expect(preferredPairedDevice(appSnapshot({ devices: [offline, online] }))).toEqual(online)
+  })
+
+  test("returns a single offline peer", () => {
+    const offline = device("offline", "Offline computer", "offline")
+
+    expect(preferredPairedDevice(appSnapshot({ devices: [offline] }))).toEqual(offline)
+  })
+
+  test("returns undefined when there are no paired peers", () => {
+    expect(preferredPairedDevice(appSnapshot())).toBeUndefined()
+  })
+
+  test("never returns the local device", () => {
+    const local = device("local", "This computer", "this-device")
+
+    expect(preferredPairedDevice(appSnapshot({ devices: [local] }))).toBeUndefined()
+  })
+})
 
 describe("createSnapshotSubscription", () => {
   test("subscribes before reading and lets a pushed snapshot win", async () => {

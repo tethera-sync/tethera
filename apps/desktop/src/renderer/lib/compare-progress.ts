@@ -54,14 +54,15 @@ export function comparePhaseText(
 ): { headline: string; detail: string } {
   const { thisComputer, otherComputer, scannedFiles, activity, elapsed } = options
   const elapsedSuffix = ` · ${elapsed} elapsed`
-  if (phase === "scan-local") {
-    if (activity) {
-      const action = { listing: "Listing folders", inspecting: "Checking file metadata", hashing: "Reading file contents to compare", complete: "Local scan finished" }[activity.stage]
-      return {
-        headline: `${action} on ${thisComputer}${activity.stage === "complete" ? "." : "…"}`,
-        detail: `${activity.scannedFiles.toLocaleString("en-GB")} files checked · ${formatBytes(activity.hashedBytes)} hashed · ${activity.ignoredEntries.toLocaleString("en-GB")} excluded entries · ${activity.unreadableEntries.toLocaleString("en-GB")} unreadable. Nothing is copied${elapsedSuffix}.`,
-      }
+  if ((phase === "scan-local" || phase === "scan-remote") && activity) {
+    const computer = phase === "scan-local" ? thisComputer : otherComputer
+    const action = { listing: "Listing folders", inspecting: "Checking file metadata", hashing: "Reading file contents to compare", complete: "Scan finished" }[activity.stage]
+    return {
+      headline: `${action} on ${computer}${activity.stage === "complete" ? "." : "…"}`,
+      detail: `${activity.scannedFiles.toLocaleString("en-GB")} files checked · ${formatBytes(activity.hashedBytes)} hashed · ${activity.ignoredEntries.toLocaleString("en-GB")} excluded entries · ${activity.unreadableEntries.toLocaleString("en-GB")} unreadable. Nothing is copied${elapsedSuffix}.`,
     }
+  }
+  if (phase === "scan-local") {
     const count = scannedFiles === undefined ? "" : ` · ${scannedFiles.toLocaleString("en-GB")} files so far`
     return {
       headline: `Scanning folders on ${thisComputer}…`,
