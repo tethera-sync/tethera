@@ -1,6 +1,6 @@
 # Data model
 
-SQLite is local to each device. Schema version `4` is authoritative for mapping configuration, verified file baselines, retry/conflict state, and replacement recovery metadata. User-file bytes are never stored in SQLite.
+SQLite is local to each device. Schema version `6` is authoritative for mapping configuration, verified file baselines, retry/conflict state, replacement recovery metadata, and staged scan generations. User-file bytes are never stored in SQLite.
 
 ## Implemented mapping tables
 
@@ -58,6 +58,8 @@ The active records, any tombstones needed to defeat stale PR #4 rows, outbox ent
 - Version 2 additively creates the revision, tombstone, outbox, and legacy-import tables and backfills version-1 active rows.
 - Version 3 adds verified file baselines, retryable operations, and durable conflicts.
 - Version 4 additively creates content-addressed archive-object metadata and the replacement/restore journal.
+- Version 5 adds the per-folder maximum file-size column.
+- Version 6 additively creates staged scan generations (`scan_generations`) and their ordered entries (`scan_entries`) with mapping/revision/participant binding, open/sealed/aborted lifecycle, idempotent batch ingestion, and keyset paging indexes.
 - Every schema step and `PRAGMA user_version` bump shares one immediate transaction.
 - Malformed version-1 data rolls the whole step back and leaves version 1 intact.
 - A database newer than this build supports is refused without writes.
@@ -89,6 +91,26 @@ States are `planned`, `archived`, `installed`, `completed`, `aborted`, `recovery
 
 Explicit conflict selection does not add another persistence model or schema version. While the exact `file_sync_conflicts` row remains present, each participant records the user's choice as a normal `file_sync_operations` row in its local orientation, containing the selected direction and exact source/destination metadata. Repeating the same exact choice is idempotent; a stale version or a different queued operation for that path is rejected. Each participant's verified-completion transaction independently advances its baseline, removes its operation, and clears its local conflict after exact completion is recorded; authenticated peer acknowledgement drives the other participant's transaction.
 
+## Staged scan generations (version 6)
+
+`scan_generations` binds one staged observation to its mapping, authenticated
+participant, mapping revision, canonical owning root, ignore rules, and hash
+mode (`full-sha256` or `preview`), with `open`, `sealed`, or `aborted` state,
+a staged entry count, next batch sequence, and expiry. `scan_entries` stores
+one row per relative path per generation, ordered by `(generation_id,
+relative_path)` for keyset paging.
+
+Batches are transactional and idempotent: an identical re-delivery is accepted
+without double-counting, while gaps, changed duplicates, stale revisions, and
+cross-mapping reads fail. Sealing verifies the staged count; only a sealed
+generation is visible to planning reads and `fileSync.reconcileGenerations`,
+which streams the union of both generations and the baseline in ordered pages
+and publishes the completed plan atomically. Aborted and expired generations
+are cleaned without touching baselines, operations, conflicts, or recovery
+evidence. At most four open generations per mapping and one million entries
+per generation are staged; one batch holds at most 1,000 entries and one
+planning page reads at most 1,000 paths.
+
 ## Not implemented in this schema
 
-Logical content revisions, scan generations, transfer/chunk resume state, archive retention/pruning, and file deletion propagation remain future work. They must arrive in later versioned migrations rather than being inferred from mapping configuration. General archive browsing is also not represented by the conflict-resolution projection.
+Logical content revisions, transfer/chunk resume state, archive retention/pruning, and file deletion propagation remain future work. They must arrive in later versioned migrations rather than being inferred from mapping configuration. General archive browsing is also not represented by the conflict-resolution projection.

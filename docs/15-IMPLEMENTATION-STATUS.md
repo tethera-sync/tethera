@@ -17,7 +17,7 @@ This document separates implemented behaviour from planned behaviour so the prod
 
 SQLite is the sole authoritative store for approved folder-mapping configuration. The desktop starts its stable device identity, opens the authenticated Rust RPC session, completes or verifies the legacy import, and then obtains active mappings through `mapping.list`. It never silently falls back to `state.json`.
 
-Schema version 4 keeps the original migrations and adds:
+Schema version 6 keeps the original migrations and adds:
 
 - `mapping_revisions` for the current active event metadata;
 - `mapping_tombstones` for durable deletion evidence;
@@ -29,6 +29,8 @@ Schema version 4 keeps the original migrations and adds:
 - `file_sync_conflicts` for simultaneous changes, one-sided deletion, direction mismatch, or unbased state.
 - `archive_objects` for verified content-addressed archive metadata; and
 - `file_replacement_journal` for restart-safe replacement and restore lifecycle state.
+- `scan_generations` and `scan_entries` (version 6) for bounded staged scan generations with participant/revision/root/rules/hash-mode binding, idempotent batches, seal verification, ordered paging, quota/expiry, and startup cleanup; and
+- `fileSync.reconcileGenerations`, `fileSync.operationsPage`, `fileSync.conflictsPage`, and `scanGeneration.begin/append/seal/abort/readPage/cleanup` RPC.
 
 Each migration step and each mapping mutation is transactional. A startup write probe distinguishes a genuinely writable store from a WAL database that can be opened for reads while another writer holds it. A newer schema is refused without modification.
 
@@ -77,7 +79,7 @@ The RPC exposes no SQL, no arbitrary file operation and no identity private key.
 
 ## Initial merge and continuous synchronization
 
-Desktop comparison previews report time-throttled local listing, metadata and hashing activity, the current relative path, checked files, excluded/unreadable entries and bytes hashed. Remote scans currently report a waiting phase rather than live remote counts. Preview samples retain the 14 largest differences across the scanned manifests, ordered by size with path/category tie-breaks. Initial-merge local scans also expose activity before transfer starts. Explicit `**/node_modules/**` rules prune root and nested dependency directories before traversal and before the scan-file ceiling is consumed.
+Desktop comparison previews report time-throttled local listing, metadata and hashing activity, the current relative path, checked files, excluded/unreadable entries and bytes hashed. Remote scans currently report a waiting phase rather than live remote counts. Preview samples retain the 14 largest differences across the scanned manifests, ordered by size with path/category tie-breaks. Initial-merge local scans also expose activity before transfer starts. Explicit `**/node_modules/**` rules prune root and nested dependency directories before traversal and before the scan-file ceiling is consumed. Read-only scans are cooperatively cancellable (preview supersession, peer disconnect/deadline, pause/removal, shutdown, paired-scan sibling abort) with per-scan hash-buffer reuse and a process-wide budget of 4 active and 16 queued scans; peer frames stay capped at 16 MiB with a 32-message/4 MiB parked queue.
 
 The preliminary Rust scanner, comparison and no-write plan are not wired into the live desktop transfer path. They still have documented development ceilings, use BLAKE3 rather than the desktop transfer path's SHA-256, and have no durable per-file index. Their opaque digest values must not be mixed with the desktop manifest contract.
 
@@ -95,16 +97,16 @@ For a durable conflict where both files are present, the coordinator can inspect
 
 ## Clearly not implemented
 
-- Scan generations, incremental hashing, paging beyond the configurable scan-file ceiling, or production-scale performance work.
+- Automatic large-folder sync through staged generations in the live initial/continuous flows (the contracts, paging, and peer serving above are implemented, but live merge/reconciliation still uses legacy full manifests with explicit fail-closed limits).
 - Engine-owned filesystem watching/network transfer, resumable/content-defined chunking, or bandwidth scheduling.
 - File deletion or rename propagation, archive retention/pruning, or resolving conflicts where either copy is missing.
 - NAT traversal, cloud services, accounts or telemetry.
-- Removal of the scan-file ceiling itself. It is now a global preference (1,000–1,000,000 files, or explicitly unlimited; 10,000 by default), but every scan is still a single in-memory pass.
+- Removal of the scan-file ceiling itself. It is now a global preference (1,000–1,000,000 files, or explicitly unlimited; 10,000 by default), but every legacy scan is still a single in-memory pass with cooperative cancellation, bounded admission (4 active, 16 queued), per-scan hash-buffer reuse, and pre-send byte budgets.
 - Code-signed/notarised release builds.
 
 ## Recommended next pull request
 
-The next milestone should add the archive retention policy over the browser that now exists: an explicit age/count/size budget, a pruning pass that can never delete an object still referenced by an unfinished, recovery-required or integrity-failed journal entry, and tests for interrupted pruning. Deletion and rename propagation should remain disabled until archive recovery and cross-platform interruption tests prove the lifecycle safe.
+Wire the live initial merge and continuous reconciliation through sealed generations end to end (streamed staging, peer generation exchange, generation reconciliation, paged operation/conflict consumers, and UI summaries), then add the archive retention policy over the browser that now exists: an explicit age/count/size budget, a pruning pass that can never delete an object still referenced by an unfinished, recovery-required or integrity-failed journal entry, and tests for interrupted pruning. Deletion and rename propagation should remain disabled until archive recovery and cross-platform interruption tests prove the lifecycle safe.
 
 ## LAN ports
 

@@ -126,6 +126,19 @@ pub struct ReconcileRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReconcileGenerationsRequest {
+    pub mapping_id: String,
+    pub local_generation_id: String,
+    pub remote_generation_id: String,
+    pub mode: String,
+    pub observed_at: String,
+    pub queue_operations: bool,
+}
+
+const GENERATION_RECONCILE_PAGE: i64 = 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolveConflictRequest {
     pub mapping_id: String,
     pub path: String,
@@ -271,6 +284,189 @@ impl MappingStore {
                 conflicts: state.conflicts,
                 recovery_issues: state.recovery_issues,
             })
+    }
+
+    /// Reconciles two sealed scan generations with bounded indexed reads.
+    ///
+    /// Observations are streamed in ordered pages and merged without ever
+    /// materialising full manifests, baselines, or path sets. The completed
+    /// plan is published atomically; a failure commits nothing. Incomplete
+    /// generations are invisible: only `sealed` generations with matching
+    /// mapping, revision, and full SHA-256 digests are accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, mapping-state, or database error without
+    /// committing a partial reconciliation.
+    pub fn reconcile_generations(
+        &self,
+        request: &ReconcileGenerationsRequest,
+    ) -> Result<ReconcileResult, MappingStoreError> {
+        self.ensure_import_completed()?;
+        validate_generations_request(request)?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        require_active_mapping(&transaction, &request.mapping_id)?;
+        if has_active_replacement_journal(&transaction, &request.mapping_id)? {
+            return Err(MappingStoreError::Invalid(
+                "file reconciliation is blocked by an active replacement recovery journal"
+                    .to_owned(),
+            ));
+        }
+        let current_revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM mapping_revisions WHERE mapping_id = ?1",
+                params![request.mapping_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| MappingStoreError::NotFound(request.mapping_id.clone()))?;
+        let local_meta = sealed_generation_meta(
+            &transaction,
+            &request.local_generation_id,
+            &request.mapping_id,
+        )?;
+        let remote_meta = sealed_generation_meta(
+            &transaction,
+            &request.remote_generation_id,
+            &request.mapping_id,
+        )?;
+        if local_meta.revision != current_revision || remote_meta.revision != current_revision {
+            return Err(MappingStoreError::Invalid(
+                "scan generation mapping revision is stale".to_owned(),
+            ));
+        }
+        if local_meta.hash_mode != "full-sha256" || remote_meta.hash_mode != "full-sha256" {
+            return Err(MappingStoreError::Invalid(
+                "generation reconciliation requires full SHA-256 observations".to_owned(),
+            ));
+        }
+        let initialized = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_sync_mapping_state WHERE mapping_id = ?1)",
+            params![request.mapping_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let plan = plan_generations_reconciliation(
+            &transaction,
+            request,
+            initialized,
+            &request.local_generation_id,
+            &request.remote_generation_id,
+        )?;
+        persist_generations_reconciliation(
+            &transaction,
+            request,
+            &plan.operations,
+            &plan.conflicts,
+        )?;
+        transaction.commit()?;
+        self.file_sync_state(&request.mapping_id)
+            .map(|state| ReconcileResult {
+                mapping_id: state.mapping_id,
+                initialized: state.initialized,
+                baseline_count: state.baseline_count,
+                verified_count: plan.verified_count,
+                operations: state.operations,
+                conflicts: state.conflicts,
+                recovery_issues: state.recovery_issues,
+            })
+    }
+
+    /// Bounded page over durable operations, ordered by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation or database error.
+    pub fn file_sync_operations_page(
+        &self,
+        mapping_id: &str,
+        cursor: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<SyncOperation>, Option<i64>), MappingStoreError> {
+        self.ensure_import_completed()?;
+        check_identifier("mappingId", mapping_id)?;
+        if limit <= 0 || limit > 1_000 {
+            return Err(MappingStoreError::Invalid(
+                "operations page limit is outside the supported bound".to_owned(),
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, mapping_id, relative_path, direction, source_digest, source_size,
+                    expected_destination_digest, status, attempts, last_error, created_at, updated_at
+             FROM file_sync_operations
+             WHERE mapping_id = ?1 AND (?2 IS NULL OR id > ?2)
+             ORDER BY id LIMIT ?3",
+        )?;
+        let rows =
+            statement.query_map(params![mapping_id, cursor, limit + 1], operation_from_row)?;
+        let mut operations = Vec::new();
+        for row in rows {
+            operations.push(row?);
+        }
+        let next = if i64::try_from(operations.len()).unwrap_or(i64::MAX) > limit {
+            operations.pop();
+            operations.last().map(|operation| operation.id)
+        } else {
+            None
+        };
+        Ok((operations, next))
+    }
+
+    /// Bounded page over durable conflicts, ordered by path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation or database error.
+    pub fn file_sync_conflicts_page(
+        &self,
+        mapping_id: &str,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<(Vec<SyncConflict>, Option<String>), MappingStoreError> {
+        self.ensure_import_completed()?;
+        check_identifier("mappingId", mapping_id)?;
+        if limit <= 0 || limit > 1_000 {
+            return Err(MappingStoreError::Invalid(
+                "conflicts page limit is outside the supported bound".to_owned(),
+            ));
+        }
+        if let Some(cursor) = cursor {
+            validate_path(cursor)?;
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT mapping_id, relative_path, kind, local_digest, remote_digest, detected_at
+             FROM file_sync_conflicts
+             WHERE mapping_id = ?1 AND (?2 IS NULL OR relative_path > ?2)
+             ORDER BY relative_path LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![mapping_id, cursor, limit + 1], |row| {
+            let kind: String = row.get(2)?;
+            Ok(SyncConflict {
+                mapping_id: row.get(0)?,
+                path: row.get(1)?,
+                kind: ConflictKind::parse(&kind).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                local_digest: row.get(3)?,
+                remote_digest: row.get(4)?,
+                detected_at: row.get(5)?,
+            })
+        })?;
+        let mut conflicts = Vec::new();
+        for row in rows {
+            conflicts.push(row?);
+        }
+        let next = if i64::try_from(conflicts.len()).unwrap_or(i64::MAX) > limit {
+            conflicts.pop();
+            conflicts.last().map(|conflict| conflict.path.clone())
+        } else {
+            None
+        };
+        Ok((conflicts, next))
     }
 
     /// Returns the durable baseline, retry, and conflict projection for one mapping.
@@ -1025,6 +1221,289 @@ fn validate_reconcile_request(request: &ReconcileRequest) -> Result<(), MappingS
         validate_digest(&file.digest)?;
     }
     Ok(())
+}
+
+struct SealedGenerationMeta {
+    revision: i64,
+    hash_mode: String,
+}
+
+fn sealed_generation_meta(
+    transaction: &Transaction<'_>,
+    generation_id: &str,
+    mapping_id: &str,
+) -> Result<SealedGenerationMeta, MappingStoreError> {
+    crate::scan_generations::validate_generation_id(generation_id)?;
+    let row: Option<(String, i64, String, String)> = transaction
+        .query_row(
+            "SELECT mapping_id, mapping_revision, hash_mode, state
+             FROM scan_generations WHERE generation_id = ?1",
+            params![generation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    match row {
+        Some((owner, revision, hash_mode, state)) => {
+            if owner != mapping_id {
+                return Err(MappingStoreError::Invalid(
+                    "scan generation does not belong to this mapping".to_owned(),
+                ));
+            }
+            if state != "sealed" {
+                return Err(MappingStoreError::Invalid(
+                    "scan generation is not sealed and complete".to_owned(),
+                ));
+            }
+            Ok(SealedGenerationMeta {
+                revision,
+                hash_mode,
+            })
+        }
+        None => Err(MappingStoreError::NotFound(format!(
+            "scan generation {generation_id}"
+        ))),
+    }
+}
+
+fn validate_generations_request(
+    request: &ReconcileGenerationsRequest,
+) -> Result<(), MappingStoreError> {
+    check_identifier("mappingId", &request.mapping_id)?;
+    crate::scan_generations::validate_generation_id(&request.local_generation_id)?;
+    crate::scan_generations::validate_generation_id(&request.remote_generation_id)?;
+    validate_timestamp("observedAt", &request.observed_at)?;
+    if !["two-way", "send-only", "receive-only"].contains(&request.mode.as_str()) {
+        return Err(MappingStoreError::Invalid(
+            "mode must be two-way, send-only, or receive-only".to_owned(),
+        ));
+    }
+    if request.local_generation_id == request.remote_generation_id {
+        return Err(MappingStoreError::Invalid(
+            "local and remote generations must differ".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct GenerationObserved {
+    digest: String,
+    size: i64,
+}
+
+/// Streams two sealed generations and the baseline in path order, planning
+/// without materialising any full set. Baseline advances for identical paths
+/// are applied inline within the same transaction.
+#[allow(clippy::too_many_lines)]
+fn plan_generations_reconciliation(
+    transaction: &Transaction<'_>,
+    request: &ReconcileGenerationsRequest,
+    initialized: bool,
+    local_generation: &str,
+    remote_generation: &str,
+) -> Result<ReconciliationPlan, MappingStoreError> {
+    let mut plan = ReconciliationPlan {
+        verified_count: 0,
+        operations: Vec::new(),
+        conflicts: Vec::new(),
+    };
+    let mut cursor: Option<String> = None;
+    loop {
+        let (paths, next) = read_distinct_paths_page(
+            transaction,
+            &request.mapping_id,
+            local_generation,
+            remote_generation,
+            cursor.as_deref(),
+            GENERATION_RECONCILE_PAGE,
+        )?;
+        if paths.is_empty() {
+            break;
+        }
+        for path in &paths {
+            let local_file = read_generation_entry(transaction, local_generation, path)?;
+            let remote_file = read_generation_entry(transaction, remote_generation, path)?;
+            let baseline = read_baseline_entry(transaction, &request.mapping_id, path)?;
+            match (local_file, remote_file) {
+                (Some(local_file), Some(remote_file))
+                    if local_file.digest == remote_file.digest =>
+                {
+                    upsert_baseline(
+                        transaction,
+                        &request.mapping_id,
+                        path,
+                        &local_file.digest,
+                        local_file.size,
+                        &request.observed_at,
+                    )?;
+                    plan.verified_count += 1;
+                }
+                (Some(local_file), Some(remote_file)) => {
+                    let local = ObservedFile {
+                        path: path.clone(),
+                        size: local_file.size,
+                        digest: local_file.digest.clone(),
+                    };
+                    let remote = ObservedFile {
+                        path: path.clone(),
+                        size: remote_file.size,
+                        digest: remote_file.digest.clone(),
+                    };
+                    plan_divergent_pair(
+                        path,
+                        &local,
+                        &remote,
+                        baseline.as_ref(),
+                        &request.mode,
+                        &mut plan.operations,
+                        &mut plan.conflicts,
+                    );
+                }
+                (Some(file), None) => {
+                    let observed = ObservedFile {
+                        path: path.clone(),
+                        size: file.size,
+                        digest: file.digest.clone(),
+                    };
+                    plan_one_sided(
+                        path,
+                        &observed,
+                        true,
+                        baseline.is_some(),
+                        initialized,
+                        &request.mode,
+                        &mut plan,
+                    );
+                }
+                (None, Some(file)) => {
+                    let observed = ObservedFile {
+                        path: path.clone(),
+                        size: file.size,
+                        digest: file.digest.clone(),
+                    };
+                    plan_one_sided(
+                        path,
+                        &observed,
+                        false,
+                        baseline.is_some(),
+                        initialized,
+                        &request.mode,
+                        &mut plan,
+                    );
+                }
+                (None, None) => {
+                    plan.conflicts.push(PlannedConflict {
+                        path: path.clone(),
+                        kind: ConflictKind::DeletionNotPropagated,
+                        local_digest: None,
+                        remote_digest: None,
+                    });
+                }
+            }
+        }
+        match next {
+            Some(next_cursor) => cursor = Some(next_cursor),
+            None => break,
+        }
+    }
+    Ok(plan)
+}
+
+fn read_distinct_paths_page(
+    transaction: &Transaction<'_>,
+    mapping_id: &str,
+    local_generation: &str,
+    remote_generation: &str,
+    cursor: Option<&str>,
+    limit: i64,
+) -> Result<(Vec<String>, Option<String>), MappingStoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT path FROM (
+            SELECT relative_path AS path FROM scan_entries WHERE generation_id = ?1
+            UNION
+            SELECT relative_path AS path FROM scan_entries WHERE generation_id = ?2
+            UNION
+            SELECT relative_path AS path FROM file_sync_baselines WHERE mapping_id = ?3
+        ) WHERE (?4 IS NULL OR path > ?4)
+        ORDER BY path LIMIT ?5",
+    )?;
+    let rows = statement.query_map(
+        params![
+            local_generation,
+            remote_generation,
+            mapping_id,
+            cursor,
+            limit + 1
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut paths = Vec::new();
+    for row in rows {
+        paths.push(row?);
+    }
+    let next = if i64::try_from(paths.len()).unwrap_or(i64::MAX) > limit {
+        paths.pop();
+        paths.last().cloned()
+    } else {
+        None
+    };
+    Ok((paths, next))
+}
+
+fn read_generation_entry(
+    transaction: &Transaction<'_>,
+    generation_id: &str,
+    path: &str,
+) -> Result<Option<GenerationObserved>, MappingStoreError> {
+    let row: Option<(Option<String>, i64)> = transaction
+        .query_row(
+            "SELECT digest, size FROM scan_entries WHERE generation_id = ?1 AND relative_path = ?2",
+            params![generation_id, path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((None, _)) => Err(MappingStoreError::Invalid(
+            "generation reconciliation requires full SHA-256 observations".to_owned(),
+        )),
+        Some((Some(digest), size)) => {
+            validate_digest(&digest)?;
+            Ok(Some(GenerationObserved { digest, size }))
+        }
+    }
+}
+
+fn read_baseline_entry(
+    transaction: &Transaction<'_>,
+    mapping_id: &str,
+    path: &str,
+) -> Result<Option<(String, i64)>, MappingStoreError> {
+    transaction
+        .query_row(
+            "SELECT digest, size FROM file_sync_baselines WHERE mapping_id = ?1 AND relative_path = ?2",
+            params![mapping_id, path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn persist_generations_reconciliation(
+    transaction: &Transaction<'_>,
+    request: &ReconcileGenerationsRequest,
+    operations: &[PlannedOperation],
+    conflicts: &[PlannedConflict],
+) -> Result<(), MappingStoreError> {
+    let proxy = ReconcileRequest {
+        mapping_id: request.mapping_id.clone(),
+        local: Vec::new(),
+        remote: Vec::new(),
+        mode: request.mode.clone(),
+        observed_at: request.observed_at.clone(),
+        queue_operations: request.queue_operations,
+    };
+    persist_reconciliation(transaction, &proxy, operations, conflicts)
 }
 
 pub(crate) fn validate_path(path: &str) -> Result<(), MappingStoreError> {

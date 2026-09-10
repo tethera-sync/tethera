@@ -22,6 +22,8 @@ const REQUEST_TIMEOUT_MS = 45_000
 const RESPONSE_FLUSH_TIMEOUT_MS = 15_000
 const CLOCK_SKEW_MS = 2 * 60_000
 const MAX_LINE_BYTES = 16 * 1024 * 1024
+const MAX_QUEUED_MESSAGES = 32
+const MAX_QUEUED_BYTES = 4 * 1024 * 1024
 const MAX_AUTHENTICATED_SESSIONS = 16
 const MAX_AUTHENTICATED_SESSIONS_PER_PEER = 4
 
@@ -76,6 +78,12 @@ export interface PeerRequestContext {
   peerName: string
   remoteAddress: string
   requestId: string
+  /** Aborts when the peer socket closes or the request deadline fires. Handlers must thread it into scan work. */
+  signal: AbortSignal
+}
+
+export interface PeerRequestOptions {
+  signal?: AbortSignal | null
 }
 
 export interface PeerSessionServiceOptions {
@@ -135,14 +143,19 @@ export class PeerSessionService extends EventEmitter {
     })
   }
 
-  async request<T = unknown>(deviceId: string, request: PeerRequest, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
+  async request<T = unknown>(deviceId: string, request: PeerRequest, timeoutMs = REQUEST_TIMEOUT_MS, options: PeerRequestOptions = {}): Promise<T> {
     const peer = this.#options.pairing.getTrustedSessionPeer(deviceId)
     if (!peer) throw new Error("This computer is not trusted.")
     if (!peer.address) throw new Error(`${peer.name} is offline or has no known LAN address.`)
+    if (options.signal?.aborted) throw new Error("The peer request was cancelled before it started.")
 
     const local = this.#options.pairing.getLocalSessionIdentity()
     const socket = net.createConnection({ host: peer.address, port: peer.sessionPort })
     const connection = new JsonLineConnection(socket)
+    const abortOnCancel = (): void => {
+      connection.close()
+    }
+    options.signal?.addEventListener("abort", abortOnCancel, { once: true })
 
     try {
       try {
@@ -213,19 +226,28 @@ export class PeerSessionService extends EventEmitter {
       const response = parsePeerResponse(decryptFrame<unknown>(key, sessionId, "response", responseFrame))
       if (!response.ok) throw new Error(response.error)
       return response.result as T
+    } catch (error) {
+      if (options.signal?.aborted) throw new Error("The peer request was cancelled.")
+      throw error
     } finally {
+      options.signal?.removeEventListener("abort", abortOnCancel)
       connection.close()
     }
   }
 
   async #handleIncoming(socket: Socket): Promise<void> {
     const connection = new JsonLineConnection(socket)
+    const handlerController = new AbortController()
+    const abortHandler = (): void => {
+      connection.close()
+    }
+    socket.once("close", abortHandler)
     let sessionId: string | undefined
     let requestId: string | undefined
     let peerIdForLog: string | undefined
     let authenticatedPeerId: string | undefined
     try {
-      const first = await connection.read(CONNECT_TIMEOUT_MS)
+      const first = await connection.read(CONNECT_TIMEOUT_MS, handlerController.signal)
       if (first.type !== "session-hello") {
         await connection.end({ type: "session-error", protocol: PROTOCOL_VERSION, reason: "Expected a secure-session hello." })
         return
@@ -282,7 +304,7 @@ export class PeerSessionService extends EventEmitter {
         first.ephemeralPublicKey,
         buildSessionTranscript(helloBody, welcomeBody),
       )
-      const frame = await connection.read(REQUEST_TIMEOUT_MS)
+      const frame = await connection.read(REQUEST_TIMEOUT_MS, handlerController.signal)
       if (frame.type !== "secure-frame") throw new Error("Expected an encrypted peer request.")
       requestId = safeCorrelationId(frame.requestId)
       const request = decryptFrame<PeerRequest>(key, first.sessionId, "request", frame)
@@ -291,6 +313,7 @@ export class PeerSessionService extends EventEmitter {
         peerName: peer.name,
         remoteAddress: normalizeRemoteAddress(socket.remoteAddress),
         requestId,
+        signal: handlerController.signal,
       }
 
       let response: PeerResponse
@@ -330,6 +353,8 @@ export class PeerSessionService extends EventEmitter {
         })
       }
     } finally {
+      handlerController.abort()
+      socket.off("close", abortHandler)
       if (authenticatedPeerId) this.#endAuthenticatedSession(authenticatedPeerId)
       connection.close()
     }
@@ -415,6 +440,7 @@ class JsonLineConnection {
   readonly #socket: Socket
   #buffer = ""
   #queue: WireMessage[] = []
+  #queuedBytes = 0
   #waiters: Array<{ resolve: (message: WireMessage) => void; reject: (error: Error) => void }> = []
   #closedError: Error | null = null
 
@@ -424,6 +450,14 @@ class JsonLineConnection {
     socket.on("data", (chunk: Buffer | string) => this.#onData(typeof chunk === "string" ? chunk : chunk.toString("utf8")))
     socket.on("error", (error) => this.#closeWithError(error))
     socket.on("close", () => this.#closeWithError(new Error("The secure peer connection closed.")))
+  }
+
+  get queuedMessages(): number {
+    return this.#queue.length
+  }
+
+  get queuedBytes(): number {
+    return this.#queuedBytes
   }
 
   write(message: WireMessage): void {
@@ -456,30 +490,55 @@ class JsonLineConnection {
     })
   }
 
-  async read(timeoutMs: number): Promise<WireMessage> {
-    if (this.#queue.length > 0) return this.#queue.shift() as WireMessage
+  async read(timeoutMs: number, signal?: AbortSignal | null): Promise<WireMessage> {
+    if (signal?.aborted) throw new Error("The secure peer request was cancelled.")
+    if (this.#queue.length > 0) {
+      const queued = this.#queue.shift() as WireMessage
+      this.#queuedBytes = Math.max(0, this.#queuedBytes - Buffer.byteLength(JSON.stringify(queued), "utf8"))
+      return queued
+    }
     if (this.#closedError) throw this.#closedError
     return await new Promise<WireMessage>((resolve, reject) => {
       const waiter = { resolve, reject }
       this.#waiters.push(waiter)
+      const cleanup = (): void => {
+        clearTimeout(timeout)
+        signal?.removeEventListener("abort", onAbort)
+      }
+      const onAbort = (): void => {
+        const index = this.#waiters.indexOf(waiter)
+        if (index >= 0) this.#waiters.splice(index, 1)
+        cleanup()
+        reject(new Error("The secure peer request was cancelled."))
+      }
       const timeout = setTimeout(() => {
         const index = this.#waiters.indexOf(waiter)
         if (index >= 0) this.#waiters.splice(index, 1)
+        cleanup()
         reject(new Error("The secure peer request timed out."))
       }, timeoutMs)
+      signal?.addEventListener("abort", onAbort, { once: true })
       waiter.resolve = (message) => {
-        clearTimeout(timeout)
+        cleanup()
         resolve(message)
       }
       waiter.reject = (error) => {
-        clearTimeout(timeout)
+        cleanup()
         reject(error)
       }
     })
   }
 
   close(): void {
+    this.#clearRetained()
     if (!this.#socket.destroyed) this.#socket.destroy()
+  }
+
+  #clearRetained(): void {
+    // Terminal state must not retain parsed peer objects or partial line data.
+    this.#queue = []
+    this.#queuedBytes = 0
+    this.#buffer = ""
   }
 
   #onData(chunk: string): void {
@@ -499,7 +558,21 @@ class JsonLineConnection {
         const message = JSON.parse(line) as WireMessage
         const waiter = this.#waiters.shift()
         if (waiter) waiter.resolve(message)
-        else this.#queue.push(message)
+        else {
+          // A stream of individually bounded frames can still exhaust memory
+          // while a long handler runs, so bound the parked queue as well.
+          const messageBytes = Buffer.byteLength(line, "utf8")
+          if (
+            this.#queue.length >= MAX_QUEUED_MESSAGES ||
+            this.#queuedBytes + messageBytes > MAX_QUEUED_BYTES
+          ) {
+            this.#closeWithError(new Error("The peer queued more messages than the safe limit."))
+            this.close()
+            return
+          }
+          this.#queue.push(message)
+          this.#queuedBytes += messageBytes
+        }
       } catch {
         this.#closeWithError(new Error("The peer sent invalid session data."))
       }
@@ -509,6 +582,7 @@ class JsonLineConnection {
   #closeWithError(error: Error): void {
     if (this.#closedError) return
     this.#closedError = error
+    this.#clearRetained()
     for (const waiter of this.#waiters.splice(0)) waiter.reject(error)
   }
 }
