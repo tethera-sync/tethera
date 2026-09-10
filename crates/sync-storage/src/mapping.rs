@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Schema version this build reads and writes. Version 1 is intentionally left unchanged below.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 200;
@@ -747,7 +747,48 @@ impl MappingStore {
         }
         if current < 5 {
             self.migrate_v4_to_v5()?;
+            current = 5;
         }
+        if current < 6 {
+            self.migrate_v5_to_v6()?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v5_to_v6(&self) -> Result<(), MappingStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS scan_generations (
+                generation_id TEXT PRIMARY KEY,
+                mapping_id TEXT NOT NULL REFERENCES folder_mappings(id) ON DELETE CASCADE,
+                participant_device_id TEXT NOT NULL,
+                mapping_revision INTEGER NOT NULL CHECK (mapping_revision > 0),
+                root TEXT NOT NULL,
+                ignore_patterns TEXT NOT NULL,
+                hash_mode TEXT NOT NULL CHECK (hash_mode IN ('full-sha256', 'preview')),
+                state TEXT NOT NULL CHECK (state IN ('open', 'sealed', 'aborted')),
+                entry_count INTEGER NOT NULL DEFAULT 0 CHECK (entry_count >= 0),
+                next_sequence INTEGER NOT NULL DEFAULT 0 CHECK (next_sequence >= 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sealed_at TEXT,
+                expires_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scan_entries (
+                generation_id TEXT NOT NULL REFERENCES scan_generations(generation_id) ON DELETE CASCADE,
+                relative_path TEXT NOT NULL,
+                digest TEXT,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                PRIMARY KEY (generation_id, relative_path)
+            );
+            CREATE INDEX IF NOT EXISTS scan_generations_by_mapping
+                ON scan_generations (mapping_id, state, updated_at);
+            CREATE INDEX IF NOT EXISTS scan_entries_ordered
+                ON scan_entries (generation_id, relative_path);
+            PRAGMA user_version = 6;",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2552,6 +2593,46 @@ mod tests {
                 .expect("revision")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn migrates_schema_v5_to_v6_without_rewriting_existing_mapping_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("mappings.sqlite3");
+        let original = sample("existing-v5-mapping");
+        seed_v1(&path, std::slice::from_ref(&original));
+        drop(MappingStore::open(&path).expect("create representative current schema"));
+
+        let connection = rusqlite::Connection::open(&path).expect("open representative v5");
+        connection
+            .execute_batch(
+                "DROP TABLE IF EXISTS scan_entries;
+                 DROP TABLE IF EXISTS scan_generations;
+                 PRAGMA user_version = 5;",
+            )
+            .expect("downgrade representative schema to v5");
+        drop(connection);
+
+        let reopened = MappingStore::open(&path).expect("migrate v5 to v6");
+        assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
+        let mapping_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM folder_mappings WHERE id = 'existing-v5-mapping'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mapping count");
+        assert_eq!(mapping_count, 1);
+        let generation_tables: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('scan_generations', 'scan_entries')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("generation tables");
+        assert_eq!(generation_tables, 2);
     }
 
     #[test]

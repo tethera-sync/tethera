@@ -205,6 +205,8 @@ export class FolderChangeMonitor {
   #fallback: NodeJS.Timeout | null = null
   #stopped = false
   #refreshing: Promise<void> | null = null
+  /** Cancels an in-flight directory collection when the monitor closes. */
+  #collectionController: AbortController | null = null
   /** The currently reported degradation, so an unchanged condition is not re-reported. `null` while watching normally. */
   #degradedKey: string | null = null
 
@@ -230,6 +232,8 @@ export class FolderChangeMonitor {
 
   close(): void {
     this.#stopped = true
+    this.#collectionController?.abort()
+    this.#collectionController = null
     if (this.#debounce) clearTimeout(this.#debounce)
     if (this.#fallback) clearInterval(this.#fallback)
     this.#debounce = null
@@ -292,45 +296,60 @@ export class FolderChangeMonitor {
   }
 
   async #replaceWatchers(): Promise<void> {
-    const directories = await collectWatchDirectories(this.#rootPath, this.#ignorePatterns)
-    if (this.#stopped) return
-    const wanted = new Set(directories)
-    for (const [directory, watcher] of this.#watchers) {
-      if (!wanted.has(directory)) {
-        watcher.close()
-        this.#watchers.delete(directory)
-      }
-    }
-    for (const directory of directories) {
-      if (this.#watchers.has(directory)) continue
-      try {
-        const watcher = watch(directory, { persistent: false }, (event) => this.#schedule(event === "rename"))
-        watcher.on("error", () => {
+    const controller = new AbortController()
+    this.#collectionController?.abort()
+    this.#collectionController = controller
+    try {
+      const directories = await collectWatchDirectories(this.#rootPath, this.#ignorePatterns, controller.signal)
+      if (this.#stopped || controller.signal.aborted) return
+      const wanted = new Set(directories)
+      for (const [directory, watcher] of this.#watchers) {
+        if (!wanted.has(directory)) {
           watcher.close()
           this.#watchers.delete(directory)
-          this.#schedule(false)
-        })
-        this.#watchers.set(directory, watcher)
-      } catch (error) {
-        // e.g. ENOSPC once the OS's native watch-descriptor limit is exhausted
-        // (common on large trees). The directory is left unwatched; report it
-        // rather than silently losing coverage of that subtree.
-        this.#reportDegraded({
-          kind: "watcher-rejected",
-          directory,
-          message: error instanceof Error ? error.message : String(error),
-        })
-        this.#schedule(false)
+        }
       }
+      for (const directory of directories) {
+        if (this.#stopped || controller.signal.aborted) return
+        if (this.#watchers.has(directory)) continue
+        try {
+          const watcher = watch(directory, { persistent: false }, (event) => this.#schedule(event === "rename"))
+          watcher.on("error", () => {
+            watcher.close()
+            this.#watchers.delete(directory)
+            this.#schedule(false)
+          })
+          this.#watchers.set(directory, watcher)
+        } catch (error) {
+          // e.g. ENOSPC once the OS's native watch-descriptor limit is exhausted
+          // (common on large trees). The directory is left unwatched; report it
+          // rather than silently losing coverage of that subtree.
+          this.#reportDegraded({
+            kind: "watcher-rejected",
+            directory,
+            message: error instanceof Error ? error.message : String(error),
+          })
+          this.#schedule(false)
+        }
+      }
+    } catch (error) {
+      // A close() during collection aborts the walk; a stopped monitor swallows
+      // it instead of reporting a refresh failure for a scan it no longer wants.
+      if (controller.signal.aborted || this.#stopped) return
+      throw error
+    } finally {
+      if (this.#collectionController === controller) this.#collectionController = null
     }
   }
 }
 
-async function collectWatchDirectories(rootPath: string, ignorePatterns: string[]): Promise<string[]> {
+export async function collectWatchDirectories(rootPath: string, ignorePatterns: string[], signal?: AbortSignal | null): Promise<string[]> {
   const canonicalRoot = await realpath(rootPath)
+  if (signal?.aborted) throw new Error("The watcher collection was cancelled.")
   const directories: string[] = []
 
   async function visit(directoryPath: string, relativeDirectory: string, depth: number): Promise<void> {
+    if (signal?.aborted) throw new Error("The watcher collection was cancelled.")
     if (depth > MAX_WATCH_DEPTH) {
       throw new WatchDepthExceededError(`The synchronized folder exceeds the ${MAX_WATCH_DEPTH}-level watch limit.`)
     }
@@ -340,17 +359,23 @@ async function collectWatchDirectories(rootPath: string, ignorePatterns: string[
       )
     }
     const canonicalDirectory = await realpath(directoryPath)
+    if (signal?.aborted) throw new Error("The watcher collection was cancelled.")
     const relativeCanonical = path.relative(canonicalRoot, canonicalDirectory)
     if (relativeCanonical.startsWith("..") || path.isAbsolute(relativeCanonical)) return
     directories.push(directoryPath)
     const directory = await opendir(directoryPath)
-    for await (const entry of directory) {
-      if (!entry.isDirectory() || entry.isSymbolicLink()) continue
-      const relativePath = path.join(relativeDirectory, entry.name).replaceAll("\\", "/")
-      if (isTetheraStagingPath(relativePath) || isManifestPathIgnored(`${relativePath}/placeholder`, ignorePatterns)) {
-        continue
+    try {
+      for await (const entry of directory) {
+        if (signal?.aborted) throw new Error("The watcher collection was cancelled.")
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue
+        const relativePath = path.join(relativeDirectory, entry.name).replaceAll("\\", "/")
+        if (isTetheraStagingPath(relativePath) || isManifestPathIgnored(`${relativePath}/placeholder`, ignorePatterns)) {
+          continue
+        }
+        await visit(path.join(directoryPath, entry.name), relativePath, depth + 1)
       }
-      await visit(path.join(directoryPath, entry.name), relativePath, depth + 1)
+    } finally {
+      await directory.close().catch(() => undefined)
     }
   }
 

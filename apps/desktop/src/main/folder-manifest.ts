@@ -8,6 +8,33 @@ export const DEFAULT_MAX_MANIFEST_FILES = 10_000
 const MAX_HASH_FILE_BYTES = 16 * 1024 * 1024
 const MAX_SAMPLE_ITEMS = 14
 const SCAN_ACTIVITY_INTERVAL_MS = 250
+const HASH_BUFFER_BYTES = 512 * 1024
+/** Conservative ceiling for one legacy full-manifest peer frame, reserving room for JSON escaping, UTF-8, encryption/base64 and envelope overhead below the 16 MiB wire cap. */
+export const MAX_LEGACY_MANIFEST_ENCODED_BYTES = 12 * 1024 * 1024
+/** Mirrors the Rust reconciliation ceiling so callers can fail closed before invoking the engine. */
+export const MAX_LEGACY_OBSERVATION_FILES = 10_000
+const MAX_MANIFEST_PATH_BYTES = 4096
+
+export class ScanCancelledError extends Error {
+  constructor(message = "The folder scan was cancelled.") {
+    super(message)
+    this.name = "ScanCancelledError"
+  }
+}
+
+export function isScanCancelled(error: unknown): boolean {
+  if (error instanceof ScanCancelledError) return true
+  if (error instanceof Error) {
+    if (error.name === "AbortError") return true
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ABORT_ERR") return true
+  }
+  return false
+}
+
+function throwIfScanCancelled(signal: AbortSignal | null | undefined): void {
+  if (signal?.aborted) throw new ScanCancelledError()
+}
 
 export interface FileManifestEntry {
   path: string
@@ -49,6 +76,12 @@ export interface ScanFolderOptions {
   maxFileBytes?: number | null
   /** Time-throttled local activity, including long hashes and scans of small folders. */
   onActivity?: (activity: FolderScanActivity) => void
+  /**
+   * Cooperative cancellation. Checked before/after awaits and between hash
+   * chunks; an abort escapes per-file catch blocks instead of counting the
+   * file as unreadable. Never used for filesystem commit/recovery sequences.
+   */
+  signal?: AbortSignal | null
 }
 
 export async function scanFolder(
@@ -68,6 +101,15 @@ export async function scanFolder(
   let truncated = false
   const maxFiles = resolveScanLimit(options.maxFiles)
   const maxFileBytes = resolveFileSizeLimit(options.maxFileBytes)
+  const signal = options.signal ?? null
+  throwIfScanCancelled(signal)
+  // One lazy buffer per scan, reused sequentially across files. Empty files
+  // never allocate it; concurrent scans each own their buffer.
+  let hashBuffer: Buffer | undefined
+  function hashScratch(): Buffer {
+    if (!hashBuffer) hashBuffer = Buffer.allocUnsafe(HASH_BUFFER_BYTES)
+    return hashBuffer
+  }
   let hashedBytes = 0
   let lastActivityAt = -Infinity
   function reportActivity(stage: FolderScanActivity["stage"], currentPath: string, force = false): void {
@@ -83,71 +125,91 @@ export async function scanFolder(
   }
 
   async function visit(directoryPath: string, relativeDirectory: string): Promise<void> {
+    throwIfScanCancelled(signal)
     if (truncated) return
     reportActivity("listing", relativeDirectory)
     let directory: Awaited<ReturnType<typeof opendir>> | undefined
     try {
       directory = await opendir(directoryPath)
+      throwIfScanCancelled(signal)
       const canonicalDirectory = await realpath(directoryPath)
       if (!isCanonicalPathInside(canonicalRoot, canonicalDirectory)) {
         await directory.close()
+        directory = undefined
         unreadable += 1
         return
       }
-    } catch {
+    } catch (error) {
+      if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
       await directory?.close().catch(() => undefined)
+      directory = undefined
       unreadable += 1
       return
     }
 
-    for await (const entry of directory) {
-      if (truncated) break
-      reportActivity("listing", relativeDirectory)
-      const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name))
-      if (isTetheraStagingPath(relativePath)) {
-        ignored += 1
-        continue
-      }
-      if (matcher(relativePath, entry.isDirectory())) {
-        ignored += 1
-        continue
-      }
-      const absolutePath = path.join(directoryPath, entry.name)
-      if (entry.isSymbolicLink()) {
-        ignored += 1
-        continue
-      }
-      if (entry.isDirectory()) {
-        await visit(absolutePath, relativePath)
-        continue
-      }
-      if (!entry.isFile()) continue
-      try {
-        reportActivity("inspecting", relativePath)
-        const inspection = await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true, maxFileBytes, (bytesRead) => {
-          hashedBytes += bytesRead
-          reportActivity("hashing", relativePath)
-        })
-        // Oversize files are excluded like an ignore-pattern match, so they must not
-        // consume the file ceiling: counting them would report `truncated` for a scan
-        // that actually omitted nothing, and a truncated scan blocks the merge entirely.
-        if (inspection.outcome === "excluded-oversize") {
+    try {
+      for await (const entry of directory) {
+        throwIfScanCancelled(signal)
+        if (truncated) break
+        reportActivity("listing", relativeDirectory)
+        const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name))
+        if (isTetheraStagingPath(relativePath)) {
           ignored += 1
           continue
         }
-        if (files.length >= maxFiles) {
-          truncated = true
-          break
+        if (matcher(relativePath, entry.isDirectory())) {
+          ignored += 1
+          continue
         }
-        files.push(inspection.entry)
-      } catch {
-        unreadable += 1
-        continue
+        const absolutePath = path.join(directoryPath, entry.name)
+        if (entry.isSymbolicLink()) {
+          ignored += 1
+          continue
+        }
+        if (entry.isDirectory()) {
+          await visit(absolutePath, relativePath)
+          continue
+        }
+        if (!entry.isFile()) continue
+        try {
+          reportActivity("inspecting", relativePath)
+          throwIfScanCancelled(signal)
+          const inspection = await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true, maxFileBytes, (bytesRead) => {
+            hashedBytes += bytesRead
+            reportActivity("hashing", relativePath)
+          }, signal, hashScratch)
+          throwIfScanCancelled(signal)
+          // Oversize files are excluded like an ignore-pattern match, so they must not
+          // consume the file ceiling: counting them would report `truncated` for a scan
+          // that actually omitted nothing, and a truncated scan blocks the merge entirely.
+          if (inspection.outcome === "excluded-oversize") {
+            ignored += 1
+            continue
+          }
+          if (files.length >= maxFiles) {
+            truncated = true
+            break
+          }
+          files.push(inspection.entry)
+        } catch (error) {
+          // Cancellation must escape instead of counting the file as unreadable.
+          if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
+          unreadable += 1
+          continue
+        }
       }
+    } finally {
+      await directory?.close().catch(() => undefined)
     }
   }
 
-  await visit(root, "")
+  try {
+    await visit(root, "")
+  } finally {
+    // Release the per-scan scratch promptly; the manifest retains only entries.
+    hashBuffer = undefined
+  }
+  throwIfScanCancelled(signal)
   reportActivity("complete", "", true)
   return { rootPath: root, files, ignored, unreadable, truncated }
 }
@@ -169,9 +231,14 @@ export function compareManifests(
   remote: FileManifest,
   options: CompareManifestOptions,
 ): FolderMappingPreview {
-  const localByPath = new Map(local.files.map((entry) => [entry.path, entry]))
-  const remoteByPath = new Map(remote.files.map((entry) => [entry.path, entry]))
-  const paths = [...new Set([...localByPath.keys(), ...remoteByPath.keys()])].sort((a, b) => a.localeCompare(b))
+  // Two passes over path-indexed maps: no global union set and no global path
+  // sort. Counts are identical to the union iteration; sample membership is
+  // identical because the bounded top-14 set is order-independent and its
+  // final ordering is re-established by addSample.
+  const localByPath = new Map<string, FileManifestEntry>()
+  for (const entry of local.files) localByPath.set(entry.path, entry)
+  const remoteByPath = new Map<string, FileManifestEntry>()
+  for (const entry of remote.files) remoteByPath.set(entry.path, entry)
 
   let identicalFiles = 0
   let differentFiles = 0
@@ -181,32 +248,28 @@ export function compareManifests(
   let bytesToLocal = 0
   const samples: MappingPreviewItem[] = []
 
-  for (const relativePath of paths) {
-    const localEntry = localByPath.get(relativePath)
+  for (const [relativePath, localEntry] of localByPath) {
     const remoteEntry = remoteByPath.get(relativePath)
-    if (localEntry && !remoteEntry) {
+    if (!remoteEntry) {
       localOnlyFiles += 1
       if (options.mode !== "receive-only") bytesToRemote += localEntry.size
       addSample(samples, { path: relativePath, category: "local-only", size: localEntry.size })
       continue
     }
-    if (remoteEntry && !localEntry) {
-      remoteOnlyFiles += 1
-      if (options.mode !== "send-only") bytesToLocal += remoteEntry.size
-      addSample(samples, { path: relativePath, category: "remote-only", size: remoteEntry.size })
-      continue
-    }
-    if (!localEntry || !remoteEntry) continue
-
     if (manifestEntriesMatch(localEntry, remoteEntry)) {
       identicalFiles += 1
       continue
     }
-
     differentFiles += 1
     // The initial merge is additive-only. Same-path differences are surfaced and left untouched
     // until durable revisions and history exist, so they must not inflate transfer estimates.
     addSample(samples, { path: relativePath, category: "different", size: Math.max(localEntry.size, remoteEntry.size) })
+  }
+  for (const [relativePath, remoteEntry] of remoteByPath) {
+    if (localByPath.has(relativePath)) continue
+    remoteOnlyFiles += 1
+    if (options.mode !== "send-only") bytesToLocal += remoteEntry.size
+    addSample(samples, { path: relativePath, category: "remote-only", size: remoteEntry.size })
   }
 
   const invalidWindowsNames = new Set<string>()
@@ -306,7 +369,7 @@ function buildIgnoreRule(pattern: string): Array<{ directoryOnly: boolean; basen
   return rules
 }
 
-function createIgnoreMatcher(patterns: string[]): (relativePath: string, directory: boolean) => boolean {
+export function createIgnoreMatcher(patterns: string[]): (relativePath: string, directory: boolean) => boolean {
   const rules = patterns.flatMap((pattern) => buildIgnoreRule(pattern) ?? [])
 
   return (relativePath, directory) => {
@@ -412,9 +475,13 @@ async function inspectManifestFile(
   hashAllFiles: boolean,
   maxFileBytes: number,
   onHashBytes?: (bytesRead: number) => void,
+  signal?: AbortSignal | null,
+  getHashBuffer?: () => Buffer,
 ): Promise<ManifestFileInspection> {
+  throwIfScanCancelled(signal)
   const absolutePath = resolveWithinRoot(rootPath, relativePath)
   const entry = await lstat(absolutePath)
+  throwIfScanCancelled(signal)
   if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("The manifest path is not a regular file.")
   const canonicalFile = await realpath(absolutePath)
   if (!isCanonicalPathInside(canonicalRoot, canonicalFile)) throw new Error("The manifest file escapes the folder root.")
@@ -433,14 +500,21 @@ async function inspectManifestFile(
     let digest: string | undefined
     if (hashAllFiles || initial.size <= MAX_HASH_FILE_BYTES) {
       const hash = createHash("sha256")
-      const buffer = Buffer.allocUnsafe(512 * 1024)
-      let offset = 0
-      while (offset < initial.size) {
-        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, initial.size - offset), offset)
-        if (bytesRead === 0) throw new Error("The manifest file changed while it was read.")
-        hash.update(buffer.subarray(0, bytesRead))
-        offset += bytesRead
-        onHashBytes?.(bytesRead)
+      if (initial.size > 0) {
+        const buffer = getHashBuffer?.() ?? Buffer.allocUnsafe(HASH_BUFFER_BYTES)
+        let offset = 0
+        while (offset < initial.size) {
+          throwIfScanCancelled(signal)
+          const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, initial.size - offset), offset)
+          throwIfScanCancelled(signal)
+          if (bytesRead === 0) throw new Error("The manifest file changed while it was read.")
+          hash.update(buffer.subarray(0, bytesRead))
+          offset += bytesRead
+          onHashBytes?.(bytesRead)
+        }
+      } else {
+        // Empty files hash without touching the shared scratch buffer.
+        hash.update(Buffer.alloc(0))
       }
       digest = hash.digest("hex")
     }
@@ -485,4 +559,89 @@ export const folderManifestTestHelpers = {
   createIgnoreMatcher,
   findCaseCollisions,
   hasWindowsInvalidPath,
+  parsePeerManifest,
+  estimateManifestEncodedBytes,
+  assertManifestWithinLegacyByteBudget,
+}
+
+function isLowerHexDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value)
+}
+
+/**
+ * Validates an untrusted peer manifest before comparison. Rejects duplicates,
+ * over-long paths, negative sizes, non-finite mtimes and malformed digests.
+ * A `truncated: true` preview stays an explicit partial result for preview
+ * callers; transfer callers still fail closed via assertCompleteTransferManifest.
+ */
+export function parsePeerManifest(value: unknown): FileManifest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The paired computer returned an invalid folder scan.")
+  }
+  const candidate = value as Partial<FileManifest> & { files?: unknown }
+  if (typeof candidate.rootPath !== "string" || !Array.isArray(candidate.files)) {
+    throw new Error("The paired computer returned an invalid folder scan.")
+  }
+  if (candidate.files.length > 1_000_000) {
+    throw new Error("The paired computer returned a folder scan larger than the supported preview limit.")
+  }
+  const seen = new Set<string>()
+  const files: FileManifestEntry[] = []
+  for (const item of candidate.files) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("The paired computer returned an invalid folder scan.")
+    }
+    const entry = item as Partial<FileManifestEntry>
+    if (
+      typeof entry.path !== "string" || entry.path.length === 0 ||
+      Buffer.byteLength(entry.path, "utf8") > MAX_MANIFEST_PATH_BYTES ||
+      entry.path.includes("\0") ||
+      typeof entry.size !== "number" || !Number.isSafeInteger(entry.size) || entry.size < 0 ||
+      typeof entry.modifiedMs !== "number" || !Number.isFinite(entry.modifiedMs) ||
+      (entry.digest !== undefined && !isLowerHexDigest(entry.digest))
+    ) {
+      throw new Error("The paired computer returned an invalid folder scan.")
+    }
+    if (seen.has(entry.path)) {
+      throw new Error("The paired computer returned a folder scan with a duplicate path.")
+    }
+    seen.add(entry.path)
+    files.push({ path: entry.path, size: entry.size, modifiedMs: entry.modifiedMs, digest: entry.digest })
+  }
+  const ignored = typeof candidate.ignored === "number" && Number.isSafeInteger(candidate.ignored) && candidate.ignored >= 0
+    ? candidate.ignored
+    : 0
+  const unreadable = typeof candidate.unreadable === "number" && Number.isSafeInteger(candidate.unreadable) && candidate.unreadable >= 0
+    ? candidate.unreadable
+    : 0
+  return { rootPath: candidate.rootPath, files, ignored, unreadable, truncated: candidate.truncated === true }
+}
+
+/**
+ * Estimates the encrypted wire size of a legacy full-manifest response without
+ * serializing it: per-entry UTF-8 path bytes plus JSON/envelope overhead,
+ * expanded for base64 ciphertext. Used to fail closed before serialization.
+ */
+export function estimateManifestEncodedBytes(manifest: FileManifest): number {
+  let bytes = 256
+  for (const entry of manifest.files) {
+    bytes += Buffer.byteLength(entry.path, "utf8") * 2 + 128
+    if (entry.digest) bytes += 64
+  }
+  // AES-GCM ciphertext base64 expansion plus the secure-frame envelope.
+  return Math.ceil(bytes * 1.37) + 512
+}
+
+export function assertManifestWithinLegacyByteBudget(manifest: FileManifest, computer: string): void {
+  if (manifest.files.length > MAX_LEGACY_OBSERVATION_FILES) {
+    throw new Error(
+      `${computer}'s folder lists ${manifest.files.length.toLocaleString("en-GB")} files, above the supported legacy limit of ${MAX_LEGACY_OBSERVATION_FILES.toLocaleString("en-GB")} per side. Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
+    )
+  }
+  const estimated = estimateManifestEncodedBytes(manifest)
+  if (estimated > MAX_LEGACY_MANIFEST_ENCODED_BYTES) {
+    throw new Error(
+      `${computer}'s folder scan would need about ${(estimated / 1_048_576).toFixed(1)} MiB on the peer channel, above the ${(MAX_LEGACY_MANIFEST_ENCODED_BYTES / 1_048_576).toFixed(0)} MiB legacy budget. Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
+    )
+  }
 }

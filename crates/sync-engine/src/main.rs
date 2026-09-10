@@ -322,7 +322,18 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
             handle_mapping_record_migration_failure(request, mapping_store)
         }
         "fileSync.reconcile" => handle_file_sync_reconcile(request, mapping_store),
+        "fileSync.reconcileGenerations" => {
+            handle_file_sync_reconcile_generations(request, mapping_store)
+        }
+        "fileSync.operationsPage" => handle_file_sync_operations_page(request, mapping_store),
+        "fileSync.conflictsPage" => handle_file_sync_conflicts_page(request, mapping_store),
         "fileSync.resolveConflict" => handle_file_sync_resolve_conflict(request, mapping_store),
+        "scanGeneration.begin" => handle_scan_generation_begin(request, mapping_store),
+        "scanGeneration.append" => handle_scan_generation_append(request, mapping_store),
+        "scanGeneration.seal" => handle_scan_generation_seal(request, mapping_store),
+        "scanGeneration.abort" => handle_scan_generation_abort(request, mapping_store),
+        "scanGeneration.readPage" => handle_scan_generation_read_page(request, mapping_store),
+        "scanGeneration.cleanup" => handle_scan_generation_cleanup(request, mapping_store),
         "fileSync.authorizeApply" => handle_file_sync_authorize_apply(request, mapping_store),
         "fileSync.getState" => handle_file_sync_get_state(request, mapping_store),
         "fileSync.complete" => handle_file_sync_complete(request, mapping_store),
@@ -694,6 +705,212 @@ fn handle_file_sync_reconcile(request: RpcRequest, mapping_store: &MappingStoreS
     match store.reconcile_files(&params) {
         Ok(result) => success_response(request.id, result),
         Err(error) => store_error_response(request.id, "Failed to reconcile file state", &error),
+    }
+}
+
+fn handle_file_sync_reconcile_generations(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: sync_storage::file_sync::ReconcileGenerationsRequest =
+        match parse_params(request.params, "fileSync.reconcileGenerations") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.reconcile_generations(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => {
+            store_error_response(request.id, "Failed to reconcile scan generations", &error)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OperationsPageParams {
+    id: String,
+    cursor: Option<i64>,
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConflictsPageParams {
+    id: String,
+    cursor: Option<String>,
+    limit: Option<i64>,
+}
+
+fn handle_file_sync_operations_page(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: OperationsPageParams = match parse_params(request.params, "fileSync.operationsPage")
+    {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.file_sync_operations_page(&params.id, params.cursor, params.limit.unwrap_or(200)) {
+        Ok((operations, next_cursor)) => success_response(
+            request.id,
+            serde_json::json!({ "operations": operations, "nextCursor": next_cursor }),
+        ),
+        Err(error) => store_error_response(request.id, "Failed to read operations page", &error),
+    }
+}
+
+fn handle_file_sync_conflicts_page(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ConflictsPageParams = match parse_params(request.params, "fileSync.conflictsPage") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.file_sync_conflicts_page(
+        &params.id,
+        params.cursor.as_deref(),
+        params.limit.unwrap_or(200),
+    ) {
+        Ok((conflicts, next_cursor)) => success_response(
+            request.id,
+            serde_json::json!({ "conflicts": conflicts, "nextCursor": next_cursor }),
+        ),
+        Err(error) => store_error_response(request.id, "Failed to read conflicts page", &error),
+    }
+}
+
+fn handle_scan_generation_begin(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: sync_storage::scan_generations::BeginGenerationRequest =
+        match parse_params(request.params, "scanGeneration.begin") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.begin_scan_generation(&params) {
+        Ok(status) => success_response(request.id, status),
+        Err(error) => store_error_response(request.id, "Failed to begin scan generation", &error),
+    }
+}
+
+fn handle_scan_generation_append(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: sync_storage::scan_generations::AppendBatchRequest =
+        match parse_params(request.params, "scanGeneration.append") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.append_scan_batch(&params) {
+        Ok(status) => success_response(request.id, status),
+        Err(error) => store_error_response(request.id, "Failed to append scan batch", &error),
+    }
+}
+
+fn handle_scan_generation_seal(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: sync_storage::scan_generations::SealGenerationRequest =
+        match parse_params(request.params, "scanGeneration.seal") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.seal_scan_generation(&params) {
+        Ok(status) => success_response(request.id, status),
+        Err(error) => store_error_response(request.id, "Failed to seal scan generation", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScanGenerationAbortParams {
+    generation_id: String,
+}
+
+fn handle_scan_generation_abort(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ScanGenerationAbortParams =
+        match parse_params(request.params, "scanGeneration.abort") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.abort_scan_generation(&params.generation_id) {
+        Ok(status) => success_response(request.id, status),
+        Err(error) => store_error_response(request.id, "Failed to abort scan generation", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScanGenerationReadPageParams {
+    generation_id: String,
+    cursor: Option<String>,
+    limit: Option<i64>,
+}
+
+fn handle_scan_generation_read_page(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: ScanGenerationReadPageParams =
+        match parse_params(request.params, "scanGeneration.readPage") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.read_generation_page(
+        &params.generation_id,
+        params.cursor.as_deref(),
+        params.limit.unwrap_or(200),
+    ) {
+        Ok(page) => success_response(request.id, page),
+        Err(error) => {
+            store_error_response(request.id, "Failed to read scan generation page", &error)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScanGenerationCleanupParams {
+    now: String,
+}
+
+fn handle_scan_generation_cleanup(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ScanGenerationCleanupParams =
+        match parse_params(request.params, "scanGeneration.cleanup") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.cleanup_scan_generations(&params.now) {
+        Ok(removed) => success_response(request.id, serde_json::json!({ "removed": removed })),
+        Err(error) => store_error_response(request.id, "Failed to clean scan generations", &error),
     }
 }
 
@@ -1333,7 +1550,16 @@ mod tests {
             "mapping.importLegacy",
             "mapping.recordMigrationFailure",
             "fileSync.reconcile",
+            "fileSync.reconcileGenerations",
+            "fileSync.operationsPage",
+            "fileSync.conflictsPage",
             "fileSync.resolveConflict",
+            "scanGeneration.begin",
+            "scanGeneration.append",
+            "scanGeneration.seal",
+            "scanGeneration.abort",
+            "scanGeneration.readPage",
+            "scanGeneration.cleanup",
             "fileSync.authorizeApply",
             "fileSync.getState",
             "fileSync.complete",

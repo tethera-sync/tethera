@@ -35,6 +35,11 @@ export const MAX_IGNORE_PATTERN_LENGTH = 512
  */
 export const MIN_SCAN_FILES = 1_000
 export const MAX_SCAN_FILES = 1_000_000
+/** Legacy full-observation ceiling enforced by the Rust engine per side. Sync fails closed above it. */
+export const MAX_LEGACY_OBSERVATION_FILES = 10_000
+/** Encrypted peer frame ceiling; legacy manifests reserve headroom below it. */
+export const MAX_PEER_FRAME_BYTES = 16 * 1024 * 1024
+export const MAX_LEGACY_MANIFEST_ENCODED_BYTES = 12 * 1024 * 1024
 
 const pathString = z
   .string()
@@ -410,4 +415,25 @@ export function validatePeerOperationId(request: PeerRequest): number {
     throw new Error("The continuous-sync operation identity is invalid.")
   }
   return request.operationId
+}
+
+/**
+ * Fails closed before a legacy full-observation reconcile or peer send.
+ * Keeps the user's scan preference intact: explains the limit instead of
+ * silently trimming a complete observation to fit.
+ */
+export function assertLegacyObservationCapacity(localCount: number, remoteCount: number, computer = "This computer"): void {
+  if (localCount > MAX_LEGACY_OBSERVATION_FILES || remoteCount > MAX_LEGACY_OBSERVATION_FILES) {
+    throw new Error(
+      `${computer}'s folder scan holds ${Math.max(localCount, remoteCount).toLocaleString("en-GB")} files, above the supported legacy limit of ${MAX_LEGACY_OBSERVATION_FILES.toLocaleString("en-GB")} per side. Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
+    )
+  }
+}
+
+export function assertLegacyEncodedBudget(estimatedBytes: number, computer = "This computer"): void {
+  if (estimatedBytes > MAX_LEGACY_MANIFEST_ENCODED_BYTES) {
+    throw new Error(
+      `${computer}'s folder scan would need about ${(estimatedBytes / 1_048_576).toFixed(1)} MiB on the peer channel, above the ${(MAX_LEGACY_MANIFEST_ENCODED_BYTES / 1_048_576).toFixed(0)} MiB legacy budget below the ${(MAX_PEER_FRAME_BYTES / 1_048_576).toFixed(0)} MiB frame cap. Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
+    )
+  }
 }

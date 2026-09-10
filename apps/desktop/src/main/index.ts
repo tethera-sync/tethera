@@ -51,7 +51,12 @@ import {
   type EngineState,
   type MappingStoreHealth,
 } from "./engine-supervisor"
-import { compareManifests, DEFAULT_MAX_MANIFEST_FILES, isManifestPathIgnored, scanFolder, type FileManifest } from "./folder-manifest"
+import {
+  compareManifests, DEFAULT_MAX_MANIFEST_FILES, isManifestPathIgnored, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, estimateManifestEncodedBytes, type FileManifest,
+} from "./folder-manifest"
+import { globalScanCoordinator } from "./scan-coordinator"
+import { runPairedScans } from "./paired-scan"
+import { SCAN_GENERATION_CAPABILITY, SCAN_PAGE_MAX_ENTRIES } from "./scan-generation"
 import {
   assessInitialMergeConvergence,
   computeSyncPlan,
@@ -96,6 +101,8 @@ import { PeerSessionService, type PeerRequest, type PeerRequestContext } from ".
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import {
   applySettingUpdate,
+  assertLegacyEncodedBudget,
+  assertLegacyObservationCapacity,
   normalizePersistedScanLimit,
   parseArchiveHistoryRequest,
   parseExactConflictChoice,
@@ -278,6 +285,77 @@ const defaultSettings: AppSettings = {
  */
 function currentScanLimit(): number | null {
   return snapshot.settings.maxScanFiles
+}
+
+/**
+ * Cooperative scan lifetime. Preview supersession, folder pause/removal and
+ * app shutdown abort their scans at the next checkpoint; a paired-scan
+ * failure aborts its sibling. Slots are held only for the local walk, never
+ * across a peer wait, so two devices cannot deadlock holding a slot each.
+ */
+const previewScanControllers = new Map<string, AbortController>()
+const folderScanControllers = new Map<string, Set<AbortController>>()
+const shutdownScanController = new AbortController()
+
+function trackFolderScan(folderId: string | undefined, controller: AbortController): () => void {
+  if (!folderId) return () => undefined
+  let set = folderScanControllers.get(folderId)
+  if (!set) {
+    set = new Set()
+    folderScanControllers.set(folderId, set)
+  }
+  set.add(controller)
+  return () => {
+    set?.delete(controller)
+    if (set?.size === 0) folderScanControllers.delete(folderId)
+  }
+}
+
+function abortFolderScans(folderId: string): void {
+  const set = folderScanControllers.get(folderId)
+  if (!set) return
+  for (const controller of [...set]) controller.abort()
+}
+
+function runLocalScan(
+  key: string,
+  rootPath: string,
+  ignorePatterns: string[],
+  options: { hashAllFiles?: boolean; maxFiles?: number | null; onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void; folderId?: string },
+  signal: AbortSignal | null,
+): Promise<FileManifest> {
+  const controller = new AbortController()
+  const forwardShutdown = (): void => controller.abort()
+  const forwardOuter = (): void => controller.abort()
+  shutdownScanController.signal.addEventListener("abort", forwardShutdown, { once: true })
+  signal?.addEventListener("abort", forwardOuter, { once: true })
+  const untrack = trackFolderScan(options.folderId, controller)
+  // Admission covers only the local walk; the caller releases it before any
+  // peer wait by awaiting the local walk inside runPairedScans separately.
+  return globalScanCoordinator.run(key, () => {
+    const effective = AbortSignal.any([controller.signal, shutdownScanController.signal, ...(signal ? [signal] : [])])
+    return scanFolder(rootPath, ignorePatterns, {
+      hashAllFiles: options.hashAllFiles,
+      maxFiles: options.maxFiles,
+      onActivity: options.onActivity,
+      signal: effective,
+    })
+  }, controller.signal).finally(() => {
+    shutdownScanController.signal.removeEventListener("abort", forwardShutdown)
+    signal?.removeEventListener("abort", forwardOuter)
+    untrack()
+  })
+}
+
+function requestPeerManifest(peerId: string, payload: PeerRequest, timeoutMs: number, signal: AbortSignal): Promise<FileManifest> {
+  return requirePeerSessions().request<unknown>(peerId, payload, timeoutMs, { signal }).then((raw) => parsePeerManifest(raw))
+}
+
+/** Fails closed before legacy reconcile/send: count cap plus encoded-byte budget. */
+function assertLegacyManifestSendable(manifest: FileManifest, computer: string): void {
+  assertLegacyObservationCapacity(manifest.files.length, manifest.files.length, computer)
+  assertManifestWithinLegacyByteBudget(manifest, computer)
+  assertLegacyEncodedBudget(estimateManifestEncodedBytes(manifest), computer)
 }
 
 function platform(): DeviceSummary["platform"] {
@@ -1135,24 +1213,40 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
   if (!peer) throw new Error("Pair a trusted computer before previewing a folder mapping.")
   if (peer.status !== "online") throw new Error(`${peer.name} must be online to compare the folders.`)
   const operationId = parsePreviewProgressToken(progressOperationId)
-  const localPath = path.resolve(input.localPath)
-  emitPreviewProgress(operationId, "scan-local", 0)
-  const localManifest = await scanFolder(localPath, input.ignorePatterns, {
-    maxFiles: currentScanLimit(),
-    onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
-  })
-  emitPreviewProgress(operationId, "scan-remote")
-  const remoteManifest = await requirePeerSessions().request<FileManifest>(peer.id, {
-    type: "scan-manifest",
-    path: input.remotePath,
-    ignorePatterns: input.ignorePatterns,
-  }, 5 * 60_000)
-  emitPreviewProgress(operationId, "compare")
-  return compareManifests(localManifest, remoteManifest, {
-    mode: input.mode,
-    localPlatform: platform(),
-    remotePlatform: peer.platform,
-  })
+  // Supersession: a repeated preview token cancels the previous scan.
+  if (operationId) previewScanControllers.get(operationId)?.abort()
+  const controller = new AbortController()
+  if (operationId) previewScanControllers.set(operationId, controller)
+  const onShutdown = (): void => controller.abort()
+  shutdownScanController.signal.addEventListener("abort", onShutdown, { once: true })
+  try {
+    const localPath = path.resolve(input.localPath)
+    emitPreviewProgress(operationId, "scan-local", 0)
+    // Local slot is held only for the walk; the subsequent peer wait runs
+    // without it so two devices cannot deadlock holding a slot each.
+    const localManifest = await runLocalScan(`preview:${localPath}`, localPath, input.ignorePatterns, {
+      maxFiles: currentScanLimit(),
+      onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
+    }, controller.signal)
+    if (controller.signal.aborted) throw new ScanCancelledError()
+    emitPreviewProgress(operationId, "scan-remote")
+    const remoteManifest = await requestPeerManifest(peer.id, {
+      type: "scan-manifest",
+      path: input.remotePath,
+      ignorePatterns: input.ignorePatterns,
+    }, 5 * 60_000, controller.signal)
+    if (controller.signal.aborted) throw new ScanCancelledError()
+    emitPreviewProgress(operationId, "compare")
+    // Truncated previews stay explicit partial results; sync paths fail closed elsewhere.
+    return compareManifests(localManifest, remoteManifest, {
+      mode: input.mode,
+      localPlatform: platform(),
+      remotePlatform: peer.platform,
+    })
+  } finally {
+    shutdownScanController.signal.removeEventListener("abort", onShutdown)
+    if (operationId && previewScanControllers.get(operationId) === controller) previewScanControllers.delete(operationId)
+  }
 }
 
 async function requestFolderMapping(input: RequestFolderMappingInput, progressOperationId?: unknown): Promise<AppSnapshot> {
@@ -1184,6 +1278,7 @@ async function requestFolderMapping(input: RequestFolderMappingInput, progressOp
     ignorePatterns: input.ignorePatterns,
     historyDays: input.historyDays,
     historyMaxBytes: input.historyMaxBytes,
+    maxFileBytes: input.maxFileBytes ?? null,
     preview: authoritativePreview,
     createdAt: new Date().toISOString(),
   }
@@ -1227,26 +1322,38 @@ async function buildIncomingMappingPreview(
   if (!peer) throw new Error("The requesting computer is no longer trusted.")
   if (peer.status !== "online") throw new Error(`${peer.name} must be online to compare the folders.`)
   const operationId = parsePreviewProgressToken(progressOperationId)
-  const target = path.resolve(destinationPath)
-  const targetStat = await stat(target)
-  if (!targetStat.isDirectory()) throw new Error("The selected destination is not a folder.")
-  emitPreviewProgress(operationId, "scan-remote")
-  const initiatorManifest = await requirePeerSessions().request<FileManifest>(peer.id, {
-    type: "scan-manifest",
-    path: request.proposal.initiatorPath,
-    ignorePatterns: request.proposal.ignorePatterns,
-  }, 5 * 60_000)
-  emitPreviewProgress(operationId, "scan-local", 0)
-  const responderManifest = await scanFolder(target, request.proposal.ignorePatterns, {
-    maxFiles: currentScanLimit(),
-    onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
-  })
-  emitPreviewProgress(operationId, "compare")
-  return compareManifests(initiatorManifest, responderManifest, {
-    mode: request.proposal.mode,
-    localPlatform: peer.platform,
-    remotePlatform: platform(),
-  })
+  if (operationId) previewScanControllers.get(operationId)?.abort()
+  const controller = new AbortController()
+  if (operationId) previewScanControllers.set(operationId, controller)
+  const onShutdown = (): void => controller.abort()
+  shutdownScanController.signal.addEventListener("abort", onShutdown, { once: true })
+  try {
+    const target = path.resolve(destinationPath)
+    const targetStat = await stat(target)
+    if (!targetStat.isDirectory()) throw new Error("The selected destination is not a folder.")
+    emitPreviewProgress(operationId, "scan-remote")
+    const initiatorManifest = await requestPeerManifest(peer.id, {
+      type: "scan-manifest",
+      path: request.proposal.initiatorPath,
+      ignorePatterns: request.proposal.ignorePatterns,
+    }, 5 * 60_000, controller.signal)
+    if (controller.signal.aborted) throw new ScanCancelledError()
+    emitPreviewProgress(operationId, "scan-local", 0)
+    const responderManifest = await runLocalScan(`incoming:${target}`, target, request.proposal.ignorePatterns, {
+      maxFiles: currentScanLimit(),
+      onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
+    }, controller.signal)
+    if (controller.signal.aborted) throw new ScanCancelledError()
+    emitPreviewProgress(operationId, "compare")
+    return compareManifests(initiatorManifest, responderManifest, {
+      mode: request.proposal.mode,
+      localPlatform: peer.platform,
+      remotePlatform: platform(),
+    })
+  } finally {
+    shutdownScanController.signal.removeEventListener("abort", onShutdown)
+    if (operationId && previewScanControllers.get(operationId) === controller) previewScanControllers.delete(operationId)
+  }
 }
 
 async function refreshIncomingMappingPreview(input: RefreshIncomingMappingPreviewInput, progressOperationId?: unknown): Promise<AppSnapshot> {
@@ -2004,15 +2111,18 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     // One limit for the whole flow: rereading the setting after the awaited
     // scans could validate against a ceiling the scans never used.
     const scanLimit = currentScanLimit()
-    const [localManifest, remoteManifest] = await Promise.all([
-      scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit }),
-      requirePeerSessions().request<FileManifest>(peer.id, {
+    const { local: localManifest, peer: remoteManifest } = await runPairedScans(
+      (signal) => runLocalScan(`continuous:${folderId}`, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit, folderId }, signal),
+      (signal) => requestPeerManifest(peer.id, {
         type: "continuous-sync-scan",
         folderId,
-      }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS),
-    ])
+      }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, signal),
+    )
     assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
     assertCompleteTransferManifest(remoteManifest, peer.name)
+    assertLegacyManifestSendable(localManifest, "This computer")
+    assertLegacyManifestSendable(remoteManifest, peer.name)
+    assertLegacyObservationCapacity(localManifest.files.length, remoteManifest.files.length)
     const localObservation = observedFiles(localManifest)
     const remoteObservation = observedFiles(remoteManifest)
 
@@ -2162,6 +2272,9 @@ async function flushContinuousSync(folderId: string): Promise<void> {
 function blockContinuousSync(folderId: string): () => void {
   continuousSyncBlocked.add(folderId)
   continuousSyncQueued.delete(folderId)
+  // Pause/removal/configuration changes cancel queued and in-flight
+  // read-only scans for the folder at their next checkpoint.
+  abortFolderScans(folderId)
   const retry = continuousSyncRetryTimers.get(folderId)
   if (retry) clearTimeout(retry)
   continuousSyncRetryTimers.delete(folderId)
@@ -2472,10 +2585,11 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
   // scans could validate against a ceiling the scans never used.
   const scanLimit = currentScanLimit()
   let scanning = true
-  const [localManifest, remoteManifest] = await Promise.all([
-    scanFolder(folder.localPath, folder.ignorePatterns, {
+  const { local: localManifest, peer: remoteManifest } = await runPairedScans(
+    (signal) => runLocalScan(`initial:${folder.id}`, folder.localPath, folder.ignorePatterns, {
       hashAllFiles: true,
       maxFiles: scanLimit,
+      folderId: folder.id,
       onActivity: (activity) => {
         if (!scanning) return
         const action = { listing: "Listing", inspecting: "Checking", hashing: "Hashing", complete: "Local scan complete" }[activity.stage]
@@ -2484,17 +2598,19 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
         })
         broadcastSnapshot()
       },
-    }),
-    requirePeerSessions().request<FileManifest>(peer.id, {
+    }, signal),
+    (signal) => requestPeerManifest(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
       path: folder.remotePath,
       ignorePatterns: folder.ignorePatterns,
       hashAllFiles: true,
-    }, 5 * 60_000),
-  ]).finally(() => { scanning = false })
+    }, 5 * 60_000, signal),
+  ).finally(() => { scanning = false })
   assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
   assertCompleteTransferManifest(remoteManifest, peer.name)
+  assertLegacyManifestSendable(localManifest, "This computer")
+  assertLegacyManifestSendable(remoteManifest, peer.name)
 
   const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode)
   const totalBytes = plan.toPull.reduce((total, entry) => total + entry.size, 0)
@@ -2548,18 +2664,20 @@ async function verifyInitialMergeQuiescent(folder: FolderSummary, peer: DeviceSu
   // One limit for the whole check, as above: the scans and their validation
   // must agree even if the setting changes mid-flight.
   const scanLimit = currentScanLimit()
-  const [localManifest, remoteManifest] = await Promise.all([
-    scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit }),
-    requirePeerSessions().request<FileManifest>(peer.id, {
+  const { local: localManifest, peer: remoteManifest } = await runPairedScans(
+    (signal) => runLocalScan(`verify:${folder.id}`, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit, folderId: folder.id }, signal),
+    (signal) => requestPeerManifest(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
       path: folder.remotePath,
       ignorePatterns: folder.ignorePatterns,
       hashAllFiles: true,
-    }, 5 * 60_000),
-  ])
+    }, 5 * 60_000, signal),
+  )
   assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
   assertCompleteTransferManifest(remoteManifest, peer.name)
+  assertLegacyManifestSendable(localManifest, "This computer")
+  assertLegacyManifestSendable(remoteManifest, peer.name)
   const convergence = assessInitialMergeConvergence(localManifest, remoteManifest, folder.mode)
   if (!convergence.complete) {
     throw new Error("A folder changed while the initial merge was running. The copied files are safe; retry to include the new changes.")
@@ -2896,6 +3014,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     // fails closed here instead of reaching the folder walker. The ceiling
     // always comes from this machine's setting — a peer-supplied limit is
     // never accepted, so a paired device cannot dictate our memory use.
+    // The peer socket close/deadline aborts the walk via context.signal.
     const { path: requestedPath, ignorePatterns } = parsePeerScanManifest(request)
     const hashAllFiles = request.hashAllFiles === true
     if (hashAllFiles) {
@@ -2910,18 +3029,45 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       ) {
         throw new Error("A full-integrity scan must use the approved folder's sync rules.")
       }
-      return withPeerFileOperation(context, folderId, () =>
-        scanFolder(requestedPath, ignorePatterns, { hashAllFiles, maxFiles: currentScanLimit() }),
-      )
+      return withPeerFileOperation(context, folderId, async () => {
+        const manifest = await runLocalScan(`inbound:${folderId}`, requestedPath, ignorePatterns, { hashAllFiles, maxFiles: currentScanLimit(), folderId }, context.signal)
+        assertLegacyManifestSendable(manifest, "This computer")
+        return manifest
+      })
     }
-    return scanFolder(requestedPath, ignorePatterns, { hashAllFiles, maxFiles: currentScanLimit() })
+    const manifest = await runLocalScan("inbound:preview", requestedPath, ignorePatterns, { hashAllFiles, maxFiles: currentScanLimit() }, context.signal)
+    assertLegacyManifestSendable(manifest, "This computer")
+    return manifest
   }
   if (request.type === "continuous-sync-scan") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const folder = requireSharedActiveFolder(context, folderId)
-    return withPeerFileOperation(context, folderId, () =>
-      scanFolder(folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit() }),
-    )
+    return withPeerFileOperation(context, folderId, async () => {
+      const manifest = await runLocalScan(`inbound:${folderId}`, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: currentScanLimit(), folderId }, context.signal)
+      assertLegacyManifestSendable(manifest, "This computer")
+      return manifest
+    })
+  }
+  if (request.type === "scan-capabilities") {
+    return { capabilities: [SCAN_GENERATION_CAPABILITY] }
+  }
+  if (request.type === "scan-generation-read-page") {
+    const folderId = typeof request.folderId === "string" ? request.folderId : ""
+    const generationId = typeof request.generationId === "string" ? request.generationId : ""
+    const cursor = request.cursor === undefined || request.cursor === null ? undefined : typeof request.cursor === "string" ? request.cursor : ""
+    const limit = typeof request.limit === "number" ? request.limit : 200
+    requireSharedActiveFolder(context, folderId)
+    if (!generationId || cursor === "") throw new Error("The scan generation page request is invalid.")
+    return withPeerFileOperation(context, folderId, async () => {
+      if (context.signal.aborted) throw new ScanCancelledError()
+      const page = await engine.request<{ entries: Array<{ path: string; size: number; digest?: string }>; nextCursor?: string }>(
+        "scanGeneration.readPage",
+        { generationId, cursor, limit },
+      )
+      // Bound the served page even if the engine contract widens later.
+      if (page.entries.length > SCAN_PAGE_MAX_ENTRIES) throw new Error("The staged scan page exceeds the supported bound.")
+      return { ...page, generationId }
+    })
   }
   if (request.type === "continuous-sync-get-operations") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -3963,7 +4109,13 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   app.on("activate", showMainWindow)
 })
 
-app.on("before-quit", () => { isQuitting = true })
+app.on("before-quit", () => {
+  isQuitting = true
+  // Cooperative shutdown: read-only scans abort at their next checkpoint.
+  // Commit/recovery sequences never take a scan signal, so they are unaffected.
+  shutdownScanController.abort()
+  globalScanCoordinator.cancelQueued("Tethera is shutting down.")
+})
 app.on("window-all-closed", () => {
   // Staying alive with no window is only useful when the tray can reopen it.
   if (process.platform === "darwin" || (snapshot?.settings.closeToTray && tray)) return

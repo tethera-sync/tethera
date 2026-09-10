@@ -10,6 +10,13 @@ pub struct ProtocolVersion {
     pub minor: u16,
 }
 
+/// Capability advertised for staged scan generations. Legacy peers speak only
+/// full-manifest frames and retain their explicit 10,000-file / 16 MiB limits.
+pub const SCAN_GENERATION_CAPABILITY: &str = "scan-generations-v1";
+/// Upper bound for one generation page: entry count and encoded bytes both apply.
+pub const SCAN_PAGE_MAX_ENTRIES: usize = 1_000;
+pub const SCAN_PAGE_MAX_BYTES: usize = 1_048_576;
+
 impl Default for ProtocolVersion {
     fn default() -> Self {
         Self { major: 0, minor: 1 }
