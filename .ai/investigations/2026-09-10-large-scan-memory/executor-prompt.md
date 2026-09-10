@@ -1,0 +1,20 @@
+---
+type: executor-prompt
+title: Fix Tethera large-scan memory pressure
+slug: large-scan-memory
+created: 2026-09-10
+status: ready
+target: Electron scanning and Rust reconciliation
+---
+
+Implement this in two separately validated milestones. Read AGENTS.md and the sync/security/testing/implementation-status docs first. Preserve existing user changes. The live scanner is Electron main; Rust owns SQLite. No permanent memory leak has been proven. Confirm retainers with measurements before claiming one.
+
+1. Build an opt-in temporary-root stress harness: 10k/100k/1m files, deep and directory-heavy trees, long paths, repeated scans/cancellation. Measure Electron main heap/external memory and RSS, renderer/Rust RSS, active jobs, queue bytes and handles; establish reproducible numeric budgets. Never use real user folders.
+2. Milestone A: add cooperative scan cancellation through peer disconnect/deadline, preview supersession, pause/removal and shutdown; cancel failed paired-scan siblings and watcher collection. Abort must escape per-file catch blocks. Close resources and release slots in finally. Do not interrupt filesystem commit/recovery sequences.
+3. Bound total scan admission and pending work across preview/initial/continuous/inbound paths, preserving existing limits and avoiding a local slot held across peer waits. Bound peer queued messages/bytes and clear terminal buffers. Reuse a lazy per-scan hashing buffer, remove comparison union/sort/temporary tuples where behavior stays identical, and retain only bounded displayed warnings. Preserve top-14 samples and case-collision semantics. Validate preview peer manifests at runtime; truncated previews remain explicit partial results.
+4. Fail closed before unsupported legacy operations: Rust reconciliation currently caps 10,000 files per side, while peer frames cap 16 MiB. Enforce encoded-byte budgets before full serialization. Keep scan preferences intact; explain limits rather than silently trimming complete observations. Do not raise limits as the fix.
+5. Milestone B: introduce Rust-owned SQLite scan generations with bounded begin/append/seal/abort/page contracts in Rust protocol and matching TS validation. Bind generations to authenticated participants, mapping revision/root/rules/hash mode. Make batches idempotent and reject gaps, changed duplicates and stale revisions. Seal only complete scans; incomplete generations never affect baseline/planning. Use transactional ingestion, quota/expiry, startup cleanup and migration safety tests.
+6. Page peer scans with byte limits, backpressure, cancellation and capability negotiation. Legacy peers retain explicit limits. Replace full-array reconciliation/planning with indexed bounded reads; page operations/conflicts and initial merge consumers too. Atomically publish complete plans, retain recovery guards, and preserve full SHA-256 and pre-transfer verification. Bound directory frontier/handles or explicitly fail at tested resource limits. Do not move traversal to the preliminary Rust scanner or change digest algorithms.
+7. Add regression tests for resource cleanup, peer floods/disconnect, sample equivalence, byte boundaries, generation replay/restart/disk-full/stale revision, incomplete invisibility and scan-admission deadlocks. Run focused tests, bun run verify, git diff --check and real Electron synthetic stress checks. State physical Linux/Windows coverage exactly. Update existing protocol/data-model/implementation-status/testing docs. No any, new dependencies, forced production GC, unrelated refactors, deletion propagation or weakened file recovery.
+
+Use $orchestrate for bounded cheaper workers, with no recursive delegation. Lead owns cancellation/contract/migration decisions and reviews actual diffs. Initial evidence: folder-manifest.ts:65,172,435; peer-session-service.ts:296,485,517,557; continuous-sync.ts:108,231,294; index.ts:2006,2475; crates/sync-storage/src/file_sync.rs:16,252,629,1017. Existing focused tests passed 26/26; no Electron memory proof exists yet. Report milestones separately with measurements, commands and remaining limitations.
