@@ -97,7 +97,7 @@ import {
   type PersistedInitialSyncOutcome,
 } from "./desktop-state-storage"
 import { PairingService } from "./pairing-service"
-import { PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
+import { measurePeerRequest, PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
 import { requestPeerPreview } from "./peer-preview"
 import { PEER_SCAN_PROGRESS_CAPABILITY } from "./peer-scan-progress"
 import { folderComparisonResult } from "../shared/folder-comparison-result"
@@ -356,6 +356,15 @@ function requestPeerManifest(peerId: string, payload: PeerRequest, timeoutMs: nu
 /** Fails closed before legacy reconcile/send: the encoded-byte budget for one legacy full-manifest peer frame. */
 function assertLegacyManifestSendable(manifest: FileManifest, computer: string): void {
   assertManifestWithinLegacyByteBudget(manifest, computer)
+}
+
+/** Fails closed before reconcile when both observations would not fit in the single observe frame sent to the peer. */
+function assertObservationExchangeSendable(request: PeerRequest, peerName: string): void {
+  const { bytes, limit, fits } = measurePeerRequest(request)
+  if (fits) return
+  throw new Error(
+    `Together, this computer and ${peerName} list too many files to exchange in one sync message (about ${(bytes / 1_048_576).toFixed(1)} MiB, above the ${(limit / 1_048_576).toFixed(0)} MiB peer limit). Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
+  )
 }
 
 function platform(): DeviceSummary["platform"] {
@@ -2170,6 +2179,17 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       return
     }
 
+    // Both observations travel to the peer in one frame. Check it fits before
+    // reconciling, so no local state is committed for a cycle that cannot finish.
+    const observeRequest: PeerRequest = {
+      type: "continuous-sync-observe",
+      folderId,
+      local: remoteObservation,
+      remote: localObservation,
+      mode: invertMode(folder.mode),
+      observedAt,
+    }
+    assertObservationExchangeSendable(observeRequest, peer.name)
     const result = await engine.request<ReconcileFilesResult>("fileSync.reconcile", {
       mappingId: folderId,
       local: localObservation,
@@ -2185,14 +2205,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       recordContinuousConflicts(folder, result.conflicts)
       broadcastSnapshot()
     }
-    const peerResult = await requirePeerSessions().request<unknown>(peer.id, {
-      type: "continuous-sync-observe",
-      folderId,
-      local: remoteObservation,
-      remote: localObservation,
-      mode: invertMode(folder.mode),
-      observedAt,
-    }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
+    const peerResult = await requirePeerSessions().request<unknown>(peer.id, observeRequest, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
 
     const copiedFiles = await executeContinuousOperations(
       folder,

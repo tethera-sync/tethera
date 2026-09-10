@@ -828,6 +828,25 @@ class JsonLineConnection {
   }
 }
 
+/**
+ * Exact size of the line a request occupies once encrypted, computed without a
+ * session key: AES-GCM ciphertext is exactly as long as its plaintext, and the
+ * rest of the frame is fixed-width base64 around a random UUID request id.
+ * Lets a caller refuse an oversized request before committing any local work.
+ */
+export function measurePeerRequest(request: PeerRequest): { bytes: number; limit: number; fits: boolean } {
+  const plaintextBytes = Buffer.byteLength(JSON.stringify(request), "utf8")
+  const envelope: SecureFrame = {
+    type: "secure-frame",
+    requestId: randomUUID(),
+    iv: Buffer.alloc(12).toString("base64"),
+    ciphertext: "",
+    tag: Buffer.alloc(16).toString("base64"),
+  }
+  const bytes = Buffer.byteLength(`${JSON.stringify(envelope)}\n`, "utf8") + Math.ceil(plaintextBytes / 3) * 4
+  return { bytes, limit: MAX_LINE_BYTES, fits: bytes <= MAX_LINE_BYTES }
+}
+
 function serializeWireMessage(message: WireMessage): string {
   const serialized = `${JSON.stringify(message)}\n`
   if (Buffer.byteLength(serialized, "utf8") > MAX_LINE_BYTES) {
@@ -934,4 +953,5 @@ export const peerSessionTestHelpers = {
   exportX25519PublicKey,
   parsePeerResponse,
   parsePeerScanProgressEnvelope,
+  serializeWireMessage,
 }

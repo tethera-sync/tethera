@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import { createPublicKey, generateKeyPairSync, sign, verify, type KeyObject } from "node:crypto"
+import { createPublicKey, generateKeyPairSync, randomUUID, sign, verify, type KeyObject } from "node:crypto"
 import type { PairingService } from "../src/main/pairing-service"
-import { PeerSessionService, peerSessionTestHelpers } from "../src/main/peer-session-service"
+import { measurePeerRequest, PeerSessionService, peerSessionTestHelpers } from "../src/main/peer-session-service"
 import { MAX_ACTIVE_SCANS, ScanCoordinator } from "../src/main/scan-coordinator"
 
 const LARGE_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -105,6 +105,28 @@ describe("secure peer-session crypto", () => {
     const frame = peerSessionTestHelpers.encryptFrame(key, "session", "request", "request", { type: "ping" })
     expect(peerSessionTestHelpers.decryptFrame(key, "session", "request", frame)).toEqual({ type: "ping" })
     expect(() => peerSessionTestHelpers.decryptFrame(key, "session", "response", frame)).toThrow()
+  })
+
+  test("measures a request's exact encrypted line size without a session key", () => {
+    const key = Buffer.alloc(32, 7)
+    const requests = [
+      { type: "ping" },
+      // JSON escaping of quotes, backslashes and control characters is counted exactly.
+      { type: "continuous-sync-observe", local: [{ path: 'a"b\\c\u0001d', size: 1, digest: "a".repeat(64) }], remote: [] },
+      { type: "multibyte", text: "é漢😀".repeat(1_000) },
+    ]
+    for (const request of requests) {
+      const frame = peerSessionTestHelpers.encryptFrame(key, "session", randomUUID(), "request", request)
+      const line = peerSessionTestHelpers.serializeWireMessage(frame)
+      expect(measurePeerRequest(request).bytes).toBe(Buffer.byteLength(line, "utf8"))
+    }
+  })
+
+  test("reports a request above the peer line cap as not fitting", () => {
+    expect(measurePeerRequest({ type: "ping" }).fits).toBe(true)
+    const oversized = measurePeerRequest({ type: "continuous-sync-observe", payload: "x".repeat(13 * 1024 * 1024) })
+    expect(oversized.fits).toBe(false)
+    expect(oversized.bytes).toBeGreaterThan(oversized.limit)
   })
 
   test("bounds and validates peer error responses", () => {
