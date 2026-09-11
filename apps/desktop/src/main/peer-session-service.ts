@@ -898,19 +898,36 @@ function encryptFrame(
   }
 }
 
+const GCM_IV_BYTES = 12
+const GCM_TAG_BYTES = 16
+
+/**
+ * Decodes a frame's sealed fields from the wire. Each must be a base64 string:
+ * any other JSON value could make `Buffer.from` allocate an arbitrary length.
+ * The IV and tag must be exactly GCM's sizes, because Node otherwise verifies
+ * a truncated tag prefix and authentication drops to as little as 32 bits.
+ */
+function decodeSealedFields(frame: { iv: unknown; tag: unknown; ciphertext: unknown }): { iv: Buffer; tag: Buffer; ciphertext: Buffer } {
+  if (typeof frame.iv !== "string" || typeof frame.tag !== "string" || typeof frame.ciphertext !== "string") {
+    throw new Error("The peer sent an invalid encrypted frame.")
+  }
+  const iv = Buffer.from(frame.iv, "base64")
+  const tag = Buffer.from(frame.tag, "base64")
+  if (iv.length !== GCM_IV_BYTES || tag.length !== GCM_TAG_BYTES) throw new Error("The peer sent an invalid encrypted frame.")
+  return { iv, tag, ciphertext: Buffer.from(frame.ciphertext, "base64") }
+}
+
 function decryptFrame<T>(
   key: Buffer,
   sessionId: string,
   direction: "request" | "response",
   frame: SecureFrame,
 ): T {
-  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(frame.iv, "base64"))
+  const { iv, tag, ciphertext } = decodeSealedFields(frame)
+  const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: GCM_TAG_BYTES })
   decipher.setAAD(Buffer.from(`${sessionId}\0${frame.requestId}\0${direction}`))
-  decipher.setAuthTag(Buffer.from(frame.tag, "base64"))
-  const plaintext = Buffer.concat([
-    decipher.update(Buffer.from(frame.ciphertext, "base64")),
-    decipher.final(),
-  ]).toString("utf8")
+  decipher.setAuthTag(tag)
+  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8")
   return JSON.parse(plaintext) as T
 }
 

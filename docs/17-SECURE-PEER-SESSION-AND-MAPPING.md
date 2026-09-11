@@ -15,7 +15,7 @@ Each request opens a short-lived TCP connection on port `47656`.
 3. The receiving computer rejects the hello unless the device ID is trusted, the signature matches the pinned public key, the target identity is exact and the timestamp is fresh.
 4. The receiver creates its own ephemeral X25519 key and nonce and signs the complete response.
 5. Both computers derive the same session key using X25519, SHA-256 and HKDF.
-6. The request and response are encrypted with AES-256-GCM. The session ID, request ID and direction are authenticated as additional data.
+6. The request and response are encrypted with AES-256-GCM. The session ID, request ID and direction are authenticated as additional data. Every frame carries a 12-byte IV and a full 16-byte authentication tag; any other length, or a non-string sealed field, is rejected before decryption, because Node would otherwise verify a truncated tag prefix.
 7. The connection closes after one request and response, providing a new ephemeral key exchange for every RPC.
 
 The persistent Ed25519 private key never enters the renderer. The React UI only uses the narrow context-isolated preload bridge.

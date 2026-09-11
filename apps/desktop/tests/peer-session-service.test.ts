@@ -129,6 +129,20 @@ describe("secure peer-session crypto", () => {
     expect(oversized.bytes).toBeGreaterThan(oversized.limit)
   })
 
+  test("rejects truncated tags, wrong-size IVs and non-string sealed fields", () => {
+    const key = Buffer.alloc(32, 7)
+    const frame = peerSessionTestHelpers.encryptFrame(key, "session", "request", "request", { type: "ping" })
+    expect(peerSessionTestHelpers.decryptFrame(key, "session", "request", frame)).toEqual({ type: "ping" })
+    // Node verifies a 4-byte prefix of the genuine tag unless the tag length is pinned.
+    const truncatedTag = Buffer.from(frame.tag, "base64").subarray(0, 4).toString("base64")
+    expect(() => peerSessionTestHelpers.decryptFrame(key, "session", "request", { ...frame, tag: truncatedTag })).toThrow("invalid encrypted frame")
+    const shortIv = Buffer.from(frame.iv, "base64").subarray(0, 8).toString("base64")
+    expect(() => peerSessionTestHelpers.decryptFrame(key, "session", "request", { ...frame, iv: shortIv })).toThrow("invalid encrypted frame")
+    // As it would arrive off the wire: an array-like IV must never reach Buffer.from.
+    const arrayLikeIv: Parameters<typeof peerSessionTestHelpers.decryptFrame>[3] = JSON.parse(JSON.stringify({ ...frame, iv: { length: 1_000_000_000 } }))
+    expect(() => peerSessionTestHelpers.decryptFrame(key, "session", "request", arrayLikeIv)).toThrow("invalid encrypted frame")
+  })
+
   test("bounds and validates peer error responses", () => {
     expect(peerSessionTestHelpers.parsePeerResponse({ ok: false, error: "retry" })).toEqual({ ok: false, error: "retry" })
     expect(() => peerSessionTestHelpers.parsePeerResponse({ ok: false, error: "x".repeat(513) })).toThrow("invalid")
