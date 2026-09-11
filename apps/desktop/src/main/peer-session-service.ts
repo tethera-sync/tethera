@@ -340,9 +340,16 @@ export class PeerSessionService extends EventEmitter {
       if (responseFrame.type === "session-error") throw new Error(responseFrame.reason)
       if (options.chunked && responseFrame.type === "secure-chunk") {
         const readChunk = async (): Promise<WireMessage> => {
+          const remainingForChunk = deadline - performance.now()
+          if (remainingForChunk <= 0) {
+            throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
+          }
           try {
-            return await connection.read(readTimeout, options.signal)
+            return await connection.read(Math.min(readTimeout, remainingForChunk), options.signal)
           } catch (error) {
+            if (performance.now() >= deadline) {
+              throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
+            }
             throw asPeerPhaseTimeout(error, "The secure peer scan stopped reporting progress.", "PEER_SCAN_IDLE_TIMEOUT")
           }
         }

@@ -215,6 +215,24 @@ describe("comparison equivalence and peer validation", () => {
     expect(() => folderManifestTestHelpers.assertManifestWithinLegacyByteBudget(many, "This computer")).toThrow("MiB legacy budget")
   })
 
+  // Regression: a C0 control character serializes as a six-byte \u00XX JSON
+  // escape, so raw UTF-8 length times two undercounts the true wire size and
+  // let such manifests pass the budget check before serialization rejected
+  // them at the 16 MiB line limit.
+  test("control-character paths count their six-byte JSON escapes toward the byte budget", () => {
+    const files = Array.from({ length: 6500 }, (_, index) => ({
+      path: `${"\u0001".repeat(200)}-${index}`,
+      size: 1,
+      modifiedMs: 1,
+      digest: "a".repeat(64),
+    }))
+    const manifest = { rootPath: "/local", files, ignored: 0, unreadable: 0, truncated: false }
+    const plaintextBytes = Buffer.byteLength(JSON.stringify(files), "utf8")
+    const estimated = folderManifestTestHelpers.estimateManifestEncodedBytes(manifest)
+    expect(estimated).toBeGreaterThan(Math.ceil(plaintextBytes * 1.37) + 512)
+    expect(() => folderManifestTestHelpers.assertManifestWithinLegacyByteBudget(manifest, "This computer")).toThrow("MiB legacy budget")
+  })
+
   // Regression for the fixed 10,000-files-per-side ceiling that used to fail closed
   // no matter how high the "Scan file limit" setting allowed: a manifest with well
   // over 10,000 short-path files must sync as long as it stays under the real

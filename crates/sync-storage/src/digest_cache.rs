@@ -171,6 +171,14 @@ impl MappingStore {
                     })
                     .optional()?;
                 if let Some(entry) = found {
+                    validate_cached_digest_entry(&entry).map_err(|error| {
+                        MappingStoreError::CorruptMetadata {
+                            id: request.mapping_id.clone(),
+                            detail: format!(
+                                "scan digest cache row for {path:?} is invalid: {error}"
+                            ),
+                        }
+                    })?;
                     entries.push(entry);
                 }
             }
@@ -354,6 +362,33 @@ mod tests {
         assert_eq!(found.modified_ns, "1700000000000000000");
         assert_eq!(found.changed_ns, "-1700000000000000000");
         assert_eq!(found.digest, "a".repeat(64));
+    }
+
+    #[test]
+    fn lookup_rejects_a_corrupted_persisted_row() {
+        let store = active_store();
+        store
+            .record_digest_cache(&DigestCacheRecordRequest {
+                mapping_id: "mapping-1".to_owned(),
+                sweep_id: "sweep-1".to_owned(),
+                entries: vec![entry("a.txt", 'a')],
+            })
+            .expect("record");
+        store
+            .connection
+            .execute(
+                "UPDATE scan_digest_cache SET digest = 'not-a-digest' WHERE mapping_id = 'mapping-1'",
+                [],
+            )
+            .expect("corrupt row");
+
+        assert!(matches!(
+            store.lookup_digest_cache(&DigestCacheLookupRequest {
+                mapping_id: "mapping-1".to_owned(),
+                paths: vec!["a.txt".to_owned()],
+            }),
+            Err(MappingStoreError::CorruptMetadata { .. })
+        ));
     }
 
     #[test]

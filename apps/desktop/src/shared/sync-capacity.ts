@@ -23,6 +23,17 @@ function utf8ByteLength(value: string): number {
 }
 
 /**
+ * UTF-8 byte length of a string's `JSON.stringify` content, without the two
+ * surrounding quotes. Most characters pass through untouched, but `"`, `\`,
+ * and C0 controls are escaped -- most C0 controls become six-byte `\u00XX`
+ * sequences, so adversarial filenames can cost far more wire bytes than
+ * their UTF-8 length suggests.
+ */
+function jsonEscapedByteLength(value: string): number {
+  return utf8ByteLength(JSON.stringify(value)) - 2
+}
+
+/**
  * Estimates the encrypted wire size of a legacy full-manifest response without
  * serializing it: per-entry UTF-8 path bytes plus JSON/envelope overhead,
  * expanded for base64 ciphertext. Used to fail closed before serialization.
@@ -30,7 +41,11 @@ function utf8ByteLength(value: string): number {
 export function estimateManifestEncodedBytes(files: readonly { path: string; digest?: string }[]): number {
   let bytes = 256
   for (const entry of files) {
-    bytes += utf8ByteLength(entry.path) * 2 + 128
+    // Count both the raw and the JSON-escaped path length. For escape-free
+    // paths they are equal, preserving the historical 2x margin; a path full
+    // of C0 controls instead contributes its true six-bytes-per-character
+    // wire cost rather than undercounting it as two.
+    bytes += utf8ByteLength(entry.path) + jsonEscapedByteLength(entry.path) + 128
     if (entry.digest) bytes += 64
   }
   // AES-GCM ciphertext base64 expansion plus the secure-frame envelope.
