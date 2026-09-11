@@ -97,7 +97,8 @@ import {
   type PersistedInitialSyncOutcome,
 } from "./desktop-state-storage"
 import { PairingService } from "./pairing-service"
-import { measurePeerRequest, PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
+import { CHUNKED_FRAMES_CAPABILITY, measurePeerRequest, PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
+import { requestPeerCapabilities } from "./peer-capabilities"
 import { requestPeerPreview } from "./peer-preview"
 import { PEER_SCAN_PROGRESS_CAPABILITY } from "./peer-scan-progress"
 import { folderComparisonResult } from "../shared/folder-comparison-result"
@@ -373,21 +374,41 @@ async function runCachedFolderScan(
   return manifest
 }
 
-function requestPeerManifest(peerId: string, payload: PeerRequest, timeoutMs: number, signal: AbortSignal): Promise<FileManifest> {
-  return requirePeerSessions().request<unknown>(peerId, payload, timeoutMs, { signal }).then((raw) => parsePeerManifest(raw))
+function requestPeerManifest(peerId: string, payload: PeerRequest, timeoutMs: number, signal: AbortSignal, chunked: boolean): Promise<FileManifest> {
+  return requirePeerSessions().request<unknown>(peerId, payload, timeoutMs, { signal, chunked }).then((raw) => parsePeerManifest(raw))
 }
 
-/** Fails closed before legacy reconcile/send: the encoded-byte budget for one legacy full-manifest peer frame. */
-function assertLegacyManifestSendable(manifest: FileManifest, computer: string): void {
-  assertManifestWithinLegacyByteBudget(manifest, computer)
+/** A peer's optional features change only when its app updates, so a short cache saves a round trip per sync cycle. */
+const PEER_CAPABILITY_TTL_MS = 10 * 60_000
+const peerCapabilityCache = new Map<string, { capabilities: ReadonlySet<string>; fetchedAt: number }>()
+
+/** Whether manifests and observations can cross to this peer as chunks larger than one frame. */
+async function peerSupportsChunkedFrames(peerId: string): Promise<boolean> {
+  const cached = peerCapabilityCache.get(peerId)
+  if (cached && Date.now() - cached.fetchedAt < PEER_CAPABILITY_TTL_MS) return cached.capabilities.has(CHUNKED_FRAMES_CAPABILITY)
+  const capabilities = await requestPeerCapabilities(requirePeerSessions(), peerId)
+  peerCapabilityCache.set(peerId, { capabilities, fetchedAt: Date.now() })
+  return capabilities.has(CHUNKED_FRAMES_CAPABILITY)
 }
 
-/** Fails closed before reconcile when both observations would not fit in the single observe frame sent to the peer. */
-function assertObservationExchangeSendable(request: PeerRequest, peerName: string): void {
-  const { bytes, limit, fits } = measurePeerRequest(request)
+/**
+ * Fails closed before a manifest crosses the peer channel. A chunked exchange
+ * is bounded exactly by the transport; a single-frame exchange with an older
+ * peer keeps the legacy encoded-byte budget.
+ */
+function assertManifestFitsExchange(manifest: FileManifest, computer: string, chunked: boolean): void {
+  if (!chunked) assertManifestWithinLegacyByteBudget(manifest, computer)
+}
+
+/** Fails closed before reconcile when both observations would not fit in the observe exchange sent to the peer. */
+function assertObservationExchangeSendable(request: PeerRequest, peerName: string, chunked: boolean): void {
+  const { bytes, limit, fits } = measurePeerRequest(request, { chunked })
   if (fits) return
+  const remedy = chunked
+    ? "Add ignore rules to exclude large generated folders"
+    : "Update Tethera on both computers to sync larger folders, or add ignore rules"
   throw new Error(
-    `Together, this computer and ${peerName} list too many files to exchange in one sync message (about ${(bytes / 1_048_576).toFixed(1)} MiB, above the ${(limit / 1_048_576).toFixed(0)} MiB peer limit). Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
+    `Together, this computer and ${peerName} list too many files to exchange in one sync (about ${(bytes / 1_048_576).toFixed(1)} MiB, above the ${(limit / 1_048_576).toFixed(0)} MiB limit). ${remedy}; no incomplete observation was reconciled.`,
   )
 }
 
@@ -2142,17 +2163,18 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     // One limit for the whole flow: rereading the setting after the awaited
     // scans could validate against a ceiling the scans never used.
     const scanLimit = currentScanLimit()
+    const chunked = await peerSupportsChunkedFrames(peer.id)
     const { local: localManifest, peer: remoteManifest } = await runPairedScans(
       (signal) => runCachedFolderScan(`continuous:${folderId}`, folder, scanLimit, signal),
       (signal) => requestPeerManifest(peer.id, {
         type: "continuous-sync-scan",
         folderId,
-      }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, signal),
+      }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, signal, chunked),
     )
     assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
     assertCompleteTransferManifest(remoteManifest, peer.name)
-    assertLegacyManifestSendable(localManifest, "This computer")
-    assertLegacyManifestSendable(remoteManifest, peer.name)
+    assertManifestFitsExchange(localManifest, "This computer", chunked)
+    assertManifestFitsExchange(remoteManifest, peer.name, chunked)
     const localObservation = observedFiles(localManifest)
     const remoteObservation = observedFiles(remoteManifest)
 
@@ -2213,7 +2235,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       mode: invertMode(folder.mode),
       observedAt,
     }
-    assertObservationExchangeSendable(observeRequest, peer.name)
+    assertObservationExchangeSendable(observeRequest, peer.name, chunked)
     const result = await engine.request<ReconcileFilesResult>("fileSync.reconcile", {
       mappingId: folderId,
       local: localObservation,
@@ -2229,7 +2251,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       recordContinuousConflicts(folder, result.conflicts)
       broadcastSnapshot()
     }
-    const peerResult = await requirePeerSessions().request<unknown>(peer.id, observeRequest, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
+    const peerResult = await requirePeerSessions().request<unknown>(peer.id, observeRequest, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, { chunked })
 
     const copiedFiles = await executeContinuousOperations(
       folder,
@@ -2618,6 +2640,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
   // One limit for the whole pass: rereading the setting after the awaited
   // scans could validate against a ceiling the scans never used.
   const scanLimit = currentScanLimit()
+  const chunked = await peerSupportsChunkedFrames(peer.id)
   let scanning = true
   const { local: localManifest, peer: remoteManifest } = await runPairedScans(
     (signal) => runLocalScan(`initial:${folder.id}`, folder.localPath, folder.ignorePatterns, {
@@ -2639,12 +2662,12 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary): P
       path: folder.remotePath,
       ignorePatterns: folder.ignorePatterns,
       hashAllFiles: true,
-    }, 5 * 60_000, signal),
+    }, 5 * 60_000, signal, chunked),
   ).finally(() => { scanning = false })
   assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
   assertCompleteTransferManifest(remoteManifest, peer.name)
-  assertLegacyManifestSendable(localManifest, "This computer")
-  assertLegacyManifestSendable(remoteManifest, peer.name)
+  assertManifestFitsExchange(localManifest, "This computer", chunked)
+  assertManifestFitsExchange(remoteManifest, peer.name, chunked)
 
   const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode)
   const totalBytes = plan.toPull.reduce((total, entry) => total + entry.size, 0)
@@ -2698,6 +2721,7 @@ async function verifyInitialMergeQuiescent(folder: FolderSummary, peer: DeviceSu
   // One limit for the whole check, as above: the scans and their validation
   // must agree even if the setting changes mid-flight.
   const scanLimit = currentScanLimit()
+  const chunked = await peerSupportsChunkedFrames(peer.id)
   const { local: localManifest, peer: remoteManifest } = await runPairedScans(
     (signal) => runLocalScan(`verify:${folder.id}`, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles: scanLimit, folderId: folder.id }, signal),
     (signal) => requestPeerManifest(peer.id, {
@@ -2706,12 +2730,12 @@ async function verifyInitialMergeQuiescent(folder: FolderSummary, peer: DeviceSu
       path: folder.remotePath,
       ignorePatterns: folder.ignorePatterns,
       hashAllFiles: true,
-    }, 5 * 60_000, signal),
+    }, 5 * 60_000, signal, chunked),
   )
   assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
   assertCompleteTransferManifest(remoteManifest, peer.name)
-  assertLegacyManifestSendable(localManifest, "This computer")
-  assertLegacyManifestSendable(remoteManifest, peer.name)
+  assertManifestFitsExchange(localManifest, "This computer", chunked)
+  assertManifestFitsExchange(remoteManifest, peer.name, chunked)
   const convergence = assessInitialMergeConvergence(localManifest, remoteManifest, folder.mode)
   if (!convergence.complete) {
     throw new Error("A folder changed while the initial merge was running. The copied files are safe; retry to include the new changes.")
@@ -3065,7 +3089,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       }
       return withPeerFileOperation(context, folderId, async () => {
         const manifest = await runLocalScan(`inbound:${folderId}`, requestedPath, ignorePatterns, { hashAllFiles, maxFiles: currentScanLimit(), folderId }, context.signal)
-        assertLegacyManifestSendable(manifest, "This computer")
+        assertManifestFitsExchange(manifest, "This computer", context.chunkedResponse)
         return manifest
       })
     }
@@ -3076,7 +3100,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
         context.reportProgress?.({ stage, scannedFiles, ignoredEntries, unreadableEntries, hashedBytes })
       } : undefined,
     }, context.signal)
-    assertLegacyManifestSendable(manifest, "This computer")
+    assertManifestFitsExchange(manifest, "This computer", context.chunkedResponse)
     return manifest
   }
   if (request.type === "continuous-sync-scan") {
@@ -3084,12 +3108,12 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const folder = requireSharedActiveFolder(context, folderId)
     return withPeerFileOperation(context, folderId, async () => {
       const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, currentScanLimit(), context.signal)
-      assertLegacyManifestSendable(manifest, "This computer")
+      assertManifestFitsExchange(manifest, "This computer", context.chunkedResponse)
       return manifest
     })
   }
   if (request.type === "scan-capabilities") {
-    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY] }
+    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY] }
   }
   if (request.type === "scan-generation-read-page") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""

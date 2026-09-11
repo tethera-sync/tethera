@@ -834,7 +834,7 @@ export function assertManifestWithinLegacyByteBudget(manifest: FileManifest, com
   const estimated = estimateManifestEncodedBytes(manifest)
   if (estimated > MAX_LEGACY_MANIFEST_ENCODED_BYTES) {
     throw new Error(
-      `${computer}'s folder scan would need about ${(estimated / 1_048_576).toFixed(1)} MiB on the peer channel, above the ${(MAX_LEGACY_MANIFEST_ENCODED_BYTES / 1_048_576).toFixed(0)} MiB legacy budget. Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
+      `${computer}'s folder scan would need about ${(estimated / 1_048_576).toFixed(1)} MiB on the peer channel, above the ${(MAX_LEGACY_MANIFEST_ENCODED_BYTES / 1_048_576).toFixed(0)} MiB legacy budget used with an older version of Tethera. Update Tethera on both computers to sync larger folders, or add ignore rules; no incomplete observation was reconciled.`,
     )
   }
 }
