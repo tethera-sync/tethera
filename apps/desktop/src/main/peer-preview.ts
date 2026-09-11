@@ -1,17 +1,11 @@
-import { z } from "zod"
 import { ScanCancelledError, parsePeerManifest, type FileManifest } from "./folder-manifest"
-import type { PeerRequest, PeerRequestOptions } from "./peer-session-service"
+import { requestPeerCapabilities, type CapabilityPeerClient } from "./peer-capabilities"
 import { PEER_SCAN_IDLE_TIMEOUT_MS, PEER_SCAN_PROGRESS_CAPABILITY, type PeerScanProgress } from "./peer-scan-progress"
+import { CHUNKED_FRAMES_CAPABILITY } from "./peer-session-service"
 
-interface PreviewPeerClient {
-  request(deviceId: string, request: PeerRequest, timeoutMs?: number, options?: PeerRequestOptions): Promise<unknown>
-}
-
-const capabilitiesSchema = z.object({ capabilities: z.array(z.string().max(100)).max(32) })
-
-/** Negotiate progress before sending a multi-response request to an older app. */
+/** Negotiate progress and chunked frames before sending a multi-response request to an older app. */
 export async function requestPeerPreview(
-  client: PreviewPeerClient,
+  client: CapabilityPeerClient,
   peer: { id: string; name: string },
   input: { path: string; ignorePatterns: string[] },
   signal: AbortSignal,
@@ -20,22 +14,15 @@ export async function requestPeerPreview(
   let supportsProgress = false
   let scanRequested = false
   try {
-    try {
-      const response = await client.request(peer.id, { type: "scan-capabilities" }, undefined, { signal })
-      const parsed = capabilitiesSchema.safeParse(response)
-      if (!parsed.success) throw new Error("The other computer returned invalid scan capabilities. Update Tethera on both computers and retry.")
-      supportsProgress = parsed.data.capabilities.includes(PEER_SCAN_PROGRESS_CAPABILITY)
-    } catch (error) {
-      // Older version-4 peers predate capability discovery. Only their exact
-      // unsupported-operation response permits downgrade; transport failures do not.
-      if (!(error instanceof Error) || error.message !== "This secure peer request is not supported.") throw error
-    }
+    const capabilities = await requestPeerCapabilities(client, peer.id, signal)
+    supportsProgress = capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
+    const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
     scanRequested = true
     const manifest = await client.request(peer.id, {
       type: "scan-manifest",
       ...input,
       ...(supportsProgress ? { reportProgress: true } : {}),
-    }, PEER_SCAN_IDLE_TIMEOUT_MS, { signal, ...(supportsProgress ? { onProgress } : {}) })
+    }, PEER_SCAN_IDLE_TIMEOUT_MS, { signal, ...(supportsProgress ? { onProgress } : {}), ...(chunked ? { chunked: true } : {}) })
     if (signal.aborted) throw new ScanCancelledError()
     return parsePeerManifest(manifest)
   } catch (error) {

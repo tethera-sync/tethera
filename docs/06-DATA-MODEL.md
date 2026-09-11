@@ -60,6 +60,7 @@ The active records, any tombstones needed to defeat stale PR #4 rows, outbox ent
 - Version 4 additively creates content-addressed archive-object metadata and the replacement/restore journal.
 - Version 5 adds the per-folder maximum file-size column.
 - Version 6 additively creates staged scan generations (`scan_generations`) and their ordered entries (`scan_entries`) with mapping/revision/participant binding, open/sealed/aborted lifecycle, idempotent batch ingestion, and keyset paging indexes.
+- Version 7 additively creates the per-mapping scan digest cache (`scan_digest_cache`), a derived performance cache keyed by mapping and relative path.
 - Every schema step and `PRAGMA user_version` bump shares one immediate transaction.
 - Malformed version-1 data rolls the whole step back and leaves version 1 intact.
 - A database newer than this build supports is refused without writes.
@@ -110,6 +111,12 @@ are cleaned without touching baselines, operations, conflicts, or recovery
 evidence. At most four open generations per mapping and one million entries
 per generation are staged; one batch holds at most 1,000 entries and one
 planning page reads at most 1,000 paths.
+
+## Scan digest cache (version 7)
+
+`scan_digest_cache` stores one row per mapping and relative path: the file's device and inode, size, modification and status-change timestamps in nanoseconds, its digest, and the sweep token it was last recorded under. Device, inode, and the two timestamps are stored as exact decimal-string renderings rather than integers, because they can exceed i64/f64 precision on some platforms; the engine stores and returns them byte-for-byte and never parses them.
+
+This table is a derived performance cache, not authoritative sync state. Losing it costs nothing but re-hashing on the next scan — it holds no information a full rescan cannot reproduce. Rows cascade away when their owning mapping is removed (`ON DELETE CASCADE`). The desktop scanner decides when a cached digest may still be trusted against the current filesystem state; the engine only records and returns exact values. Pruning is by sweep token rather than wall-clock time: the desktop calls `digestCache.prune` only after a complete sweep that re-recorded every eligible file, so a clock jump cannot cause a live entry to be dropped or a stale one to be kept.
 
 ## Not implemented in this schema
 

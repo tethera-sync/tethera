@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test"
-import { createPublicKey, generateKeyPairSync, sign, verify, type KeyObject } from "node:crypto"
+import { createPublicKey, generateKeyPairSync, randomBytes, randomUUID, sign, verify, type KeyObject } from "node:crypto"
+import net from "node:net"
 import type { PairingService } from "../src/main/pairing-service"
-import { PeerSessionService, peerSessionTestHelpers } from "../src/main/peer-session-service"
+import { measurePeerRequest, PeerSessionService, peerSessionTestHelpers } from "../src/main/peer-session-service"
 import { MAX_ACTIVE_SCANS, ScanCoordinator } from "../src/main/scan-coordinator"
 
 const LARGE_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -105,6 +106,42 @@ describe("secure peer-session crypto", () => {
     const frame = peerSessionTestHelpers.encryptFrame(key, "session", "request", "request", { type: "ping" })
     expect(peerSessionTestHelpers.decryptFrame(key, "session", "request", frame)).toEqual({ type: "ping" })
     expect(() => peerSessionTestHelpers.decryptFrame(key, "session", "response", frame)).toThrow()
+  })
+
+  test("measures a request's exact encrypted line size without a session key", () => {
+    const key = Buffer.alloc(32, 7)
+    const requests = [
+      { type: "ping" },
+      // JSON escaping of quotes, backslashes and control characters is counted exactly.
+      { type: "continuous-sync-observe", local: [{ path: 'a"b\\c\u0001d', size: 1, digest: "a".repeat(64) }], remote: [] },
+      { type: "multibyte", text: "é漢😀".repeat(1_000) },
+    ]
+    for (const request of requests) {
+      const frame = peerSessionTestHelpers.encryptFrame(key, "session", randomUUID(), "request", request)
+      const line = peerSessionTestHelpers.serializeWireMessage(frame)
+      expect(measurePeerRequest(request).bytes).toBe(Buffer.byteLength(line, "utf8"))
+    }
+  })
+
+  test("reports a request above the peer line cap as not fitting", () => {
+    expect(measurePeerRequest({ type: "ping" }).fits).toBe(true)
+    const oversized = measurePeerRequest({ type: "continuous-sync-observe", payload: "x".repeat(13 * 1024 * 1024) })
+    expect(oversized.fits).toBe(false)
+    expect(oversized.bytes).toBeGreaterThan(oversized.limit)
+  })
+
+  test("rejects truncated tags, wrong-size IVs and non-string sealed fields", () => {
+    const key = Buffer.alloc(32, 7)
+    const frame = peerSessionTestHelpers.encryptFrame(key, "session", "request", "request", { type: "ping" })
+    expect(peerSessionTestHelpers.decryptFrame(key, "session", "request", frame)).toEqual({ type: "ping" })
+    // Node verifies a 4-byte prefix of the genuine tag unless the tag length is pinned.
+    const truncatedTag = Buffer.from(frame.tag, "base64").subarray(0, 4).toString("base64")
+    expect(() => peerSessionTestHelpers.decryptFrame(key, "session", "request", { ...frame, tag: truncatedTag })).toThrow("invalid encrypted frame")
+    const shortIv = Buffer.from(frame.iv, "base64").subarray(0, 8).toString("base64")
+    expect(() => peerSessionTestHelpers.decryptFrame(key, "session", "request", { ...frame, iv: shortIv })).toThrow("invalid encrypted frame")
+    // As it would arrive off the wire: an array-like IV must never reach Buffer.from.
+    const arrayLikeIv: Parameters<typeof peerSessionTestHelpers.decryptFrame>[3] = JSON.parse(JSON.stringify({ ...frame, iv: { length: 1_000_000_000 } }))
+    expect(() => peerSessionTestHelpers.decryptFrame(key, "session", "request", arrayLikeIv)).toThrow("invalid encrypted frame")
   })
 
   test("bounds and validates peer error responses", () => {
@@ -360,6 +397,307 @@ describe("secure peer-session crypto", () => {
       await Promise.all(blockers)
       await requester.stop()
       await responder.stop()
+    }
+  })
+})
+
+type ChunkFrame = Awaited<ReturnType<Parameters<typeof peerSessionTestHelpers.readChunkedMessage>[1]>>
+
+describe("chunked secure frames", () => {
+  const key = Buffer.alloc(32, 9)
+  // Four chunks: three full 1 MiB slices and a short remainder.
+  const message = { type: "bulk", text: "x".repeat(3 * 1024 * 1024 + 123) }
+
+  function encrypt(value: unknown, requestId: string, direction: "request" | "response" = "response"): ChunkFrame[] {
+    return [...peerSessionTestHelpers.encryptChunks(key, "session", requestId, direction, value)]
+  }
+
+  function pick(chunks: ChunkFrame[], ...indexes: number[]): ChunkFrame[] {
+    return indexes.map((index) => {
+      const chunk = chunks[index]
+      if (!chunk) throw new Error(`missing chunk ${index}`)
+      return chunk
+    })
+  }
+
+  function reassemble(frames: ChunkFrame[], requestId: string, direction: "request" | "response" = "response"): Promise<unknown> {
+    const [first, ...rest] = frames
+    if (!first || first.type !== "secure-chunk") throw new Error("expected a first chunk")
+    let position = 0
+    const next = async (): Promise<ChunkFrame> => {
+      const frame = rest[position]
+      position += 1
+      if (!frame) throw new Error("The secure peer connection closed.")
+      return frame
+    }
+    return peerSessionTestHelpers.readChunkedMessage(first, next, key, "session", requestId, direction)
+  }
+
+  test("reassembles an authenticated multi-chunk message", async () => {
+    const requestId = randomUUID()
+    const chunks = encrypt(message, requestId)
+    expect(chunks).toHaveLength(4)
+    expect(await reassemble(chunks, requestId)).toEqual(message)
+  })
+
+  test("rejects reordered, repeated, dropped and truncated chunks", async () => {
+    const requestId = randomUUID()
+    const chunks = encrypt(message, requestId)
+    for (const order of [[0, 2, 1, 3], [0, 1, 1, 2, 3], [0, 1, 3], [0, 1, 2]]) {
+      await expect(reassemble(pick(chunks, ...order), requestId)).rejects.toThrow()
+    }
+  })
+
+  test("rejects a header rewritten consistently across every chunk", async () => {
+    const requestId = randomUUID()
+    // The forged total keeps the same chunk count, so only authentication can catch it.
+    const forged = encrypt(message, requestId).map((chunk) => (chunk.type === "secure-chunk" ? { ...chunk, totalBytes: chunk.totalBytes - 1 } : chunk))
+    await expect(reassemble(forged, requestId)).rejects.toThrow()
+  })
+
+  test("rejects a chunk spliced from another request or sealed for the other direction", async () => {
+    const requestId = randomUUID()
+    const chunks = encrypt(message, requestId)
+    const other = encrypt(message, randomUUID())
+    await expect(reassemble([...pick(chunks, 0), ...pick(other, 1), ...pick(chunks, 2, 3)], requestId)).rejects.toThrow("invalid chunked message")
+    await expect(reassemble(encrypt(message, requestId, "request"), requestId, "response")).rejects.toThrow()
+  })
+
+  test("surfaces a session error that interrupts the chunk stream", async () => {
+    const requestId = randomUUID()
+    const frames: ChunkFrame[] = [...pick(encrypt(message, requestId), 0, 1), { type: "session-error", protocol: 4, reason: "The peer request failed." }]
+    await expect(reassemble(frames, requestId)).rejects.toThrow("The peer request failed.")
+  })
+
+  test("refuses a total above the exchange limit before sizing any buffer", async () => {
+    const requestId = randomUUID()
+    const [first] = pick(encrypt({ type: "small" }, requestId), 0)
+    if (!first || first.type !== "secure-chunk") throw new Error("expected a chunk")
+    await expect(reassemble([{ ...first, totalBytes: 300 * 1024 * 1024, count: 300 }], requestId)).rejects.toThrow("invalid chunked message")
+  })
+
+  test("measures a chunked request as plaintext against the exchange limit", () => {
+    const request = { type: "continuous-sync-observe", payload: "x".repeat(20 * 1024 * 1024) }
+    expect(measurePeerRequest(request).fits).toBe(false)
+    const chunked = measurePeerRequest(request, { chunked: true })
+    expect(chunked.fits).toBe(true)
+    expect(chunked.bytes).toBe(Buffer.byteLength(JSON.stringify(request), "utf8"))
+  })
+
+  test("carries a request and a response larger than one frame between chunk-capable peers", async () => {
+    const requesterIdentity = testIdentity("requester-chunked")
+    const responderIdentity = testIdentity("responder-chunked")
+    const bulk = "y".repeat(20 * 1024 * 1024)
+    let responderSawChunks: boolean | undefined
+    const responder = new PeerSessionService({
+      pairing: fakePairing(responderIdentity, requesterIdentity, 0),
+      port: 0,
+      onRequest: async (context, request) => {
+        responderSawChunks = context.chunkedResponse
+        return { received: typeof request.bulk === "string" ? request.bulk.length : -1, bulk }
+      },
+    })
+    await responder.start()
+    const requester = new PeerSessionService({
+      pairing: fakePairing(requesterIdentity, responderIdentity, responder.port),
+      port: 0,
+      onRequest: async () => undefined,
+    })
+    try {
+      const response = await requester.request<{ received: number; bulk: string }>(responderIdentity.id, { type: "bulk", bulk }, 30_000, { chunked: true })
+      expect(response.received).toBe(bulk.length)
+      expect(response.bulk === bulk).toBe(true)
+      expect(responderSawChunks).toBe(true)
+    } finally {
+      await requester.stop()
+      await responder.stop()
+    }
+  })
+
+  test("a single-frame exchange still fails closed above the frame cap", async () => {
+    const requesterIdentity = testIdentity("requester-single")
+    const responderIdentity = testIdentity("responder-single")
+    const responder = new PeerSessionService({
+      pairing: fakePairing(responderIdentity, requesterIdentity, 0),
+      port: 0,
+      onRequest: async () => ({ bulk: "z".repeat(17 * 1024 * 1024) }),
+    })
+    await responder.start()
+    const requester = new PeerSessionService({
+      pairing: fakePairing(requesterIdentity, responderIdentity, responder.port),
+      port: 0,
+      onRequest: async () => undefined,
+    })
+    try {
+      await expect(requester.request(responderIdentity.id, { type: "bulk" }, 10_000)).rejects.toThrow()
+    } finally {
+      await requester.stop()
+      await responder.stop()
+    }
+  })
+
+  test("delivers scan progress before a chunked terminal manifest", async () => {
+    const requesterIdentity = testIdentity("requester-chunked-scan")
+    const responderIdentity = testIdentity("responder-chunked-scan")
+    const files = "f".repeat(2 * 1024 * 1024 + 7)
+    const responder = new PeerSessionService({
+      pairing: fakePairing(responderIdentity, requesterIdentity, 0),
+      port: 0,
+      testTiming: { scanProgressIntervalMs: 5 },
+      onRequest: async (context) => {
+        context.reportProgress?.(TEST_PROGRESS)
+        await delay(12)
+        context.reportProgress?.({ ...TEST_PROGRESS, scannedFiles: 2 })
+        return { files }
+      },
+    })
+    await responder.start()
+    const requester = new PeerSessionService({
+      pairing: fakePairing(requesterIdentity, responderIdentity, responder.port),
+      port: 0,
+      onRequest: async () => undefined,
+    })
+    const activity: number[] = []
+    try {
+      const response = await requester.request<{ files: string }>(
+        responderIdentity.id,
+        { type: "scan-manifest", reportProgress: true },
+        5_000,
+        { chunked: true, onProgress: (progress) => activity.push(progress.scannedFiles) },
+      )
+      expect(response.files === files).toBe(true)
+      expect(activity.length).toBeGreaterThan(0)
+    } finally {
+      await requester.stop()
+      await responder.stop()
+    }
+  })
+
+  // Regression: every chunk read once restarted the full response timeout, so
+  // a peer that answered one chunk per period could hold a non-scan exchange
+  // for count x timeoutMs. One exchange-wide deadline must bound all chunks.
+  test("a trickling chunked response fails at the exchange deadline", async () => {
+    const requesterIdentity = testIdentity("requester-trickle")
+    const responderIdentity = testIdentity("responder-trickle")
+    const responderPairing = fakePairing(responderIdentity, requesterIdentity, 0)
+    const timeoutMs = 1_000
+    const firstChunkAtMs = 700
+    // ~2.4 MiB response, so the terminal message arrives as three chunks.
+    const bulk = "q".repeat(2_400_000)
+    const sockets = new Set<net.Socket>()
+    // Literal 4 must match PROTOCOL_VERSION in peer-session-service.ts.
+    const server = net.createServer((socket) => {
+      sockets.add(socket)
+      socket.on("close", () => sockets.delete(socket))
+      socket.on("error", () => undefined)
+      const ephemeral = generateKeyPairSync("x25519")
+      let buffer = ""
+      let stage: "hello" | "request" | "done" = "hello"
+      let key: Buffer | undefined
+      let sessionId = ""
+      socket.setEncoding("utf8")
+      socket.on("data", (data: string) => {
+        buffer += data
+        let newline = buffer.indexOf("\n")
+        while (newline >= 0) {
+          const line = buffer.slice(0, newline)
+          buffer = buffer.slice(newline + 1)
+          if (stage === "hello") {
+            stage = "request"
+            const hello: unknown = JSON.parse(line)
+            if (
+              !hello || typeof hello !== "object" ||
+              typeof (hello as { sessionId?: unknown }).sessionId !== "string" ||
+              typeof (hello as { deviceId?: unknown }).deviceId !== "string" ||
+              typeof (hello as { nonce?: unknown }).nonce !== "string" ||
+              typeof (hello as { ephemeralPublicKey?: unknown }).ephemeralPublicKey !== "string" ||
+              typeof (hello as { sentAt?: unknown }).sentAt !== "number"
+            ) {
+              throw new Error("expected a session hello")
+            }
+            const parsed = hello as { sessionId: string; deviceId: string; nonce: string; ephemeralPublicKey: string; sentAt: number }
+            sessionId = parsed.sessionId
+            const helloBody = {
+              protocol: 4,
+              sessionId: parsed.sessionId,
+              deviceId: parsed.deviceId,
+              targetDeviceId: responderIdentity.id,
+              nonce: parsed.nonce,
+              ephemeralPublicKey: parsed.ephemeralPublicKey,
+              sentAt: parsed.sentAt,
+            }
+            const welcomeBody = {
+              protocol: 4,
+              sessionId: parsed.sessionId,
+              deviceId: responderIdentity.id,
+              targetDeviceId: requesterIdentity.id,
+              initiatorNonce: parsed.nonce,
+              responderNonce: randomBytes(32).toString("base64url"),
+              ephemeralPublicKey: peerSessionTestHelpers.exportX25519PublicKey(ephemeral.publicKey),
+              sentAt: Date.now(),
+            }
+            key = peerSessionTestHelpers.deriveSessionKey(
+              ephemeral.privateKey,
+              parsed.ephemeralPublicKey,
+              peerSessionTestHelpers.buildSessionTranscript(helloBody, welcomeBody),
+            )
+            socket.write(
+              `${JSON.stringify({
+                type: "session-welcome",
+                ...welcomeBody,
+                signature: responderPairing.signSessionPayload("session-welcome", welcomeBody),
+              })}\n`,
+            )
+          } else if (stage === "request") {
+            stage = "done"
+            if (!key) throw new Error("missing session key")
+            const frame: unknown = JSON.parse(line)
+            if (!frame || typeof frame !== "object" || typeof (frame as { requestId?: unknown }).requestId !== "string") {
+              throw new Error("expected a request frame")
+            }
+            const chunks = [
+              ...peerSessionTestHelpers.encryptChunks(key, sessionId, (frame as { requestId: string }).requestId, "response", {
+                ok: true,
+                result: { bulk },
+              }),
+            ]
+            const first = chunks[0]
+            if (!first) throw new Error("expected a first chunk")
+            setTimeout(() => {
+              if (!socket.destroyed) socket.write(peerSessionTestHelpers.serializeWireMessage(first))
+            }, firstChunkAtMs)
+            // The remaining chunks are never sent: the requester must fail at
+            // the exchange deadline instead of waiting out another timeout.
+          }
+          newline = buffer.indexOf("\n")
+        }
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()))
+    const address = server.address()
+    if (!address || typeof address === "string") throw new Error("Unable to determine test server port.")
+    const requester = new PeerSessionService({
+      pairing: fakePairing(requesterIdentity, responderIdentity, address.port),
+      port: 0,
+      onRequest: async () => undefined,
+    })
+    const startedAt = Date.now()
+    try {
+      const failure = await requester.request(responderIdentity.id, { type: "bulk" }, timeoutMs, { chunked: true }).then(
+        (): null => null,
+        (error: unknown): unknown => error,
+      )
+      const elapsedMs = Date.now() - startedAt
+      expect(failure).toBeInstanceOf(Error)
+      expect((failure as Error & { code?: unknown }).code).toBe("PEER_RESPONSE_TIMEOUT")
+      // Without the exchange deadline the stalled second chunk would restart
+      // the full timeout: ~700ms + 1,000ms instead of ~1,000ms total.
+      expect(elapsedMs).toBeGreaterThanOrEqual(timeoutMs - 100)
+      expect(elapsedMs).toBeLessThan(timeoutMs + 600)
+    } finally {
+      await requester.stop()
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
 })

@@ -116,6 +116,69 @@ export interface ReconcileFilesResult extends FileSyncState {
   verifiedCount: number
 }
 
+/** Advertised by peers that can answer a continuous scan with "unchanged" instead of a full manifest. */
+export const CONTINUOUS_FINGERPRINT_CAPABILITY = "continuous-fingerprint-v1"
+
+/** However quiet a folder looks, it is fully reconciled at least this often. */
+export const FULL_RECONCILE_INTERVAL_MS = 60 * 60_000
+
+/**
+ * The last continuous reconcile that queued nothing, and what it saw. While
+ * both observations and the durable state still match it, reconciling again
+ * would decide exactly the same, so an idle cycle can stop after scanning.
+ */
+export interface QuietReconcile {
+  revision: number
+  localFingerprint: string
+  remoteFingerprint: string
+  baselineCount: number
+  conflictKey: string
+  reconciledAt: number
+}
+
+/** Identifies a set of open conflicts, independent of the order they were listed in. */
+export function conflictKey(conflicts: FileSyncConflict[]): string {
+  return conflicts
+    .map((conflict) => JSON.stringify([conflict.path, conflict.kind, conflict.localDigest ?? null, conflict.remoteDigest ?? null]))
+    .sort()
+    .join("\n")
+}
+
+/**
+ * Whether an idle cycle may stop after its scans, provided both come back
+ * unchanged since `quiet`: the same mapping revision, nothing queued or
+ * awaiting recovery, the same baseline count and conflicts, and a full
+ * reconcile recent enough.
+ */
+export function canSkipUnchangedCycle(
+  quiet: QuietReconcile | undefined,
+  durable: FileSyncState,
+  revision: number,
+  now: number,
+): quiet is QuietReconcile {
+  return (
+    quiet !== undefined &&
+    quiet.revision === revision &&
+    durable.operations.length === 0 &&
+    durable.recoveryIssues.length === 0 &&
+    durable.baselineCount === quiet.baselineCount &&
+    conflictKey(durable.conflicts) === quiet.conflictKey &&
+    now - quiet.reconciledAt < FULL_RECONCILE_INTERVAL_MS
+  )
+}
+
+/** A peer's answer that its folder still matches the fingerprint it was asked about. */
+export function isUnchangedScanReply(value: unknown): value is { unchanged: true } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 1 &&
+    "unchanged" in value &&
+    value.unchanged === true
+  )
+}
+
 export function observedFiles(manifest: FileManifest): ObservedFile[] {
   return manifest.files.map((entry) => {
     if (!entry.digest) throw new Error(`The full-content scan did not produce a digest for ${entry.path}.`)

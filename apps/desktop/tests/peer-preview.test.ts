@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { requestPeerPreview } from "../src/main/peer-preview"
 import { PEER_SCAN_PROGRESS_CAPABILITY, parsePeerScanProgress } from "../src/main/peer-scan-progress"
-import type { PeerRequest, PeerRequestOptions } from "../src/main/peer-session-service"
+import { CHUNKED_FRAMES_CAPABILITY, type PeerRequest, type PeerRequestOptions } from "../src/main/peer-session-service"
 import { folderComparisonResult, unwrapFolderComparisonResult } from "../src/shared/folder-comparison-result"
 
 const peer = { id: "peer", name: "Office PC" }
@@ -36,6 +36,21 @@ describe("peer preview compatibility", () => {
       },
     }
     expect(await requestPeerPreview(client, peer, input, new AbortController().signal, () => {})).toEqual(manifest)
+  })
+
+  test("asks only a chunk-capable peer for a manifest larger than one frame", async () => {
+    for (const [capabilities, expected] of [[[CHUNKED_FRAMES_CAPABILITY], true], [["scan-generations-v1"], undefined]] as const) {
+      let scanOptions: PeerRequestOptions | undefined
+      const client = {
+        async request(_peerId: string, request: PeerRequest, _timeout?: number, options?: PeerRequestOptions): Promise<unknown> {
+          if (request.type === "scan-capabilities") return { capabilities }
+          scanOptions = options
+          return manifest
+        },
+      }
+      expect(await requestPeerPreview(client, peer, input, new AbortController().signal, () => {})).toEqual(manifest)
+      expect(scanOptions?.chunked).toBe(expected)
+    }
   })
 
   test("does not downgrade malformed capabilities or a failed connection into another scan", async () => {

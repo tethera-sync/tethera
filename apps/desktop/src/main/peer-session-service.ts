@@ -35,6 +35,13 @@ const MAX_AUTHENTICATED_SESSIONS_PER_PEER = 4
 const MAX_PEER_SCAN_PROGRESS_BYTES = 4_096
 const MAX_PEER_SCAN_PROGRESS_MESSAGES = 8_000
 const PEER_SCAN_PROGRESS_INTERVAL_MS = 250
+/** Advertised by peers that accept requests and responses split across several authenticated frames. */
+export const CHUNKED_FRAMES_CAPABILITY = "chunked-frames-v1"
+// 1 MiB of plaintext (~1.4 MiB per frame), so a frame parked while its reader
+// is busy stays within the parked-message byte bound.
+const CHUNK_PLAINTEXT_BYTES = 1024 * 1024
+/** Largest message, in plaintext JSON bytes, sent or reassembled as chunks in one exchange. */
+const MAX_CHUNKED_MESSAGE_BYTES = 256 * 1024 * 1024
 
 type SessionHello = {
   type: "session-hello"
@@ -75,7 +82,19 @@ type SecureFrame = {
   tag: string
 }
 
-type WireMessage = SessionHello | SessionWelcome | SessionError | SecureFrame
+/** One authenticated piece of a message too large for a single frame; see `encryptChunks`. */
+type SecureChunk = {
+  type: "secure-chunk"
+  requestId: string
+  index: number
+  count: number
+  totalBytes: number
+  iv: string
+  ciphertext: string
+  tag: string
+}
+
+type WireMessage = SessionHello | SessionWelcome | SessionError | SecureFrame | SecureChunk
 
 export type PeerRequest = { type: string; [key: string]: unknown }
 export type PeerResponse =
@@ -89,6 +108,8 @@ export interface PeerRequestContext {
   requestId: string
   /** Aborts when the peer socket closes or the request deadline fires. Handlers must thread it into scan work. */
   signal: AbortSignal
+  /** True when the request arrived in chunks, so the response may exceed one frame too. */
+  chunkedResponse: boolean
   /**
    * Sends bounded advisory scan activity for a `scan-manifest` request that
    * explicitly opted into it. It is absent for every other peer operation.
@@ -100,6 +121,12 @@ export interface PeerRequestOptions {
   signal?: AbortSignal | null
   /** Receives bounded advisory activity for an opted-in `scan-manifest` request. */
   onProgress?: (progress: PeerScanProgress) => void
+  /**
+   * Sends the request, and accepts the response, as authenticated chunks so
+   * either may exceed one frame. Only for a peer advertising
+   * `CHUNKED_FRAMES_CAPABILITY`: an older peer rejects chunk frames.
+   */
+  chunked?: boolean
 }
 
 interface PeerSessionTimingOptions {
@@ -256,17 +283,30 @@ export class PeerSessionService extends EventEmitter {
         buildSessionTranscript(helloBody, welcomeBody),
       )
       const requestId = randomUUID()
-      connection.write(encryptFrame(key, sessionId, requestId, "request", request))
+      if (options.chunked) await connection.writeAll(encryptChunks(key, sessionId, requestId, "request", request))
+      else connection.write(encryptFrame(key, sessionId, requestId, "request", request))
       if (isScanManifest) {
         return await this.#readScanResponse<T>(connection, key, sessionId, requestId, timeoutMs, options)
       }
-      let responseFrame: WireMessage
-      try {
-        responseFrame = await connection.read(timeoutMs, options.signal)
-      } catch (error) {
-        throw asPeerPhaseTimeout(error, "The secure peer operation timed out.", "PEER_RESPONSE_TIMEOUT")
+      // One exchange-wide deadline bounds every chunk read: without it a peer
+      // that answers one chunk per timeout could hold this request for
+      // count x timeoutMs. A single-frame response still gets the full timeout.
+      const responseDeadline = performance.now() + timeoutMs
+      const readResponse = async (): Promise<WireMessage> => {
+        const remaining = responseDeadline - performance.now()
+        if (remaining <= 0) {
+          throw peerSessionError("The secure peer operation timed out.", "PEER_RESPONSE_TIMEOUT")
+        }
+        try {
+          return await connection.read(Math.min(timeoutMs, remaining), options.signal)
+        } catch (error) {
+          throw asPeerPhaseTimeout(error, "The secure peer operation timed out.", "PEER_RESPONSE_TIMEOUT")
+        }
       }
-      return parseTerminalResponse<T>(key, sessionId, requestId, responseFrame)
+      const responseFrame = await readResponse()
+      return options.chunked
+        ? await parseChunkedTerminalResponse<T>(responseFrame, readResponse, key, sessionId, requestId)
+        : parseTerminalResponse<T>(key, sessionId, requestId, responseFrame)
     } catch (error) {
       if (options.signal?.aborted) throw new Error("The peer request was cancelled.")
       throw error
@@ -306,11 +346,30 @@ export class PeerSessionService extends EventEmitter {
         throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
       }
       if (responseFrame.type === "session-error") throw new Error(responseFrame.reason)
+      if (options.chunked && responseFrame.type === "secure-chunk") {
+        const readChunk = async (): Promise<WireMessage> => {
+          const remainingForChunk = deadline - performance.now()
+          if (remainingForChunk <= 0) {
+            throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
+          }
+          try {
+            return await connection.read(Math.min(readTimeout, remainingForChunk), options.signal)
+          } catch (error) {
+            if (performance.now() >= deadline) {
+              throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
+            }
+            throw asPeerPhaseTimeout(error, "The secure peer scan stopped reporting progress.", "PEER_SCAN_IDLE_TIMEOUT")
+          }
+        }
+        return await parseChunkedTerminalResponse<T>(responseFrame, readChunk, key, sessionId, requestId)
+      }
       if (responseFrame.type !== "secure-frame" || responseFrame.requestId !== requestId) {
         throw new Error("The peer returned an invalid encrypted response.")
       }
       const value = decryptFrame<unknown>(key, sessionId, "response", responseFrame)
       if (isPeerResponse(value)) {
+        // In chunked mode the terminal response always arrives as chunks.
+        if (options.chunked) throw new Error("The peer returned an invalid encrypted response.")
         const response = parsePeerResponse(value)
         if (!response.ok) throw new Error(response.error)
         return response.result as T
@@ -401,10 +460,23 @@ export class PeerSessionService extends EventEmitter {
         first.ephemeralPublicKey,
         buildSessionTranscript(helloBody, welcomeBody),
       )
-      const frame = await connection.read(REQUEST_TIMEOUT_MS, handlerController.signal)
-      if (frame.type !== "secure-frame") throw new Error("Expected an encrypted peer request.")
+      // Bound the whole chunked request to one REQUEST_TIMEOUT_MS window so a
+      // peer cannot occupy a handler slot for count x timeout by trickling
+      // one chunk per period.
+      const requestDeadline = performance.now() + REQUEST_TIMEOUT_MS
+      const readRequestFrame = async (): Promise<WireMessage> => {
+        const remaining = requestDeadline - performance.now()
+        if (remaining <= 0) throw new Error("The secure peer request timed out.")
+        return await connection.read(Math.min(REQUEST_TIMEOUT_MS, remaining), handlerController.signal)
+      }
+      const frame = await readRequestFrame()
+      if (frame.type !== "secure-frame" && frame.type !== "secure-chunk") throw new Error("Expected an encrypted peer request.")
       requestId = safeCorrelationId(frame.requestId)
-      const request = decryptFrame<PeerRequest>(key, first.sessionId, "request", frame)
+      // A requester that sends chunks can also reassemble a chunked response.
+      const chunkedResponse = frame.type === "secure-chunk"
+      const request = frame.type === "secure-chunk"
+        ? await readChunkedMessage<PeerRequest>(frame, readRequestFrame, key, first.sessionId, frame.requestId, "request")
+        : decryptFrame<PeerRequest>(key, first.sessionId, "request", frame)
       const isScanManifest = request.type === "scan-manifest"
       const canReportProgress = isScanManifest && request.reportProgress === true
       if (isScanManifest) {
@@ -424,6 +496,7 @@ export class PeerSessionService extends EventEmitter {
         remoteAddress: normalizeRemoteAddress(socket.remoteAddress),
         requestId,
         signal: handlerController.signal,
+        chunkedResponse,
         ...(canReportProgress ? { reportProgress: this.#createProgressReporter(connection, key, first.sessionId, frame.requestId, handlerController.signal) } : {}),
       }
 
@@ -455,7 +528,8 @@ export class PeerSessionService extends EventEmitter {
         })
         response = { ok: false, error: detail }
       }
-      await connection.end(encryptFrame(key, first.sessionId, frame.requestId, "response", response))
+      if (chunkedResponse) await connection.endChunked(encryptChunks(key, first.sessionId, frame.requestId, "response", response))
+      else await connection.end(encryptFrame(key, first.sessionId, frame.requestId, "response", response))
     } catch (error) {
       const detail = boundedPeerError(error, "The secure peer session failed.")
       console.warn("[peer-session] secure session failed", {
@@ -624,6 +698,22 @@ function parseTerminalResponse<T>(key: Buffer, sessionId: string, requestId: str
   return response.result as T
 }
 
+async function parseChunkedTerminalResponse<T>(
+  first: WireMessage,
+  next: () => Promise<WireMessage>,
+  key: Buffer,
+  sessionId: string,
+  requestId: string,
+): Promise<T> {
+  if (first.type === "session-error") throw new Error(first.reason)
+  if (first.type !== "secure-chunk" || first.requestId !== requestId) {
+    throw new Error("The peer returned an invalid encrypted response.")
+  }
+  const response = parsePeerResponse(await readChunkedMessage<unknown>(first, next, key, sessionId, requestId, "response"))
+  if (!response.ok) throw new Error(response.error)
+  return response.result as T
+}
+
 function parsePeerScanProgressEnvelope(value: unknown, expectedSequence: number): PeerScanProgress {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("The peer returned invalid scan progress.")
@@ -688,6 +778,50 @@ class JsonLineConnection {
   write(message: WireMessage): void {
     if (this.#socket.destroyed) throw new Error("The secure peer connection is closed.")
     this.#socket.write(serializeWireMessage(message))
+  }
+
+  /** Writes frames one at a time, waiting for the socket to drain so a large message is never buffered whole. */
+  async writeAll(messages: Iterable<WireMessage>): Promise<void> {
+    for (const message of messages) {
+      if (this.#socket.destroyed || this.#socket.writableEnded) {
+        throw peerSessionError("The secure peer connection is closed.", "PEER_CONNECTION_CLOSED")
+      }
+      if (!this.#socket.write(serializeWireMessage(message))) await this.#drain()
+    }
+  }
+
+  /** Writes every frame but the last with backpressure, then ends the socket with the last. */
+  async endChunked(messages: Iterable<WireMessage>): Promise<void> {
+    let previous: WireMessage | undefined
+    for (const message of messages) {
+      if (previous) await this.writeAll([previous])
+      previous = message
+    }
+    if (!previous) throw new Error("A chunked message needs at least one frame.")
+    await this.end(previous)
+  }
+
+  #drain(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const finish = (error?: Error): void => {
+        clearTimeout(timeout)
+        this.#socket.off("drain", onDrain)
+        this.#socket.off("close", onClose)
+        this.#socket.off("error", onError)
+        if (error) reject(error)
+        else resolve()
+      }
+      const onDrain = (): void => finish()
+      const onClose = (): void => finish(peerSessionError("The secure peer connection is closed.", "PEER_CONNECTION_CLOSED"))
+      const onError = (error: Error): void => finish(error)
+      const timeout = setTimeout(
+        () => finish(peerSessionError("The secure peer stopped reading.", "PEER_RESPONSE_FLUSH_TIMEOUT")),
+        RESPONSE_FLUSH_TIMEOUT_MS,
+      )
+      this.#socket.once("drain", onDrain)
+      this.#socket.once("close", onClose)
+      this.#socket.once("error", onError)
+    })
   }
 
   /**
@@ -828,6 +962,30 @@ class JsonLineConnection {
   }
 }
 
+/**
+ * Exact size of a request against the limit it will be sent under, computed
+ * without a session key, so a caller can refuse an oversized request before
+ * committing any local work. A single frame is measured as its encrypted line:
+ * AES-GCM ciphertext is exactly as long as its plaintext, and the rest is
+ * fixed-width base64 around a random UUID request id. A chunked request is
+ * measured as plaintext against the chunked-exchange limit.
+ */
+export function measurePeerRequest(request: PeerRequest, options: { chunked?: boolean } = {}): { bytes: number; limit: number; fits: boolean } {
+  const plaintextBytes = Buffer.byteLength(JSON.stringify(request), "utf8")
+  if (options.chunked) {
+    return { bytes: plaintextBytes, limit: MAX_CHUNKED_MESSAGE_BYTES, fits: plaintextBytes <= MAX_CHUNKED_MESSAGE_BYTES }
+  }
+  const envelope: SecureFrame = {
+    type: "secure-frame",
+    requestId: randomUUID(),
+    iv: Buffer.alloc(12).toString("base64"),
+    ciphertext: "",
+    tag: Buffer.alloc(16).toString("base64"),
+  }
+  const bytes = Buffer.byteLength(`${JSON.stringify(envelope)}\n`, "utf8") + Math.ceil(plaintextBytes / 3) * 4
+  return { bytes, limit: MAX_LINE_BYTES, fits: bytes <= MAX_LINE_BYTES }
+}
+
 function serializeWireMessage(message: WireMessage): string {
   const serialized = `${JSON.stringify(message)}\n`
   if (Buffer.byteLength(serialized, "utf8") > MAX_LINE_BYTES) {
@@ -879,20 +1037,144 @@ function encryptFrame(
   }
 }
 
+const GCM_IV_BYTES = 12
+const GCM_TAG_BYTES = 16
+
+/**
+ * Decodes a frame's sealed fields from the wire. Each must be a base64 string:
+ * any other JSON value could make `Buffer.from` allocate an arbitrary length.
+ * The IV and tag must be exactly GCM's sizes, because Node otherwise verifies
+ * a truncated tag prefix and authentication drops to as little as 32 bits.
+ */
+function decodeSealedFields(frame: { iv: unknown; tag: unknown; ciphertext: unknown }): { iv: Buffer; tag: Buffer; ciphertext: Buffer } {
+  if (typeof frame.iv !== "string" || typeof frame.tag !== "string" || typeof frame.ciphertext !== "string") {
+    throw new Error("The peer sent an invalid encrypted frame.")
+  }
+  const iv = Buffer.from(frame.iv, "base64")
+  const tag = Buffer.from(frame.tag, "base64")
+  if (iv.length !== GCM_IV_BYTES || tag.length !== GCM_TAG_BYTES) throw new Error("The peer sent an invalid encrypted frame.")
+  return { iv, tag, ciphertext: Buffer.from(frame.ciphertext, "base64") }
+}
+
 function decryptFrame<T>(
   key: Buffer,
   sessionId: string,
   direction: "request" | "response",
   frame: SecureFrame,
 ): T {
-  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(frame.iv, "base64"))
+  const { iv, tag, ciphertext } = decodeSealedFields(frame)
+  const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: GCM_TAG_BYTES })
   decipher.setAAD(Buffer.from(`${sessionId}\0${frame.requestId}\0${direction}`))
-  decipher.setAuthTag(Buffer.from(frame.tag, "base64"))
-  const plaintext = Buffer.concat([
-    decipher.update(Buffer.from(frame.ciphertext, "base64")),
-    decipher.final(),
-  ]).toString("utf8")
+  decipher.setAuthTag(tag)
+  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8")
   return JSON.parse(plaintext) as T
+}
+
+function chunkAad(
+  sessionId: string,
+  requestId: string,
+  direction: "request" | "response",
+  chunk: { index: number; count: number; totalBytes: number },
+): Buffer {
+  return Buffer.from(`${sessionId}\0${requestId}\0${direction}\0chunk\0${chunk.index}\0${chunk.count}\0${chunk.totalBytes}`)
+}
+
+/**
+ * Splits one message into authenticated chunks of `CHUNK_PLAINTEXT_BYTES`.
+ * Each chunk's index, the chunk count and the total size are bound into its
+ * AAD, so a chunk cannot be reordered, repeated, dropped or moved into another
+ * message without failing authentication or layout validation.
+ */
+function* encryptChunks(
+  key: Buffer,
+  sessionId: string,
+  requestId: string,
+  direction: "request" | "response",
+  value: unknown,
+): Generator<SecureChunk, void, void> {
+  const plaintext = Buffer.from(JSON.stringify(value), "utf8")
+  if (plaintext.length > MAX_CHUNKED_MESSAGE_BYTES) {
+    throw peerSessionError(
+      `The secure message is ${(plaintext.length / 1_048_576).toFixed(1)} MiB, above the ${MAX_CHUNKED_MESSAGE_BYTES / 1_048_576} MiB limit for one peer exchange.`,
+      "PEER_MESSAGE_TOO_LARGE",
+    )
+  }
+  const count = Math.ceil(plaintext.length / CHUNK_PLAINTEXT_BYTES)
+  for (let index = 0; index < count; index += 1) {
+    const header = { index, count, totalBytes: plaintext.length }
+    const iv = randomBytes(GCM_IV_BYTES)
+    const cipher = createCipheriv("aes-256-gcm", key, iv)
+    cipher.setAAD(chunkAad(sessionId, requestId, direction, header))
+    const slice = plaintext.subarray(index * CHUNK_PLAINTEXT_BYTES, (index + 1) * CHUNK_PLAINTEXT_BYTES)
+    const ciphertext = Buffer.concat([cipher.update(slice), cipher.final()])
+    yield {
+      type: "secure-chunk",
+      requestId,
+      ...header,
+      iv: iv.toString("base64"),
+      ciphertext: ciphertext.toString("base64"),
+      tag: cipher.getAuthTag().toString("base64"),
+    }
+  }
+}
+
+function decryptChunk(key: Buffer, sessionId: string, direction: "request" | "response", chunk: SecureChunk): Buffer {
+  const { iv, tag, ciphertext } = decodeSealedFields(chunk)
+  const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: GCM_TAG_BYTES })
+  decipher.setAAD(chunkAad(sessionId, chunk.requestId, direction, chunk))
+  decipher.setAuthTag(tag)
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()])
+}
+
+function hasValidChunkLayout(count: unknown, totalBytes: unknown): boolean {
+  if (typeof count !== "number" || typeof totalBytes !== "number") return false
+  if (!Number.isSafeInteger(count) || !Number.isSafeInteger(totalBytes)) return false
+  return totalBytes > 0 && totalBytes <= MAX_CHUNKED_MESSAGE_BYTES && count === Math.ceil(totalBytes / CHUNK_PLAINTEXT_BYTES)
+}
+
+/**
+ * Reassembles one chunked message. Chunk 0 is authenticated before any buffer
+ * is sized from the total its header claims; every later chunk must repeat the
+ * same count and total, arrive at the next index, and carry exactly the length
+ * the sender's split produces.
+ */
+async function readChunkedMessage<T>(
+  first: SecureChunk,
+  next: () => Promise<WireMessage>,
+  key: Buffer,
+  sessionId: string,
+  requestId: string,
+  direction: "request" | "response",
+): Promise<T> {
+  const { count, totalBytes } = first
+  if (first.requestId !== requestId || first.index !== 0 || !hasValidChunkLayout(count, totalBytes)) {
+    throw new Error("The peer sent an invalid chunked message.")
+  }
+  let plaintext: Buffer | undefined
+  let offset = 0
+  let chunk: WireMessage = first
+  for (let index = 0; index < count; index += 1) {
+    if (index > 0) chunk = await next()
+    if (chunk.type === "session-error") throw new Error(chunk.reason)
+    if (
+      chunk.type !== "secure-chunk" ||
+      chunk.requestId !== requestId ||
+      chunk.index !== index ||
+      chunk.count !== count ||
+      chunk.totalBytes !== totalBytes
+    ) {
+      throw new Error("The peer sent an invalid chunked message.")
+    }
+    const decrypted = decryptChunk(key, sessionId, direction, chunk)
+    if (decrypted.length !== Math.min(CHUNK_PLAINTEXT_BYTES, totalBytes - offset)) {
+      throw new Error("The peer sent an invalid chunked message.")
+    }
+    plaintext ??= Buffer.allocUnsafe(totalBytes)
+    decrypted.copy(plaintext, offset)
+    offset += decrypted.length
+  }
+  if (!plaintext || offset !== totalBytes) throw new Error("The peer sent an invalid chunked message.")
+  return JSON.parse(plaintext.toString("utf8")) as T
 }
 
 function waitForConnect(socket: Socket, timeoutMs: number): Promise<void> {
@@ -930,8 +1212,11 @@ export const peerSessionTestHelpers = {
   buildSessionTranscript,
   decryptFrame,
   deriveSessionKey,
+  encryptChunks,
   encryptFrame,
   exportX25519PublicKey,
   parsePeerResponse,
   parsePeerScanProgressEnvelope,
+  readChunkedMessage,
+  serializeWireMessage,
 }

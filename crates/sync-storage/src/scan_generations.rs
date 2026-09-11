@@ -505,20 +505,26 @@ impl MappingStore {
         }
     }
 
-    /// Ordered keyset page over a sealed generation. Incomplete generations
-    /// are invisible to planning reads by design.
-    /// Reads one ordered page of a sealed generation.
+    /// Ordered keyset page over a sealed generation owned by `mapping_id`.
+    /// Incomplete generations are invisible to planning reads by design.
+    ///
+    /// A generation owned by another mapping is reported exactly like a
+    /// missing one, so a peer-facing read cannot confirm that an unrelated
+    /// generation exists.
     ///
     /// # Errors
     ///
-    /// Returns a validation, incomplete-generation, or database error.
+    /// Returns a validation, missing-generation, incomplete-generation, or
+    /// database error.
     pub fn read_generation_page(
         &self,
+        mapping_id: &str,
         generation_id: &str,
         cursor: Option<&str>,
         limit: i64,
     ) -> Result<GenerationPage, MappingStoreError> {
         self.ensure_import_completed()?;
+        check_identifier("mappingId", mapping_id)?;
         validate_generation_id(generation_id)?;
         if limit <= 0 || limit > MAX_PAGE_ENTRIES {
             return Err(MappingStoreError::Invalid(
@@ -531,8 +537,8 @@ impl MappingStore {
         let state: String = self
             .connection
             .query_row(
-                "SELECT state FROM scan_generations WHERE generation_id = ?1",
-                params![generation_id],
+                "SELECT state FROM scan_generations WHERE generation_id = ?1 AND mapping_id = ?2",
+                params![generation_id, mapping_id],
                 |row| row.get(0),
             )
             .optional()?
@@ -797,7 +803,11 @@ mod tests {
                 entries: vec![entry("a.txt", 'a')],
             })
             .expect("append");
-        assert!(store.read_generation_page("gen-1", None, 10).is_err());
+        assert!(
+            store
+                .read_generation_page("mapping-1", "gen-1", None, 10)
+                .is_err()
+        );
     }
 
     #[test]
@@ -828,7 +838,11 @@ mod tests {
             .expect("append");
         let aborted = store.abort_scan_generation("gen-1").expect("abort");
         assert_eq!(aborted.state, "aborted");
-        assert!(store.read_generation_page("gen-1", None, 10).is_err());
+        assert!(
+            store
+                .read_generation_page("mapping-1", "gen-1", None, 10)
+                .is_err()
+        );
         // Aborting twice stays idempotent.
         assert_eq!(
             store
@@ -856,12 +870,14 @@ mod tests {
                 expected_count: 2,
             })
             .expect("seal");
-        let first = store.read_generation_page("gen-1", None, 1).expect("page");
+        let first = store
+            .read_generation_page("mapping-1", "gen-1", None, 1)
+            .expect("page");
         assert_eq!(first.entries.len(), 1);
         assert_eq!(first.entries[0].path, "a.txt");
         let cursor = first.next_cursor.expect("cursor");
         let second = store
-            .read_generation_page("gen-1", Some(&cursor), 1)
+            .read_generation_page("mapping-1", "gen-1", Some(&cursor), 1)
             .expect("page");
         assert_eq!(second.entries.len(), 1);
         assert_eq!(second.entries[0].path, "b.txt");
@@ -910,6 +926,41 @@ mod tests {
         assert_eq!(result.baseline_count, 1);
         assert!(result.operations.is_empty());
         assert!(result.conflicts.is_empty());
+    }
+
+    #[test]
+    fn a_generation_cannot_be_read_through_another_mapping() {
+        let store = active_store();
+        begin(&store, "gen-1");
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-1".to_owned(),
+                sequence: 0,
+                entries: vec![entry("a.txt", 'a')],
+            })
+            .expect("append");
+        store
+            .seal_scan_generation(&SealGenerationRequest {
+                generation_id: "gen-1".to_owned(),
+                expected_count: 1,
+            })
+            .expect("seal");
+        assert!(
+            store
+                .read_generation_page("mapping-1", "gen-1", None, 10)
+                .is_ok()
+        );
+        // Another mapping gets the same error as for a generation that does not exist.
+        let foreign = store.read_generation_page("mapping-2", "gen-1", None, 10);
+        let missing = store.read_generation_page("mapping-2", "gen-missing", None, 10);
+        assert!(matches!(
+            foreign,
+            Err(super::MappingStoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            missing,
+            Err(super::MappingStoreError::NotFound(_))
+        ));
     }
 
     #[test]

@@ -1,8 +1,13 @@
 import { createHash } from "node:crypto"
+import type { BigIntStats } from "node:fs"
 import { lstat, open, opendir, realpath, stat } from "node:fs/promises"
 import path from "node:path"
 import type { FolderMappingPreview, FolderScanActivity, MappingPreviewItem, SyncMode } from "../shared/contracts"
-import { MAX_SYNCABLE_FILES_PER_SIDE as MAX_LEGACY_OBSERVATION_FILES } from "../shared/sync-capacity"
+import {
+  estimateManifestEncodedBytes as estimateEncodedBytesForFiles,
+  MAX_LEGACY_MANIFEST_ENCODED_BYTES,
+} from "../shared/sync-capacity"
+import { ObservationFingerprint } from "./observation-fingerprint"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 
 export const DEFAULT_MAX_MANIFEST_FILES = 10_000
@@ -10,10 +15,16 @@ const MAX_HASH_FILE_BYTES = 16 * 1024 * 1024
 const MAX_SAMPLE_ITEMS = 14
 const SCAN_ACTIVITY_INTERVAL_MS = 250
 const HASH_BUFFER_BYTES = 512 * 1024
-/** Conservative ceiling for one legacy full-manifest peer frame, reserving room for JSON escaping, UTF-8, encryption/base64 and envelope overhead below the 16 MiB wire cap. */
-export const MAX_LEGACY_MANIFEST_ENCODED_BYTES = 12 * 1024 * 1024
-export { MAX_LEGACY_OBSERVATION_FILES }
+export { MAX_LEGACY_MANIFEST_ENCODED_BYTES }
 const MAX_MANIFEST_PATH_BYTES = 4096
+/**
+ * Bounded fan-out for concurrent `inspectManifestFile` calls within one scan.
+ * The scan coordinator admits up to 4 concurrent scans, so this keeps the
+ * worst case at 4 * 16 = 64 in-flight file operations and 4 * 16 * 512KiB =
+ * 32 MiB of hash scratch buffers, instead of growing unboundedly with scan
+ * count or directory size.
+ */
+export const SCAN_FILE_CONCURRENCY = 16
 
 export class ScanCancelledError extends Error {
   constructor(message = "The folder scan was cancelled.") {
@@ -55,6 +66,35 @@ export interface FileManifestEntry {
   digest?: string
 }
 
+/**
+ * Exact on-disk identity of a file. Values are decimal strings because device
+ * and inode ids are 64-bit and nanosecond timestamps exceed float precision.
+ */
+export interface FileIdentity {
+  device: string
+  inode: string
+  size: number
+  modifiedNs: string
+  changedNs: string
+}
+
+export interface CachedFileDigest extends FileIdentity {
+  digest: string
+}
+
+/**
+ * Durable digests from earlier full-integrity scans. A cached digest stands in
+ * for reading a file only when every identity value still matches exactly;
+ * ctime is part of the identity because userspace cannot set it the way
+ * `touch -r` can set mtime.
+ */
+export interface ScanDigestCache {
+  /** Recorded digests for these paths; a path without a record is simply absent. */
+  lookup(relativePaths: string[]): Promise<ReadonlyMap<string, CachedFileDigest>>
+  /** Offers a freshly hashed, committed file whose identity is settled enough to trust later. */
+  record(relativePath: string, entry: CachedFileDigest): void
+}
+
 export interface FileManifest {
   rootPath: string
   files: FileManifestEntry[]
@@ -94,34 +134,171 @@ export interface ScanFolderOptions {
    * file as unreadable. Never used for filesystem commit/recovery sequences.
    */
   signal?: AbortSignal | null
+  /**
+   * Skips re-reading files whose identity matches an earlier full-integrity
+   * digest. Honoured only with `hashAllFiles`, so preview scans never gain
+   * digests they would not otherwise compute.
+   */
+  digestCache?: ScanDigestCache
 }
 
-export async function scanFolder(
+/** One walk observation, yielded in exactly the order the sequential walk encountered it. */
+type ScanRecord =
+  | { kind: "ignored" }
+  | { kind: "unreadable" }
+  | { kind: "file"; relativePath: string }
+
+/** A walked record, with any cached digest for a file attached ahead of inspection. */
+type ReadyScanRecord =
+  | { kind: "ignored" }
+  | { kind: "unreadable" }
+  | { kind: "file"; relativePath: string; cached?: CachedFileDigest }
+
+type InspectionSettlement =
+  | { ok: true; inspection: ManifestFileInspection }
+  | { ok: false; error: unknown }
+
+type PendingScanRecord =
+  | { kind: "ignored" }
+  | { kind: "unreadable" }
+  | { kind: "file"; settled: Promise<InspectionSettlement> }
+
+interface ScanWalkContext {
+  canonicalRoot: string
+  matcher: (relativePath: string, directory: boolean) => boolean
+  signal: AbortSignal | null
+  onListing: (relativeDirectory: string) => void
+}
+
+/** Caps queued ignored/unreadable records so a slow file cannot let the walk run arbitrarily far ahead. */
+const MAX_PENDING_SCAN_RECORDS = SCAN_FILE_CONCURRENCY * 8
+/** Files are looked up in the digest cache this many at a time, ahead of inspection. */
+const DIGEST_LOOKUP_BATCH = 256
+/** Bounds walk-ahead while gathering one lookup batch through long runs of ignored entries. */
+const MAX_LOOKUP_BATCH_RECORDS = DIGEST_LOOKUP_BATCH * 4
+/**
+ * A digest is recorded only when the file's modification and change times sit
+ * at least this far behind the moment hashing began. Coarse filesystem clocks
+ * (FAT keeps a 2 s mtime) could otherwise let a write share the hashed
+ * content's timestamp tick and hide behind an unchanged identity.
+ */
+const DIGEST_SETTLE_NS = 2_000_000_000n
+
+/**
+ * Depth-first walk yielding one record per entry. Traversal order, containment
+ * checks and skip rules are those of the original recursive scan; counting is
+ * left to the consumer so counters advance at the same logical point.
+ */
+async function* walkScanRecords(directoryPath: string, relativeDirectory: string, context: ScanWalkContext): AsyncGenerator<ScanRecord, void, void> {
+  const { canonicalRoot, matcher, signal, onListing } = context
+  throwIfScanCancelled(signal)
+  onListing(relativeDirectory)
+  let directory: Awaited<ReturnType<typeof opendir>> | undefined
+  try {
+    directory = await opendir(directoryPath)
+    throwIfScanCancelled(signal)
+    const canonicalDirectory = await realpath(directoryPath)
+    if (!isCanonicalPathInside(canonicalRoot, canonicalDirectory)) {
+      await closeDirQuietly(directory)
+      yield { kind: "unreadable" }
+      return
+    }
+  } catch (error) {
+    if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
+    await closeDirQuietly(directory)
+    yield { kind: "unreadable" }
+    return
+  }
+
+  try {
+    for await (const entry of directory) {
+      throwIfScanCancelled(signal)
+      onListing(relativeDirectory)
+      const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name))
+      if (isTetheraStagingPath(relativePath) || matcher(relativePath, entry.isDirectory()) || entry.isSymbolicLink()) {
+        yield { kind: "ignored" }
+        continue
+      }
+      if (entry.isDirectory()) {
+        yield* walkScanRecords(path.join(directoryPath, entry.name), relativePath, context)
+        continue
+      }
+      if (entry.isFile()) yield { kind: "file", relativePath }
+    }
+  } finally {
+    await closeDirQuietly(directory)
+  }
+}
+
+/**
+ * Re-yields walk records in order, looking cached digests up for up to
+ * `batchSize` files per engine round trip before any of them is inspected.
+ * With a batch size of one and no cache it passes records straight through.
+ */
+async function* withCachedDigests(
+  source: AsyncGenerator<ScanRecord, void, void>,
+  cache: ScanDigestCache | undefined,
+  batchSize: number,
+): AsyncGenerator<ReadyScanRecord, void, void> {
+  try {
+    for (;;) {
+      const batch: ScanRecord[] = []
+      const filePaths: string[] = []
+      let exhausted = false
+      while (filePaths.length < batchSize && batch.length < MAX_LOOKUP_BATCH_RECORDS) {
+        const next = await source.next()
+        if (next.done) {
+          exhausted = true
+          break
+        }
+        batch.push(next.value)
+        if (next.value.kind === "file") filePaths.push(next.value.relativePath)
+      }
+      const cached = cache && filePaths.length > 0 ? await cache.lookup(filePaths) : undefined
+      for (const record of batch) {
+        yield record.kind === "file" ? { ...record, cached: cached?.get(record.relativePath) } : record
+      }
+      if (exhausted) return
+    }
+  } finally {
+    await source.return(undefined)
+  }
+}
+
+/**
+ * Scans a folder, inspecting up to `SCAN_FILE_CONCURRENCY` files at once.
+ *
+ * Per-file work is dominated by syscall latency (lstat, realpath, open, stat,
+ * read), so overlapping it is where scan throughput comes from. Results are
+ * committed strictly in walk order, which keeps `files` ordering, every
+ * counter, and the truncation point identical to a sequential scan.
+ */
+async function scanFolderEntries(
   rootPath: string,
   ignorePatterns: string[],
-  options: ScanFolderOptions = {},
-): Promise<FileManifest> {
+  options: ScanFolderOptions,
+  onEntry: (entry: FileManifestEntry) => void,
+): Promise<ScanSummary> {
   const root = path.resolve(rootPath)
   const rootStat = await stat(root)
   if (!rootStat.isDirectory()) throw new Error("The selected path is not a folder.")
   const canonicalRoot = await realpath(root)
 
   const matcher = createIgnoreMatcher(ignorePatterns)
-  const files: FileManifestEntry[] = []
+  let committedFiles = 0
   let ignored = 0
   let unreadable = 0
   let truncated = false
   const maxFiles = resolveScanLimit(options.maxFiles)
   const maxFileBytes = resolveFileSizeLimit(options.maxFileBytes)
+  const hashAllFiles = options.hashAllFiles === true
+  const digestCache = hashAllFiles ? options.digestCache : undefined
   const signal = options.signal ?? null
   throwIfScanCancelled(signal)
-  // One lazy buffer per scan, reused sequentially across files. Empty files
-  // never allocate it; concurrent scans each own their buffer.
-  let hashBuffer: Buffer | undefined
-  function hashScratch(): Buffer {
-    if (!hashBuffer) hashBuffer = Buffer.allocUnsafe(HASH_BUFFER_BYTES)
-    return hashBuffer
-  }
+  // Each in-flight inspection borrows a slot and lazily allocates that slot's
+  // scratch buffer, so peak scratch memory is bounded by the concurrency and
+  // scans of empty files never allocate.
+  const freeSlots: Array<{ buffer?: Buffer }> = Array.from({ length: SCAN_FILE_CONCURRENCY }, () => ({}))
   let hashedBytes = 0
   let lastActivityAt = -Infinity
   function reportActivity(stage: FolderScanActivity["stage"], currentPath: string, force = false): void {
@@ -130,100 +307,139 @@ export async function scanFolder(
     if (!force && now - lastActivityAt < SCAN_ACTIVITY_INTERVAL_MS) return
     lastActivityAt = now
     try {
-      options.onActivity({ stage, currentPath, scannedFiles: files.length, ignoredEntries: ignored, unreadableEntries: unreadable, hashedBytes })
+      options.onActivity({ stage, currentPath, scannedFiles: committedFiles, ignoredEntries: ignored, unreadableEntries: unreadable, hashedBytes })
     } catch {
       // Advisory UI delivery must never change the scan result.
     }
   }
 
-  async function visit(directoryPath: string, relativeDirectory: string): Promise<void> {
-    throwIfScanCancelled(signal)
-    if (truncated) return
-    reportActivity("listing", relativeDirectory)
-    let directory: Awaited<ReturnType<typeof opendir>> | undefined
-    try {
-      directory = await opendir(directoryPath)
-      throwIfScanCancelled(signal)
-      const canonicalDirectory = await realpath(directoryPath)
-      if (!isCanonicalPathInside(canonicalRoot, canonicalDirectory)) {
-        await closeDirQuietly(directory)
-        directory = undefined
-        unreadable += 1
-        return
-      }
-    } catch (error) {
-      if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
-      await closeDirQuietly(directory)
-      directory = undefined
-      unreadable += 1
-      return
-    }
-
-    try {
-      for await (const entry of directory) {
-        throwIfScanCancelled(signal)
-        if (truncated) break
-        reportActivity("listing", relativeDirectory)
-        const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name))
-        if (isTetheraStagingPath(relativePath)) {
-          ignored += 1
-          continue
-        }
-        if (matcher(relativePath, entry.isDirectory())) {
-          ignored += 1
-          continue
-        }
-        const absolutePath = path.join(directoryPath, entry.name)
-        if (entry.isSymbolicLink()) {
-          ignored += 1
-          continue
-        }
-        if (entry.isDirectory()) {
-          await visit(absolutePath, relativePath)
-          continue
-        }
-        if (!entry.isFile()) continue
-        try {
-          reportActivity("inspecting", relativePath)
-          throwIfScanCancelled(signal)
-          const inspection = await inspectManifestFile(root, canonicalRoot, relativePath, options.hashAllFiles === true, maxFileBytes, (bytesRead) => {
-            hashedBytes += bytesRead
-            reportActivity("hashing", relativePath)
-          }, signal, hashScratch)
-          throwIfScanCancelled(signal)
-          // Oversize files are excluded like an ignore-pattern match, so they must not
-          // consume the file ceiling: counting them would report `truncated` for a scan
-          // that actually omitted nothing, and a truncated scan blocks the merge entirely.
-          if (inspection.outcome === "excluded-oversize") {
-            ignored += 1
-            continue
-          }
-          if (files.length >= maxFiles) {
-            truncated = true
-            break
-          }
-          files.push(inspection.entry)
-        } catch (error) {
-          // Cancellation must escape instead of counting the file as unreadable.
-          if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
-          unreadable += 1
-          continue
-        }
-      }
-    } finally {
-      await closeDirQuietly(directory)
-    }
+  function inspect(relativePath: string, cached: CachedFileDigest | undefined): Promise<InspectionSettlement> {
+    // A free slot always exists: at most SCAN_FILE_CONCURRENCY files are pending.
+    const slot = freeSlots.pop() ?? {}
+    reportActivity("inspecting", relativePath)
+    return inspectManifestFile(root, canonicalRoot, relativePath, hashAllFiles, maxFileBytes, (bytesRead) => {
+      hashedBytes += bytesRead
+      reportActivity("hashing", relativePath)
+    }, signal, () => (slot.buffer ??= Buffer.allocUnsafe(HASH_BUFFER_BYTES)), cached)
+      // Settled rather than rejected, so an inspection abandoned by truncation
+      // or cancellation can never surface as an unhandled rejection.
+      .then((inspection): InspectionSettlement => ({ ok: true, inspection }), (error: unknown): InspectionSettlement => ({ ok: false, error }))
+      .finally(() => freeSlots.push(slot))
   }
 
+  const walk = walkScanRecords(root, "", { canonicalRoot, matcher, signal, onListing: (directory) => reportActivity("listing", directory) })
+  const records = withCachedDigests(walk, digestCache, digestCache ? DIGEST_LOOKUP_BATCH : 1)
+  const pending: PendingScanRecord[] = []
+  let pendingFiles = 0
+  let walkDone = false
   try {
-    await visit(root, "")
+    for (;;) {
+      while (!walkDone && pendingFiles < SCAN_FILE_CONCURRENCY && pending.length < MAX_PENDING_SCAN_RECORDS) {
+        const next = await records.next()
+        if (next.done) {
+          walkDone = true
+          break
+        }
+        const record = next.value
+        if (record.kind === "file") {
+          pending.push({ kind: "file", settled: inspect(record.relativePath, record.cached) })
+          pendingFiles += 1
+        } else {
+          pending.push(record)
+        }
+      }
+
+      const head = pending.shift()
+      if (!head) break
+      if (head.kind === "ignored") {
+        ignored += 1
+        continue
+      }
+      if (head.kind === "unreadable") {
+        unreadable += 1
+        continue
+      }
+      pendingFiles -= 1
+      const settlement = await head.settled
+      throwIfScanCancelled(signal)
+      if (!settlement.ok) {
+        // Cancellation must escape instead of counting the file as unreadable.
+        if (isScanCancelled(settlement.error) || signal?.aborted) throw new ScanCancelledError()
+        unreadable += 1
+        continue
+      }
+      // Oversize files are excluded like an ignore-pattern match, so they must not
+      // consume the file ceiling: counting them would report `truncated` for a scan
+      // that actually omitted nothing, and a truncated scan blocks the merge entirely.
+      if (settlement.inspection.outcome === "excluded-oversize") {
+        ignored += 1
+        continue
+      }
+      if (committedFiles >= maxFiles) {
+        truncated = true
+        break
+      }
+      const { entry, settledIdentity } = settlement.inspection
+      onEntry(entry)
+      committedFiles += 1
+      if (digestCache && settledIdentity && entry.digest) digestCache.record(entry.path, { ...settledIdentity, digest: entry.digest })
+    }
   } finally {
-    // Release the per-scan scratch promptly; the manifest retains only entries.
-    hashBuffer = undefined
+    // Close any directories the suspended walk still holds, then let abandoned
+    // inspections finish so no file handle outlives the scan's admission slot.
+    await records.return(undefined)
+    await Promise.all(pending.flatMap((record) => (record.kind === "file" ? [record.settled] : [])))
   }
   throwIfScanCancelled(signal)
   reportActivity("complete", "", true)
-  return { rootPath: root, files, ignored, unreadable, truncated }
+  return { rootPath: root, files: committedFiles, ignored, unreadable, truncated }
+}
+
+/** Counters of a scan whose entries were streamed to a callback instead of collected. */
+interface ScanSummary {
+  rootPath: string
+  files: number
+  ignored: number
+  unreadable: number
+  truncated: boolean
+}
+
+export async function scanFolder(
+  rootPath: string,
+  ignorePatterns: string[],
+  options: ScanFolderOptions = {},
+): Promise<FileManifest> {
+  const files: FileManifestEntry[] = []
+  const summary = await scanFolderEntries(rootPath, ignorePatterns, options, (entry) => files.push(entry))
+  return { rootPath: summary.rootPath, files, ignored: summary.ignored, unreadable: summary.unreadable, truncated: summary.truncated }
+}
+
+/** A full-integrity scan reduced to its observation fingerprint. */
+export interface FolderFingerprint {
+  fingerprint: string
+  files: number
+  ignored: number
+  unreadable: number
+  truncated: boolean
+}
+
+/**
+ * Hashes every file exactly like a full-integrity scan but keeps only an
+ * order-independent fingerprint, so memory stays flat however large the
+ * folder is. The result equals `fingerprintObservation` over the manifest a
+ * full-integrity scan of the same files would return.
+ */
+export async function fingerprintFolder(
+  rootPath: string,
+  ignorePatterns: string[],
+  options: Omit<ScanFolderOptions, "hashAllFiles"> = {},
+): Promise<FolderFingerprint> {
+  const fingerprint = new ObservationFingerprint()
+  const summary = await scanFolderEntries(rootPath, ignorePatterns, { ...options, hashAllFiles: true }, (entry) => {
+    if (entry.digest === undefined) throw new Error("A full-integrity scan produced a file without a digest.")
+    fingerprint.add(entry.path, entry.size, entry.digest)
+  })
+  return { fingerprint: fingerprint.value(), files: summary.files, ignored: summary.ignored, unreadable: summary.unreadable, truncated: summary.truncated }
 }
 
 /**
@@ -477,8 +693,27 @@ function hasUnpairedSurrogate(value: string): boolean {
 }
 
 type ManifestFileInspection =
-  | { outcome: "collected"; entry: FileManifestEntry }
+  | { outcome: "collected"; entry: FileManifestEntry; settledIdentity?: FileIdentity }
   | { outcome: "excluded-oversize" }
+
+function fileIdentity(stats: BigIntStats): FileIdentity {
+  return {
+    device: stats.dev.toString(),
+    inode: stats.ino.toString(),
+    size: Number(stats.size),
+    modifiedNs: stats.mtimeNs.toString(),
+    changedNs: stats.ctimeNs.toString(),
+  }
+}
+
+function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
+  return a.device === b.device && a.inode === b.inode && a.size === b.size && a.modifiedNs === b.modifiedNs && a.changedNs === b.changedNs
+}
+
+/** Millisecond mtime computed with Node's own `Stats.mtimeMs` arithmetic, so manifest values are unchanged. */
+function modifiedMsFromNs(modifiedNs: bigint): number {
+  return Number(modifiedNs / 1_000_000_000n) * 1e3 + Number(modifiedNs % 1_000_000_000n) / 1e6
+}
 
 async function inspectManifestFile(
   rootPath: string,
@@ -489,35 +724,42 @@ async function inspectManifestFile(
   onHashBytes?: (bytesRead: number) => void,
   signal?: AbortSignal | null,
   getHashBuffer?: () => Buffer,
+  cached?: CachedFileDigest,
 ): Promise<ManifestFileInspection> {
   throwIfScanCancelled(signal)
   const absolutePath = resolveWithinRoot(rootPath, relativePath)
-  const entry = await lstat(absolutePath)
+  const entry = await lstat(absolutePath, { bigint: true })
   throwIfScanCancelled(signal)
   if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("The manifest path is not a regular file.")
   const canonicalFile = await realpath(absolutePath)
   if (!isCanonicalPathInside(canonicalRoot, canonicalFile)) throw new Error("The manifest file escapes the folder root.")
   // Excluded before the file is opened, so an oversize file is never read or hashed.
-  if (entry.size > maxFileBytes) return { outcome: "excluded-oversize" }
+  if (Number(entry.size) > maxFileBytes) return { outcome: "excluded-oversize" }
+  // An exact identity match means the bytes hashed earlier are still the bytes on disk.
+  if (cached && sameIdentity(cached, fileIdentity(entry))) {
+    return { outcome: "collected", entry: { path: relativePath, size: Number(entry.size), modifiedMs: modifiedMsFromNs(entry.mtimeNs), digest: cached.digest } }
+  }
 
+  const hashStartedNs = BigInt(Date.now()) * 1_000_000n
   const handle = await open(absolutePath, "r")
   try {
-    const initial = await handle.stat()
+    const initial = await handle.stat({ bigint: true })
     if (!initial.isFile() || initial.dev !== entry.dev || initial.ino !== entry.ino) {
       throw new Error("The manifest file changed while it was opened.")
     }
+    const size = Number(initial.size)
     // Re-checked against the opened handle: a file that grew past the cap between
     // the lstat above and this open must not slip into the manifest.
-    if (initial.size > maxFileBytes) return { outcome: "excluded-oversize" }
+    if (size > maxFileBytes) return { outcome: "excluded-oversize" }
     let digest: string | undefined
-    if (hashAllFiles || initial.size <= MAX_HASH_FILE_BYTES) {
+    if (hashAllFiles || size <= MAX_HASH_FILE_BYTES) {
       const hash = createHash("sha256")
-      if (initial.size > 0) {
+      if (size > 0) {
         const buffer = getHashBuffer?.() ?? Buffer.allocUnsafe(HASH_BUFFER_BYTES)
         let offset = 0
-        while (offset < initial.size) {
+        while (offset < size) {
           throwIfScanCancelled(signal)
-          const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, initial.size - offset), offset)
+          const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - offset), offset)
           throwIfScanCancelled(signal)
           if (bytesRead === 0) throw new Error("The manifest file changed while it was read.")
           hash.update(buffer.subarray(0, bytesRead))
@@ -525,16 +767,20 @@ async function inspectManifestFile(
           onHashBytes?.(bytesRead)
         }
       } else {
-        // Empty files hash without touching the shared scratch buffer.
+        // Empty files hash without borrowing the slot's scratch buffer.
         hash.update(Buffer.alloc(0))
       }
       digest = hash.digest("hex")
     }
-    const after = await handle.stat()
-    if (initial.size !== after.size || initial.mtimeMs !== after.mtimeMs) {
+    const after = await handle.stat({ bigint: true })
+    if (initial.size !== after.size || initial.mtimeNs !== after.mtimeNs) {
       throw new Error("The manifest file changed while it was read.")
     }
-    return { outcome: "collected", entry: { path: relativePath, size: initial.size, modifiedMs: initial.mtimeMs, digest } }
+    const collected: FileManifestEntry = { path: relativePath, size, modifiedMs: modifiedMsFromNs(initial.mtimeNs), digest }
+    const identity = fileIdentity(after)
+    const latestChangeNs = after.mtimeNs > after.ctimeNs ? after.mtimeNs : after.ctimeNs
+    const settled = digest !== undefined && sameIdentity(fileIdentity(initial), identity) && latestChangeNs <= hashStartedNs - DIGEST_SETTLE_NS
+    return settled ? { outcome: "collected", entry: collected, settledIdentity: identity } : { outcome: "collected", entry: collected }
   } finally {
     await handle.close()
   }
@@ -629,31 +875,16 @@ export function parsePeerManifest(value: unknown): FileManifest {
   return { rootPath: candidate.rootPath, files, ignored, unreadable, truncated: candidate.truncated === true }
 }
 
-/**
- * Estimates the encrypted wire size of a legacy full-manifest response without
- * serializing it: per-entry UTF-8 path bytes plus JSON/envelope overhead,
- * expanded for base64 ciphertext. Used to fail closed before serialization.
- */
+/** Thin manifest-shaped wrapper over the shared estimator; see `../shared/sync-capacity` for the estimate itself. */
 export function estimateManifestEncodedBytes(manifest: FileManifest): number {
-  let bytes = 256
-  for (const entry of manifest.files) {
-    bytes += Buffer.byteLength(entry.path, "utf8") * 2 + 128
-    if (entry.digest) bytes += 64
-  }
-  // AES-GCM ciphertext base64 expansion plus the secure-frame envelope.
-  return Math.ceil(bytes * 1.37) + 512
+  return estimateEncodedBytesForFiles(manifest.files)
 }
 
 export function assertManifestWithinLegacyByteBudget(manifest: FileManifest, computer: string): void {
-  if (manifest.files.length > MAX_LEGACY_OBSERVATION_FILES) {
-    throw new Error(
-      `${computer}'s folder lists ${manifest.files.length.toLocaleString("en-GB")} files, above the supported legacy limit of ${MAX_LEGACY_OBSERVATION_FILES.toLocaleString("en-GB")} per side. Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
-    )
-  }
   const estimated = estimateManifestEncodedBytes(manifest)
   if (estimated > MAX_LEGACY_MANIFEST_ENCODED_BYTES) {
     throw new Error(
-      `${computer}'s folder scan would need about ${(estimated / 1_048_576).toFixed(1)} MiB on the peer channel, above the ${(MAX_LEGACY_MANIFEST_ENCODED_BYTES / 1_048_576).toFixed(0)} MiB legacy budget. Add ignore rules or wait for staged scan generations; no incomplete observation was reconciled.`,
+      `${computer}'s folder scan would need about ${(estimated / 1_048_576).toFixed(1)} MiB on the peer channel, above the ${(MAX_LEGACY_MANIFEST_ENCODED_BYTES / 1_048_576).toFixed(0)} MiB legacy budget used with an older version of Tethera. Update Tethera on both computers to sync larger folders, or add ignore rules; no incomplete observation was reconciled.`,
     )
   }
 }

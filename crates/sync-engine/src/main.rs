@@ -334,6 +334,9 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
         "scanGeneration.abort" => handle_scan_generation_abort(request, mapping_store),
         "scanGeneration.readPage" => handle_scan_generation_read_page(request, mapping_store),
         "scanGeneration.cleanup" => handle_scan_generation_cleanup(request, mapping_store),
+        "digestCache.lookup" => handle_digest_cache_lookup(request, mapping_store),
+        "digestCache.record" => handle_digest_cache_record(request, mapping_store),
+        "digestCache.prune" => handle_digest_cache_prune(request, mapping_store),
         "fileSync.authorizeApply" => handle_file_sync_authorize_apply(request, mapping_store),
         "fileSync.getState" => handle_file_sync_get_state(request, mapping_store),
         "fileSync.complete" => handle_file_sync_complete(request, mapping_store),
@@ -862,6 +865,7 @@ fn handle_scan_generation_abort(request: RpcRequest, mapping_store: &MappingStor
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScanGenerationReadPageParams {
+    mapping_id: String,
     generation_id: String,
     cursor: Option<String>,
     limit: Option<i64>,
@@ -881,6 +885,7 @@ fn handle_scan_generation_read_page(
         Err(failure) => return rpc_failure_response(request.id, failure),
     };
     match store.read_generation_page(
+        &params.mapping_id,
         &params.generation_id,
         params.cursor.as_deref(),
         params.limit.unwrap_or(200),
@@ -911,6 +916,56 @@ fn handle_scan_generation_cleanup(request: RpcRequest, mapping_store: &MappingSt
     match store.cleanup_scan_generations(&params.now) {
         Ok(removed) => success_response(request.id, serde_json::json!({ "removed": removed })),
         Err(error) => store_error_response(request.id, "Failed to clean scan generations", &error),
+    }
+}
+
+fn handle_digest_cache_lookup(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: sync_storage::digest_cache::DigestCacheLookupRequest =
+        match parse_params(request.params, "digestCache.lookup") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.lookup_digest_cache(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => {
+            store_error_response(request.id, "Failed to look up the digest cache", &error)
+        }
+    }
+}
+
+fn handle_digest_cache_record(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: sync_storage::digest_cache::DigestCacheRecordRequest =
+        match parse_params(request.params, "digestCache.record") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.record_digest_cache(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(request.id, "Failed to record the digest cache", &error),
+    }
+}
+
+fn handle_digest_cache_prune(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: sync_storage::digest_cache::DigestCachePruneRequest =
+        match parse_params(request.params, "digestCache.prune") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.prune_digest_cache(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(request.id, "Failed to prune the digest cache", &error),
     }
 }
 
@@ -1560,6 +1615,9 @@ mod tests {
             "scanGeneration.abort",
             "scanGeneration.readPage",
             "scanGeneration.cleanup",
+            "digestCache.lookup",
+            "digestCache.record",
+            "digestCache.prune",
             "fileSync.authorizeApply",
             "fileSync.getState",
             "fileSync.complete",
@@ -1895,6 +1953,162 @@ mod tests {
         );
         assert_eq!(response["result"]["initialized"], true);
         assert_eq!(response["result"]["operations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn scan_generation_pages_are_readable_only_through_their_owning_mapping() {
+        let store = ready_store();
+        let mut upsert: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("mapping json");
+        upsert["mapping"]["setupStatus"] = serde_json::json!("active");
+        let response = handle_line(
+            &request("mapping.upsert", &upsert.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["ok"], true);
+        for (method, params) in [
+            (
+                "scanGeneration.begin",
+                r#"{"generationId":"gen-1","mappingId":"mapping-1","participantDeviceId":"linux-box","mappingRevision":1,"root":"/tmp/a","ignorePatterns":[],"hashMode":"full-sha256"}"#,
+            ),
+            (
+                "scanGeneration.append",
+                r#"{"generationId":"gen-1","sequence":0,"entries":[{"path":"a.txt","size":4,"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+            ),
+            (
+                "scanGeneration.seal",
+                r#"{"generationId":"gen-1","expectedCount":1}"#,
+            ),
+        ] {
+            let response = handle_line(&request(method, params), "correct", &store);
+            assert_eq!(response["ok"], true, "{method} failed: {response}");
+        }
+
+        let owned = handle_line(
+            &request(
+                "scanGeneration.readPage",
+                r#"{"mappingId":"mapping-1","generationId":"gen-1"}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(owned["ok"], true);
+        assert_eq!(owned["result"]["entries"][0]["path"], "a.txt");
+
+        let unscoped = handle_line(
+            &request("scanGeneration.readPage", r#"{"generationId":"gen-1"}"#),
+            "correct",
+            &store,
+        );
+        assert_eq!(unscoped["errorCode"], "INVALID_PARAMS");
+
+        // A foreign mapping must be indistinguishable from a missing generation.
+        let foreign = handle_line(
+            &request(
+                "scanGeneration.readPage",
+                r#"{"mappingId":"mapping-2","generationId":"gen-1"}"#,
+            ),
+            "correct",
+            &store,
+        );
+        let missing = handle_line(
+            &request(
+                "scanGeneration.readPage",
+                r#"{"mappingId":"mapping-2","generationId":"gen-missing"}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(foreign["errorCode"], "MAPPING_NOT_FOUND");
+        assert_eq!(missing["errorCode"], "MAPPING_NOT_FOUND");
+        assert_eq!(foreign["result"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn digest_cache_round_trips_exact_identity_strings_and_prunes_by_sweep() {
+        let store = ready_store();
+        let mut upsert: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("mapping json");
+        upsert["mapping"]["setupStatus"] = serde_json::json!("active");
+        let response = handle_line(
+            &request("mapping.upsert", &upsert.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["ok"], true);
+
+        let entry = serde_json::json!({
+            "path": "a.txt",
+            "device": "12345678901234567890",
+            "inode": "1",
+            "size": 4,
+            "modifiedNs": "-1700000000000000000",
+            "changedNs": "1700000000000000000",
+            "digest": "a".repeat(64),
+        });
+        let recorded = handle_line(
+            &request(
+                "digestCache.record",
+                &serde_json::json!({
+                    "mappingId": "mapping-1",
+                    "sweepId": "sweep-1",
+                    "entries": [entry],
+                })
+                .to_string(),
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(recorded["ok"], true, "{recorded}");
+        assert_eq!(recorded["result"]["recorded"], 1);
+
+        let looked_up = handle_line(
+            &request(
+                "digestCache.lookup",
+                r#"{"mappingId":"mapping-1","paths":["a.txt"]}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(looked_up["ok"], true, "{looked_up}");
+        let found = &looked_up["result"]["entries"][0];
+        assert_eq!(found["device"], "12345678901234567890");
+        assert_eq!(found["inode"], "1");
+        assert_eq!(found["modifiedNs"], "-1700000000000000000");
+        assert_eq!(found["changedNs"], "1700000000000000000");
+        assert_eq!(found["digest"], "a".repeat(64));
+
+        let pruned = handle_line(
+            &request(
+                "digestCache.prune",
+                r#"{"mappingId":"mapping-1","keepSweepId":"sweep-2"}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(pruned["ok"], true, "{pruned}");
+        assert_eq!(pruned["result"]["removed"], 1);
+
+        let after_prune = handle_line(
+            &request(
+                "digestCache.lookup",
+                r#"{"mappingId":"mapping-1","paths":["a.txt"]}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(after_prune["result"]["entries"], serde_json::json!([]));
+
+        let rejected = handle_line(
+            &request(
+                "digestCache.record",
+                r#"{"mappingId":"mapping-1","sweepId":"sweep-1","entries":[{"path":"a.txt"}]}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(rejected["errorCode"], "INVALID_PARAMS");
     }
 
     #[test]

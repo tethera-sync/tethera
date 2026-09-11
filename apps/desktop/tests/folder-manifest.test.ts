@@ -1,8 +1,19 @@
 import { describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, truncate, writeFile } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { fingerprintObservation } from "../src/main/observation-fingerprint"
+import { lstat, mkdir, mkdtemp, opendir, rm, truncate, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { folderManifestTestHelpers, isManifestPathIgnored, scanFolder } from "../src/main/folder-manifest"
+import {
+  fingerprintFolder,
+  folderManifestTestHelpers,
+  isManifestPathIgnored,
+  SCAN_FILE_CONCURRENCY,
+  scanFolder,
+  type CachedFileDigest,
+  type FileIdentity,
+  type ScanDigestCache,
+} from "../src/main/folder-manifest"
 import { manifest } from "./helpers"
 import type { FolderScanActivity } from "../src/shared/contracts"
 
@@ -337,6 +348,237 @@ describe("folder mapping comparison", () => {
       const result = await scanFolder(root, [], { hashAllFiles: true, onActivity: () => { throw new Error("renderer closed") } })
       expect(result.files.map((entry) => entry.path)).toEqual(["file.txt"])
       expect(result.unreadable).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+/** Sequential depth-first readdir walk: the file order a one-at-a-time scan produces. */
+async function sequentialWalkOrder(root: string, relative = ""): Promise<string[]> {
+  const paths: string[] = []
+  for await (const entry of await opendir(path.join(root, relative))) {
+    const relativePath = relative ? `${relative}/${entry.name}` : entry.name
+    if (entry.isDirectory()) paths.push(...(await sequentialWalkOrder(root, relativePath)))
+    else if (entry.isFile()) paths.push(relativePath)
+  }
+  return paths
+}
+
+/**
+ * Enough small files to keep every inspection slot busy, with multi-MiB files
+ * spread through the tree so inspections finish out of walk order.
+ */
+async function buildMixedTree(root: string): Promise<{ largeFiles: string[] }> {
+  const largeFiles = ["large-root.bin", "a/large-a.bin", "a/deep/large-deep.bin"]
+  await mkdir(path.join(root, "a", "deep"), { recursive: true })
+  await mkdir(path.join(root, "b"), { recursive: true })
+  const smallFiles = Array.from({ length: SCAN_FILE_CONCURRENCY * 4 }, (_, index) => {
+    const folder = ["", "a", "a/deep", "b"][index % 4]
+    return `${folder ? `${folder}/` : ""}small-${String(index).padStart(3, "0")}.txt`
+  })
+  await Promise.all(smallFiles.map((relativePath) => writeFile(path.join(root, relativePath), `content ${relativePath}`)))
+  await Promise.all(largeFiles.map((relativePath) => writeFile(path.join(root, relativePath), Buffer.alloc(6 * 1024 * 1024, 1))))
+  return { largeFiles }
+}
+
+describe("concurrent scan parity", () => {
+  test("commits files in walk order even when inspections finish out of order", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-order-test-"))
+    try {
+      await buildMixedTree(root)
+      const expected = await sequentialWalkOrder(root)
+      const result = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null })
+      expect(result.files.map((entry) => entry.path)).toEqual(expected)
+      expect(result.files.every((entry) => /^[a-f0-9]{64}$/.test(entry.digest ?? ""))).toBe(true)
+      expect(result.truncated).toBe(false)
+      expect(result.unreadable).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("truncates at exactly the file a sequential scan would stop at", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-truncation-test-"))
+    try {
+      const { largeFiles } = await buildMixedTree(root)
+      const expected = await sequentialWalkOrder(root)
+      const limit = SCAN_FILE_CONCURRENCY + 3
+      const limited = await scanFolder(root, [], { hashAllFiles: true, maxFiles: limit })
+      expect(limited.truncated).toBe(true)
+      expect(limited.files.map((entry) => entry.path)).toEqual(expected.slice(0, limit))
+
+      // Oversize exclusions must not consume the ceiling, even while later files are in flight.
+      const withoutLarge = expected.filter((relativePath) => !largeFiles.includes(relativePath))
+      const sizeLimited = await scanFolder(root, [], { hashAllFiles: true, maxFiles: limit, maxFileBytes: 1024 * 1024 })
+      expect(sizeLimited.truncated).toBe(true)
+      expect(sizeLimited.files.map((entry) => entry.path)).toEqual(withoutLarge.slice(0, limit))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+function sha256(content: string): string {
+  return createHash("sha256").update(content).digest("hex")
+}
+
+async function identityOf(filePath: string): Promise<FileIdentity> {
+  const stats = await lstat(filePath, { bigint: true })
+  return {
+    device: stats.dev.toString(),
+    inode: stats.ino.toString(),
+    size: Number(stats.size),
+    modifiedNs: stats.mtimeNs.toString(),
+    changedNs: stats.ctimeNs.toString(),
+  }
+}
+
+function fakeDigestCache(seed: ReadonlyMap<string, CachedFileDigest> = new Map()) {
+  const lookups: string[][] = []
+  const recorded = new Map<string, CachedFileDigest>()
+  const cache: ScanDigestCache = {
+    async lookup(relativePaths) {
+      lookups.push(relativePaths)
+      return new Map(relativePaths.flatMap((relativePath) => {
+        const entry = seed.get(relativePath)
+        return entry ? [[relativePath, entry] as const] : []
+      }))
+    },
+    record(relativePath, entry) {
+      recorded.set(relativePath, entry)
+    },
+  }
+  return { cache, lookups, recorded }
+}
+
+describe("scan digest cache", () => {
+  test("uses a cached digest without reading a file whose identity is unchanged", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-hit-test-"))
+    try {
+      const filePath = path.join(root, "kept.txt")
+      await writeFile(filePath, "real content")
+      // A digest that the bytes on disk cannot produce proves the file was not read.
+      const cachedDigest = "f".repeat(64)
+      const { cache } = fakeDigestCache(new Map([["kept.txt", { ...(await identityOf(filePath)), digest: cachedDigest }]]))
+      const result = await scanFolder(root, [], { hashAllFiles: true, digestCache: cache })
+      expect(result.files.map((entry) => entry.digest)).toEqual([cachedDigest])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("hashes a file again once any identity value differs", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-miss-test-"))
+    try {
+      await writeFile(path.join(root, "moved.txt"), "moved")
+      await writeFile(path.join(root, "rewritten.txt"), "before")
+      const stale = "f".repeat(64)
+      const seed = new Map<string, CachedFileDigest>([
+        ["moved.txt", { ...(await identityOf(path.join(root, "moved.txt"))), inode: "1", digest: stale }],
+        ["rewritten.txt", { ...(await identityOf(path.join(root, "rewritten.txt"))), digest: stale }],
+      ])
+      // Same length, different bytes: only timestamps betray the rewrite.
+      await writeFile(path.join(root, "rewritten.txt"), "after!")
+      const { cache } = fakeDigestCache(seed)
+      const result = await scanFolder(root, [], { hashAllFiles: true, digestCache: cache })
+      const digests = new Map(result.files.map((entry) => [entry.path, entry.digest]))
+      expect(digests.get("moved.txt")).toBe(sha256("moved"))
+      expect(digests.get("rewritten.txt")).toBe(sha256("after!"))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("preview scans never take digests from the cache", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-preview-test-"))
+    try {
+      const filePath = path.join(root, "preview.txt")
+      await writeFile(filePath, "preview content")
+      const { cache, lookups } = fakeDigestCache(new Map([["preview.txt", { ...(await identityOf(filePath)), digest: "f".repeat(64) }]]))
+      const result = await scanFolder(root, [], { digestCache: cache })
+      expect(result.files.map((entry) => entry.digest)).toEqual([sha256("preview content")])
+      expect(lookups).toHaveLength(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a correct cache produces exactly the manifest an uncached scan does", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-parity-test-"))
+    try {
+      await buildMixedTree(root)
+      const uncached = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null })
+      const seed = new Map<string, CachedFileDigest>()
+      for (const entry of uncached.files) {
+        seed.set(entry.path, { ...(await identityOf(path.join(root, entry.path))), digest: entry.digest ?? "" })
+      }
+      const { cache } = fakeDigestCache(seed)
+      const cached = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null, digestCache: cache })
+      expect(cached).toEqual(uncached)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("looks every file up exactly once, in batches rather than one round trip per file", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-batch-test-"))
+    try {
+      const fileCount = 600
+      await Promise.all(Array.from({ length: fileCount }, (_, index) => writeFile(path.join(root, `file-${index}.txt`), `${index}`)))
+      const { cache, lookups } = fakeDigestCache()
+      await scanFolder(root, [], { hashAllFiles: true, maxFiles: null, digestCache: cache })
+      const looked = lookups.flat()
+      expect(looked).toHaveLength(fileCount)
+      expect(new Set(looked).size).toBe(fileCount)
+      expect(lookups.length).toBeLessThan(fileCount / 10)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("records only files whose timestamps have settled past the coarse-clock window", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-settle-test-"))
+    try {
+      await writeFile(path.join(root, "settled.txt"), "settled")
+      // Deliberately real time: the rule under test is about wall-clock distance.
+      await Bun.sleep(2_100)
+      await writeFile(path.join(root, "fresh.txt"), "fresh")
+      const { cache, recorded } = fakeDigestCache()
+      await scanFolder(root, [], { hashAllFiles: true, digestCache: cache })
+      expect([...recorded.keys()]).toEqual(["settled.txt"])
+      expect(recorded.get("settled.txt")).toEqual({ ...(await identityOf(path.join(root, "settled.txt"))), digest: sha256("settled") })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("folder fingerprint", () => {
+  test("equals the fingerprint of the same folder's full-integrity manifest", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-fingerprint-parity-test-"))
+    try {
+      await buildMixedTree(root)
+      const manifest = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null })
+      const pass = await fingerprintFolder(root, [], { maxFiles: null })
+      expect(pass.fingerprint).toBe(fingerprintObservation(manifest.files.map(({ path: filePath, size, digest }) => ({ path: filePath, size, digest: digest ?? "" }))))
+      expect(pass).toMatchObject({ files: manifest.files.length, ignored: manifest.ignored, unreadable: manifest.unreadable, truncated: false })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("changes when one file's bytes change at the same size, and reports truncation like a scan", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-fingerprint-change-test-"))
+    try {
+      await writeFile(path.join(root, "a.txt"), "before")
+      await writeFile(path.join(root, "b.txt"), "steady")
+      const first = await fingerprintFolder(root, [])
+      await writeFile(path.join(root, "a.txt"), "after!")
+      const second = await fingerprintFolder(root, [])
+      expect(second.fingerprint).not.toBe(first.fingerprint)
+      const limited = await fingerprintFolder(root, [], { maxFiles: 1 })
+      expect(limited.truncated).toBe(true)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
