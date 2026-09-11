@@ -692,6 +692,7 @@ describe("chunked secure frames", () => {
       expect((failure as Error & { code?: unknown }).code).toBe("PEER_RESPONSE_TIMEOUT")
       // Without the exchange deadline the stalled second chunk would restart
       // the full timeout: ~700ms + 1,000ms instead of ~1,000ms total.
+      expect(elapsedMs).toBeGreaterThanOrEqual(timeoutMs - 100)
       expect(elapsedMs).toBeLessThan(timeoutMs + 600)
     } finally {
       await requester.stop()
