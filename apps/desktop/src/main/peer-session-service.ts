@@ -288,9 +288,17 @@ export class PeerSessionService extends EventEmitter {
       if (isScanManifest) {
         return await this.#readScanResponse<T>(connection, key, sessionId, requestId, timeoutMs, options)
       }
+      // One exchange-wide deadline bounds every chunk read: without it a peer
+      // that answers one chunk per timeout could hold this request for
+      // count x timeoutMs. A single-frame response still gets the full timeout.
+      const responseDeadline = performance.now() + timeoutMs
       const readResponse = async (): Promise<WireMessage> => {
+        const remaining = responseDeadline - performance.now()
+        if (remaining <= 0) {
+          throw peerSessionError("The secure peer operation timed out.", "PEER_RESPONSE_TIMEOUT")
+        }
         try {
-          return await connection.read(timeoutMs, options.signal)
+          return await connection.read(Math.min(timeoutMs, remaining), options.signal)
         } catch (error) {
           throw asPeerPhaseTimeout(error, "The secure peer operation timed out.", "PEER_RESPONSE_TIMEOUT")
         }
@@ -452,13 +460,22 @@ export class PeerSessionService extends EventEmitter {
         first.ephemeralPublicKey,
         buildSessionTranscript(helloBody, welcomeBody),
       )
-      const frame = await connection.read(REQUEST_TIMEOUT_MS, handlerController.signal)
+      // Bound the whole chunked request to one REQUEST_TIMEOUT_MS window so a
+      // peer cannot occupy a handler slot for count x timeout by trickling
+      // one chunk per period.
+      const requestDeadline = performance.now() + REQUEST_TIMEOUT_MS
+      const readRequestFrame = async (): Promise<WireMessage> => {
+        const remaining = requestDeadline - performance.now()
+        if (remaining <= 0) throw new Error("The secure peer request timed out.")
+        return await connection.read(Math.min(REQUEST_TIMEOUT_MS, remaining), handlerController.signal)
+      }
+      const frame = await readRequestFrame()
       if (frame.type !== "secure-frame" && frame.type !== "secure-chunk") throw new Error("Expected an encrypted peer request.")
       requestId = safeCorrelationId(frame.requestId)
       // A requester that sends chunks can also reassemble a chunked response.
       const chunkedResponse = frame.type === "secure-chunk"
       const request = frame.type === "secure-chunk"
-        ? await readChunkedMessage<PeerRequest>(frame, () => connection.read(REQUEST_TIMEOUT_MS, handlerController.signal), key, first.sessionId, frame.requestId, "request")
+        ? await readChunkedMessage<PeerRequest>(frame, readRequestFrame, key, first.sessionId, frame.requestId, "request")
         : decryptFrame<PeerRequest>(key, first.sessionId, "request", frame)
       const isScanManifest = request.type === "scan-manifest"
       const canReportProgress = isScanManifest && request.reportProgress === true
