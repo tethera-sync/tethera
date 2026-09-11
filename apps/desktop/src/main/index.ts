@@ -52,7 +52,7 @@ import {
   type MappingStoreHealth,
 } from "./engine-supervisor"
 import {
-  compareManifests, DEFAULT_MAX_MANIFEST_FILES, isManifestPathIgnored, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, type FileManifest, type ScanDigestCache,
+  compareManifests, DEFAULT_MAX_MANIFEST_FILES, isManifestPathIgnored, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, type FileManifest, type ScanDigestCache, fingerprintFolder, type FolderFingerprint,
 } from "./folder-manifest"
 import { globalScanCoordinator } from "./scan-coordinator"
 import { runPairedScans } from "./paired-scan"
@@ -125,6 +125,11 @@ import {
   type PeerConflictCopy,
 } from "./ipc-validation"
 import {
+  canSkipUnchangedCycle,
+  conflictKey,
+  CONTINUOUS_FINGERPRINT_CAPABILITY,
+  isUnchangedScanReply,
+  type QuietReconcile,
   conflictSummary,
   findMirroredPeerOperation,
   FolderChangeMonitor,
@@ -139,6 +144,7 @@ import {
   type ExactConflictChoice,
   type ReconcileFilesResult,
 } from "./continuous-sync"
+import { fingerprintObservation, isObservationFingerprint } from "./observation-fingerprint"
 import { listArchivedVersions } from "./archive-history"
 import { DigestCacheVerifier, EngineScanDigestCache } from "./digest-cache"
 import {
@@ -320,31 +326,23 @@ function abortFolderScans(folderId: string): void {
   for (const controller of [...set]) controller.abort()
 }
 
-function runLocalScan(
-  key: string,
-  rootPath: string,
-  ignorePatterns: string[],
-  options: { hashAllFiles?: boolean; maxFiles?: number | null; onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void; folderId?: string; digestCache?: ScanDigestCache },
-  signal: AbortSignal | null,
-): Promise<FileManifest> {
+/**
+ * Runs one local folder walk under process-wide scan admission, aborting it on
+ * app shutdown or the caller's signal. Admission covers only the local walk;
+ * the caller releases it before any peer wait by awaiting the walk inside
+ * runPairedScans separately.
+ */
+function runAdmittedScan<T>(key: string, folderId: string | undefined, signal: AbortSignal | null, walk: (signal: AbortSignal) => Promise<T>): Promise<T> {
   const controller = new AbortController()
   if (signal?.aborted || shutdownScanController.signal.aborted) controller.abort()
   const forwardShutdown = (): void => controller.abort()
   const forwardOuter = (): void => controller.abort()
   shutdownScanController.signal.addEventListener("abort", forwardShutdown, { once: true })
   signal?.addEventListener("abort", forwardOuter, { once: true })
-  const untrack = trackFolderScan(options.folderId, controller)
-  // Admission covers only the local walk; the caller releases it before any
-  // peer wait by awaiting the local walk inside runPairedScans separately.
+  const untrack = trackFolderScan(folderId, controller)
   return globalScanCoordinator.run(key, () => {
     const effective = AbortSignal.any([controller.signal, shutdownScanController.signal, ...(signal ? [signal] : [])])
-    return scanFolder(rootPath, ignorePatterns, {
-      hashAllFiles: options.hashAllFiles,
-      maxFiles: options.maxFiles,
-      onActivity: options.onActivity,
-      signal: effective,
-      digestCache: options.digestCache,
-    })
+    return walk(effective)
   }, controller.signal).finally(() => {
     shutdownScanController.signal.removeEventListener("abort", forwardShutdown)
     signal?.removeEventListener("abort", forwardOuter)
@@ -352,26 +350,55 @@ function runLocalScan(
   })
 }
 
+function runLocalScan(
+  key: string,
+  rootPath: string,
+  ignorePatterns: string[],
+  options: { hashAllFiles?: boolean; maxFiles?: number | null; onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void; folderId?: string; digestCache?: ScanDigestCache },
+  signal: AbortSignal | null,
+): Promise<FileManifest> {
+  return runAdmittedScan(key, options.folderId, signal, (effective) => scanFolder(rootPath, ignorePatterns, {
+    hashAllFiles: options.hashAllFiles,
+    maxFiles: options.maxFiles,
+    onActivity: options.onActivity,
+    signal: effective,
+    digestCache: options.digestCache,
+  }))
+}
+
 const digestCacheVerifier = new DigestCacheVerifier()
 
 /**
- * Full-integrity scan of an active folder that reuses the digests of files
- * whose exact identity is unchanged since an earlier sweep.
+ * Runs one full-integrity pass over an active folder through the digest
+ * cache, so files whose exact identity is unchanged since an earlier sweep
+ * are not read again.
  */
-async function runCachedFolderScan(
-  key: string,
-  folder: Pick<FolderSummary, "id" | "localPath" | "ignorePatterns">,
-  maxFiles: number | null,
-  signal: AbortSignal | null,
-): Promise<FileManifest> {
+async function withFolderDigestCache<T extends { truncated: boolean }>(
+  folderId: string,
+  pass: (digestCache: ScanDigestCache) => Promise<T>,
+): Promise<T> {
   const startedAt = Date.now()
-  const deep = digestCacheVerifier.requiresDeepSweep(folder.id, startedAt)
-  const digestCache = new EngineScanDigestCache(engine, folder.id, { deep })
-  const manifest = await runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache }, signal)
-  const complete = !manifest.truncated
+  const deep = digestCacheVerifier.requiresDeepSweep(folderId, startedAt)
+  const digestCache = new EngineScanDigestCache(engine, folderId, { deep })
+  const result = await pass(digestCache)
+  const complete = !result.truncated
   await digestCache.finish({ complete })
-  if (deep && complete) digestCacheVerifier.completedDeepSweep(folder.id, startedAt)
-  return manifest
+  if (deep && complete) digestCacheVerifier.completedDeepSweep(folderId, startedAt)
+  return result
+}
+
+type ActiveFolderScanTarget = Pick<FolderSummary, "id" | "localPath" | "ignorePatterns">
+
+/** Full-integrity scan of an active folder, reusing the digests of unchanged files. */
+function runCachedFolderScan(key: string, folder: ActiveFolderScanTarget, maxFiles: number | null, signal: AbortSignal | null): Promise<FileManifest> {
+  return withFolderDigestCache(folder.id, (digestCache) =>
+    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache }, signal))
+}
+
+/** The same pass reduced to an observation fingerprint, holding no file list in memory. */
+function runCachedFolderFingerprint(key: string, folder: ActiveFolderScanTarget, maxFiles: number | null, signal: AbortSignal | null): Promise<FolderFingerprint> {
+  return withFolderDigestCache(folder.id, (digestCache) =>
+    runAdmittedScan(key, folder.id, signal, (effective) => fingerprintFolder(folder.localPath, folder.ignorePatterns, { maxFiles, signal: effective, digestCache })))
 }
 
 function requestPeerManifest(peerId: string, payload: PeerRequest, timeoutMs: number, signal: AbortSignal, chunked: boolean): Promise<FileManifest> {
@@ -382,13 +409,36 @@ function requestPeerManifest(peerId: string, payload: PeerRequest, timeoutMs: nu
 const PEER_CAPABILITY_TTL_MS = 10 * 60_000
 const peerCapabilityCache = new Map<string, { capabilities: ReadonlySet<string>; fetchedAt: number }>()
 
-/** Whether manifests and observations can cross to this peer as chunks larger than one frame. */
-async function peerSupportsChunkedFrames(peerId: string): Promise<boolean> {
+async function cachedPeerCapabilities(peerId: string): Promise<ReadonlySet<string>> {
   const cached = peerCapabilityCache.get(peerId)
-  if (cached && Date.now() - cached.fetchedAt < PEER_CAPABILITY_TTL_MS) return cached.capabilities.has(CHUNKED_FRAMES_CAPABILITY)
+  if (cached && Date.now() - cached.fetchedAt < PEER_CAPABILITY_TTL_MS) return cached.capabilities
   const capabilities = await requestPeerCapabilities(requirePeerSessions(), peerId)
   peerCapabilityCache.set(peerId, { capabilities, fetchedAt: Date.now() })
-  return capabilities.has(CHUNKED_FRAMES_CAPABILITY)
+  return capabilities
+}
+
+/** Whether manifests and observations can cross to this peer as chunks larger than one frame. */
+async function peerSupportsChunkedFrames(peerId: string): Promise<boolean> {
+  return (await cachedPeerCapabilities(peerId)).has(CHUNKED_FRAMES_CAPABILITY)
+}
+
+/** Per folder, the last continuous reconcile that queued nothing. Lost on restart, so the first cycle always reconciles. */
+const quietReconciles = new Map<string, QuietReconcile>()
+
+/**
+ * Asks the peer for its continuous-sync observation, offering the fingerprint
+ * it had at the last quiet reconcile so a supporting peer can answer that
+ * nothing changed instead of sending it.
+ */
+async function requestPeerContinuousScan(
+  peerId: string,
+  folderId: string,
+  knownFingerprint: string,
+  signal: AbortSignal,
+  chunked: boolean,
+): Promise<FileManifest | { unchanged: true }> {
+  const raw = await requirePeerSessions().request<unknown>(peerId, { type: "continuous-sync-scan", folderId, knownFingerprint }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, { signal, chunked })
+  return isUnchangedScanReply(raw) ? raw : parsePeerManifest(raw)
 }
 
 /**
@@ -2163,13 +2213,32 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     // One limit for the whole flow: rereading the setting after the awaited
     // scans could validate against a ceiling the scans never used.
     const scanLimit = currentScanLimit()
-    const chunked = await peerSupportsChunkedFrames(peer.id)
+    const capabilities = await cachedPeerCapabilities(peer.id)
+    const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
+    const quiet = quietReconciles.get(folderId)
+    let knownPeerManifest: FileManifest | undefined
+    if (capabilities.has(CONTINUOUS_FINGERPRINT_CAPABILITY) && canSkipUnchangedCycle(quiet, durableBeforeReconcile, record.revision, Date.now())) {
+      // Cheap first pass: fingerprints only, with no file list held on either computer.
+      const { local: localPass, peer: peerReply } = await runPairedScans(
+        (signal) => runCachedFolderFingerprint(`continuous:${folderId}`, folder, scanLimit, signal),
+        (signal) => requestPeerContinuousScan(peer.id, folderId, quiet.remoteFingerprint, signal, chunked),
+      )
+      const localUnchanged = !localPass.truncated && localPass.unreadable === 0 && localPass.fingerprint === quiet.localFingerprint
+      if (localUnchanged && isUnchangedScanReply(peerReply)) {
+        applyFileSyncStateToFolder(folderId, durableBeforeReconcile, new Date().toISOString())
+        continuousLastErrors.delete(folderId)
+        recordContinuousConflicts(folder, durableBeforeReconcile.conflicts)
+        return
+      }
+      if (!isUnchangedScanReply(peerReply)) knownPeerManifest = peerReply
+    }
+    // Only a clean quiet reconcile below may leave a skip record behind.
+    quietReconciles.delete(folderId)
     const { local: localManifest, peer: remoteManifest } = await runPairedScans(
       (signal) => runCachedFolderScan(`continuous:${folderId}`, folder, scanLimit, signal),
-      (signal) => requestPeerManifest(peer.id, {
-        type: "continuous-sync-scan",
-        folderId,
-      }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, signal, chunked),
+      (signal) => knownPeerManifest
+        ? Promise.resolve(knownPeerManifest)
+        : requestPeerManifest(peer.id, { type: "continuous-sync-scan", folderId }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, signal, chunked),
     )
     assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
     assertCompleteTransferManifest(remoteManifest, peer.name)
@@ -2253,16 +2322,27 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     }
     const peerResult = await requirePeerSessions().request<unknown>(peer.id, observeRequest, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, { chunked })
 
+    const peerOperations = parsePeerFileOperations(peerResult)
     const copiedFiles = await executeContinuousOperations(
       folder,
       peer,
       remoteManifest,
       result.operations,
-      parsePeerFileOperations(peerResult),
+      peerOperations,
     )
 
     const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
     const completedAt = new Date().toISOString()
+    if (result.operations.length === 0 && peerOperations.length === 0 && state.operations.length === 0) {
+      quietReconciles.set(folderId, {
+        revision: record.revision,
+        localFingerprint: fingerprintObservation(localObservation),
+        remoteFingerprint: fingerprintObservation(remoteObservation),
+        baselineCount: state.baselineCount,
+        conflictKey: conflictKey(state.conflicts),
+        reconciledAt: Date.now(),
+      })
+    }
     applyFileSyncStateToFolder(folderId, state, completedAt)
     continuousLastErrors.delete(folderId)
     if (copiedFiles > 0) {
@@ -3106,14 +3186,24 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
   if (request.type === "continuous-sync-scan") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const folder = requireSharedActiveFolder(context, folderId)
+    // A malformed fingerprint is treated as absent, never as a match.
+    const knownFingerprint = isObservationFingerprint(request.knownFingerprint) ? request.knownFingerprint : undefined
     return withPeerFileOperation(context, folderId, async () => {
-      const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, currentScanLimit(), context.signal)
+      const scanLimit = currentScanLimit()
+      if (knownFingerprint !== undefined) {
+        const pass = await runCachedFolderFingerprint(`inbound:${folderId}`, folder, scanLimit, context.signal)
+        if (!pass.truncated && pass.unreadable === 0 && pass.fingerprint === knownFingerprint) {
+          const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+          if (state.operations.length === 0 && state.recoveryIssues.length === 0) return { unchanged: true }
+        }
+      }
+      const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, scanLimit, context.signal)
       assertManifestFitsExchange(manifest, "This computer", context.chunkedResponse)
       return manifest
     })
   }
   if (request.type === "scan-capabilities") {
-    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY] }
+    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY, CONTINUOUS_FINGERPRINT_CAPABILITY] }
   }
   if (request.type === "scan-generation-read-page") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""

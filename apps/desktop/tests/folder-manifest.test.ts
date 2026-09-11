@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
+import { fingerprintObservation } from "../src/main/observation-fingerprint"
 import { lstat, mkdir, mkdtemp, opendir, rm, truncate, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
+  fingerprintFolder,
   folderManifestTestHelpers,
   isManifestPathIgnored,
   SCAN_FILE_CONCURRENCY,
@@ -546,6 +548,37 @@ describe("scan digest cache", () => {
       await scanFolder(root, [], { hashAllFiles: true, digestCache: cache })
       expect([...recorded.keys()]).toEqual(["settled.txt"])
       expect(recorded.get("settled.txt")).toEqual({ ...(await identityOf(path.join(root, "settled.txt"))), digest: sha256("settled") })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("folder fingerprint", () => {
+  test("equals the fingerprint of the same folder's full-integrity manifest", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-fingerprint-parity-test-"))
+    try {
+      await buildMixedTree(root)
+      const manifest = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null })
+      const pass = await fingerprintFolder(root, [], { maxFiles: null })
+      expect(pass.fingerprint).toBe(fingerprintObservation(manifest.files.map(({ path: filePath, size, digest }) => ({ path: filePath, size, digest: digest ?? "" }))))
+      expect(pass).toMatchObject({ files: manifest.files.length, ignored: manifest.ignored, unreadable: manifest.unreadable, truncated: false })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("changes when one file's bytes change at the same size, and reports truncation like a scan", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-fingerprint-change-test-"))
+    try {
+      await writeFile(path.join(root, "a.txt"), "before")
+      await writeFile(path.join(root, "b.txt"), "steady")
+      const first = await fingerprintFolder(root, [])
+      await writeFile(path.join(root, "a.txt"), "after!")
+      const second = await fingerprintFolder(root, [])
+      expect(second.fingerprint).not.toBe(first.fingerprint)
+      const limited = await fingerprintFolder(root, [], { maxFiles: 1 })
+      expect(limited.truncated).toBe(true)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

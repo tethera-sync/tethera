@@ -7,6 +7,7 @@ import {
   estimateManifestEncodedBytes as estimateEncodedBytesForFiles,
   MAX_LEGACY_MANIFEST_ENCODED_BYTES,
 } from "../shared/sync-capacity"
+import { ObservationFingerprint } from "./observation-fingerprint"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 
 export const DEFAULT_MAX_MANIFEST_FILES = 10_000
@@ -272,18 +273,19 @@ async function* withCachedDigests(
  * committed strictly in walk order, which keeps `files` ordering, every
  * counter, and the truncation point identical to a sequential scan.
  */
-export async function scanFolder(
+async function scanFolderEntries(
   rootPath: string,
   ignorePatterns: string[],
-  options: ScanFolderOptions = {},
-): Promise<FileManifest> {
+  options: ScanFolderOptions,
+  onEntry: (entry: FileManifestEntry) => void,
+): Promise<ScanSummary> {
   const root = path.resolve(rootPath)
   const rootStat = await stat(root)
   if (!rootStat.isDirectory()) throw new Error("The selected path is not a folder.")
   const canonicalRoot = await realpath(root)
 
   const matcher = createIgnoreMatcher(ignorePatterns)
-  const files: FileManifestEntry[] = []
+  let committedFiles = 0
   let ignored = 0
   let unreadable = 0
   let truncated = false
@@ -305,7 +307,7 @@ export async function scanFolder(
     if (!force && now - lastActivityAt < SCAN_ACTIVITY_INTERVAL_MS) return
     lastActivityAt = now
     try {
-      options.onActivity({ stage, currentPath, scannedFiles: files.length, ignoredEntries: ignored, unreadableEntries: unreadable, hashedBytes })
+      options.onActivity({ stage, currentPath, scannedFiles: committedFiles, ignoredEntries: ignored, unreadableEntries: unreadable, hashedBytes })
     } catch {
       // Advisory UI delivery must never change the scan result.
     }
@@ -373,12 +375,13 @@ export async function scanFolder(
         ignored += 1
         continue
       }
-      if (files.length >= maxFiles) {
+      if (committedFiles >= maxFiles) {
         truncated = true
         break
       }
       const { entry, settledIdentity } = settlement.inspection
-      files.push(entry)
+      onEntry(entry)
+      committedFiles += 1
       if (digestCache && settledIdentity && entry.digest) digestCache.record(entry.path, { ...settledIdentity, digest: entry.digest })
     }
   } finally {
@@ -389,7 +392,54 @@ export async function scanFolder(
   }
   throwIfScanCancelled(signal)
   reportActivity("complete", "", true)
-  return { rootPath: root, files, ignored, unreadable, truncated }
+  return { rootPath: root, files: committedFiles, ignored, unreadable, truncated }
+}
+
+/** Counters of a scan whose entries were streamed to a callback instead of collected. */
+interface ScanSummary {
+  rootPath: string
+  files: number
+  ignored: number
+  unreadable: number
+  truncated: boolean
+}
+
+export async function scanFolder(
+  rootPath: string,
+  ignorePatterns: string[],
+  options: ScanFolderOptions = {},
+): Promise<FileManifest> {
+  const files: FileManifestEntry[] = []
+  const summary = await scanFolderEntries(rootPath, ignorePatterns, options, (entry) => files.push(entry))
+  return { rootPath: summary.rootPath, files, ignored: summary.ignored, unreadable: summary.unreadable, truncated: summary.truncated }
+}
+
+/** A full-integrity scan reduced to its observation fingerprint. */
+export interface FolderFingerprint {
+  fingerprint: string
+  files: number
+  ignored: number
+  unreadable: number
+  truncated: boolean
+}
+
+/**
+ * Hashes every file exactly like a full-integrity scan but keeps only an
+ * order-independent fingerprint, so memory stays flat however large the
+ * folder is. The result equals `fingerprintObservation` over the manifest a
+ * full-integrity scan of the same files would return.
+ */
+export async function fingerprintFolder(
+  rootPath: string,
+  ignorePatterns: string[],
+  options: Omit<ScanFolderOptions, "hashAllFiles"> = {},
+): Promise<FolderFingerprint> {
+  const fingerprint = new ObservationFingerprint()
+  const summary = await scanFolderEntries(rootPath, ignorePatterns, { ...options, hashAllFiles: true }, (entry) => {
+    if (entry.digest === undefined) throw new Error("A full-integrity scan produced a file without a digest.")
+    fingerprint.add(entry.path, entry.size, entry.digest)
+  })
+  return { fingerprint: fingerprint.value(), files: summary.files, ignored: summary.ignored, unreadable: summary.unreadable, truncated: summary.truncated }
 }
 
 /**
