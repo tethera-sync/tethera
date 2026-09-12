@@ -335,6 +335,8 @@ interface PreparedInitialSyncScan {
   signature: string
   /** Canonical digest of the inaccessible-path report the user is reviewing. */
   issuesSignature: string
+  /** Complete local block set for planning; never bounded like the exchanged report. */
+  localUnreadableEntries?: FolderScanIssue[]
   /** Manifests are omitted when retaining them would be too large; the signature still honours the decision. */
   localManifest?: FileManifest
   remoteManifest?: FileManifest
@@ -433,6 +435,7 @@ function runLocalScan(
     onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void
     onMetrics?: (metrics: ScanMetrics) => void
     onSettledDigest?: (relativePath: string, digest: CachedFileDigest) => void
+    onUnreadable?: (issue: FolderScanIssue) => void
     reuse?: ReadonlyMap<string, CachedFileDigest>
     folderId?: string
     digestCache?: ScanDigestCache
@@ -448,6 +451,7 @@ function runLocalScan(
       options.onMetrics?.(metrics)
     },
     onSettledDigest: options.onSettledDigest,
+    onUnreadable: options.onUnreadable,
     reuse: options.reuse,
     signal: effective,
     digestCache: options.digestCache,
@@ -484,9 +488,10 @@ function runCachedFolderScan(
   maxFiles: number | null,
   signal: AbortSignal | null,
   reuse?: ReadonlyMap<string, CachedFileDigest>,
+  onUnreadable?: (issue: FolderScanIssue) => void,
 ): Promise<FileManifest> {
   return withFolderDigestCache(folder.id, (digestCache) =>
-    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache, reuse }, signal))
+    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache, reuse, onUnreadable }, signal))
 }
 
 /** The same pass reduced to an observation fingerprint, holding no file list in memory. */
@@ -3046,9 +3051,14 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   // clock read could accept a reviewer decision the manifests no longer
   // support. An absent prepared scan always falls through to a fresh walk.
   const prepared = options.prepared
-  if (prepared?.localManifest && prepared.remoteManifest) {
+  // The complete per-path block set for this side. `manifest.unreadableEntries`
+  // is bounded for exchange, so planning must never treat it as complete: a
+  // path omitted from the report could otherwise still receive a pull.
+  const localBlocked: FolderScanIssue[] = []
+  if (prepared?.localManifest && prepared.remoteManifest && prepared.localUnreadableEntries) {
     localManifest = prepared.localManifest
     remoteManifest = prepared.remoteManifest
+    localBlocked.push(...prepared.localUnreadableEntries)
   } else {
     const chunked = await peerSupportsChunkedFrames(peer.id)
     let scanning = true
@@ -3060,6 +3070,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
           folderId: folder.id,
           digestCache,
           reuse,
+          onUnreadable: (issue) => localBlocked.push(issue),
           onActivity: (activity) => {
             if (!scanning) return
             const action = { listing: "Listing", inspecting: "Checking", hashing: "Hashing", complete: "Local scan complete" }[activity.stage]
@@ -3097,6 +3108,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
       capturedAt: Date.now(),
       signature: initialSyncScanSignature(folder),
       issuesSignature,
+      localUnreadableEntries: localBlocked,
       ...(totalFiles <= MAX_PREPARED_SCAN_FILES ? { localManifest, remoteManifest } : {}),
     })
     updateFolder(folder.id, {
@@ -3117,7 +3129,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   assertCompleteTransferManifest(localManifest, "This computer", scanLimit, { allowUnreadable: true })
   assertCompleteTransferManifest(remoteManifest, peer.name, undefined, { allowUnreadable: true })
 
-  const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode, { destinationBlocked: localManifest.unreadableEntries })
+  const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode, { destinationBlocked: localBlocked })
   const totalBytes = plan.toPull.reduce((total, entry) => total + entry.size, 0)
   const totalFiles = plan.toPull.length
   let copiedFiles = 0
@@ -3193,8 +3205,13 @@ async function verifyInitialMergeQuiescent(
   // must agree even if the setting changes mid-flight.
   const scanLimit = currentScanLimit()
   const chunked = await peerSupportsChunkedFrames(peer.id)
+  // Keep the complete local block set for convergence. The peer's list stays
+  // bounded by the exchanged report, so a peer with more than the reported
+  // number of inaccessible paths fails convergence and retries rather than
+  // being pulled into an unreadable path.
+  const localBlocked: FolderScanIssue[] = []
   const { local: localManifest, peer: remoteManifest } = await runPairedScans(
-    (signal) => runCachedFolderScan(`verify:${folder.id}`, folder, scanLimit, signal),
+    (signal) => runCachedFolderScan(`verify:${folder.id}`, folder, scanLimit, signal, undefined, (issue) => localBlocked.push(issue)),
     (signal) => requestPeerManifest(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
@@ -3211,7 +3228,7 @@ async function verifyInitialMergeQuiescent(
   assertManifestFitsExchange(localManifest, "This computer", chunked)
   assertManifestFitsExchange(remoteManifest, peer.name, chunked)
   const convergence = assessInitialMergeConvergence(localManifest, remoteManifest, folder.mode, {
-    localBlocked: localManifest.unreadableEntries,
+    localBlocked,
     remoteBlocked: remoteManifest.unreadableEntries,
   })
   if (!convergence.complete) {
@@ -3371,6 +3388,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     const preparedStillHolds = prepared !== undefined &&
       prepared.localManifest !== undefined &&
       prepared.remoteManifest !== undefined &&
+      prepared.localUnreadableEntries !== undefined &&
       prepared.signature === initialSyncScanSignature(folder) &&
       Date.now() - prepared.capturedAt <= PREPARED_INITIAL_SYNC_TTL_MS
     const allowUnreadable = acknowledgeUnreadable && preparedStillHolds

@@ -12,11 +12,13 @@ import {
   identityIsReusable,
   isManifestPathIgnored,
   isPathBlockedByScanIssue,
+  MAX_UNREADABLE_REPORTED,
   SCAN_FILE_CONCURRENCY,
   scanFolder,
   statFileIdentity,
   type CachedFileDigest,
   type FileIdentity,
+  type FolderScanIssue,
   type ScanDigestCache,
   type ScanMetrics,
 } from "../src/main/folder-manifest"
@@ -651,6 +653,29 @@ describe("unreadable path reporting", () => {
     // The legacy combined count keeps its original meaning for older peers.
     expect(preview.ignoredLocal).toBe(1)
     expect(preview.ignoredRemote).toBe(1)
+  })
+
+  test("passes every unreadable item to the planner while the exchanged report stays bounded", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-block-set-test-"))
+    const locked: string[] = []
+    try {
+      for (let index = 0; index <= MAX_UNREADABLE_REPORTED; index += 1) {
+        const directory = path.join(root, `locked-${String(index).padStart(3, "0")}`)
+        await mkdir(directory)
+        await chmod(directory, 0o000)
+        locked.push(directory)
+      }
+      const seen: FolderScanIssue[] = []
+      const result = await scanFolder(root, [], { hashAllFiles: true, onUnreadable: (issue) => seen.push(issue) })
+      expect(result.unreadable).toBe(MAX_UNREADABLE_REPORTED + 1)
+      expect(result.unreadableEntries).toHaveLength(MAX_UNREADABLE_REPORTED)
+      expect(seen).toHaveLength(MAX_UNREADABLE_REPORTED + 1)
+      expect(seen.every((issue) => issue.kind === "directory" && issue.reason === "Permission denied")).toBe(true)
+    } finally {
+      for (const directory of locked) await chmod(directory, 0o700)
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   test("round-trips an untrusted peer report and defaults its absence to empty", () => {

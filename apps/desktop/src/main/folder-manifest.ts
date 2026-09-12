@@ -155,6 +155,12 @@ export interface ScanFolderOptions {
    * later scan of the same tree.
    */
   onSettledDigest?: (relativePath: string, digest: CachedFileDigest) => void
+  /**
+   * Called for every inaccessible item, including those beyond the bounded
+   * `unreadableEntries` report. Planning uses the complete set so a file
+   * hidden behind a path omitted from the report can never be pulled into it.
+   */
+  onUnreadable?: (issue: FolderScanIssue) => void
   /** Final counters for tests and user-facing progress. Called once per scan. */
   onMetrics?: (metrics: ScanMetrics) => void
 }
@@ -395,6 +401,16 @@ async function scanFolderEntries(
     }
   }
 
+  function recordUnreadable(issue: FolderScanIssue): void {
+    unreadable += 1
+    if (unreadableEntries.length < MAX_UNREADABLE_REPORTED) unreadableEntries.push(issue)
+    try {
+      options.onUnreadable?.(issue)
+    } catch {
+      // Advisory delivery must never change the scan result.
+    }
+  }
+
   function inspect(relativePath: string, cached: CachedFileDigest | undefined): Promise<InspectionSettlement> {
     // A free slot always exists: at most SCAN_FILE_CONCURRENCY files are pending.
     const slot = freeSlots.pop() ?? {}
@@ -441,10 +457,7 @@ async function scanFolderEntries(
         continue
       }
       if (head.kind === "unreadable") {
-        unreadable += 1
-        if (unreadableEntries.length < MAX_UNREADABLE_REPORTED) {
-          unreadableEntries.push({ path: head.relativePath, reason: head.reason, kind: head.entryKind })
-        }
+        recordUnreadable({ path: head.relativePath, reason: head.reason, kind: head.entryKind })
         continue
       }
       pendingFiles -= 1
@@ -453,10 +466,7 @@ async function scanFolderEntries(
       if (!settlement.ok) {
         // Cancellation must escape instead of counting the file as unreadable.
         if (isScanCancelled(settlement.error) || signal?.aborted) throw new ScanCancelledError()
-        unreadable += 1
-        if (unreadableEntries.length < MAX_UNREADABLE_REPORTED) {
-          unreadableEntries.push({ path: head.relativePath, reason: describeScanReason(settlement.error), kind: "file" })
-        }
+        recordUnreadable({ path: head.relativePath, reason: describeScanReason(settlement.error), kind: "file" })
         continue
       }
       // Oversize files are excluded like an ignore-pattern match, so they must not
