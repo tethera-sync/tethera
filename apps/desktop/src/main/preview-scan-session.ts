@@ -83,7 +83,9 @@ export class PreviewScanSessions {
   }
 
   #trimSessions(): void {
-    while (this.#sessions.size > MAX_SESSIONS) {
+    // Called before the new session is inserted, so free a slot when the map
+    // is already at capacity; otherwise record() would retain one too many.
+    while (this.#sessions.size >= MAX_SESSIONS) {
       let oldestId: string | undefined
       let oldestAt = Number.POSITIVE_INFINITY
       for (const [sessionId, session] of this.#sessions) {

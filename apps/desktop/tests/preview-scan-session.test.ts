@@ -56,4 +56,16 @@ describe("PreviewScanSessions", () => {
     sessions.drop("op-2")
     expect(sessions.lookup("op-2", key)).toBeUndefined()
   })
+
+  test("never retains more than eight sessions", () => {
+    const sessions = new PreviewScanSessions(() => 0)
+    const key = previewScanKey(baseInput)
+    for (let index = 0; index < 9; index += 1) {
+      sessions.record(`op-${index}`, key, manifest([{ path: `f${index}`, size: 0, modifiedMs: 0 }]))
+    }
+    // The ninth record evicts the oldest session, keeping the newest eight.
+    expect(sessions.lookup("op-0", key)).toBeUndefined()
+    expect(sessions.lookup("op-1", key)).toBeDefined()
+    expect(sessions.lookup("op-8", key)).toBeDefined()
+  })
 })
