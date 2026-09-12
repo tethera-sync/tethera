@@ -72,8 +72,14 @@ export function FolderMappingApprovalDialog({
   useEffect(() => {
     setDestinationPath(request?.selectedDestinationPath ?? "")
     setError(null)
-    comparisonIdRef.current = null
   }, [request?.id, request?.selectedDestinationPath])
+
+  // A destination refresh updates `selectedDestinationPath` after recording
+  // the scan pair under the current operation id; the id must survive so
+  // approval can reuse that pair. Only a different request starts a new one.
+  useEffect(() => {
+    comparisonIdRef.current = null
+  }, [request?.id])
 
   if (!request || request.status !== "pending") return null
   const proposal = request.proposal
