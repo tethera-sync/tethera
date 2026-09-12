@@ -3376,24 +3376,20 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     const allowUnreadable = acknowledgeUnreadable && preparedStillHolds
     const acknowledgedIssuesSignature = acknowledgeUnreadable ? prepared?.issuesSignature : undefined
     const reusablePrepared = preparedStillHolds ? prepared : undefined
-    let peerAllowUnreadable = allowUnreadable
     const { local: localResult, peer: remoteResult } = await runCoordinatedInitialMerge(
-      async () => {
-        const result = await runInitialSyncPass(folder, peer, { allowUnreadable, prepared: reusablePrepared, acknowledgedIssuesSignature })
-        // The local pass only returns after the unreadable-path decision was
-        // accepted (or none were found), so the peer's inverse pass may skip
-        // the same acknowledged items instead of failing on them.
-        if (result.unreadableSkipped.length > 0) peerAllowUnreadable = true
-        return result
-      },
+      () => runInitialSyncPass(folder, peer, { allowUnreadable, prepared: reusablePrepared, acknowledgedIssuesSignature }),
       async () => {
         updateFolder(folderId, { currentAction: `Asking ${peer.name} to merge files in the other direction…` })
         broadcastSnapshot()
+        // The peer applies its own approved-report check. Promoting the local
+        // pass's skips into a blanket allowance would let the peer skip
+        // unreadable paths discovered after the coordinator's scan without
+        // the coordinator (or the peer's user) seeing them.
         return validateInitialSyncPassResult(
           await requirePeerSessions().request<InitialSyncPassResult>(peer.id, {
             type: "initial-sync-run",
             folderId,
-            allowUnreadable: peerAllowUnreadable,
+            allowUnreadable,
           }, 30 * 60_000),
         )
       },
