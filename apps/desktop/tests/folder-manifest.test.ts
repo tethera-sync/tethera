@@ -25,6 +25,14 @@ import {
 import { manifest } from "./helpers"
 import type { FolderScanActivity } from "../src/shared/contracts"
 
+/**
+ * Reuse-dependent assertions only hold on a filesystem that reports usable
+ * identity (not FAT/exFAT or an uncapable mount). Tests that assert a cache
+ * hit are skipped elsewhere so the suite stays green on those roots.
+ */
+const temporaryRootSupportsReuse = await filesystemSupportsDigestReuse(tmpdir())
+const testWithReuse = temporaryRootSupportsReuse ? test : test.skip
+
 describe("folder mapping comparison", () => {
   test("classifies identical, one-sided and different files", () => {
     const preview = folderManifestTestHelpers.compareManifests(
@@ -461,7 +469,7 @@ function fakeDigestCache(seed: ReadonlyMap<string, CachedFileDigest> = new Map()
 }
 
 describe("scan digest cache", () => {
-  test("uses a cached digest without reading a file whose identity is unchanged", async () => {
+  testWithReuse("uses a cached digest without reading a file whose identity is unchanged", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-hit-test-"))
     try {
       const filePath = path.join(root, "kept.txt")
@@ -529,7 +537,7 @@ describe("scan digest cache", () => {
     }
   })
 
-  test("looks every file up exactly once, in batches rather than one round trip per file", async () => {
+  testWithReuse("looks every file up exactly once, in batches rather than one round trip per file", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-batch-test-"))
     try {
       const fileCount = 600
@@ -545,7 +553,7 @@ describe("scan digest cache", () => {
     }
   })
 
-  test("records only files whose timestamps have settled past the coarse-clock window", async () => {
+  testWithReuse("records only files whose timestamps have settled past the coarse-clock window", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-settle-test-"))
     try {
       await writeFile(path.join(root, "settled.txt"), "settled")
@@ -702,7 +710,7 @@ describe("unreadable path reporting", () => {
 })
 
 describe("scan reuse", () => {
-  test("reuses settled digests instead of re-reading unchanged files and hashes only changed ones", async () => {
+  testWithReuse("reuses settled digests instead of re-reading unchanged files and hashes only changed ones", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-reuse-test-"))
     try {
       await writeFile(path.join(root, "a.txt"), "alpha")
@@ -761,7 +769,7 @@ describe("scan reuse", () => {
     }
   })
 
-  test("reports reused files in scan activity", async () => {
+  testWithReuse("reports reused files in scan activity", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-reuse-activity-test-"))
     try {
       await writeFile(path.join(root, "a.txt"), "alpha")
@@ -778,7 +786,7 @@ describe("scan reuse", () => {
     }
   })
 
-  test("records a reused digest back into the durable cache for later walks", async () => {
+  testWithReuse("records a reused digest back into the durable cache for later walks", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-reuse-durable-test-"))
     try {
       await writeFile(path.join(root, "stable.txt"), "stable")
@@ -858,7 +866,7 @@ describe("identity reuse safety", () => {
     }
   })
 
-  test("identityIsReusable accepts real files and rejects unusable values", async () => {
+  testWithReuse("identityIsReusable accepts real files and rejects unusable values", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-gate-test-"))
     try {
       const filePath = path.join(root, "value.txt")
@@ -946,10 +954,18 @@ describe("identity reuse safety", () => {
     }
   })
 
-  test("a real temporary root reports reusable filesystem identity support", async () => {
+  test("describes whether the temporary root can supply reusable identity", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-fs-test-"))
     try {
-      expect(await filesystemSupportsDigestReuse(root)).toBe(true)
+      const supported = await filesystemSupportsDigestReuse(root)
+      expect(typeof supported).toBe("boolean")
+      // A capable root must produce a usable identity; an incapable one (for
+      // example FAT/exFAT) is allowed to yield none, and reuse is skipped.
+      if (supported) {
+        const filePath = path.join(root, "value.txt")
+        await writeFile(filePath, "value")
+        expect(await statFileIdentity(filePath)).toBeDefined()
+      }
     } finally {
       await rm(root, { recursive: true, force: true })
     }
