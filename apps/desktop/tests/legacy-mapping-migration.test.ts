@@ -195,6 +195,59 @@ describe("legacy state conversion", () => {
     })
     expect(() => bundle(readable(document))).toThrow("malformed comparison preview")
   })
+
+  test("rejects malformed unreadable issue detail before sanitisation", () => {
+    const validPreview = {
+      localFiles: 0,
+      remoteFiles: 0,
+      identicalFiles: 0,
+      differentFiles: 0,
+      localOnlyFiles: 0,
+      remoteOnlyFiles: 0,
+      ignoredLocal: 0,
+      ignoredRemote: 0,
+      bytesToRemote: 0,
+      bytesToLocal: 0,
+      invalidWindowsNames: [],
+      caseCollisions: [],
+      truncated: false,
+      samples: [],
+    }
+    const malformedValues: unknown[] = [
+      "not-an-array",
+      [{ path: "locked", reason: "", kind: "directory" }],
+      [{ path: "locked", reason: "denied", kind: "socket" }],
+      [{ path: "locked", reason: "x".repeat(201), kind: "file" }],
+      Array.from({ length: 101 }, (_, index) => ({ path: `p${index}`, reason: "denied", kind: "file" })),
+    ]
+    for (const malformed of malformedValues) {
+      const document = legacyDocument({
+        mappings: {
+          incoming: [{ id: "mapping-1", proposal: { preview: { ...validPreview, unreadableLocal: malformed } } }],
+          outgoing: [],
+        },
+      })
+      expect(() => bundle(readable(document))).toThrow("malformed comparison preview")
+    }
+
+    // An empty path means the scanned root and stays valid; totals are not capped like the detail list.
+    const accepted = legacyDocument({
+      mappings: {
+        incoming: [{
+          id: "mapping-1",
+          proposal: {
+            preview: {
+              ...validPreview,
+              unreadableLocal: [{ path: "", reason: "Permission denied", kind: "directory" }],
+              unreadableLocalCount: 10_000,
+            },
+          },
+        }],
+        outgoing: [],
+      },
+    })
+    expect(() => bundle(readable(accepted))).not.toThrow()
+  })
 })
 
 describe("legacy migration durability", () => {
