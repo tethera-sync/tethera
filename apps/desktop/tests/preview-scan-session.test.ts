@@ -44,13 +44,21 @@ describe("PreviewScanSessions", () => {
     expect(sessions.lookup("op-1", key)).toBeUndefined()
   })
 
-  test("does not cache oversized manifests and can drop a session", () => {
+  test("caches a manifest at the entry cap and rejects one above it", () => {
     const sessions = new PreviewScanSessions()
     const key = previewScanKey(baseInput)
-    const oversized = manifest(Array.from({ length: 50_001 }, (_, index) => ({ path: `f${index}`, size: 0, modifiedMs: 0 })))
-    sessions.record("op-1", key, oversized)
-    expect(sessions.lookup("op-1", key)).toBeUndefined()
+    const atLimit = manifest(Array.from({ length: 50_000 }, (_, index) => ({ path: `f${index}`, size: 0, modifiedMs: 0 })))
+    sessions.record("op-limit", key, atLimit)
+    expect(sessions.lookup("op-limit", key)).toBe(atLimit)
 
+    const oversized = manifest(Array.from({ length: 50_001 }, (_, index) => ({ path: `g${index}`, size: 0, modifiedMs: 0 })))
+    sessions.record("op-over", key, oversized)
+    expect(sessions.lookup("op-over", key)).toBeUndefined()
+  })
+
+  test("can drop a session", () => {
+    const sessions = new PreviewScanSessions()
+    const key = previewScanKey(baseInput)
     const scan = manifest([{ path: "a.txt", size: 1, modifiedMs: 1 }])
     sessions.record("op-2", key, scan)
     sessions.drop("op-2")
