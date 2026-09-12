@@ -2951,9 +2951,12 @@ function scanIssueTotal(report: FolderScanIssueReport): number {
 
 /** Canonical digest of an inaccessible-path report, used to match a decision to a fresh scan. */
 function scanIssueSignature(report: FolderScanIssueReport): string {
+  // Serialise each triple so the sort compares whole records, not the default
+  // comma-joined coercion of nested arrays: a path or reason containing a
+  // comma must not tie two different issues and fall back to walk order.
   const canonical = JSON.stringify({
-    local: [...report.local].map((issue) => [issue.kind, issue.path, issue.reason]).sort(),
-    remote: [...report.remote].map((issue) => [issue.kind, issue.path, issue.reason]).sort(),
+    local: report.local.map((issue) => JSON.stringify([issue.kind, issue.path, issue.reason])).sort(),
+    remote: report.remote.map((issue) => JSON.stringify([issue.kind, issue.path, issue.reason])).sort(),
     localCount: report.localCount,
     remoteCount: report.remoteCount,
   })
