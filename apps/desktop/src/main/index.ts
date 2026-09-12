@@ -1496,8 +1496,9 @@ function remotePreviewScanKey(peerId: string, remotePath: string, ignorePatterns
   return previewScanKey({ kind: "remote", peerId, rootPath: remotePath, ignorePatterns, hashAllFiles: false, maxFiles: null })
 }
 
-function localPreviewScanKey(localPath: string, ignorePatterns: string[]): string {
-  return previewScanKey({ kind: "local", rootPath: localPath, ignorePatterns, hashAllFiles: false, maxFiles: currentScanLimit() })
+/** The lookup side reads the current limit so captures taken under a different limit safely miss. */
+function localPreviewScanKey(localPath: string, ignorePatterns: string[], maxFiles: number | null = currentScanLimit()): string {
+  return previewScanKey({ kind: "local", rootPath: localPath, ignorePatterns, hashAllFiles: false, maxFiles })
 }
 
 /** Both scans captured during a renderer's review step, if still cached and unchanged. */
@@ -1628,14 +1629,17 @@ async function buildIncomingMappingPreview(
     // This is the responder's first look at its own destination folder. Its
     // settled identities seed the local inverse merge walk after approval.
     const settled = new Map<string, CachedFileDigest>()
+    // One limit for the scan and its cache key: if the setting changes during
+    // the walk, the manifest must not later be reused under the new limit.
+    const scanLimit = currentScanLimit()
     const responderManifest = await runLocalScan(`incoming:${target}`, target, request.proposal.ignorePatterns, {
-      maxFiles: currentScanLimit(),
+      maxFiles: scanLimit,
       reuse: scanReuseSeeds.lookup(target, request.proposal.ignorePatterns),
       onSettledDigest: (relativePath, digest) => settled.set(relativePath, digest),
       onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
     }, controller.signal)
     scanReuseSeeds.remember(target, request.proposal.ignorePatterns, settled)
-    if (operationId) previewScanSessions.record(operationId, localPreviewScanKey(target, request.proposal.ignorePatterns), responderManifest)
+    if (operationId) previewScanSessions.record(operationId, localPreviewScanKey(target, request.proposal.ignorePatterns, scanLimit), responderManifest)
     if (controller.signal.aborted) throw new ScanCancelledError()
     emitPreviewProgress(operationId, "compare")
     return compareManifests(initiatorManifest, responderManifest, {
