@@ -2963,11 +2963,22 @@ function scanIssueSignature(report: FolderScanIssueReport): string {
   return createHash("sha256").update(canonical).digest("hex")
 }
 
+/** Matches the persistence bound applied by `isBoundedSkipArray` and `isPersistedSkipArray`. */
+const MAX_PERSISTED_SKIP_REASON_LENGTH = 1_024
+
 function scanIssueSkips(report: FolderScanIssueReport, localName: string, remoteName: string): SyncSkip[] {
-  const toSkips = (issues: FolderScanIssue[], computer: string): SyncSkip[] => issues.map((issue) => ({
-    path: issue.path || "(folder root)",
-    reason: `${computer} could not read this item (${issue.reason}); it was left out of the merge.`,
-  }))
+  // A peer's display name is not length-bounded, so the formatted reason must
+  // be clamped: an over-long reason would make the whole persisted outcome
+  // fail validation and disappear on restart.
+  const toSkips = (issues: FolderScanIssue[], computer: string): SyncSkip[] => issues.map((issue) => {
+    const reason = `${computer} could not read this item (${issue.reason}); it was left out of the merge.`
+    return {
+      path: issue.path || "(folder root)",
+      reason: reason.length > MAX_PERSISTED_SKIP_REASON_LENGTH
+        ? `${reason.slice(0, MAX_PERSISTED_SKIP_REASON_LENGTH - 1)}…`
+        : reason,
+    }
+  })
   return [...toSkips(report.local, localName), ...toSkips(report.remote, remoteName)]
 }
 
