@@ -346,6 +346,31 @@ const PREPARED_INITIAL_SYNC_TTL_MS = 5 * 60_000
 const MAX_PREPARED_SCAN_FILES = 200_000
 const preparedInitialSyncScans = new Map<string, PreparedInitialSyncScan>()
 
+/**
+ * Releases the retained manifests of expired prepared scans while keeping the
+ * accepted issue signature, so "Continue anyway" after the window still
+ * honours the reviewed report. This runs on its own timer: an abandoned review
+ * dialog may never touch the map again, and the window can be hidden in the
+ * tray for hours while the process stays alive.
+ */
+function releaseExpiredPreparedScans(now = Date.now()): void {
+  for (const [folderId, prepared] of preparedInitialSyncScans) {
+    if (prepared.localManifest === undefined && prepared.remoteManifest === undefined) continue
+    if (now - prepared.capturedAt < PREPARED_INITIAL_SYNC_TTL_MS) continue
+    preparedInitialSyncScans.set(folderId, {
+      capturedAt: prepared.capturedAt,
+      signature: prepared.signature,
+      issuesSignature: prepared.issuesSignature,
+    })
+  }
+}
+
+const preparedInitialSyncSweepTimer = setInterval(
+  () => releaseExpiredPreparedScans(),
+  Math.min(PREPARED_INITIAL_SYNC_TTL_MS, 60_000),
+)
+preparedInitialSyncSweepTimer.unref()
+
 /** Raised after the folder has been put into its "review inaccessible items" state. */
 class InitialSyncUnreadableError extends Error {
   constructor() {
@@ -4731,6 +4756,7 @@ app.on("window-all-closed", () => {
   app.quit()
 })
 app.on("will-quit", () => {
+  clearInterval(preparedInitialSyncSweepTimer)
   if (updateCheckTimer) clearInterval(updateCheckTimer)
   if (decisionRetryTimer) clearInterval(decisionRetryTimer)
   for (const retry of continuousSyncRetryTimers.values()) clearTimeout(retry)
