@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import {
   CheckCircle2Icon,
   ComputerIcon,
@@ -8,9 +8,10 @@ import {
   ShieldCheckIcon,
   XIcon,
 } from "lucide-react"
-import type { DeviceSummary, FolderScanActivity, IncomingMappingRequest } from "@shared/contracts"
+import type { DeviceSummary, FolderMappingPreview, FolderScanActivity, IncomingMappingRequest } from "@shared/contracts"
 import { CompareStatus } from "@/components/compare-status"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
+import { ScanIssuesAlert } from "@/components/scan-issues-alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -24,6 +25,7 @@ import {
 } from "@/components/ui/dialog"
 import { formatBytes } from "@/lib/format"
 import { formatElapsed, useElapsedSeconds, type ComparePhase } from "@/lib/compare-progress"
+import { scanIssueReportFromPreview, scanIssueTotal } from "@shared/folder-scan-issues"
 
 export function FolderMappingApprovalDialog({
   request,
@@ -48,28 +50,44 @@ export function FolderMappingApprovalDialog({
     phase: ComparePhase | null
     scannedFiles?: number
     activity?: FolderScanActivity
+    reused?: boolean
   } | null>(null)
   const [action, setAction] = useState<"approve" | "reject" | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [cancelRequested, setCancelRequested] = useState(false)
+  // Acknowledgement is tied to the exact preview object, so a refreshed
+  // comparison resets it without extra effects.
+  const [acknowledgedPreview, setAcknowledgedPreview] = useState<FolderMappingPreview | null>(null)
+  // One operation id per request lets approval reuse the scans from the last
+  // destination refresh instead of scanning both folders again.
+  const comparisonIdRef = useRef<string | null>(null)
   const working = compare !== null || action !== null
   const elapsed = formatElapsed(useElapsedSeconds(compare !== null))
+
+  function comparisonOperationId(): string {
+    comparisonIdRef.current ??= crypto.randomUUID()
+    return comparisonIdRef.current
+  }
 
   useEffect(() => {
     setDestinationPath(request?.selectedDestinationPath ?? "")
     setError(null)
+    comparisonIdRef.current = null
   }, [request?.id, request?.selectedDestinationPath])
 
   if (!request || request.status !== "pending") return null
   const proposal = request.proposal
   const blockingWarnings = proposal.preview.invalidWindowsNames.length + proposal.preview.caseCollisions.length
+  const issueReport = scanIssueReportFromPreview(proposal.preview)
+  const issueTotal = scanIssueTotal(issueReport)
+  const issuesAcknowledged = acknowledgedPreview === proposal.preview
 
   function trackCompareProgress(operationId: string): () => void {
     return window.folderSync.onPreviewProgress((progress) => {
       if (progress.operationId !== operationId) return
       setCompare((current) =>
         current?.operationId === operationId
-          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles, activity: progress.activity }
+          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles, activity: progress.activity, reused: progress.reused ?? current.reused }
           : current,
       )
     })
@@ -77,7 +95,7 @@ export function FolderMappingApprovalDialog({
 
   async function refreshDestination(nextPath: string) {
     if (!request || working) return
-    const operationId = crypto.randomUUID()
+    const operationId = comparisonOperationId()
     setCancelRequested(false)
     setCompare({ operationId, kind: "refresh", phase: null })
     setError(null)
@@ -95,7 +113,8 @@ export function FolderMappingApprovalDialog({
 
   async function approve() {
     if (!request || !destinationPath || working || blockingWarnings > 0) return
-    const operationId = crypto.randomUUID()
+    if (issueTotal > 0 && !issuesAcknowledged) return
+    const operationId = comparisonOperationId()
     setCancelRequested(false)
     setAction("approve")
     setCompare({ operationId, kind: "verify", phase: null })
@@ -148,7 +167,7 @@ export function FolderMappingApprovalDialog({
           onOpenChange(nextOpen)
         }}
       >
-        <DialogContent className="mapping-approval-dialog [max-width:720px]" showCloseButton={!working}>
+        <DialogContent className="mapping-approval-dialog [max-width:min(720px,calc(100%-2rem))]" showCloseButton={!working}>
           <DialogHeader>
             <div className="mapping-approval-heading [display:flex] [align-items:flex-start] [gap:12px]">
               <div className="mapping-approval-icon [display:grid] [place-items:center] [width:42px] [height:42px] [flex:0_0_auto] [border:1px_solid_color-mix(in_oklab,_var(--primary)_33%,_var(--border))] [border-radius:12px] [background:color-mix(in_oklab,_var(--primary)_10%,_var(--surface))] [color:var(--primary)] [&_svg]:[width:20px] [&_svg]:[height:20px]"><ShieldCheckIcon /></div>
@@ -198,6 +217,17 @@ export function FolderMappingApprovalDialog({
             <Alert className="mt-[10px]"><FileWarningIcon /><AlertTitle>Preview limit reached</AlertTitle><AlertDescription>The comparison sampled only part of one or both folders. Each computer applies its own scan limit, and the preview does not say which side stopped first. Check Settings on both computers, or add ignore rules, then refresh the comparison.</AlertDescription></Alert>
           ) : null}
 
+          {issueTotal > 0 ? (
+            <ScanIssuesAlert
+              report={issueReport}
+              localName={localDevice.name}
+              remoteName={request.fromDeviceName}
+              acknowledged={issuesAcknowledged}
+              onAcknowledgedChange={(value) => setAcknowledgedPreview(value ? proposal.preview : null)}
+              continueLabel={`Approve anyway and skip ${issueTotal === 1 ? "1 item" : `${issueTotal.toLocaleString("en-GB")} items`}`}
+            />
+          ) : null}
+
           {blockingWarnings > 0 ? (
             <Alert variant="destructive"><FileWarningIcon /><AlertTitle>Approval blocked</AlertTitle><AlertDescription>Rename {blockingWarnings} Windows-invalid or case-colliding paths first.</AlertDescription></Alert>
           ) : (
@@ -216,6 +246,7 @@ export function FolderMappingApprovalDialog({
               scannedFiles={compare.scannedFiles}
               activity={compare.activity}
               elapsed={elapsed}
+              reused={compare.reused ?? false}
             />
           ) : null}
 
@@ -228,12 +259,12 @@ export function FolderMappingApprovalDialog({
               {action === "reject" ? "Rejecting…" : "Reject"}
             </Button>
             <Button
-              disabled={!mutationsEnabled || working || !destinationPath || blockingWarnings > 0}
+              disabled={!mutationsEnabled || working || !destinationPath || blockingWarnings > 0 || (issueTotal > 0 && !issuesAcknowledged)}
               title={!mutationsEnabled ? disabledReason : undefined}
               onClick={() => void approve()}
             >
               {working ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <ShieldCheckIcon data-icon="inline-start" />}
-              {action === "approve" ? "Approving…" : compare ? "Comparing…" : "Approve mapping"}
+              {action === "approve" ? "Approving…" : compare ? "Comparing…" : issueTotal > 0 ? "Continue anyway" : "Approve mapping"}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -17,6 +17,7 @@ import type { AppSnapshot, FolderSummary } from "@shared/contracts"
 import type { View } from "@/lib/navigation"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { CompactEmptyState } from "@/components/compact-empty-state"
+import { InitialSyncIssuesDialog } from "@/components/initial-sync-issues-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Meter } from "@/components/ui/meter"
@@ -204,7 +205,7 @@ function FolderCard({
   disabledReason: string
   onReviewRecovery: () => void
 }) {
-  type PendingAction = "pause" | "resume" | "remove" | "sync" | "reveal"
+  type PendingAction = "pause" | "resume" | "remove" | "sync" | "reveal" | "continue-merge" | "dismiss-issues"
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const pendingActionRef = useRef<PendingAction | null>(null)
@@ -240,7 +241,15 @@ function FolderCard({
   }
 
   async function startSync() {
-    await runAction("sync", () => window.folderSync.startInitialSync(folder.id), "Unable to start the initial merge.")
+    await runAction("sync", () => window.folderSync.startInitialSync(folder.id, false), "Unable to start the initial merge.")
+  }
+
+  async function continueInitialSync() {
+    await runAction("continue-merge", () => window.folderSync.startInitialSync(folder.id, true), "Unable to continue the initial merge.")
+  }
+
+  async function dismissIssues() {
+    await runAction("dismiss-issues", () => window.folderSync.dismissInitialSyncIssues(folder.id), "Unable to dismiss the inaccessible paths.")
   }
 
   const pending = pendingAction !== null
@@ -366,6 +375,18 @@ function FolderCard({
           <Trash2Icon />
         </Button>
       </div>
+
+      {folder.scanIssues ? (
+        <InitialSyncIssuesDialog
+          folder={folder}
+          localName={localDeviceName}
+          remoteName={remoteDevice?.name ?? "Paired computer"}
+          working={pendingAction === "continue-merge" || pendingAction === "dismiss-issues"}
+          error={actionError}
+          onContinue={() => void continueInitialSync()}
+          onDismiss={() => void dismissIssues()}
+        />
+      ) : null}
     </article>
   )
 }

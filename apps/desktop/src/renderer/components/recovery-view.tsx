@@ -320,7 +320,7 @@ function ConflictResolutionDialog({
 
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => { if (!submitting) onOpenChange(nextOpen) }}>
-      <DialogContent className="max-w-[760px]" showCloseButton={!submitting}>
+      <DialogContent className="max-w-[min(760px,calc(100%-2rem))]" showCloseButton={!submitting}>
         <DialogHeader>
           <DialogTitle>Choose the version to keep</DialogTitle>
           <DialogDescription className="break-all">

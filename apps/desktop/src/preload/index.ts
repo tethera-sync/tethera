@@ -41,7 +41,9 @@ const api: TetheraApi = {
   approveFolderMapping: (input: ApproveFolderMappingInput, progressOperationId?: string) =>
     invokeComparison<AppSnapshot>("folders:approve-mapping", input, progressOperationId),
   rejectFolderMapping: (requestId: string) => ipcRenderer.invoke("folders:reject-mapping", requestId),
-  startInitialSync: (folderId: string) => ipcRenderer.invoke("folders:start-initial-sync", folderId),
+  startInitialSync: (folderId: string, acknowledgeUnreadable?: boolean) =>
+    ipcRenderer.invoke("folders:start-initial-sync", folderId, acknowledgeUnreadable === true),
+  dismissInitialSyncIssues: (folderId: string) => ipcRenderer.invoke("folders:dismiss-initial-sync-issues", folderId),
   addFolder: (input: AddFolderInput) => ipcRenderer.invoke("folders:add", input),
   setFolderPaused: (folderId: string, paused: boolean) => ipcRenderer.invoke("folders:set-paused", folderId, paused),
   removeFolder: (folderId: string) => ipcRenderer.invoke("folders:remove", folderId),

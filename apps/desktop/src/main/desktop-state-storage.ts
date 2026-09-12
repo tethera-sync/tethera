@@ -18,6 +18,8 @@ export interface PersistedInitialSyncOutcome {
   copiedFiles: number
   fileCount: number
   conflicts: Array<{ path: string; reason: string }>
+  /** Inaccessible items the user chose to skip; absent in state written before this was recorded. */
+  unreadableSkipped?: Array<{ path: string; reason: string }>
 }
 
 const TRANSIENT_STATE_FIELDS = [

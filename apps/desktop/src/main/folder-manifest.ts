@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto"
 import type { BigIntStats } from "node:fs"
-import { lstat, open, opendir, realpath, stat } from "node:fs/promises"
+import { lstat, open, opendir, realpath, stat, statfs } from "node:fs/promises"
 import path from "node:path"
-import type { FolderMappingPreview, FolderScanActivity, MappingPreviewItem, SyncMode } from "../shared/contracts"
+import type { FolderMappingPreview, FolderScanActivity, FolderScanIssue, MappingPreviewItem, SyncMode } from "../shared/contracts"
 import {
   estimateManifestEncodedBytes as estimateEncodedBytesForFiles,
   MAX_LEGACY_MANIFEST_ENCODED_BYTES,
@@ -100,6 +100,8 @@ export interface FileManifest {
   files: FileManifestEntry[]
   ignored: number
   unreadable: number
+  /** Bounded report of the first inaccessible paths, in walk order. */
+  unreadableEntries: FolderScanIssue[]
   truncated: boolean
 }
 
@@ -140,18 +142,47 @@ export interface ScanFolderOptions {
    * digests they would not otherwise compute.
    */
   digestCache?: ScanDigestCache
+  /**
+   * Digests captured by an earlier scan of the same root and rules, keyed by
+   * relative path. A file is read only when its exact on-disk identity no
+   * longer matches the captured one, so this is safe for every scan mode:
+   * the entry is a hint, never a substitute for the identity check.
+   */
+  reuse?: ReadonlyMap<string, CachedFileDigest>
+  /**
+   * Called for each file whose digest settled during this scan (`reused` or
+   * freshly hashed). The caller can feed the entries back as `reuse` for a
+   * later scan of the same tree.
+   */
+  onSettledDigest?: (relativePath: string, digest: CachedFileDigest) => void
+  /** Final counters for tests and user-facing progress. Called once per scan. */
+  onMetrics?: (metrics: ScanMetrics) => void
+}
+
+/** How one scan spent its work: walked records and whether bytes were re-read. */
+export interface ScanMetrics {
+  files: number
+  /** Files whose digest came from the engine digest cache or the caller's reuse map. */
+  reusedFiles: number
+  /** Files whose bytes were read and hashed during this scan. */
+  hashedFiles: number
+  /** Files collected without a digest (an oversize preview file). */
+  unhashedFiles: number
+  ignored: number
+  unreadable: number
+  truncated: boolean
 }
 
 /** One walk observation, yielded in exactly the order the sequential walk encountered it. */
 type ScanRecord =
   | { kind: "ignored" }
-  | { kind: "unreadable" }
+  | { kind: "unreadable"; relativePath: string; reason: string; entryKind: "file" | "directory" }
   | { kind: "file"; relativePath: string }
 
 /** A walked record, with any cached digest for a file attached ahead of inspection. */
 type ReadyScanRecord =
   | { kind: "ignored" }
-  | { kind: "unreadable" }
+  | { kind: "unreadable"; relativePath: string; reason: string; entryKind: "file" | "directory" }
   | { kind: "file"; relativePath: string; cached?: CachedFileDigest }
 
 type InspectionSettlement =
@@ -160,8 +191,8 @@ type InspectionSettlement =
 
 type PendingScanRecord =
   | { kind: "ignored" }
-  | { kind: "unreadable" }
-  | { kind: "file"; settled: Promise<InspectionSettlement> }
+  | { kind: "unreadable"; relativePath: string; reason: string; entryKind: "file" | "directory" }
+  | { kind: "file"; relativePath: string; settled: Promise<InspectionSettlement> }
 
 interface ScanWalkContext {
   canonicalRoot: string
@@ -177,12 +208,50 @@ const DIGEST_LOOKUP_BATCH = 256
 /** Bounds walk-ahead while gathering one lookup batch through long runs of ignored entries. */
 const MAX_LOOKUP_BATCH_RECORDS = DIGEST_LOOKUP_BATCH * 4
 /**
+ * A scan reports at most this many inaccessible paths per side. The total
+ * count is never capped; only the per-entry detail the UI renders is.
+ */
+export const MAX_UNREADABLE_REPORTED = 100
+/**
  * A digest is recorded only when the file's modification and change times sit
  * at least this far behind the moment hashing began. Coarse filesystem clocks
  * (FAT keeps a 2 s mtime) could otherwise let a write share the hashed
  * content's timestamp tick and hide behind an unchanged identity.
  */
 const DIGEST_SETTLE_NS = 2_000_000_000n
+
+/**
+ * Maps a filesystem failure to a short reason that never contains an absolute
+ * path or a raw operating-system message.
+ */
+export function describeScanReason(error: unknown): string {
+  const code = error && typeof error === "object" && "code" in error
+    ? (error as NodeJS.ErrnoException).code
+    : undefined
+  switch (code) {
+    case "EACCES": return "Permission denied"
+    case "EPERM": return "Operation not permitted"
+    case "ENOENT": return "No longer exists"
+    case "ELOOP": return "Too many symbolic links"
+    case "ENOTDIR": return "Not a folder"
+    case "EBUSY": return "In use by another program"
+    case "EIO": return "Filesystem read error"
+    case "EMFILE":
+    case "ENFILE": return "Too many open files"
+    default: break
+  }
+  // These are Tethera's own containment/stability errors. They never embed a
+  // path, so they are safe to show; any other bare message could leak one.
+  if (error instanceof Error && knownScanErrorMessages.has(error.message)) return error.message
+  return "Could not be read"
+}
+
+const knownScanErrorMessages = new Set([
+  "The manifest path is not a regular file.",
+  "The manifest file escapes the folder root.",
+  "The manifest file changed while it was opened.",
+  "The manifest file changed while it was read.",
+])
 
 /**
  * Depth-first walk yielding one record per entry. Traversal order, containment
@@ -200,13 +269,13 @@ async function* walkScanRecords(directoryPath: string, relativeDirectory: string
     const canonicalDirectory = await realpath(directoryPath)
     if (!isCanonicalPathInside(canonicalRoot, canonicalDirectory)) {
       await closeDirQuietly(directory)
-      yield { kind: "unreadable" }
+      yield { kind: "unreadable", relativePath: relativeDirectory, reason: "Resolves outside the folder root", entryKind: "directory" }
       return
     }
   } catch (error) {
     if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
     await closeDirQuietly(directory)
-    yield { kind: "unreadable" }
+    yield { kind: "unreadable", relativePath: relativeDirectory, reason: describeScanReason(error), entryKind: "directory" }
     return
   }
 
@@ -225,6 +294,12 @@ async function* walkScanRecords(directoryPath: string, relativeDirectory: string
       }
       if (entry.isFile()) yield { kind: "file", relativePath }
     }
+  } catch (error) {
+    // Some runtimes open a directory before failing its first read, so an
+    // inaccessible directory can surface here rather than at `opendir`. It is
+    // an unreadable directory, never a reason to abort the whole scan.
+    if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
+    yield { kind: "unreadable", relativePath: relativeDirectory, reason: describeScanReason(error), entryKind: "directory" }
   } finally {
     await closeDirQuietly(directory)
   }
@@ -289,10 +364,17 @@ async function scanFolderEntries(
   let ignored = 0
   let unreadable = 0
   let truncated = false
+  let reusedFiles = 0
+  let hashedFiles = 0
+  let unhashedFiles = 0
+  const unreadableEntries: FolderScanIssue[] = []
   const maxFiles = resolveScanLimit(options.maxFiles)
   const maxFileBytes = resolveFileSizeLimit(options.maxFileBytes)
   const hashAllFiles = options.hashAllFiles === true
-  const digestCache = hashAllFiles ? options.digestCache : undefined
+  // A root on FAT/exFAT (or a filesystem that cannot be identified) never
+  // reuses digests, whatever the driver-synthesized inode/ctime claim.
+  const identityReuseAllowed = await filesystemSupportsDigestReuse(root)
+  const digestCache = identityReuseAllowed && hashAllFiles ? options.digestCache : undefined
   const signal = options.signal ?? null
   throwIfScanCancelled(signal)
   // Each in-flight inspection borrows a slot and lazily allocates that slot's
@@ -307,7 +389,7 @@ async function scanFolderEntries(
     if (!force && now - lastActivityAt < SCAN_ACTIVITY_INTERVAL_MS) return
     lastActivityAt = now
     try {
-      options.onActivity({ stage, currentPath, scannedFiles: committedFiles, ignoredEntries: ignored, unreadableEntries: unreadable, hashedBytes })
+      options.onActivity({ stage, currentPath, scannedFiles: committedFiles, ignoredEntries: ignored, unreadableEntries: unreadable, hashedBytes, reusedFiles })
     } catch {
       // Advisory UI delivery must never change the scan result.
     }
@@ -317,10 +399,13 @@ async function scanFolderEntries(
     // A free slot always exists: at most SCAN_FILE_CONCURRENCY files are pending.
     const slot = freeSlots.pop() ?? {}
     reportActivity("inspecting", relativePath)
+    // The caller's earlier scan of this same tree supplies digests for
+    // unchanged files; the per-file identity check below still decides.
+    const reusable = identityReuseAllowed ? options.reuse?.get(relativePath) ?? cached : undefined
     return inspectManifestFile(root, canonicalRoot, relativePath, hashAllFiles, maxFileBytes, (bytesRead) => {
       hashedBytes += bytesRead
       reportActivity("hashing", relativePath)
-    }, signal, () => (slot.buffer ??= Buffer.allocUnsafe(HASH_BUFFER_BYTES)), cached)
+    }, signal, () => (slot.buffer ??= Buffer.allocUnsafe(HASH_BUFFER_BYTES)), reusable, identityReuseAllowed)
       // Settled rather than rejected, so an inspection abandoned by truncation
       // or cancellation can never surface as an unhandled rejection.
       .then((inspection): InspectionSettlement => ({ ok: true, inspection }), (error: unknown): InspectionSettlement => ({ ok: false, error }))
@@ -342,7 +427,7 @@ async function scanFolderEntries(
         }
         const record = next.value
         if (record.kind === "file") {
-          pending.push({ kind: "file", settled: inspect(record.relativePath, record.cached) })
+          pending.push({ kind: "file", relativePath: record.relativePath, settled: inspect(record.relativePath, record.cached) })
           pendingFiles += 1
         } else {
           pending.push(record)
@@ -357,6 +442,9 @@ async function scanFolderEntries(
       }
       if (head.kind === "unreadable") {
         unreadable += 1
+        if (unreadableEntries.length < MAX_UNREADABLE_REPORTED) {
+          unreadableEntries.push({ path: head.relativePath, reason: head.reason, kind: head.entryKind })
+        }
         continue
       }
       pendingFiles -= 1
@@ -366,6 +454,9 @@ async function scanFolderEntries(
         // Cancellation must escape instead of counting the file as unreadable.
         if (isScanCancelled(settlement.error) || signal?.aborted) throw new ScanCancelledError()
         unreadable += 1
+        if (unreadableEntries.length < MAX_UNREADABLE_REPORTED) {
+          unreadableEntries.push({ path: head.relativePath, reason: describeScanReason(settlement.error), kind: "file" })
+        }
         continue
       }
       // Oversize files are excluded like an ignore-pattern match, so they must not
@@ -379,10 +470,17 @@ async function scanFolderEntries(
         truncated = true
         break
       }
-      const { entry, settledIdentity } = settlement.inspection
+      const { entry, settledIdentity, reused, hashed } = settlement.inspection
       onEntry(entry)
       committedFiles += 1
-      if (digestCache && settledIdentity && entry.digest) digestCache.record(entry.path, { ...settledIdentity, digest: entry.digest })
+      if (reused) reusedFiles += 1
+      else if (hashed) hashedFiles += 1
+      else unhashedFiles += 1
+      if (settledIdentity && entry.digest) {
+        const settledDigest = { ...settledIdentity, digest: entry.digest }
+        if (digestCache) digestCache.record(entry.path, settledDigest)
+        options.onSettledDigest?.(entry.path, settledDigest)
+      }
     }
   } finally {
     // Close any directories the suspended walk still holds, then let abandoned
@@ -392,7 +490,13 @@ async function scanFolderEntries(
   }
   throwIfScanCancelled(signal)
   reportActivity("complete", "", true)
-  return { rootPath: root, files: committedFiles, ignored, unreadable, truncated }
+  // Advisory only: a throwing metrics listener must not fail the scan itself.
+  try {
+    options.onMetrics?.({ files: committedFiles, reusedFiles, hashedFiles, unhashedFiles, ignored, unreadable, truncated })
+  } catch {
+    // Metrics never change the scan result.
+  }
+  return { rootPath: root, files: committedFiles, ignored, unreadable, unreadableEntries, truncated }
 }
 
 /** Counters of a scan whose entries were streamed to a callback instead of collected. */
@@ -401,6 +505,7 @@ interface ScanSummary {
   files: number
   ignored: number
   unreadable: number
+  unreadableEntries: FolderScanIssue[]
   truncated: boolean
 }
 
@@ -411,7 +516,14 @@ export async function scanFolder(
 ): Promise<FileManifest> {
   const files: FileManifestEntry[] = []
   const summary = await scanFolderEntries(rootPath, ignorePatterns, options, (entry) => files.push(entry))
-  return { rootPath: summary.rootPath, files, ignored: summary.ignored, unreadable: summary.unreadable, truncated: summary.truncated }
+  return {
+    rootPath: summary.rootPath,
+    files,
+    ignored: summary.ignored,
+    unreadable: summary.unreadable,
+    unreadableEntries: summary.unreadableEntries,
+    truncated: summary.truncated,
+  }
 }
 
 /** A full-integrity scan reduced to its observation fingerprint. */
@@ -529,6 +641,10 @@ export function compareManifests(
     caseCollisions: [...caseCollisions].slice(0, 100),
     truncated: local.truncated || remote.truncated,
     samples,
+    unreadableLocal: local.unreadableEntries,
+    unreadableRemote: remote.unreadableEntries,
+    unreadableLocalCount: local.unreadable,
+    unreadableRemoteCount: remote.unreadable,
   }
 }
 
@@ -693,17 +809,97 @@ function hasUnpairedSurrogate(value: string): boolean {
 }
 
 type ManifestFileInspection =
-  | { outcome: "collected"; entry: FileManifestEntry; settledIdentity?: FileIdentity }
+  | { outcome: "collected"; entry: FileManifestEntry; settledIdentity?: FileIdentity; reused: boolean; hashed: boolean }
   | { outcome: "excluded-oversize" }
 
-function fileIdentity(stats: BigIntStats): FileIdentity {
-  return {
+/**
+ * Whether a previously computed digest may be trusted from this identity at
+ * all.
+ *
+ * A cached digest is only reusable when every identity value the platform
+ * provides proves the file has not changed: a stable volume id and file id
+ * (neither zero) and positive nanosecond modification and change timestamps.
+ * Filesystems that cannot supply those — FAT/exFAT file ids, some network and
+ * FUSE mounts, pre-epoch timestamps — fall back to rehashing forever rather
+ * than trusting weaker metadata. A miss is acceptable; a false hit is not.
+ *
+ * This is deliberately evaluated on both sides: a digest recorded before this
+ * rule existed, or by a platform that reported zeroed fields, is treated as a
+ * miss.
+ */
+export function identityIsReusable(identity: FileIdentity): boolean {
+  return isUsableDecimal(identity.device) &&
+    isUsableDecimal(identity.inode) &&
+    Number.isSafeInteger(identity.size) &&
+    identity.size >= 0 &&
+    isUsableDecimal(identity.modifiedNs) &&
+    isUsableDecimal(identity.changedNs)
+}
+
+function isUsableDecimal(value: string): boolean {
+  return /^[0-9]+$/.test(value) && !/^0+$/.test(value)
+}
+
+/** Linux `statfs` magics for FAT and exFAT, neither of which tracks a usable change time. */
+const MSDOS_SUPER_MAGIC = 0x4d44
+const EXFAT_SUPER_MAGIC = 0x2011bab0
+
+/**
+ * Whether the filesystem under a scan root can supply strong identity evidence
+ * at all.
+ *
+ * FAT and exFAT have no file index and no change time; a driver may still
+ * synthesize plausible-looking inode and ctime values that do not advance on a
+ * content write. Rather than trust those, reuse is disabled for the whole root
+ * on those filesystems and every file is read again. Windows skips the magic
+ * check because `statfs().type` is not meaningful there, and relies on the
+ * per-file gate: FAT/exFAT report a zero file index, which rejects reuse.
+ * A failure to determine the filesystem is treated as weak.
+ */
+export async function filesystemSupportsDigestReuse(rootPath: string): Promise<boolean> {
+  if (process.platform === "win32") return true
+  try {
+    const filesystem = await statfs(rootPath)
+    return filesystem.type !== MSDOS_SUPER_MAGIC && filesystem.type !== EXFAT_SUPER_MAGIC
+  } catch {
+    return false
+  }
+}
+
+/** Identity from a stat, or `undefined` when the platform/system values are too weak to reuse. */
+function fileIdentityFromStats(stats: BigIntStats): FileIdentity | undefined {
+  const identity: FileIdentity = {
     device: stats.dev.toString(),
     inode: stats.ino.toString(),
     size: Number(stats.size),
     modifiedNs: stats.mtimeNs.toString(),
     changedNs: stats.ctimeNs.toString(),
   }
+  return identityIsReusable(identity) ? identity : undefined
+}
+
+/**
+ * Reads the exact on-disk identity of a regular file, or `undefined` when the
+ * path is a symlink, not a file, or the platform cannot prove identity. Used
+ * to seed the digest cache with a file that was just written and verified.
+ */
+export async function statFileIdentity(absolutePath: string): Promise<FileIdentity | undefined> {
+  const stats = await lstat(absolutePath, { bigint: true })
+  if (stats.isSymbolicLink() || !stats.isFile()) return undefined
+  return fileIdentityFromStats(stats)
+}
+
+/**
+ * Whether a scan issue blocks a relative path: an inaccessible file blocks
+ * exactly that path, an inaccessible directory blocks the directory and
+ * everything beneath it, and an inaccessible root blocks the whole tree.
+ */
+export function isPathBlockedByScanIssue(relativePath: string, issues: readonly FolderScanIssue[]): boolean {
+  return issues.some((issue) => {
+    if (issue.kind === "file") return relativePath === issue.path
+    if (issue.path === "") return true
+    return relativePath === issue.path || relativePath.startsWith(`${issue.path}/`)
+  })
 }
 
 function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
@@ -725,6 +921,7 @@ async function inspectManifestFile(
   signal?: AbortSignal | null,
   getHashBuffer?: () => Buffer,
   cached?: CachedFileDigest,
+  identityReuseAllowed = true,
 ): Promise<ManifestFileInspection> {
   throwIfScanCancelled(signal)
   const absolutePath = resolveWithinRoot(rootPath, relativePath)
@@ -735,9 +932,20 @@ async function inspectManifestFile(
   if (!isCanonicalPathInside(canonicalRoot, canonicalFile)) throw new Error("The manifest file escapes the folder root.")
   // Excluded before the file is opened, so an oversize file is never read or hashed.
   if (Number(entry.size) > maxFileBytes) return { outcome: "excluded-oversize" }
-  // An exact identity match means the bytes hashed earlier are still the bytes on disk.
-  if (cached && sameIdentity(cached, fileIdentity(entry))) {
-    return { outcome: "collected", entry: { path: relativePath, size: Number(entry.size), modifiedMs: modifiedMsFromNs(entry.mtimeNs), digest: cached.digest } }
+  // An exact identity match means the bytes hashed earlier are still the bytes
+  // on disk. Both the cached entry and the current file must carry a usable
+  // identity; a legacy or weak cache row is a miss, never a hit.
+  const currentIdentity = fileIdentityFromStats(entry)
+  if (identityReuseAllowed && cached && identityIsReusable(cached) && currentIdentity && sameIdentity(cached, currentIdentity)) {
+    return {
+      outcome: "collected",
+      entry: { path: relativePath, size: Number(entry.size), modifiedMs: modifiedMsFromNs(entry.mtimeNs), digest: cached.digest },
+      // The cached identity is re-verified against the current file, so it can
+      // seed the durable cache again: the digest still belongs to these bytes.
+      settledIdentity: cached,
+      reused: true,
+      hashed: false,
+    }
   }
 
   const hashStartedNs = BigInt(Date.now()) * 1_000_000n
@@ -777,10 +985,21 @@ async function inspectManifestFile(
       throw new Error("The manifest file changed while it was read.")
     }
     const collected: FileManifestEntry = { path: relativePath, size, modifiedMs: modifiedMsFromNs(initial.mtimeNs), digest }
-    const identity = fileIdentity(after)
+    const initialIdentity = fileIdentityFromStats(initial)
+    const identity = fileIdentityFromStats(after)
     const latestChangeNs = after.mtimeNs > after.ctimeNs ? after.mtimeNs : after.ctimeNs
-    const settled = digest !== undefined && sameIdentity(fileIdentity(initial), identity) && latestChangeNs <= hashStartedNs - DIGEST_SETTLE_NS
-    return settled ? { outcome: "collected", entry: collected, settledIdentity: identity } : { outcome: "collected", entry: collected }
+    // Settling requires a usable identity on both ends of the read: without
+    // it the digest is still produced, but it is never offered for reuse.
+    const settled = identityReuseAllowed &&
+      digest !== undefined &&
+      initialIdentity !== undefined &&
+      identity !== undefined &&
+      sameIdentity(initialIdentity, identity) &&
+      latestChangeNs <= hashStartedNs - DIGEST_SETTLE_NS
+    if (settled && identity !== undefined) {
+      return { outcome: "collected", entry: collected, settledIdentity: identity, reused: false, hashed: true }
+    }
+    return { outcome: "collected", entry: collected, reused: false, hashed: digest !== undefined }
   } finally {
     await handle.close()
   }
@@ -836,7 +1055,7 @@ export function parsePeerManifest(value: unknown): FileManifest {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("The paired computer returned an invalid folder scan.")
   }
-  const candidate = value as Partial<FileManifest> & { files?: unknown }
+  const candidate = value as Partial<FileManifest> & { files?: unknown; unreadableEntries?: unknown }
   if (typeof candidate.rootPath !== "string" || !Array.isArray(candidate.files)) {
     throw new Error("The paired computer returned an invalid folder scan.")
   }
@@ -872,7 +1091,42 @@ export function parsePeerManifest(value: unknown): FileManifest {
   const unreadable = typeof candidate.unreadable === "number" && Number.isSafeInteger(candidate.unreadable) && candidate.unreadable >= 0
     ? candidate.unreadable
     : 0
-  return { rootPath: candidate.rootPath, files, ignored, unreadable, truncated: candidate.truncated === true }
+  return {
+    rootPath: candidate.rootPath,
+    files,
+    ignored,
+    unreadable,
+    unreadableEntries: parsePeerScanIssues(candidate.unreadableEntries),
+    truncated: candidate.truncated === true,
+  }
+}
+
+/**
+ * Validates the bounded unreadable-path report from an untrusted peer. A
+ * missing report from an older version becomes an empty list; a malformed one
+ * fails closed rather than letting invented paths reach the UI.
+ */
+function parsePeerScanIssues(value: unknown): FolderScanIssue[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.length > MAX_UNREADABLE_REPORTED) {
+    throw new Error("The paired computer returned an invalid folder scan.")
+  }
+  return value.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("The paired computer returned an invalid folder scan.")
+    }
+    const issue = item as Partial<FolderScanIssue>
+    if (
+      typeof issue.path !== "string" ||
+      Buffer.byteLength(issue.path, "utf8") > MAX_MANIFEST_PATH_BYTES ||
+      issue.path.includes("\0") ||
+      typeof issue.reason !== "string" || issue.reason.length === 0 || issue.reason.length > 200 ||
+      (issue.kind !== "file" && issue.kind !== "directory")
+    ) {
+      throw new Error("The paired computer returned an invalid folder scan.")
+    }
+    return { path: issue.path, reason: issue.reason, kind: issue.kind }
+  })
 }
 
 /** Thin manifest-shaped wrapper over the shared estimator; see `../shared/sync-capacity` for the estimate itself. */

@@ -6,7 +6,7 @@ import { folderComparisonResult, unwrapFolderComparisonResult } from "../src/sha
 
 const peer = { id: "peer", name: "Office PC" }
 const input = { path: "C:\\coding", ignorePatterns: ["**/node_modules/**"] }
-const manifest = { rootPath: input.path, files: [], ignored: 0, unreadable: 0, truncated: false }
+const manifest = { rootPath: input.path, files: [], ignored: 0, unreadable: 0, unreadableEntries: [], truncated: false }
 const activity = { stage: "hashing" as const, scannedFiles: 4, ignoredEntries: 2, unreadableEntries: 0, hashedBytes: 100 }
 
 describe("peer preview compatibility", () => {

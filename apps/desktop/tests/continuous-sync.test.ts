@@ -99,6 +99,7 @@ describe("continuous sync helpers", () => {
       files: [{ path: "large.bin", size: 20, modifiedMs: 1 }],
       ignored: 0,
       unreadable: 0,
+      unreadableEntries: [],
       truncated: false,
     })).toThrow("did not produce a digest")
   })

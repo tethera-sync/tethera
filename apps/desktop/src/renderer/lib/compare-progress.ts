@@ -41,6 +41,8 @@ export interface CompareTextOptions {
   scannedFiles?: number
   activity?: FolderPreviewProgress["activity"]
   elapsed: string
+  /** True when the comparison reused saved scans instead of walking the folders again. */
+  reused?: boolean
 }
 
 /**
@@ -52,14 +54,18 @@ export function comparePhaseText(
   phase: ComparePhase | null,
   options: CompareTextOptions,
 ): { headline: string; detail: string } {
-  const { thisComputer, otherComputer, scannedFiles, activity, elapsed } = options
+  const { thisComputer, otherComputer, scannedFiles, activity, elapsed, reused } = options
   const elapsedSuffix = ` · ${elapsed} elapsed`
   if ((phase === "scan-local" || phase === "scan-remote") && activity) {
     const computer = phase === "scan-local" ? thisComputer : otherComputer
     const action = { listing: "Listing folders", inspecting: "Checking file metadata", hashing: "Reading file contents to compare", complete: "Scan finished" }[activity.stage]
+    const reusedCount = activity.reusedFiles ?? 0
+    const reusedNote = reusedCount > 0
+      ? ` · ${reusedCount.toLocaleString("en-GB")} unchanged files reused without re-reading`
+      : ""
     return {
       headline: `${action} on ${computer}${activity.stage === "complete" ? "." : "…"}`,
-      detail: `${activity.scannedFiles.toLocaleString("en-GB")} files checked · ${formatBytes(activity.hashedBytes)} hashed · ${activity.ignoredEntries.toLocaleString("en-GB")} excluded entries · ${activity.unreadableEntries.toLocaleString("en-GB")} unreadable. Nothing is copied${elapsedSuffix}.`,
+      detail: `${activity.scannedFiles.toLocaleString("en-GB")} files checked${reusedNote} · ${formatBytes(activity.hashedBytes)} hashed · ${activity.ignoredEntries.toLocaleString("en-GB")} excluded entries · ${activity.unreadableEntries.toLocaleString("en-GB")} unreadable. Nothing is copied${elapsedSuffix}.`,
     }
   }
   if (phase === "scan-local") {
@@ -76,6 +82,12 @@ export function comparePhaseText(
     }
   }
   if (phase === "compare") {
+    if (reused) {
+      return {
+        headline: "Reusing the comparison you reviewed…",
+        detail: `No folders were re-scanned. The saved file lists are being matched up${elapsedSuffix}.`,
+      }
+    }
     return {
       headline: "Comparing the two file lists…",
       detail: `Both scans are in; matching them up${elapsedSuffix}.`,

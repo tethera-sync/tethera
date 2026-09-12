@@ -16,8 +16,8 @@ export function appSnapshot(overrides: Partial<AppSnapshot> = {}): AppSnapshot {
 }
 
 /** Builds a minimal in-memory manifest for comparison and sync-plan tests. */
-export function manifest(files: FileManifest["files"]): FileManifest {
-  return { rootPath: "/tmp/test", files, ignored: 0, unreadable: 0, truncated: false }
+export function manifest(files: FileManifest["files"], unreadableEntries: FileManifest["unreadableEntries"] = []): FileManifest {
+  return { rootPath: "/tmp/test", files, ignored: 0, unreadable: unreadableEntries.length, unreadableEntries, truncated: false }
 }
 
 /** Lowercase SHA-256 hex digest used to build deterministic fixtures. */

@@ -382,6 +382,14 @@ function sanitisePreviewForBackup(preview: FolderMappingPreview): Record<string,
       category: sample.category,
       ...(sample.size === undefined ? {} : { size: sample.size }),
     })),
+    ...(preview.unreadableLocal
+      ? { unreadableLocal: preview.unreadableLocal.map((issue) => ({ path: issue.path, reason: issue.reason, kind: issue.kind })) }
+      : {}),
+    ...(preview.unreadableRemote
+      ? { unreadableRemote: preview.unreadableRemote.map((issue) => ({ path: issue.path, reason: issue.reason, kind: issue.kind })) }
+      : {}),
+    ...(preview.unreadableLocalCount === undefined ? {} : { unreadableLocalCount: preview.unreadableLocalCount }),
+    ...(preview.unreadableRemoteCount === undefined ? {} : { unreadableRemoteCount: preview.unreadableRemoteCount }),
   }
 }
 

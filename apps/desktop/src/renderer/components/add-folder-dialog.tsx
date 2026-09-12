@@ -1,4 +1,4 @@
-import { useMemo, useState, type ChangeEvent } from "react"
+import { useMemo, useRef, useState, type ChangeEvent } from "react"
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
@@ -18,6 +18,7 @@ import type {
 } from "@shared/contracts"
 import { CompareStatus } from "@/components/compare-status"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
+import { ScanIssuesAlert } from "@/components/scan-issues-alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -37,6 +38,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import { formatBytes } from "@/lib/format"
 import { formatElapsed, useElapsedSeconds, type ComparePhase } from "@/lib/compare-progress"
+import { emptyScanIssueReport, scanIssueReportFromPreview, scanIssueTotal } from "@shared/folder-scan-issues"
 
 const defaultIgnorePatterns = [".DS_Store", "Thumbs.db", "desktop.ini", "*.tmp", "~$*"]
 type PickerTarget = "local" | "remote" | null
@@ -80,6 +82,7 @@ export function AddFolderDialog({
     phase: ComparePhase | null
     scannedFiles?: number
     activity?: FolderScanActivity
+    reused?: boolean
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const elapsed = formatElapsed(useElapsedSeconds(compare !== null))
@@ -91,6 +94,9 @@ export function AddFolderDialog({
   const [historyDays, setHistoryDays] = useState(30)
   const [historyMaxGb, setHistoryMaxGb] = useState(10)
   const [preview, setPreview] = useState<FolderMappingPreview | null>(null)
+  // Acknowledgement is tied to the exact preview object, so any refreshed
+  // comparison resets it without extra effects.
+  const [acknowledgedPreview, setAcknowledgedPreview] = useState<FolderMappingPreview | null>(null)
   const [cancelRequested, setCancelRequested] = useState(false)
 
   const ignorePatterns = useMemo(
@@ -99,16 +105,33 @@ export function AddFolderDialog({
   )
   const canContinue = Boolean(localPath.trim() && remotePath.trim())
   const hasBlockingWarnings = Boolean(preview?.invalidWindowsNames.length || preview?.caseCollisions.length)
+  const issueReport = preview ? scanIssueReportFromPreview(preview) : emptyScanIssueReport()
+  const issueTotal = scanIssueTotal(issueReport)
+  const issuesAcknowledged = preview !== null && acknowledgedPreview === preview
+  // One operation id per review attempt lets the main process reuse the scans
+  // from "Review initial merge" for the approval request instead of walking
+  // both folders again.
+  const comparisonIdRef = useRef<string | null>(null)
+
+  function comparisonOperationId(): string {
+    comparisonIdRef.current ??= crypto.randomUUID()
+    return comparisonIdRef.current
+  }
+
+  function invalidatePreview(): void {
+    comparisonIdRef.current = null
+    setPreview(null)
+  }
 
   function chooseLocalPath(selected: string) {
     setLocalPath(selected)
-    setPreview(null)
+    invalidatePreview()
     if (!name) setName(selected.split(/[\\/]/).filter(Boolean).at(-1) ?? "Synced folder")
   }
 
   function chooseRemotePath(selected: string) {
     setRemotePath(selected)
-    setPreview(null)
+    invalidatePreview()
   }
 
   function mappingInput(): Omit<RequestFolderMappingInput, "preview"> {
@@ -131,7 +154,7 @@ export function AddFolderDialog({
       if (progress.operationId !== operationId) return
       setCompare((current) =>
         current?.operationId === operationId
-          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles, activity: progress.activity }
+          ? { ...current, phase: progress.phase, scannedFiles: progress.scannedFiles, activity: progress.activity, reused: progress.reused ?? current.reused }
           : current,
       )
     })
@@ -139,7 +162,7 @@ export function AddFolderDialog({
 
   async function buildPreview() {
     if (!canContinue || !targetDevice || targetDevice.status !== "online" || compare) return
-    const operationId = crypto.randomUUID()
+    const operationId = comparisonOperationId()
     setCancelRequested(false)
     setCompare({ operationId, kind: "preview", phase: null })
     setError(null)
@@ -159,7 +182,8 @@ export function AddFolderDialog({
 
   async function requestApproval() {
     if (!preview || !targetDevice || targetDevice.status !== "online" || hasBlockingWarnings || compare) return
-    const operationId = crypto.randomUUID()
+    if (issueTotal > 0 && !issuesAcknowledged) return
+    const operationId = comparisonOperationId()
     setCancelRequested(false)
     setCompare({ operationId, kind: "request", phase: null })
     setError(null)
@@ -199,7 +223,7 @@ export function AddFolderDialog({
     setPatterns(defaultIgnorePatterns.join("\n"))
     setHistoryDays(30)
     setHistoryMaxGb(10)
-    setPreview(null)
+    invalidatePreview()
     setPickerTarget(null)
     setSelectedDeviceId(defaultDevice?.id ?? "")
     setError(null)
@@ -220,7 +244,7 @@ export function AddFolderDialog({
           <PlusIcon data-icon="inline-start" />
           Add folder
         </DialogTrigger>
-        <DialogContent className="mapping-wizard-dialog max-w-[780px]" showCloseButton={!compare}>
+        <DialogContent className="mapping-wizard-dialog max-w-[min(780px,calc(100%-2rem))]" showCloseButton={!compare}>
           <DialogHeader>
             <DialogTitle>Create a folder mapping</DialogTitle>
             <DialogDescription>
@@ -247,7 +271,7 @@ export function AddFolderDialog({
                     onChange={(event: ChangeEvent<HTMLSelectElement>) => {
                       setSelectedDeviceId(event.target.value)
                       setRemotePath("")
-                      setPreview(null)
+                      invalidatePreview()
                       setError(null)
                     }}
                   >
@@ -275,7 +299,7 @@ export function AddFolderDialog({
             <fieldset disabled={compare !== null} className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px] [border:0] [padding:0] [min-width:0]">
               <Field>
                 <FieldLabel>Sync direction</FieldLabel>
-                <NativeSelect className="w-full" value={mode} onChange={(event: ChangeEvent<HTMLSelectElement>) => { setMode(event.target.value as SyncMode); setPreview(null) }}>
+                <NativeSelect className="w-full" value={mode} onChange={(event: ChangeEvent<HTMLSelectElement>) => { setMode(event.target.value as SyncMode); invalidatePreview() }}>
                   <NativeSelectOption value="two-way">Two-way sync</NativeSelectOption>
                   <NativeSelectOption value="send-only">Send from this computer only</NativeSelectOption>
                   <NativeSelectOption value="receive-only">Receive to this computer only</NativeSelectOption>
@@ -296,7 +320,7 @@ export function AddFolderDialog({
               <p className="text-xs text-[var(--muted-foreground)]">Tethera keeps every replaced version for now. Both values are saved with the folder for a future cleanup policy; nothing is pruned or deleted yet, so history disk use is not limited today.</p>
               <Field>
                 <FieldLabel>Ignore patterns</FieldLabel>
-                <Textarea className="min-h-36 resize-y font-mono text-xs" value={patterns} onChange={(event: ChangeEvent<HTMLTextAreaElement>) => { setPatterns(event.target.value); setPreview(null) }} />
+                <Textarea className="min-h-36 resize-y font-mono text-xs" value={patterns} onChange={(event: ChangeEvent<HTMLTextAreaElement>) => { setPatterns(event.target.value); invalidatePreview() }} />
                 <FieldDescription>One glob-style pattern per line. Subfolders sync recursively unless ignored. Exclude large generated folders to keep scans and previews fast.</FieldDescription>
               </Field>
             </fieldset>
@@ -304,6 +328,16 @@ export function AddFolderDialog({
 
           {step === "preview" && preview ? (
             targetDevice ? <MappingPreviewView preview={preview} localName={localDevice.name} remoteName={targetDevice.name} /> : null
+          ) : null}
+
+          {step === "preview" && preview && targetDevice && issueTotal > 0 ? (
+            <ScanIssuesAlert
+              report={issueReport}
+              localName={localDevice.name}
+              remoteName={targetDevice.name}
+              acknowledged={issuesAcknowledged}
+              onAcknowledgedChange={(value) => setAcknowledgedPreview(value ? preview : null)}
+            />
           ) : null}
 
           {compare ? (
@@ -315,6 +349,7 @@ export function AddFolderDialog({
               scannedFiles={compare.scannedFiles}
               activity={compare.activity}
               elapsed={elapsed}
+              reused={compare.reused ?? false}
             />
           ) : null}
 
@@ -339,10 +374,17 @@ export function AddFolderDialog({
               </Button>
             ) : null}
             {step === "preview" ? (
-              <Button disabled={!targetDevice || targetDevice.status !== "online" || compare !== null || hasBlockingWarnings} onClick={() => void requestApproval()}>
-                {compare ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <SendIcon data-icon="inline-start" />}
-                {compare ? "Verifying & sending…" : "Request approval"}
-              </Button>
+              <>
+                {issueTotal > 0 ? (
+                  <Button variant="outline" disabled={compare !== null} onClick={() => setOpen(false)}>
+                    Cancel and fix access
+                  </Button>
+                ) : null}
+                <Button disabled={!targetDevice || targetDevice.status !== "online" || compare !== null || hasBlockingWarnings || (issueTotal > 0 && !issuesAcknowledged)} onClick={() => void requestApproval()}>
+                  {compare ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <SendIcon data-icon="inline-start" />}
+                  {compare ? (compare.reused ? "Sending for approval…" : "Verifying & sending…") : issueTotal > 0 ? "Continue anyway" : "Request approval"}
+                </Button>
+              </>
             ) : null}
           </DialogFooter>
         </DialogContent>
@@ -384,6 +426,7 @@ function WizardSteps({ step }: { step: Step }) {
 
 function MappingPreviewView({ preview, localName, remoteName }: { preview: FolderMappingPreview; localName: string; remoteName: string }) {
   const warnings = preview.invalidWindowsNames.length + preview.caseCollisions.length
+  const unreadable = (preview.unreadableLocalCount ?? preview.unreadableLocal?.length ?? 0) + (preview.unreadableRemoteCount ?? preview.unreadableRemote?.length ?? 0)
   return (
     <div className="mapping-preview [display:grid] [gap:14px] [margin-top:20px]">
       <div className="preview-summary-grid [display:grid] [grid-template-columns:repeat(4,_minmax(0,_1fr))] [gap:10px] max-[760px]:[grid-template-columns:repeat(2,_minmax(0,_1fr))]">
@@ -427,7 +470,7 @@ function MappingPreviewView({ preview, localName, remoteName }: { preview: Folde
 
       <div className="preview-details [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)]">
         <div className="preview-details-heading [display:flex] [align-items:center] [justify-content:space-between] [padding:10px_12px] [border-bottom:1px_solid_var(--border)] [background:var(--surface)] [&_strong]:[font-size:11px]"><strong>Largest differences</strong><Badge variant={warnings ? "danger" : "neutral"}>{preview.samples.length} shown</Badge></div>
-        {preview.samples.length === 0 ? <p className="preview-empty [padding:18px] [text-align:center] [color:var(--muted-foreground)] [font-size:11px]">Both folders currently contain the same files.</p> : (
+        {preview.samples.length === 0 ? <p className="preview-empty [padding:18px] [text-align:center] [color:var(--muted-foreground)] [font-size:11px]">{unreadable > 0 ? "Nothing readable differs; some items could not be read." : "Both folders currently contain the same files."}</p> : (
           <div className="preview-file-list [max-height:190px] [overflow:auto] [&>div]:[display:grid] [&>div]:[grid-template-columns:auto_minmax(0,_1fr)_auto] [&>div]:[align-items:center] [&>div]:[gap:8px] [&>div]:[padding:8px_12px] [&>div]:[border-top:1px_solid_color-mix(in_oklab,_var(--border)_60%,_transparent)] [&>div:first-child]:[border-top:0] [&_code]:[overflow:hidden] [&_code]:[text-overflow:ellipsis] [&_code]:[white-space:nowrap] [&_code]:[font-size:10px] [&_small]:[color:var(--muted-foreground)] [&_small]:[font-size:9px]">
             {preview.samples.map((item) => (
               <div key={`${item.category}:${item.path}`}><span data-category={item.category} className="preview-dot [width:7px] [height:7px] [border-radius:999px] [background:var(--muted-foreground)] data-[category=local-only]:[background:var(--chart-1)] data-[category=remote-only]:[background:var(--chart-2)] data-[category=different]:[background:var(--warning)] data-[category=invalid-name]:[background:var(--warning)] data-[category=case-collision]:[background:var(--warning)]" /><code title={item.path}>{item.path}</code><small>{previewCategory(item.category)}{item.size ? ` · ${formatBytes(item.size)}` : ""}</small></div>

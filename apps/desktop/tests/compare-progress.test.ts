@@ -58,4 +58,20 @@ describe("comparePhaseText", () => {
     expect(starting.headline).toContain("Starting")
     expect(starting.detail.toLowerCase()).toContain("large folders")
   })
+
+  test("reports reused files instead of claiming every file was read", () => {
+    const text = comparePhaseText("scan-local", { ...options, activity: {
+      stage: "hashing", currentPath: "src/app.ts", scannedFiles: 100,
+      ignoredEntries: 0, unreadableEntries: 0, hashedBytes: 0, reusedFiles: 97,
+    } })
+    expect(text.detail).toContain("97 unchanged files reused without re-reading")
+    expect(text.detail).toContain("0 B hashed")
+  })
+
+  test("a cache-backed compare never reads as a fresh scan", () => {
+    const text = comparePhaseText("compare", { ...options, reused: true })
+    expect(text.headline).toContain("Reusing the comparison you reviewed")
+    expect(text.detail).toContain("No folders were re-scanned")
+    expect(comparePhaseText("compare", options).headline).not.toContain("Reusing")
+  })
 })
