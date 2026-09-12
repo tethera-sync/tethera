@@ -129,7 +129,7 @@ A cached digest for a path may be reused only when all of the following hold:
 2. The size is unchanged and every identity value still matches exactly.
 3. For the durable cache, the digest was recorded when the file's timestamps sat at least two seconds behind the moment hashing began, so a write sharing a coarse timestamp tick cannot hide behind an unchanged identity.
 
-If any field is missing, zero, negative or different — including a legacy cache row recorded before this rule existed — the file is read and hashed again. Full-integrity sweeps ignore the cache entirely on the first sweep after launch and at least once every 24 hours. A miss is acceptable; a false hit is not.
+If a device id, file id or timestamp is missing, zero or negative, or if any identity value differs — including a legacy cache row recorded before this rule existed — the file is read and hashed again. A zero-length file is valid and may reuse its digest. Full-integrity sweeps ignore the cache entirely on the first sweep after launch and at least once every 24 hours. A miss is acceptable; a false hit is not.
 
 ### Platform behaviour behind those fields
 
