@@ -382,6 +382,8 @@ function FolderCard({
           localName={localDeviceName}
           remoteName={remoteDevice?.name ?? "Paired computer"}
           working={pendingAction === "continue-merge" || pendingAction === "dismiss-issues"}
+          continueEnabled={mutationsEnabled && initialSyncBlockedReason === undefined}
+          continueDisabledReason={!mutationsEnabled ? disabledReason : initialSyncBlockedReason}
           error={actionError}
           onContinue={() => void continueInitialSync()}
           onDismiss={() => void dismissIssues()}

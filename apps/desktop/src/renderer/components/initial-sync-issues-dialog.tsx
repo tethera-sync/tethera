@@ -22,6 +22,8 @@ export function InitialSyncIssuesDialog({
   localName,
   remoteName,
   working,
+  continueEnabled,
+  continueDisabledReason,
   error,
   onContinue,
   onDismiss,
@@ -30,6 +32,9 @@ export function InitialSyncIssuesDialog({
   localName: string
   remoteName: string
   working: boolean
+  /** False while the folder is paused, globally paused, or its peer is offline. */
+  continueEnabled: boolean
+  continueDisabledReason?: string
   error?: string | null
   onContinue: () => void
   onDismiss: () => void
@@ -58,7 +63,11 @@ export function InitialSyncIssuesDialog({
           <Button variant="outline" disabled={working} onClick={onDismiss}>
             Cancel and fix access
           </Button>
-          <Button disabled={working} onClick={onContinue}>
+          <Button
+            disabled={working || !continueEnabled}
+            title={continueEnabled ? undefined : continueDisabledReason}
+            onClick={onContinue}
+          >
             {working ? "Starting…" : `Continue anyway and skip ${formatScanIssueCount(total)}`}
           </Button>
         </DialogFooter>
