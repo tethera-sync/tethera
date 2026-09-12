@@ -93,7 +93,7 @@ describe("scan cancellation", () => {
         await new Promise((_, reject) => {
           signal.addEventListener("abort", () => reject(new ScanCancelledError()), { once: true })
         })
-        return { rootPath: "/peer", files: [], ignored: 0, unreadable: 0, truncated: false }
+        return { rootPath: "/peer", files: [], ignored: 0, unreadable: 0, unreadableEntries: [], truncated: false }
       },
     )).rejects.toThrow("local disk vanished")
     expect(peerAborted).toBe(true)
@@ -183,7 +183,7 @@ describe("comparison equivalence and peer validation", () => {
   })
 
   test("peer manifests reject duplicates, bad sizes and bad digests but keep truncation explicit", () => {
-    const base = { rootPath: "/peer", files: [{ path: "a.txt", size: 1, modifiedMs: 1, digest: "a".repeat(64) }], ignored: 0, unreadable: 0, truncated: true }
+    const base = { rootPath: "/peer", files: [{ path: "a.txt", size: 1, modifiedMs: 1, digest: "a".repeat(64) }], ignored: 0, unreadable: 0, unreadableEntries: [], truncated: true }
     expect(folderManifestTestHelpers.parsePeerManifest(base).truncated).toBe(true)
     expect(() => folderManifestTestHelpers.parsePeerManifest({
       ...base,
@@ -200,7 +200,7 @@ describe("comparison equivalence and peer validation", () => {
   })
 
   test("encoded-byte budgets fail closed before serialization", () => {
-    const small = { rootPath: "/local", files: [{ path: "a.txt", size: 1, modifiedMs: 1, digest: "a".repeat(64) }], ignored: 0, unreadable: 0, truncated: false }
+    const small = { rootPath: "/local", files: [{ path: "a.txt", size: 1, modifiedMs: 1, digest: "a".repeat(64) }], ignored: 0, unreadable: 0, unreadableEntries: [], truncated: false }
     expect(folderManifestTestHelpers.estimateManifestEncodedBytes(small)).toBeLessThan(12 * 1024 * 1024)
     const hugePath = "p".repeat(4000)
     const many = {
@@ -226,7 +226,7 @@ describe("comparison equivalence and peer validation", () => {
       modifiedMs: 1,
       digest: "a".repeat(64),
     }))
-    const manifest = { rootPath: "/local", files, ignored: 0, unreadable: 0, truncated: false }
+    const manifest = { rootPath: "/local", files, ignored: 0, unreadable: 0, unreadableEntries: [], truncated: false }
     const plaintextBytes = Buffer.byteLength(JSON.stringify(files), "utf8")
     const estimated = folderManifestTestHelpers.estimateManifestEncodedBytes(manifest)
     expect(estimated).toBeGreaterThan(Math.ceil(plaintextBytes * 1.37) + 512)
@@ -243,7 +243,7 @@ describe("comparison equivalence and peer validation", () => {
       size: 1,
       modifiedMs: 1,
     }))
-    const manifest = { rootPath: "/local", files, ignored: 0, unreadable: 0, truncated: false }
+    const manifest = { rootPath: "/local", files, ignored: 0, unreadable: 0, unreadableEntries: [], truncated: false }
     const estimated = folderManifestTestHelpers.estimateManifestEncodedBytes(manifest)
     expect(estimated).toBeLessThan(12 * 1024 * 1024)
     expect(() => folderManifestTestHelpers.assertManifestWithinLegacyByteBudget(manifest, "This computer")).not.toThrow()
@@ -255,7 +255,7 @@ describe("comparison equivalence and peer validation", () => {
       size: 1,
       modifiedMs: 1,
     }))
-    const manifest = { rootPath: "/local", files, ignored: 0, unreadable: 0, truncated: false }
+    const manifest = { rootPath: "/local", files, ignored: 0, unreadable: 0, unreadableEntries: [], truncated: false }
     const estimated = folderManifestTestHelpers.estimateManifestEncodedBytes(manifest)
     expect(estimated).toBeGreaterThan(12 * 1024 * 1024)
     expect(() => folderManifestTestHelpers.assertManifestWithinLegacyByteBudget(manifest, "This computer")).toThrow("MiB legacy budget")

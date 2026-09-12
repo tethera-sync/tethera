@@ -3,6 +3,7 @@ import { constants } from "node:fs"
 import { mkdir, open, readFile } from "node:fs/promises"
 import path from "node:path"
 import type { FolderMappingPreview, FolderSetupStatus, FolderSummary, SyncMode } from "../shared/contracts"
+import { isFolderScanIssue, MAX_UNREADABLE_REPORTED } from "./folder-manifest"
 import {
   mappingConfigurationFromLegacyFolder,
   type LegacyImportRecord,
@@ -301,8 +302,28 @@ function isPreview(value: unknown): value is FolderMappingPreview {
           String(sample.category),
         ) &&
         (sample.size === undefined || (Number.isSafeInteger(sample.size) && (sample.size as number) >= 0)),
-    )
+    ) &&
+    // Optional scan-issue detail: a malformed value must fail validation here,
+    // not throw later in `sanitisePreviewForBackup`.
+    isOptionalScanIssueArray(value.unreadableLocal) &&
+    isOptionalScanIssueArray(value.unreadableRemote) &&
+    isOptionalScanIssueCount(value.unreadableLocalCount) &&
+    isOptionalScanIssueCount(value.unreadableRemoteCount)
   )
+}
+
+/** One persisted scan issue, validated with the same rules as a peer-supplied report. */
+function isOptionalScanIssueArray(value: unknown): boolean {
+  return value === undefined || (
+    Array.isArray(value) &&
+    value.length <= MAX_UNREADABLE_REPORTED &&
+    value.every(isFolderScanIssue)
+  )
+}
+
+/** Totals are not capped like the detail list; they only have to be non-negative safe integers. */
+function isOptionalScanIssueCount(value: unknown): boolean {
+  return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
 }
 
 function sanitiseLegacyFolderForBackup(folder: Record<string, unknown>): Record<string, unknown> {
@@ -382,6 +403,14 @@ function sanitisePreviewForBackup(preview: FolderMappingPreview): Record<string,
       category: sample.category,
       ...(sample.size === undefined ? {} : { size: sample.size }),
     })),
+    ...(preview.unreadableLocal
+      ? { unreadableLocal: preview.unreadableLocal.map((issue) => ({ path: issue.path, reason: issue.reason, kind: issue.kind })) }
+      : {}),
+    ...(preview.unreadableRemote
+      ? { unreadableRemote: preview.unreadableRemote.map((issue) => ({ path: issue.path, reason: issue.reason, kind: issue.kind })) }
+      : {}),
+    ...(preview.unreadableLocalCount === undefined ? {} : { unreadableLocalCount: preview.unreadableLocalCount }),
+    ...(preview.unreadableRemoteCount === undefined ? {} : { unreadableRemoteCount: preview.unreadableRemoteCount }),
   }
 }
 

@@ -2,9 +2,9 @@ import { constants } from "node:fs"
 import { link, lstat, mkdir, open, realpath, rename, statfs, unlink } from "node:fs/promises"
 import { createHash, randomBytes } from "node:crypto"
 import path from "node:path"
-import type { SyncMode } from "../shared/contracts"
+import type { FolderScanIssue, SyncMode } from "../shared/contracts"
 import type { FileManifest, FileManifestEntry } from "./folder-manifest"
-import { manifestEntriesMatch } from "./folder-manifest"
+import { createScanIssueBlocklist, manifestEntriesMatch } from "./folder-manifest"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import { describeTransferFile, isSha256HexDigest } from "./file-transfer"
 import { invertMode } from "./mapping-index"
@@ -33,6 +33,8 @@ export interface InitialSyncPassResult {
   copiedBytes: number
   fileCount: number
   skipped: SyncSkip[]
+  /** Unreadable items the merge skipped after the user chose to continue. */
+  unreadableSkipped: SyncSkip[]
 }
 
 export interface InitialMergeConvergence {
@@ -59,6 +61,15 @@ export async function runCoordinatedInitialMerge(
   return { local, peer }
 }
 
+export interface SyncPlanOptions {
+  /**
+   * Inaccessible paths on the destination side. A path that could not be
+   * read cannot be written either, so it is left out of the plan instead of
+   * failing the whole merge. The issue is reported separately.
+   */
+  destinationBlocked?: readonly FolderScanIssue[]
+}
+
 /**
  * Only ever pulls: files that exist on the remote side but not locally are
  * copied down. Files that exist on both sides but differ are left alone
@@ -66,15 +77,16 @@ export async function runCoordinatedInitialMerge(
  * revision model this codebase doesn't have yet. The coordinator asks the
  * other device to run the inverse pass, which copies this side's local-only files.
  */
-export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode: SyncMode): SyncPlan {
+export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode: SyncMode, options: SyncPlanOptions = {}): SyncPlan {
   const localByPath = new Map(local.files.map((entry) => [entry.path, entry]))
+  const isBlocked = createScanIssueBlocklist(options.destinationBlocked ?? [])
   const toPull: FileManifestEntry[] = []
   const skipped: SyncSkip[] = []
 
   for (const remoteEntry of remote.files) {
     const localEntry = localByPath.get(remoteEntry.path)
     if (!localEntry) {
-      if (mode !== "send-only") toPull.push(remoteEntry)
+      if (mode !== "send-only" && !isBlocked(remoteEntry.path)) toPull.push(remoteEntry)
       continue
     }
 
@@ -89,15 +101,23 @@ export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode:
   return { toPull, skipped }
 }
 
+export interface ConvergenceOptions {
+  /** Inaccessible paths on this computer, already accepted by the user. */
+  localBlocked?: readonly FolderScanIssue[]
+  /** Inaccessible paths on the paired computer, already accepted by the user. */
+  remoteBlocked?: readonly FolderScanIssue[]
+}
+
 /** A fresh two-sided check used before activation; additive conflicts are safe, missing files are not. */
 export function assessInitialMergeConvergence(
   local: FileManifest,
   remote: FileManifest,
   mode: SyncMode,
+  options: ConvergenceOptions = {},
 ): InitialMergeConvergence {
   const inverseMode = invertMode(mode)
-  const localPlan = computeSyncPlan(local, remote, mode)
-  const peerPlan = computeSyncPlan(remote, local, inverseMode)
+  const localPlan = computeSyncPlan(local, remote, mode, { destinationBlocked: options.localBlocked })
+  const peerPlan = computeSyncPlan(remote, local, inverseMode, { destinationBlocked: options.remoteBlocked })
   const byPath = new Map<string, SyncSkip>()
   for (const skip of [...localPlan.skipped, ...peerPlan.skipped]) byPath.set(`${skip.path}\0${skip.reason}`, skip)
   return {

@@ -323,23 +323,42 @@ export function validateTransferDescriptor(entry: FileManifest["files"][number],
   }
 }
 
+/** Bounds shared by every persisted or peer-supplied skip list. */
+export const MAX_PERSISTED_SKIP_ENTRIES = 10_000
+export const MAX_PERSISTED_SKIP_PATH_LENGTH = 4_096
+export const MAX_PERSISTED_SKIP_REASON_LENGTH = 1_024
+
+export function isBoundedSkipArray(value: unknown): value is Array<{ path: string; reason: string }> {
+  return Array.isArray(value) &&
+    value.length <= MAX_PERSISTED_SKIP_ENTRIES &&
+    value.every((item) =>
+      item !== null && typeof item === "object" &&
+      typeof (item as { path?: unknown }).path === "string" && (item as { path: string }).path.length <= MAX_PERSISTED_SKIP_PATH_LENGTH &&
+      typeof (item as { reason?: unknown }).reason === "string" && (item as { reason: string }).reason.length <= MAX_PERSISTED_SKIP_REASON_LENGTH
+    )
+}
+
 export function validateInitialSyncPassResult(value: unknown): InitialSyncPassResult {
   if (!value || typeof value !== "object") throw new Error("The peer returned an invalid initial-merge result.")
   const result = value as Partial<InitialSyncPassResult>
   if (
-    !Number.isSafeInteger(result.copiedFiles) || (result.copiedFiles ?? -1) < 0 ||
-    !Number.isSafeInteger(result.copiedBytes) || (result.copiedBytes ?? -1) < 0 ||
-    !Number.isSafeInteger(result.fileCount) || (result.fileCount ?? -1) < 0 ||
-    !Array.isArray(result.skipped) ||
-    result.skipped.length > 10_000 ||
-    result.skipped.some((item) =>
-      !item || typeof item.path !== "string" || item.path.length > 4_096 ||
-      typeof item.reason !== "string" || item.reason.length > 1_024
-    )
+    typeof result.copiedFiles !== "number" || !Number.isSafeInteger(result.copiedFiles) || result.copiedFiles < 0 ||
+    typeof result.copiedBytes !== "number" || !Number.isSafeInteger(result.copiedBytes) || result.copiedBytes < 0 ||
+    typeof result.fileCount !== "number" || !Number.isSafeInteger(result.fileCount) || result.fileCount < 0 ||
+    !isBoundedSkipArray(result.skipped) ||
+    // Older peers do not report skipped inaccessible items; that is an empty
+    // list, never an invalid result.
+    (result.unreadableSkipped !== undefined && !isBoundedSkipArray(result.unreadableSkipped))
   ) {
     throw new Error("The peer returned an invalid initial-merge result.")
   }
-  return result as InitialSyncPassResult
+  return {
+    copiedFiles: result.copiedFiles,
+    copiedBytes: result.copiedBytes,
+    fileCount: result.fileCount,
+    skipped: result.skipped,
+    unreadableSkipped: result.unreadableSkipped ?? [],
+  }
 }
 
 export function validateContinuousOperationRequest(request: PeerRequest): {

@@ -1,20 +1,27 @@
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { fingerprintObservation } from "../src/main/observation-fingerprint"
-import { lstat, mkdir, mkdtemp, opendir, rm, truncate, writeFile } from "node:fs/promises"
+import { lstat, mkdir, mkdtemp, opendir, rename, rm, symlink, truncate, utimes, writeFile, chmod } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
+  describeScanReason,
   fingerprintFolder,
   folderManifestTestHelpers,
+  filesystemSupportsDigestReuse,
+  identityIsReusable,
   isManifestPathIgnored,
+  MAX_UNREADABLE_REPORTED,
   SCAN_FILE_CONCURRENCY,
   scanFolder,
+  statFileIdentity,
   type CachedFileDigest,
   type FileIdentity,
+  type FolderScanIssue,
   type ScanDigestCache,
+  type ScanMetrics,
 } from "../src/main/folder-manifest"
-import { manifest } from "./helpers"
+import { manifest, testWithReuse } from "./helpers"
 import type { FolderScanActivity } from "../src/shared/contracts"
 
 describe("folder mapping comparison", () => {
@@ -453,7 +460,7 @@ function fakeDigestCache(seed: ReadonlyMap<string, CachedFileDigest> = new Map()
 }
 
 describe("scan digest cache", () => {
-  test("uses a cached digest without reading a file whose identity is unchanged", async () => {
+  testWithReuse("uses a cached digest without reading a file whose identity is unchanged", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-hit-test-"))
     try {
       const filePath = path.join(root, "kept.txt")
@@ -521,7 +528,7 @@ describe("scan digest cache", () => {
     }
   })
 
-  test("looks every file up exactly once, in batches rather than one round trip per file", async () => {
+  testWithReuse("looks every file up exactly once, in batches rather than one round trip per file", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-batch-test-"))
     try {
       const fileCount = 600
@@ -537,7 +544,7 @@ describe("scan digest cache", () => {
     }
   })
 
-  test("records only files whose timestamps have settled past the coarse-clock window", async () => {
+  testWithReuse("records only files whose timestamps have settled past the coarse-clock window", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-settle-test-"))
     try {
       await writeFile(path.join(root, "settled.txt"), "settled")
@@ -579,6 +586,364 @@ describe("folder fingerprint", () => {
       expect(second.fingerprint).not.toBe(first.fingerprint)
       const limited = await fingerprintFolder(root, [], { maxFiles: 1 })
       expect(limited.truncated).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("unreadable path reporting", () => {
+  test("maps filesystem failures to short reasons without embedding paths", () => {
+    expect(describeScanReason(Object.assign(new Error("EACCES: permission denied, scandir '/secret'"), { code: "EACCES" }))).toBe("Permission denied")
+    expect(describeScanReason(Object.assign(new Error("boom"), { code: "ENOENT" }))).toBe("No longer exists")
+    expect(describeScanReason(new Error("EACCES: permission denied, open '/secret/file'"))).toBe("Could not be read")
+    expect(describeScanReason(new Error("The manifest file changed while it was read."))).toBe("The manifest file changed while it was read.")
+  })
+
+  test("records inaccessible directories and files with their reason", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-unreadable-test-"))
+    try {
+      await mkdir(path.join(root, "locked"))
+      await writeFile(path.join(root, "locked", "hidden.txt"), "secret")
+      await writeFile(path.join(root, "locked-file.txt"), "secret")
+      await chmod(path.join(root, "locked"), 0o000)
+      await chmod(path.join(root, "locked-file.txt"), 0o000)
+      try {
+        const result = await scanFolder(root, [], { hashAllFiles: true })
+        expect(result.unreadable).toBe(2)
+        expect([...result.unreadableEntries].sort((a, b) => a.path.localeCompare(b.path))).toEqual([
+          { path: "locked", reason: "Permission denied", kind: "directory" },
+          { path: "locked-file.txt", reason: "Permission denied", kind: "file" },
+        ])
+        expect(result.files).toEqual([])
+      } finally {
+        await chmod(path.join(root, "locked"), 0o700)
+        await chmod(path.join(root, "locked-file.txt"), 0o600)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("carries unreadable issue lists and totals into the comparison preview", () => {
+    const preview = folderManifestTestHelpers.compareManifests(
+      manifest([], [{ path: "locked", reason: "Permission denied", kind: "directory" }]),
+      manifest([], [{ path: "gone.txt", reason: "No longer exists", kind: "file" }]),
+      { mode: "two-way", localPlatform: "linux", remotePlatform: "linux" },
+    )
+    expect(preview.unreadableLocalCount).toBe(1)
+    expect(preview.unreadableRemoteCount).toBe(1)
+    expect(preview.unreadableLocal).toEqual([{ path: "locked", reason: "Permission denied", kind: "directory" }])
+    expect(preview.unreadableRemote).toEqual([{ path: "gone.txt", reason: "No longer exists", kind: "file" }])
+    // The legacy combined count keeps its original meaning for older peers.
+    expect(preview.ignoredLocal).toBe(1)
+    expect(preview.ignoredRemote).toBe(1)
+  })
+
+  test("passes every unreadable item to the planner while the exchanged report stays bounded", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-block-set-test-"))
+    const locked: string[] = []
+    try {
+      for (let index = 0; index <= MAX_UNREADABLE_REPORTED; index += 1) {
+        const directory = path.join(root, `locked-${String(index).padStart(3, "0")}`)
+        await mkdir(directory)
+        await chmod(directory, 0o000)
+        locked.push(directory)
+      }
+      const seen: FolderScanIssue[] = []
+      const result = await scanFolder(root, [], { hashAllFiles: true, onUnreadable: (issue) => seen.push(issue) })
+      expect(result.unreadable).toBe(MAX_UNREADABLE_REPORTED + 1)
+      expect(result.unreadableEntries).toHaveLength(MAX_UNREADABLE_REPORTED)
+      expect(seen).toHaveLength(MAX_UNREADABLE_REPORTED + 1)
+      expect(seen.every((issue) => issue.kind === "directory" && issue.reason === "Permission denied")).toBe(true)
+    } finally {
+      for (const directory of locked) await chmod(directory, 0o700)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("round-trips an untrusted peer report and defaults its absence to empty", () => {
+    const base = { rootPath: "/peer", files: [], ignored: 0, unreadable: 1, truncated: false }
+    expect(folderManifestTestHelpers.parsePeerManifest(base).unreadableEntries).toEqual([])
+    const parsed = folderManifestTestHelpers.parsePeerManifest({
+      ...base,
+      unreadableEntries: [{ path: "locked", reason: "Permission denied", kind: "directory" }],
+    })
+    expect(parsed.unreadableEntries).toEqual([{ path: "locked", reason: "Permission denied", kind: "directory" }])
+  })
+
+  test("rejects a malformed or oversized peer report", () => {
+    const base = { rootPath: "/peer", files: [], ignored: 0, unreadable: 0, truncated: false }
+    expect(() => folderManifestTestHelpers.parsePeerManifest({ ...base, unreadableEntries: [{ path: "a", reason: "r", kind: "socket" }] }))
+      .toThrow("The paired computer returned an invalid folder scan.")
+    expect(() => folderManifestTestHelpers.parsePeerManifest({ ...base, unreadableEntries: [{ path: "a", reason: "", kind: "file" }] }))
+      .toThrow("The paired computer returned an invalid folder scan.")
+    expect(() => folderManifestTestHelpers.parsePeerManifest({
+      ...base,
+      unreadableEntries: Array.from({ length: 101 }, (_, index) => ({ path: `p${index}`, reason: "r", kind: "file" })),
+    })).toThrow("The paired computer returned an invalid folder scan.")
+  })
+})
+
+describe("scan reuse", () => {
+  testWithReuse("reuses settled digests instead of re-reading unchanged files and hashes only changed ones", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-reuse-test-"))
+    try {
+      await writeFile(path.join(root, "a.txt"), "alpha")
+      await writeFile(path.join(root, "b.txt"), "bravo")
+      await writeFile(path.join(root, "c.txt"), "charlie")
+      // Settle the coarse-clock window so identities may be reused safely.
+      await Bun.sleep(2_100)
+
+      const seed = new Map<string, CachedFileDigest>()
+      const previewMetrics: ScanMetrics[] = []
+      const preview = await scanFolder(root, [], {
+        onSettledDigest: (relativePath, digest) => seed.set(relativePath, digest),
+        onMetrics: (metrics) => previewMetrics.push(metrics),
+      })
+      expect(seed.size).toBe(3)
+      expect(previewMetrics[0]).toMatchObject({ files: 3, reusedFiles: 0, hashedFiles: 3, unhashedFiles: 0 })
+
+      const mergeMetrics: ScanMetrics[] = []
+      const merged = await scanFolder(root, [], { hashAllFiles: true, reuse: seed, onMetrics: (metrics) => mergeMetrics.push(metrics) })
+      expect(merged.files).toEqual(preview.files)
+      expect(mergeMetrics[0]).toMatchObject({ files: 3, reusedFiles: 3, hashedFiles: 0, unhashedFiles: 0 })
+
+      await writeFile(path.join(root, "b.txt"), "BRAVO")
+      await Bun.sleep(2_100)
+      const changedMetrics: ScanMetrics[] = []
+      const changed = await scanFolder(root, [], { hashAllFiles: true, reuse: seed, onMetrics: (metrics) => changedMetrics.push(metrics) })
+      expect(changedMetrics[0]).toMatchObject({ files: 3, reusedFiles: 2, hashedFiles: 1 })
+      expect(changed.files.find((entry) => entry.path === "b.txt")?.digest)
+        .not.toBe(preview.files.find((entry) => entry.path === "b.txt")?.digest)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("reuse never hides a same-size rewrite that restores the original mtime", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-reuse-mtime-test-"))
+    try {
+      const file = path.join(root, "note.txt")
+      await writeFile(file, "original")
+      await Bun.sleep(2_100)
+      const seed = new Map<string, CachedFileDigest>()
+      await scanFolder(root, [], { onSettledDigest: (relativePath, digest) => seed.set(relativePath, digest) })
+      const seeded = seed.get("note.txt")
+      expect(seeded).toBeDefined()
+
+      const before = await lstat(file)
+      await writeFile(file, "replaced")
+      await utimes(file, before.atime, before.mtime)
+
+      const metrics: ScanMetrics[] = []
+      const rescanned = await scanFolder(root, [], { hashAllFiles: true, reuse: seed, onMetrics: (value) => metrics.push(value) })
+      expect(metrics[0]).toMatchObject({ reusedFiles: 0, hashedFiles: 1 })
+      expect(rescanned.files[0]?.digest).not.toBe(seeded?.digest)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  testWithReuse("reports reused files in scan activity", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-reuse-activity-test-"))
+    try {
+      await writeFile(path.join(root, "a.txt"), "alpha")
+      await Bun.sleep(2_100)
+      const seed = new Map<string, CachedFileDigest>()
+      await scanFolder(root, [], { onSettledDigest: (relativePath, digest) => seed.set(relativePath, digest) })
+      const activities: FolderScanActivity[] = []
+      await scanFolder(root, [], { hashAllFiles: true, reuse: seed, onActivity: (activity) => activities.push(activity) })
+      const complete = activities.at(-1)
+      expect(complete?.stage).toBe("complete")
+      expect(complete?.reusedFiles).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  testWithReuse("records a reused digest back into the durable cache for later walks", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-reuse-durable-test-"))
+    try {
+      await writeFile(path.join(root, "stable.txt"), "stable")
+      await Bun.sleep(2_100)
+      const seed = new Map<string, CachedFileDigest>()
+      const preview = await scanFolder(root, [], { onSettledDigest: (relativePath, digest) => seed.set(relativePath, digest) })
+      const { cache, recorded } = fakeDigestCache()
+      await scanFolder(root, [], { hashAllFiles: true, digestCache: cache, reuse: seed })
+      expect(recorded.get("stable.txt")?.digest).toBe(preview.files[0]?.digest)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("identity reuse safety", () => {
+  const fakeDigest = "f".repeat(64)
+
+  async function scanWithSeed(root: string, seed: ReadonlyMap<string, CachedFileDigest>): Promise<{ digest: string | undefined; metrics: ScanMetrics }> {
+    const metrics: ScanMetrics[] = []
+    const result = await scanFolder(root, [], { hashAllFiles: true, reuse: seed, onMetrics: (value) => metrics.push(value) })
+    const first = metrics[0]
+    if (!first) throw new Error("scan produced no metrics")
+    return { digest: result.files[0]?.digest, metrics: first }
+  }
+
+  test("any single identity difference invalidates a cached digest", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-field-test-"))
+    try {
+      const filePath = path.join(root, "value.txt")
+      await writeFile(filePath, "value")
+      await Bun.sleep(2_100)
+      const real = await identityOf(filePath)
+      const mutations: Array<Partial<FileIdentity>> = [
+        { device: String(BigInt(real.device) + 1n) },
+        { inode: String(BigInt(real.inode) + 1n) },
+        { size: real.size + 1 },
+        { modifiedNs: String(BigInt(real.modifiedNs) + 1n) },
+        { changedNs: String(BigInt(real.changedNs) + 1n) },
+      ]
+      for (const mutation of mutations) {
+        const seed = new Map<string, CachedFileDigest>([["value.txt", { ...real, ...mutation, digest: fakeDigest }]])
+        const { digest, metrics } = await scanWithSeed(root, seed)
+        expect(metrics).toMatchObject({ files: 1, reusedFiles: 0, hashedFiles: 1 })
+        expect(digest).toBe(sha256("value"))
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("weak or unusable identities never hit, even when every value matches", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-weak-test-"))
+    try {
+      const filePath = path.join(root, "value.txt")
+      await writeFile(filePath, "value")
+      await Bun.sleep(2_100)
+      const real = await identityOf(filePath)
+      const weaknesses: Array<Partial<FileIdentity>> = [
+        { device: "0" },
+        { device: "" },
+        { inode: "0" },
+        { inode: "000" },
+        { modifiedNs: "0" },
+        { changedNs: "0" },
+        { changedNs: "-1" },
+        { size: -1 },
+      ]
+      for (const weakness of weaknesses) {
+        const seed = new Map<string, CachedFileDigest>([["value.txt", { ...real, ...weakness, digest: fakeDigest }]])
+        const { digest, metrics } = await scanWithSeed(root, seed)
+        expect(metrics).toMatchObject({ reusedFiles: 0, hashedFiles: 1 })
+        expect(digest).toBe(sha256("value"))
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  testWithReuse("identityIsReusable accepts real files and rejects unusable values", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-gate-test-"))
+    try {
+      const filePath = path.join(root, "value.txt")
+      await writeFile(filePath, "value")
+      const real = await identityOf(filePath)
+      expect(identityIsReusable(real)).toBe(true)
+      expect(identityIsReusable({ ...real, device: "0" })).toBe(false)
+      expect(identityIsReusable({ ...real, inode: "0" })).toBe(false)
+      expect(identityIsReusable({ ...real, modifiedNs: "0" })).toBe(false)
+      expect(identityIsReusable({ ...real, changedNs: "-5" })).toBe(false)
+      expect(identityIsReusable({ ...real, size: -1 })).toBe(false)
+
+      const link = path.join(root, "link.txt")
+      await symlink(filePath, link)
+      expect(await statFileIdentity(link)).toBeUndefined()
+      expect(await statFileIdentity(filePath)).toEqual(real)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("delete and recreate at the same path rehashes", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-recreate-test-"))
+    try {
+      const filePath = path.join(root, "same.txt")
+      await writeFile(filePath, "same-bytes")
+      await Bun.sleep(2_100)
+      const seed = new Map<string, CachedFileDigest>([["same.txt", { ...(await identityOf(filePath)), digest: fakeDigest }]])
+      await rm(filePath)
+      await writeFile(filePath, "same-bytes")
+      const { digest, metrics } = await scanWithSeed(root, seed)
+      expect(metrics).toMatchObject({ reusedFiles: 0, hashedFiles: 1 })
+      expect(digest).toBe(sha256("same-bytes"))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("atomic replacement rehashes", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-atomic-test-"))
+    try {
+      const target = path.join(root, "doc.txt")
+      const staging = path.join(root, "doc.staging")
+      await writeFile(target, "original")
+      await Bun.sleep(2_100)
+      const seed = new Map<string, CachedFileDigest>([["doc.txt", { ...(await identityOf(target)), digest: sha256("original") }]])
+      await writeFile(staging, "replacement")
+      await rename(staging, target)
+      const { digest, metrics } = await scanWithSeed(root, seed)
+      expect(metrics).toMatchObject({ files: 1, reusedFiles: 0, hashedFiles: 1 })
+      expect(digest).toBe(sha256("replacement"))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("rename away and replace at the same path rehashes", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-rename-test-"))
+    const outside = await mkdtemp(path.join(tmpdir(), "tethera-identity-rename-out-"))
+    try {
+      const target = path.join(root, "note.txt")
+      await writeFile(target, "first")
+      await Bun.sleep(2_100)
+      const seed = new Map<string, CachedFileDigest>([["note.txt", { ...(await identityOf(target)), digest: sha256("first") }]])
+      await rename(target, path.join(outside, "note.txt"))
+      await writeFile(target, "second")
+      const { digest, metrics } = await scanWithSeed(root, seed)
+      expect(metrics).toMatchObject({ files: 1, reusedFiles: 0, hashedFiles: 1 })
+      expect(digest).toBe(sha256("second"))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  test("a freshly written file is not offered for reuse until its timestamps settle", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-settle-test-"))
+    try {
+      await writeFile(path.join(root, "fresh.txt"), "fresh")
+      const recorded = new Map<string, CachedFileDigest>()
+      await scanFolder(root, [], { onSettledDigest: (relativePath, digest) => recorded.set(relativePath, digest) })
+      expect(recorded.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("describes whether the temporary root can supply reusable identity", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-identity-fs-test-"))
+    try {
+      const supported = await filesystemSupportsDigestReuse(root)
+      expect(typeof supported).toBe("boolean")
+      // A capable root must produce a usable identity; an incapable one (for
+      // example FAT/exFAT) is allowed to yield none, and reuse is skipped.
+      if (supported) {
+        const filePath = path.join(root, "value.txt")
+        await writeFile(filePath, "value")
+        expect(await statFileIdentity(filePath)).toBeDefined()
+      }
     } finally {
       await rm(root, { recursive: true, force: true })
     }

@@ -82,6 +82,12 @@ export interface FolderSummary {
   maxFileBytes?: number | null
   conflictCount?: number
   recoveryIssueCount?: number
+  /**
+   * Transient report set when the initial merge stops because a fresh scan
+   * found inaccessible items the setup preview did not already cover. Never
+   * persisted; cleared when the user continues or dismisses it.
+   */
+  scanIssues?: FolderScanIssueReport
 }
 
 export interface DeviceSummary {
@@ -218,6 +224,26 @@ export interface MappingPreviewItem {
   size?: number
 }
 
+/**
+ * One file or directory a scan could not read, with a user-facing reason
+ * ("Permission denied", "No longer exists", ...). Paths are relative to the
+ * scanned folder root; an empty path means the root itself. The reason never
+ * carries an absolute path or a raw operating-system message.
+ */
+export interface FolderScanIssue {
+  path: string
+  reason: string
+  kind: "file" | "directory"
+}
+
+/** A bounded per-side report of unreadable items; `localCount`/`remoteCount` carry the true totals. */
+export interface FolderScanIssueReport {
+  local: FolderScanIssue[]
+  remote: FolderScanIssue[]
+  localCount: number
+  remoteCount: number
+}
+
 export interface FolderMappingPreview {
   localFiles: number
   remoteFiles: number
@@ -233,6 +259,15 @@ export interface FolderMappingPreview {
   caseCollisions: string[]
   truncated: boolean
   samples: MappingPreviewItem[]
+  /**
+   * Items that could not be read. Lists are bounded; the counts carry the
+   * true totals. Both are absent on previews produced by older versions, so
+   * consumers must treat missing values as zero.
+   */
+  unreadableLocal?: FolderScanIssue[]
+  unreadableRemote?: FolderScanIssue[]
+  unreadableLocalCount?: number
+  unreadableRemoteCount?: number
 }
 
 export type FolderPreviewPhase = "scan-local" | "scan-remote" | "compare"
@@ -244,6 +279,11 @@ export interface FolderScanActivity {
   ignoredEntries: number
   unreadableEntries: number
   hashedBytes: number
+  /**
+   * Files whose digest came from an earlier scan of the same tree instead of
+   * being read again. Absent from older producers, which means zero.
+   */
+  reusedFiles?: number
 }
 
 /**
@@ -257,6 +297,12 @@ export interface FolderPreviewProgress {
   phase: FolderPreviewPhase
   scannedFiles?: number
   activity?: FolderScanActivity
+  /**
+   * True when the comparison reused the scans from the operation's earlier
+   * review step, so the UI does not present a cache-backed step as a fresh
+   * folder scan.
+   */
+  reused?: boolean
 }
 
 export interface FolderMappingProposal {
@@ -496,7 +542,8 @@ export interface TetheraApi {
   refreshIncomingMappingPreview(input: RefreshIncomingMappingPreviewInput, progressOperationId?: string): Promise<AppSnapshot>
   approveFolderMapping(input: ApproveFolderMappingInput, progressOperationId?: string): Promise<AppSnapshot>
   rejectFolderMapping(requestId: string): Promise<AppSnapshot>
-  startInitialSync(folderId: string): Promise<AppSnapshot>
+  startInitialSync(folderId: string, acknowledgeUnreadable?: boolean): Promise<AppSnapshot>
+  dismissInitialSyncIssues(folderId: string): Promise<AppSnapshot>
   addFolder(input: AddFolderInput): Promise<AppSnapshot>
   setFolderPaused(folderId: string, paused: boolean): Promise<AppSnapshot>
   removeFolder(folderId: string): Promise<AppSnapshot>

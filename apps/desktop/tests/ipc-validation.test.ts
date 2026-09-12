@@ -350,7 +350,28 @@ describe("peer transfer parsing", () => {
   test("accepts a well-formed initial-merge result", () => {
     expect(
       validateInitialSyncPassResult({ copiedFiles: 2, copiedBytes: 20, fileCount: 3, skipped: [{ path: "a.txt", reason: "diverged" }] }),
-    ).toEqual({ copiedFiles: 2, copiedBytes: 20, fileCount: 3, skipped: [{ path: "a.txt", reason: "diverged" }] })
+    ).toEqual({
+      copiedFiles: 2,
+      copiedBytes: 20,
+      fileCount: 3,
+      skipped: [{ path: "a.txt", reason: "diverged" }],
+      unreadableSkipped: [],
+    })
+  })
+
+  test("accepts skipped inaccessible items and defaults their absence to an empty list", () => {
+    expect(
+      validateInitialSyncPassResult({
+        copiedFiles: 1,
+        copiedBytes: 4,
+        fileCount: 2,
+        skipped: [],
+        unreadableSkipped: [{ path: "private", reason: "Permission denied" }],
+      }).unreadableSkipped,
+    ).toEqual([{ path: "private", reason: "Permission denied" }])
+    expect(
+      validateInitialSyncPassResult({ copiedFiles: 0, copiedBytes: 0, fileCount: 0, skipped: [] }).unreadableSkipped,
+    ).toEqual([])
   })
 
   test("rejects unbounded or malformed merge results", () => {
@@ -362,6 +383,9 @@ describe("peer transfer parsing", () => {
     ).toThrow("The peer returned an invalid initial-merge result.")
     expect(() =>
       validateInitialSyncPassResult({ copiedFiles: 0, copiedBytes: 0, fileCount: 0, skipped: [{ path: "a".repeat(4_097), reason: "r" }] }),
+    ).toThrow("The peer returned an invalid initial-merge result.")
+    expect(() =>
+      validateInitialSyncPassResult({ copiedFiles: 0, copiedBytes: 0, fileCount: 0, skipped: [], unreadableSkipped: [{ path: "a", reason: 7 }] }),
     ).toThrow("The peer returned an invalid initial-merge result.")
   })
 

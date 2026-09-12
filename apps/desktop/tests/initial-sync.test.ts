@@ -9,8 +9,27 @@ import {
   writeFileAtomic,
   writeFileChunksAtomic,
 } from "../src/main/initial-sync"
+import { createScanIssueBlocklist } from "../src/main/folder-manifest"
 import { archiveObjectPath } from "../src/main/version-archive"
 import { manifest, sha256Hex } from "./helpers"
+
+describe("createScanIssueBlocklist", () => {
+  test("blocks a directory subtree, only the exact path for a file, and the whole tree for the root", () => {
+    const blocked = createScanIssueBlocklist([
+      { path: "locked", reason: "Permission denied", kind: "directory" },
+      { path: "locked.txt", reason: "Permission denied", kind: "file" },
+    ])
+    expect(blocked("locked")).toBe(true)
+    expect(blocked("locked/nested/file.txt")).toBe(true)
+    expect(blocked("locked.txt")).toBe(true)
+    expect(blocked("locked.txt.bak")).toBe(false)
+    expect(blocked("other.txt")).toBe(false)
+    expect(blocked("locked-elsewhere/file.txt")).toBe(false)
+
+    expect(createScanIssueBlocklist([{ path: "", reason: "Permission denied", kind: "directory" }])("anything")).toBe(true)
+    expect(createScanIssueBlocklist([])("anything")).toBe(false)
+  })
+})
 
 describe("computeSyncPlan", () => {
   test("pulls remote-only files and skips divergent ones", () => {
@@ -64,10 +83,29 @@ describe("computeSyncPlan", () => {
     )
     expect(plan.toPull.map((entry) => entry.path)).toEqual(["new.txt"])
   })
+
+  test("leaves paths blocked by an accepted scan issue out of the plan", () => {
+    const plan = computeSyncPlan(
+      manifest([]),
+      manifest([
+        { path: "locked/hidden.txt", size: 4, modifiedMs: 1, digest: "hidden" },
+        { path: "locked.txt", size: 4, modifiedMs: 1, digest: "locked-file" },
+        { path: "free.txt", size: 4, modifiedMs: 1, digest: "free" },
+      ]),
+      "two-way",
+      {
+        destinationBlocked: [
+          { path: "locked", reason: "Permission denied", kind: "directory" },
+          { path: "locked.txt", reason: "Permission denied", kind: "file" },
+        ],
+      },
+    )
+    expect(plan.toPull.map((entry) => entry.path)).toEqual(["free.txt"])
+  })
 })
 
 describe("runCoordinatedInitialMerge", () => {
-  const result = { copiedFiles: 1, copiedBytes: 5, fileCount: 2, skipped: [] }
+  const result = { copiedFiles: 1, copiedBytes: 5, fileCount: 2, skipped: [], unreadableSkipped: [] }
 
   test("commits completion only after both directional passes succeed", async () => {
     const calls: string[] = []
@@ -110,6 +148,26 @@ describe("assessInitialMergeConvergence", () => {
     )
     expect(result.complete).toBe(true)
     expect(result.skipped.map((skip) => skip.path)).toEqual(["notes.txt"])
+  })
+
+  test("treats files hidden by an accepted unreadable directory as converged", () => {
+    const result = assessInitialMergeConvergence(
+      manifest([]),
+      manifest([{ path: "locked/hidden.txt", size: 1, modifiedMs: 1, digest: "hidden" }]),
+      "two-way",
+      { localBlocked: [{ path: "locked", reason: "Permission denied", kind: "directory" }] },
+    )
+    expect(result.complete).toBe(true)
+  })
+
+  test("still blocks when the accepted issue does not cover the one-sided file", () => {
+    const result = assessInitialMergeConvergence(
+      manifest([]),
+      manifest([{ path: "other/new.txt", size: 1, modifiedMs: 1, digest: "new" }]),
+      "two-way",
+      { localBlocked: [{ path: "locked", reason: "Permission denied", kind: "directory" }] },
+    )
+    expect(result.complete).toBe(false)
   })
 })
 
