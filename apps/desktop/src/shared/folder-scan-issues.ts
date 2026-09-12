@@ -1,5 +1,12 @@
 import type { FolderMappingPreview, FolderScanIssue, FolderScanIssueReport } from "./contracts"
 
+/** Display label for an issue whose path is the scanned root itself. */
+export const FOLDER_ROOT_ISSUE_PATH = "(folder root)"
+
+export function formatScanIssuePath(path: string): string {
+  return path || FOLDER_ROOT_ISSUE_PATH
+}
+
 export function emptyScanIssueReport(): FolderScanIssueReport {
   return { local: [], remote: [], localCount: 0, remoteCount: 0 }
 }

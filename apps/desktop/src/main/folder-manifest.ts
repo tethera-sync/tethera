@@ -900,16 +900,37 @@ export async function statFileIdentity(absolutePath: string): Promise<FileIdenti
 }
 
 /**
- * Whether a scan issue blocks a relative path: an inaccessible file blocks
- * exactly that path, an inaccessible directory blocks the directory and
- * everything beneath it, and an inaccessible root blocks the whole tree.
+ * Compiles an issue list into an O(path depth) predicate.
+ *
+ * An inaccessible file blocks exactly that path; an inaccessible directory
+ * blocks the directory and everything beneath it; an inaccessible root ("")
+ * blocks the whole tree. Compiling once keeps planning linear in the number
+ * of files even when the block set is the complete, unbounded local report.
  */
-export function isPathBlockedByScanIssue(relativePath: string, issues: readonly FolderScanIssue[]): boolean {
-  return issues.some((issue) => {
-    if (issue.kind === "file") return relativePath === issue.path
-    if (issue.path === "") return true
-    return relativePath === issue.path || relativePath.startsWith(`${issue.path}/`)
-  })
+export function createScanIssueBlocklist(issues: readonly FolderScanIssue[]): (relativePath: string) => boolean {
+  const files = new Set<string>()
+  const directories = new Set<string>()
+  let blockedRoot = false
+  for (const issue of issues) {
+    if (issue.kind === "file") {
+      files.add(issue.path)
+      continue
+    }
+    if (issue.path === "") blockedRoot = true
+    else directories.add(issue.path)
+  }
+  if (blockedRoot) return () => true
+  if (files.size === 0 && directories.size === 0) return () => false
+  return (relativePath) => {
+    if (files.has(relativePath)) return true
+    if (directories.has(relativePath)) return true
+    let separator = relativePath.lastIndexOf("/")
+    while (separator !== -1) {
+      if (directories.has(relativePath.slice(0, separator))) return true
+      separator = relativePath.lastIndexOf("/", separator - 1)
+    }
+    return false
+  }
 }
 
 function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
@@ -1116,26 +1137,32 @@ export function parsePeerManifest(value: unknown): FileManifest {
  * missing report from an older version becomes an empty list; a malformed one
  * fails closed rather than letting invented paths reach the UI.
  */
+/** One persisted or peer-supplied scan issue. Shared by the peer parser and the legacy-preview validator. */
+export const MAX_SCAN_ISSUE_REASON_LENGTH = 200
+
+export function isFolderScanIssue(value: unknown): value is FolderScanIssue {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const issue = value as Partial<FolderScanIssue>
+  return typeof issue.path === "string" &&
+    Buffer.byteLength(issue.path, "utf8") <= MAX_MANIFEST_PATH_BYTES &&
+    !issue.path.includes("\0") &&
+    typeof issue.reason === "string" &&
+    issue.reason.length > 0 &&
+    issue.reason.length <= MAX_SCAN_ISSUE_REASON_LENGTH &&
+    (issue.kind === "file" || issue.kind === "directory")
+}
+
+/** Validates the bounded unreadable-path report from an untrusted peer. A missing report from an older version becomes an empty list. */
 function parsePeerScanIssues(value: unknown): FolderScanIssue[] {
   if (value === undefined) return []
   if (!Array.isArray(value) || value.length > MAX_UNREADABLE_REPORTED) {
     throw new Error("The paired computer returned an invalid folder scan.")
   }
   return value.map((item) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
+    if (!isFolderScanIssue(item)) {
       throw new Error("The paired computer returned an invalid folder scan.")
     }
-    const issue = item as Partial<FolderScanIssue>
-    if (
-      typeof issue.path !== "string" ||
-      Buffer.byteLength(issue.path, "utf8") > MAX_MANIFEST_PATH_BYTES ||
-      issue.path.includes("\0") ||
-      typeof issue.reason !== "string" || issue.reason.length === 0 || issue.reason.length > 200 ||
-      (issue.kind !== "file" && issue.kind !== "directory")
-    ) {
-      throw new Error("The paired computer returned an invalid folder scan.")
-    }
-    return { path: issue.path, reason: issue.reason, kind: issue.kind }
+    return { path: item.path, reason: item.reason, kind: item.kind }
   })
 }
 

@@ -1,14 +1,12 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect } from "bun:test"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { CachedFileDigest, FileManifest, ScanMetrics } from "../src/main/folder-manifest"
-import { filesystemSupportsDigestReuse, scanFolder } from "../src/main/folder-manifest"
+import { scanFolder } from "../src/main/folder-manifest"
 import { previewScanKey, PreviewScanSessions } from "../src/main/preview-scan-session"
 import { ScanLedger, type ScanStage } from "../src/main/scan-ledger"
-
-/** The reuse assertions below only hold where the filesystem supplies identity. */
-const testWithReuse = (await filesystemSupportsDigestReuse(tmpdir())) ? test : test.skip
+import { testWithReuse } from "./helpers"
 
 /**
  * Mirrors the folder-setup sequence with the same scan primitives the main

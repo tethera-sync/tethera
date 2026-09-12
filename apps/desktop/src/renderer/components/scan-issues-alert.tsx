@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { FileWarningIcon } from "lucide-react"
 import type { FolderScanIssue, FolderScanIssueReport } from "@shared/contracts"
-import { formatScanIssueCount, scanIssueTotal } from "@shared/folder-scan-issues"
+import { formatScanIssueCount, formatScanIssuePath, scanIssueTotal } from "@shared/folder-scan-issues"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Checkbox } from "@/components/ui/checkbox"
 
@@ -51,7 +51,7 @@ export function ScanIssuesDetail({
 function IssueRow({ issue }: { issue: FolderScanIssue }) {
   return (
     <li className="flex flex-wrap items-baseline gap-x-1.5">
-      <code className="[overflow-wrap:anywhere]">{issue.path || "(folder root)"}</code>
+      <code className="[overflow-wrap:anywhere]">{formatScanIssuePath(issue.path)}</code>
       <span className="text-[var(--muted-foreground)]">— {issue.reason}</span>
     </li>
   )

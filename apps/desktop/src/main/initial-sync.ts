@@ -4,7 +4,7 @@ import { createHash, randomBytes } from "node:crypto"
 import path from "node:path"
 import type { FolderScanIssue, SyncMode } from "../shared/contracts"
 import type { FileManifest, FileManifestEntry } from "./folder-manifest"
-import { isPathBlockedByScanIssue, manifestEntriesMatch } from "./folder-manifest"
+import { createScanIssueBlocklist, manifestEntriesMatch } from "./folder-manifest"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import { describeTransferFile, isSha256HexDigest } from "./file-transfer"
 import { invertMode } from "./mapping-index"
@@ -79,14 +79,14 @@ export interface SyncPlanOptions {
  */
 export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode: SyncMode, options: SyncPlanOptions = {}): SyncPlan {
   const localByPath = new Map(local.files.map((entry) => [entry.path, entry]))
-  const destinationBlocked = options.destinationBlocked ?? []
+  const isBlocked = createScanIssueBlocklist(options.destinationBlocked ?? [])
   const toPull: FileManifestEntry[] = []
   const skipped: SyncSkip[] = []
 
   for (const remoteEntry of remote.files) {
     const localEntry = localByPath.get(remoteEntry.path)
     if (!localEntry) {
-      if (mode !== "send-only" && !isPathBlockedByScanIssue(remoteEntry.path, destinationBlocked)) toPull.push(remoteEntry)
+      if (mode !== "send-only" && !isBlocked(remoteEntry.path)) toPull.push(remoteEntry)
       continue
     }
 

@@ -262,6 +262,9 @@ function FolderCard({
         : remoteDevice.status !== "online"
           ? `${remoteDevice.name} must be online before starting the initial merge.`
           : undefined
+  // One precedence for every blocked primary action: broker availability wins
+  // over the per-folder reason.
+  const continueBlockedReason = !mutationsEnabled ? disabledReason : initialSyncBlockedReason
 
   return (
     <article className="folder-card [position:relative] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--surface)] [box-shadow:var(--elevation-card)]">
@@ -382,8 +385,8 @@ function FolderCard({
           localName={localDeviceName}
           remoteName={remoteDevice?.name ?? "Paired computer"}
           working={pendingAction === "continue-merge" || pendingAction === "dismiss-issues"}
-          continueEnabled={mutationsEnabled && initialSyncBlockedReason === undefined}
-          continueDisabledReason={!mutationsEnabled ? disabledReason : initialSyncBlockedReason}
+          continueEnabled={continueBlockedReason === undefined}
+          continueDisabledReason={continueBlockedReason}
           error={actionError}
           onContinue={() => void continueInitialSync()}
           onDismiss={() => void dismissIssues()}

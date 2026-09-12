@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { EngineRpcError } from "../src/main/engine-supervisor"
 import { buildPersistedDesktopState, DesktopStateStore } from "../src/main/desktop-state-storage"
+import { MAX_SCAN_ISSUE_REASON_LENGTH, MAX_UNREADABLE_REPORTED } from "../src/main/folder-manifest"
 import {
   buildLegacyImportBundle,
   ensureLegacyBackup,
@@ -217,8 +218,8 @@ describe("legacy state conversion", () => {
       "not-an-array",
       [{ path: "locked", reason: "", kind: "directory" }],
       [{ path: "locked", reason: "denied", kind: "socket" }],
-      [{ path: "locked", reason: "x".repeat(201), kind: "file" }],
-      Array.from({ length: 101 }, (_, index) => ({ path: `p${index}`, reason: "denied", kind: "file" })),
+      [{ path: "locked", reason: "x".repeat(MAX_SCAN_ISSUE_REASON_LENGTH + 1), kind: "file" }],
+      Array.from({ length: MAX_UNREADABLE_REPORTED + 1 }, (_, index) => ({ path: `p${index}`, reason: "denied", kind: "file" })),
     ]
     for (const malformed of malformedValues) {
       const document = legacyDocument({

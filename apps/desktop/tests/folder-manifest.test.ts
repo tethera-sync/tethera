@@ -11,7 +11,6 @@ import {
   filesystemSupportsDigestReuse,
   identityIsReusable,
   isManifestPathIgnored,
-  isPathBlockedByScanIssue,
   MAX_UNREADABLE_REPORTED,
   SCAN_FILE_CONCURRENCY,
   scanFolder,
@@ -22,16 +21,8 @@ import {
   type ScanDigestCache,
   type ScanMetrics,
 } from "../src/main/folder-manifest"
-import { manifest } from "./helpers"
+import { manifest, testWithReuse } from "./helpers"
 import type { FolderScanActivity } from "../src/shared/contracts"
-
-/**
- * Reuse-dependent assertions only hold on a filesystem that reports usable
- * identity (not FAT/exFAT or an uncapable mount). Tests that assert a cache
- * hit are skipped elsewhere so the suite stays green on those roots.
- */
-const temporaryRootSupportsReuse = await filesystemSupportsDigestReuse(tmpdir())
-const testWithReuse = temporaryRootSupportsReuse ? test : test.skip
 
 describe("folder mapping comparison", () => {
   test("classifies identical, one-sided and different files", () => {
@@ -607,19 +598,6 @@ describe("unreadable path reporting", () => {
     expect(describeScanReason(Object.assign(new Error("boom"), { code: "ENOENT" }))).toBe("No longer exists")
     expect(describeScanReason(new Error("EACCES: permission denied, open '/secret/file'"))).toBe("Could not be read")
     expect(describeScanReason(new Error("The manifest file changed while it was read."))).toBe("The manifest file changed while it was read.")
-  })
-
-  test("blocks a directory issue's subtree but only the exact path for a file issue", () => {
-    const issues = [
-      { path: "locked", reason: "Permission denied", kind: "directory" as const },
-      { path: "locked.txt", reason: "Permission denied", kind: "file" as const },
-    ]
-    expect(isPathBlockedByScanIssue("locked", issues)).toBe(true)
-    expect(isPathBlockedByScanIssue("locked/nested/file.txt", issues)).toBe(true)
-    expect(isPathBlockedByScanIssue("locked.txt", issues)).toBe(true)
-    expect(isPathBlockedByScanIssue("locked.txt.bak", issues)).toBe(false)
-    expect(isPathBlockedByScanIssue("other.txt", issues)).toBe(false)
-    expect(isPathBlockedByScanIssue("anything", [{ path: "", reason: "Permission denied", kind: "directory" }])).toBe(true)
   })
 
   test("records inaccessible directories and files with their reason", async () => {

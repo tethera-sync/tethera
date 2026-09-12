@@ -3,7 +3,7 @@ import { constants } from "node:fs"
 import { mkdir, open, readFile } from "node:fs/promises"
 import path from "node:path"
 import type { FolderMappingPreview, FolderSetupStatus, FolderSummary, SyncMode } from "../shared/contracts"
-import { MAX_UNREADABLE_REPORTED } from "./folder-manifest"
+import { isFolderScanIssue, MAX_UNREADABLE_REPORTED } from "./folder-manifest"
 import {
   mappingConfigurationFromLegacyFolder,
   type LegacyImportRecord,
@@ -312,25 +312,12 @@ function isPreview(value: unknown): value is FolderMappingPreview {
   )
 }
 
-/** One persisted scan issue. Unlike `isBoundedPath`, an empty path means the scanned root and is valid. */
-function isScanIssue(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    typeof value.path === "string" &&
-    Buffer.byteLength(value.path, "utf8") <= 4_096 &&
-    !value.path.includes("\0") &&
-    typeof value.reason === "string" &&
-    value.reason.length > 0 &&
-    value.reason.length <= 200 &&
-    (value.kind === "file" || value.kind === "directory")
-  )
-}
-
+/** One persisted scan issue, validated with the same rules as a peer-supplied report. */
 function isOptionalScanIssueArray(value: unknown): boolean {
   return value === undefined || (
     Array.isArray(value) &&
     value.length <= MAX_UNREADABLE_REPORTED &&
-    value.every(isScanIssue)
+    value.every(isFolderScanIssue)
   )
 }
 

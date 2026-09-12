@@ -54,14 +54,14 @@ import {
   type MappingStoreHealth,
 } from "./engine-supervisor"
 import {
-  compareManifests, DEFAULT_MAX_MANIFEST_FILES, filesystemSupportsDigestReuse, isManifestPathIgnored, isPathBlockedByScanIssue, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
+  compareManifests, DEFAULT_MAX_MANIFEST_FILES, filesystemSupportsDigestReuse, isManifestPathIgnored, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
 } from "./folder-manifest"
 import { globalScanCoordinator } from "./scan-coordinator"
 import { runPairedScans } from "./paired-scan"
 import { previewScanKey, PreviewScanSessions } from "./preview-scan-session"
 import { ScanLedger, scanStageForKey } from "./scan-ledger"
 import { ScanReuseStore } from "./scan-reuse-store"
-import { scanIssueReportCovers } from "../shared/folder-scan-issues"
+import { formatScanIssuePath, scanIssueReportCovers, scanIssueTotal } from "../shared/folder-scan-issues"
 import { SCAN_GENERATION_CAPABILITY, SCAN_PAGE_MAX_ENTRIES } from "./scan-generation"
 import {
   assessInitialMergeConvergence,
@@ -111,6 +111,8 @@ import { folderComparisonResult } from "../shared/folder-comparison-result"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import {
   applySettingUpdate,
+  isBoundedSkipArray,
+  MAX_PERSISTED_SKIP_REASON_LENGTH,
   normalizePersistedScanLimit,
   parseArchiveHistoryRequest,
   parseExactConflictChoice,
@@ -342,23 +344,52 @@ interface PreparedInitialSyncScan {
   remoteManifest?: FileManifest
 }
 
+/** A prepared scan that still has every part a merge may reuse. */
+type RetainedPreparedScan = PreparedInitialSyncScan & {
+  localManifest: FileManifest
+  remoteManifest: FileManifest
+  localUnreadableEntries: FolderScanIssue[]
+}
+
 /** Prepared scans stay usable for a short decision window, then the merge rescans. */
 const PREPARED_INITIAL_SYNC_TTL_MS = 5 * 60_000
+/** How often abandoned prepared scans are checked for expiry while the process is alive. */
+const PREPARED_INITIAL_SYNC_SWEEP_INTERVAL_MS = 60_000
 /** Above this combined file count the manifests are not retained; verification falls back to comparing issue reports. */
 const MAX_PREPARED_SCAN_FILES = 200_000
 const preparedInitialSyncScans = new Map<string, PreparedInitialSyncScan>()
 
+/** The one freshness rule, shared by the reuse decision and the expiry sweep. */
+function preparedScanIsFresh(prepared: PreparedInitialSyncScan, now = Date.now()): boolean {
+  return now - prepared.capturedAt < PREPARED_INITIAL_SYNC_TTL_MS
+}
+
 /**
- * Releases the retained manifests of expired prepared scans while keeping the
- * accepted issue signature, so "Continue anyway" after the window still
- * honours the reviewed report. This runs on its own timer: an abandoned review
- * dialog may never touch the map again, and the window can be hidden in the
- * tray for hours while the process stays alive.
+ * Whether a stored scan may answer a merge for this folder: it must still hold
+ * its manifests and complete block set, match the folder's configuration, and
+ * be fresh. This is the single decision that pairs retained data with the
+ * user's acknowledged report.
+ */
+function hasRetainedPreparedScan(prepared: PreparedInitialSyncScan | undefined, folder: FolderSummary): prepared is RetainedPreparedScan {
+  return prepared !== undefined &&
+    prepared.localManifest !== undefined &&
+    prepared.remoteManifest !== undefined &&
+    prepared.localUnreadableEntries !== undefined &&
+    prepared.signature === initialSyncScanSignature(folder) &&
+    preparedScanIsFresh(prepared)
+}
+
+/**
+ * Releases the retained manifests and block set of expired prepared scans
+ * while keeping the accepted issue signature, so "Continue anyway" after the
+ * window still honours the reviewed report. This runs on its own timer: an
+ * abandoned review dialog may never touch the map again, and the window can be
+ * hidden in the tray for hours while the process stays alive.
  */
 function releaseExpiredPreparedScans(now = Date.now()): void {
+  if (preparedInitialSyncScans.size === 0) return
   for (const [folderId, prepared] of preparedInitialSyncScans) {
-    if (prepared.localManifest === undefined && prepared.remoteManifest === undefined) continue
-    if (now - prepared.capturedAt < PREPARED_INITIAL_SYNC_TTL_MS) continue
+    if (preparedScanIsFresh(prepared, now)) continue
     preparedInitialSyncScans.set(folderId, {
       capturedAt: prepared.capturedAt,
       signature: prepared.signature,
@@ -367,10 +398,7 @@ function releaseExpiredPreparedScans(now = Date.now()): void {
   }
 }
 
-const preparedInitialSyncSweepTimer = setInterval(
-  () => releaseExpiredPreparedScans(),
-  Math.min(PREPARED_INITIAL_SYNC_TTL_MS, 60_000),
-)
+const preparedInitialSyncSweepTimer = setInterval(() => releaseExpiredPreparedScans(), PREPARED_INITIAL_SYNC_SWEEP_INTERVAL_MS)
 preparedInitialSyncSweepTimer.unref()
 
 /** Raised after the folder has been put into its "review inaccessible items" state. */
@@ -481,17 +509,22 @@ async function withFolderDigestCache<T extends { truncated: boolean }>(
 
 type ActiveFolderScanTarget = Pick<FolderSummary, "id" | "localPath" | "ignorePatterns">
 
+interface CachedFolderScanOptions {
+  reuse?: ReadonlyMap<string, CachedFileDigest>
+  onUnreadable?: (issue: FolderScanIssue) => void
+  onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void
+}
+
 /** Full-integrity scan of an active folder, reusing the digests of unchanged files. */
 function runCachedFolderScan(
   key: string,
   folder: ActiveFolderScanTarget,
   maxFiles: number | null,
   signal: AbortSignal | null,
-  reuse?: ReadonlyMap<string, CachedFileDigest>,
-  onUnreadable?: (issue: FolderScanIssue) => void,
+  options: CachedFolderScanOptions = {},
 ): Promise<FileManifest> {
   return withFolderDigestCache(folder.id, (digestCache) =>
-    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache, reuse, onUnreadable }, signal))
+    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache, ...options }, signal))
 }
 
 /** The same pass reduced to an observation fingerprint, holding no file list in memory. */
@@ -716,16 +749,6 @@ async function persistStateDurably(): Promise<void> {
   await persistState()
 }
 
-function isPersistedSkipArray(value: unknown): value is Array<{ path: string; reason: string }> {
-  return Array.isArray(value) &&
-    value.length <= 10_000 &&
-    value.every((item) =>
-      item !== null && typeof item === "object" &&
-      typeof (item as { path?: unknown }).path === "string" && (item as { path: string }).path.length <= 4_096 &&
-      typeof (item as { reason?: unknown }).reason === "string" && (item as { reason: string }).reason.length <= 1_024
-    )
-}
-
 function parseInitialSyncOutcomes(value: unknown): Record<string, PersistedInitialSyncOutcome> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   const outcomes: Record<string, PersistedInitialSyncOutcome> = {}
@@ -737,8 +760,8 @@ function parseInitialSyncOutcomes(value: unknown): Record<string, PersistedIniti
       typeof completedAt !== "string" ||
       typeof copiedFiles !== "number" || !Number.isSafeInteger(copiedFiles) || copiedFiles < 0 ||
       typeof fileCount !== "number" || !Number.isSafeInteger(fileCount) || fileCount < 0 ||
-      !isPersistedSkipArray(conflicts) ||
-      (unreadableSkipped !== undefined && !isPersistedSkipArray(unreadableSkipped))
+      !isBoundedSkipArray(conflicts) ||
+      (unreadableSkipped !== undefined && !isBoundedSkipArray(unreadableSkipped))
     ) continue
     outcomes[folderId] = {
       completedAt,
@@ -1468,13 +1491,7 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
     }, controller.signal)
     scanReuseSeeds.remember(localPath, input.ignorePatterns, settled)
     if (operationId) {
-      previewScanSessions.record(operationId, previewScanKey({
-        kind: "local",
-        rootPath: localPath,
-        ignorePatterns: input.ignorePatterns,
-        hashAllFiles: false,
-        maxFiles: scanLimit,
-      }), localManifest)
+      previewScanSessions.record(operationId, localPreviewScanKey(localPath, input.ignorePatterns, scanLimit), localManifest)
     }
     if (controller.signal.aborted) throw new ScanCancelledError()
     emitPreviewProgress(operationId, "scan-remote")
@@ -2701,7 +2718,7 @@ function assertCompleteTransferManifest(manifest: FileManifest, computer: string
 /** Names up to three inaccessible paths for an error message, never an absolute one. */
 function describeUnreadableIssues(issues: readonly FolderScanIssue[], total: number): string {
   if (issues.length === 0) return "the paths could not be listed"
-  const shown = issues.slice(0, 3).map((issue) => `${issue.path || "(folder root)"} (${issue.reason})`)
+  const shown = issues.slice(0, 3).map((issue) => `${formatScanIssuePath(issue.path)} (${issue.reason})`)
   const remaining = total - shown.length
   return remaining > 0 ? `${shown.join(", ")} and ${remaining} more` : shown.join(", ")
 }
@@ -2950,10 +2967,6 @@ function scanIssueReportOf(localManifest: FileManifest, remoteManifest: FileMani
   }
 }
 
-function scanIssueTotal(report: FolderScanIssueReport): number {
-  return report.localCount + report.remoteCount
-}
-
 /** Canonical digest of an inaccessible-path report, used to match a decision to a fresh scan. */
 function scanIssueSignature(report: FolderScanIssueReport): string {
   // Serialise each triple so the sort compares whole records, not the default
@@ -2968,9 +2981,6 @@ function scanIssueSignature(report: FolderScanIssueReport): string {
   return createHash("sha256").update(canonical).digest("hex")
 }
 
-/** Matches the persistence bound applied by `isBoundedSkipArray` and `isPersistedSkipArray`. */
-const MAX_PERSISTED_SKIP_REASON_LENGTH = 1_024
-
 function scanIssueSkips(report: FolderScanIssueReport, localName: string, remoteName: string): SyncSkip[] {
   // A peer's display name is not length-bounded, so the formatted reason must
   // be clamped: an over-long reason would make the whole persisted outcome
@@ -2978,7 +2988,7 @@ function scanIssueSkips(report: FolderScanIssueReport, localName: string, remote
   const toSkips = (issues: FolderScanIssue[], computer: string): SyncSkip[] => issues.map((issue) => {
     const reason = `${computer} could not read this item (${issue.reason}); it was left out of the merge.`
     return {
-      path: issue.path || "(folder root)",
+      path: formatScanIssuePath(issue.path),
       reason: reason.length > MAX_PERSISTED_SKIP_REASON_LENGTH
         ? `${reason.slice(0, MAX_PERSISTED_SKIP_REASON_LENGTH - 1)}…`
         : reason,
@@ -3018,8 +3028,8 @@ function reportCoversApproved(report: FolderScanIssueReport, approved: FolderSca
 interface InitialSyncRunOptions {
   /** The user reviewed the fresh inaccessible-path report and chose to continue. */
   allowUnreadable: boolean
-  /** A full scan captured while the user reviewed inaccessible items. */
-  prepared?: PreparedInitialSyncScan
+  /** A retained full scan captured while the user reviewed inaccessible items. */
+  prepared?: RetainedPreparedScan
   /** Report the user already accepted; a fresh scan matching it proceeds without re-asking. */
   acknowledgedIssuesSignature?: string
 }
@@ -3046,40 +3056,35 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   const scanLimit = currentScanLimit()
   let localManifest: FileManifest
   let remoteManifest: FileManifest
-  // The caller has already made the single freshness decision (signature and
-  // TTL) that selected these manifests; re-evaluating it here with a second
-  // clock read could accept a reviewer decision the manifests no longer
-  // support. An absent prepared scan always falls through to a fresh walk.
+  // The caller already paired these manifests with the freshness decision and
+  // the matching unreadable allowance; an absent prepared scan always falls
+  // through to a fresh walk.
   const prepared = options.prepared
   // The complete per-path block set for this side. `manifest.unreadableEntries`
   // is bounded for exchange, so planning must never treat it as complete: a
   // path omitted from the report could otherwise still receive a pull.
-  const localBlocked: FolderScanIssue[] = []
-  if (prepared?.localManifest && prepared.remoteManifest && prepared.localUnreadableEntries) {
+  let localBlocked: FolderScanIssue[]
+  if (prepared) {
     localManifest = prepared.localManifest
     remoteManifest = prepared.remoteManifest
-    localBlocked.push(...prepared.localUnreadableEntries)
+    localBlocked = prepared.localUnreadableEntries
   } else {
     const chunked = await peerSupportsChunkedFrames(peer.id)
     let scanning = true
+    localBlocked = []
     const result = await runPairedScans(
-      (signal) => withFolderDigestCache(folder.id, (digestCache) =>
-        runLocalScan(`initial:${folder.id}`, folder.localPath, folder.ignorePatterns, {
-          hashAllFiles: true,
-          maxFiles: scanLimit,
-          folderId: folder.id,
-          digestCache,
-          reuse,
-          onUnreadable: (issue) => localBlocked.push(issue),
-          onActivity: (activity) => {
-            if (!scanning) return
-            const action = { listing: "Listing", inspecting: "Checking", hashing: "Hashing", complete: "Local scan complete" }[activity.stage]
-            updateFolder(folder.id, {
-              currentAction: `${action}${activity.currentPath ? `: ${activity.currentPath}` : ""} · ${activity.scannedFiles.toLocaleString("en-GB")} files checked · ${formatScanHashedBytes(activity.hashedBytes)} hashed · ${activity.ignoredEntries.toLocaleString("en-GB")} excluded entries · ${activity.unreadableEntries.toLocaleString("en-GB")} unreadable. Comparing with ${peer.name} before copying.`,
-            })
-            broadcastSnapshot()
-          },
-        }, signal)),
+      (signal) => runCachedFolderScan(`initial:${folder.id}`, folder, scanLimit, signal, {
+        reuse,
+        onUnreadable: (issue) => localBlocked.push(issue),
+        onActivity: (activity) => {
+          if (!scanning) return
+          const action = { listing: "Listing", inspecting: "Checking", hashing: "Hashing", complete: "Local scan complete" }[activity.stage]
+          updateFolder(folder.id, {
+            currentAction: `${action}${activity.currentPath ? `: ${activity.currentPath}` : ""} · ${activity.scannedFiles.toLocaleString("en-GB")} files checked · ${formatScanHashedBytes(activity.hashedBytes)} hashed · ${activity.ignoredEntries.toLocaleString("en-GB")} excluded entries · ${activity.unreadableEntries.toLocaleString("en-GB")} unreadable. Comparing with ${peer.name} before copying.`,
+          })
+          broadcastSnapshot()
+        },
+      }),
       (signal) => requestPeerManifest(peer.id, {
         type: "scan-manifest",
         folderId: folder.id,
@@ -3101,15 +3106,14 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   if (issueTotal > 0 && !alreadyAcknowledged && !reportCoversApproved(issues, approvedInitialSyncIssues(folder.id))) {
     // Hold the scan so "Continue anyway" reuses it instead of walking both
     // folders again, then surface the exact paths for the user's decision.
-    // Oversized manifests are dropped; the report signature still lets a
-    // matching fresh scan proceed after the user continues.
+    // Oversized scans are stored signature-only: the report signature still
+    // lets a matching fresh scan proceed after the user continues.
     const totalFiles = localManifest.files.length + remoteManifest.files.length
     preparedInitialSyncScans.set(folder.id, {
       capturedAt: Date.now(),
       signature: initialSyncScanSignature(folder),
       issuesSignature,
-      localUnreadableEntries: localBlocked,
-      ...(totalFiles <= MAX_PREPARED_SCAN_FILES ? { localManifest, remoteManifest } : {}),
+      ...(totalFiles <= MAX_PREPARED_SCAN_FILES ? { localManifest, remoteManifest, localUnreadableEntries: localBlocked } : {}),
     })
     updateFolder(folder.id, {
       status: "needs-attention",
@@ -3211,7 +3215,7 @@ async function verifyInitialMergeQuiescent(
   // being pulled into an unreadable path.
   const localBlocked: FolderScanIssue[] = []
   const { local: localManifest, peer: remoteManifest } = await runPairedScans(
-    (signal) => runCachedFolderScan(`verify:${folder.id}`, folder, scanLimit, signal, undefined, (issue) => localBlocked.push(issue)),
+    (signal) => runCachedFolderScan(`verify:${folder.id}`, folder, scanLimit, signal, { onUnreadable: (issue) => localBlocked.push(issue) }),
     (signal) => requestPeerManifest(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
@@ -3381,19 +3385,13 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     let unreadableSkipped: SyncSkip[] = []
     let completedAt = ""
     const prepared = preparedInitialSyncScans.get(folderId)
-    // Single freshness decision: it selects both the manifests that may be
-    // reused and whether the reviewed unreadable report still authorises
-    // skipping. Once false, the pass gets no prepared scan and no blanket
-    // allowance, so a fresh report is checked against the accepted signature.
-    const preparedStillHolds = prepared !== undefined &&
-      prepared.localManifest !== undefined &&
-      prepared.remoteManifest !== undefined &&
-      prepared.localUnreadableEntries !== undefined &&
-      prepared.signature === initialSyncScanSignature(folder) &&
-      Date.now() - prepared.capturedAt <= PREPARED_INITIAL_SYNC_TTL_MS
-    const allowUnreadable = acknowledgeUnreadable && preparedStillHolds
+    // A single freshness check decides both the manifests to reuse and whether
+    // the reviewed unreadable report still authorises skipping. Once it fails,
+    // the pass gets no prepared scan and no blanket allowance, so a fresh
+    // report is checked against the accepted signature instead.
+    const reusablePrepared = hasRetainedPreparedScan(prepared, folder) ? prepared : undefined
+    const allowUnreadable = acknowledgeUnreadable && reusablePrepared !== undefined
     const acknowledgedIssuesSignature = acknowledgeUnreadable ? prepared?.issuesSignature : undefined
-    const reusablePrepared = preparedStillHolds ? prepared : undefined
     const { local: localResult, peer: remoteResult } = await runCoordinatedInitialMerge(
       () => runInitialSyncPass(folder, peer, { allowUnreadable, prepared: reusablePrepared, acknowledgedIssuesSignature }),
       async () => {
@@ -3658,7 +3656,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
           folder,
           currentScanLimit(),
           context.signal,
-          scanReuseSeeds.lookup(folder.localPath, folder.ignorePatterns),
+          { reuse: scanReuseSeeds.lookup(folder.localPath, folder.ignorePatterns) },
         )
         assertManifestFitsExchange(manifest, "This computer", context.chunkedResponse)
         return manifest

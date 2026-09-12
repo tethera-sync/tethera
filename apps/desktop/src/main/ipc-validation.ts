@@ -323,13 +323,18 @@ export function validateTransferDescriptor(entry: FileManifest["files"][number],
   }
 }
 
-function isBoundedSkipArray(value: unknown): value is Array<{ path: string; reason: string }> {
+/** Bounds shared by every persisted or peer-supplied skip list. */
+export const MAX_PERSISTED_SKIP_ENTRIES = 10_000
+export const MAX_PERSISTED_SKIP_PATH_LENGTH = 4_096
+export const MAX_PERSISTED_SKIP_REASON_LENGTH = 1_024
+
+export function isBoundedSkipArray(value: unknown): value is Array<{ path: string; reason: string }> {
   return Array.isArray(value) &&
-    value.length <= 10_000 &&
+    value.length <= MAX_PERSISTED_SKIP_ENTRIES &&
     value.every((item) =>
       item !== null && typeof item === "object" &&
-      typeof (item as { path?: unknown }).path === "string" && (item as { path: string }).path.length <= 4_096 &&
-      typeof (item as { reason?: unknown }).reason === "string" && (item as { reason: string }).reason.length <= 1_024
+      typeof (item as { path?: unknown }).path === "string" && (item as { path: string }).path.length <= MAX_PERSISTED_SKIP_PATH_LENGTH &&
+      typeof (item as { reason?: unknown }).reason === "string" && (item as { reason: string }).reason.length <= MAX_PERSISTED_SKIP_REASON_LENGTH
     )
 }
 

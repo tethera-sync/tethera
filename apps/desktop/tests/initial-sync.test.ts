@@ -9,8 +9,27 @@ import {
   writeFileAtomic,
   writeFileChunksAtomic,
 } from "../src/main/initial-sync"
+import { createScanIssueBlocklist } from "../src/main/folder-manifest"
 import { archiveObjectPath } from "../src/main/version-archive"
 import { manifest, sha256Hex } from "./helpers"
+
+describe("createScanIssueBlocklist", () => {
+  test("blocks a directory subtree, only the exact path for a file, and the whole tree for the root", () => {
+    const blocked = createScanIssueBlocklist([
+      { path: "locked", reason: "Permission denied", kind: "directory" },
+      { path: "locked.txt", reason: "Permission denied", kind: "file" },
+    ])
+    expect(blocked("locked")).toBe(true)
+    expect(blocked("locked/nested/file.txt")).toBe(true)
+    expect(blocked("locked.txt")).toBe(true)
+    expect(blocked("locked.txt.bak")).toBe(false)
+    expect(blocked("other.txt")).toBe(false)
+    expect(blocked("locked-elsewhere/file.txt")).toBe(false)
+
+    expect(createScanIssueBlocklist([{ path: "", reason: "Permission denied", kind: "directory" }])("anything")).toBe(true)
+    expect(createScanIssueBlocklist([])("anything")).toBe(false)
+  })
+})
 
 describe("computeSyncPlan", () => {
   test("pulls remote-only files and skips divergent ones", () => {
