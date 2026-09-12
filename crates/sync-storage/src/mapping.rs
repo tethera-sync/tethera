@@ -203,10 +203,45 @@ pub struct MappingPreview {
     pub case_collisions: Vec<String>,
     pub truncated: bool,
     pub samples: Vec<MappingPreviewItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable_local: Option<Vec<MappingScanIssue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable_remote: Option<Vec<MappingScanIssue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable_local_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable_remote_count: Option<u64>,
 }
 
 impl MappingPreview {
     fn validate(&self) -> Result<(), MappingStoreError> {
+        for (issues, count) in [
+            (&self.unreadable_local, self.unreadable_local_count),
+            (&self.unreadable_remote, self.unreadable_remote_count),
+        ] {
+            let issues = issues.as_deref().unwrap_or_default();
+            if issues.len() > 100
+                || count.is_some_and(|count| {
+                    count < issues.len() as u64 || count > 9_007_199_254_740_991
+                })
+            {
+                return Err(MappingStoreError::Invalid(
+                    "Invalid preview scan issue count".to_owned(),
+                ));
+            }
+            for issue in issues {
+                // Empty denotes the scanned root; these paths are display-only.
+                if issue.path.len() > MAX_PATH_LENGTH
+                    || issue.path.contains('\0')
+                    || issue.reason.is_empty()
+                    || issue.reason.encode_utf16().count() > 200
+                {
+                    return Err(MappingStoreError::Invalid(
+                        "Invalid preview scan issue".to_owned(),
+                    ));
+                }
+            }
+        }
         for (field, paths) in [
             ("preview.invalidWindowsNames", &self.invalid_windows_names),
             ("preview.caseCollisions", &self.case_collisions),
@@ -236,6 +271,22 @@ impl MappingPreview {
         }
         Ok(())
     }
+}
+
+/// Bounded, display-only evidence retained with the approved comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MappingScanIssue {
+    pub path: String,
+    pub reason: String,
+    pub kind: MappingScanIssueKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MappingScanIssueKind {
+    File,
+    Directory,
 }
 
 /// One bounded path sample in a mapping comparison summary.

@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { CachedFileDigest, FileManifest, ScanMetrics } from "../src/main/folder-manifest"
-import { scanFolder } from "../src/main/folder-manifest"
+import { compareManifests, scanFolder } from "../src/main/folder-manifest"
 import { previewScanKey, PreviewScanSessions } from "../src/main/preview-scan-session"
 import { ScanLedger, type ScanStage } from "../src/main/scan-ledger"
 import { testWithReuse } from "./helpers"
@@ -54,13 +54,17 @@ describe("folder setup walk budget", () => {
       // Stage 2: request approval answers from the recorded comparison with no walk.
       const sessions = new PreviewScanSessions(() => 0)
       const scanKey = previewScanKey({
-        kind: "local",
-        rootPath: root,
+        direction: "outgoing",
+        localPath: root,
+        remotePath: "D:\\coding",
+        peerId: "peer-1",
+        localPlatform: "linux",
+        remotePlatform: "windows",
+        mode: "two-way",
         ignorePatterns: [],
-        hashAllFiles: false,
         maxFiles: null,
       })
-      sessions.record("operation-1", scanKey, preview.manifest)
+      sessions.record("operation-1", scanKey, compareManifests(preview.manifest, preview.manifest, { mode: "two-way", localPlatform: "linux", remotePlatform: "windows" }))
       expect(sessions.lookup("operation-1", scanKey)).toBeDefined()
       expect(ledger.snapshot()).toHaveLength(1)
 

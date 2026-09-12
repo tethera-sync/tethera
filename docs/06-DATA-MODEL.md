@@ -1,12 +1,14 @@
 # Data model
 
-SQLite is local to each device. Schema version `6` is authoritative for mapping configuration, verified file baselines, retry/conflict state, replacement recovery metadata, and staged scan generations. User-file bytes are never stored in SQLite.
+SQLite is local to each device. Schema version `7` is authoritative for mapping configuration, verified file baselines, retry/conflict state, replacement recovery metadata, and staged scan generations. User-file bytes are never stored in SQLite.
 
 ## Implemented mapping tables
 
 ### `folder_mappings`
 
 The active configuration row introduced in schema version 1: stable mapping ID, both participant IDs and names, both approved path strings, mode, ignore patterns, history limits, setup status, preview, and created/updated timestamps. Paths are opaque strings and are never opened by the mapping store.
+
+The preview JSON optionally retains `unreadableLocal`, `unreadableRemote`, `unreadableLocalCount` and `unreadableRemoteCount`. Each side has at most 100 display-only issues with a UTF-8 path of at most 4,096 bytes, a nonempty reason of at most 200 UTF-16 code units, and a `file` or `directory` kind. An empty path denotes the scanned root. Totals are nonnegative JavaScript-safe integers, at least as large as the retained list. Old previews omit these fields and round-trip without adding them. This uses the existing JSON column; no schema migration is required. Older builds that reject these fields cannot consume newly saved previews.
 
 An active row is visible only when it has valid version-2 revision metadata and no terminal tombstone for the same ID.
 

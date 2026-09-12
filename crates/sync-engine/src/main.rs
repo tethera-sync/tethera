@@ -1922,6 +1922,125 @@ mod tests {
         );
     }
 
+    fn preview_with_scan_issues() -> serde_json::Value {
+        serde_json::json!({
+            "localFiles": 214_613, "remoteFiles": 51587, "identicalFiles": 250,
+            "differentFiles": 1239, "localOnlyFiles": 213_124, "remoteOnlyFiles": 50098,
+            "ignoredLocal": 1, "ignoredRemote": 10, "bytesToRemote": 100, "bytesToLocal": 200,
+            "invalidWindowsNames": [], "caseCollisions": [], "truncated": false, "samples": [],
+            "unreadableLocal": [{"path": "", "reason": "Access denied", "kind": "directory"}],
+            "unreadableRemote": [{"path": "locked.txt", "reason": "File is locked", "kind": "file"}],
+            "unreadableLocalCount": 1, "unreadableRemoteCount": 10
+        })
+    }
+
+    #[test]
+    fn mapping_rpc_preserves_approved_scan_issues_in_storage_and_delivery() {
+        let store = ready_store();
+        let mut params: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("fixture");
+        let preview = preview_with_scan_issues();
+        params["mapping"]["preview"] = preview.clone();
+        params["deliveryTargetDeviceId"] = serde_json::json!("win-box");
+        let saved = handle_line(
+            &request("mapping.upsert", &params.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(saved["ok"], true, "{saved}");
+        assert_eq!(saved["result"]["mapping"]["preview"], preview);
+        let loaded = handle_line(
+            &request("mapping.get", r#"{"id":"mapping-1"}"#),
+            "correct",
+            &store,
+        );
+        assert_eq!(loaded["result"]["mapping"]["preview"], preview);
+        let delivery = handle_line(
+            &request("mapping.listPendingDelivery", "null"),
+            "correct",
+            &store,
+        );
+        assert_eq!(
+            delivery["result"][0]["event"]["record"]["mapping"]["preview"],
+            preview
+        );
+    }
+
+    #[test]
+    fn mapping_rpc_accepts_old_previews_and_rejects_invalid_scan_issues_without_writing() {
+        let mut old = preview_with_scan_issues();
+        for field in [
+            "unreadableLocal",
+            "unreadableRemote",
+            "unreadableLocalCount",
+            "unreadableRemoteCount",
+        ] {
+            old.as_object_mut().expect("preview object").remove(field);
+        }
+        let mut params: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("fixture");
+        params["mapping"]["preview"] = old.clone();
+        let saved = handle_line(
+            &request("mapping.upsert", &params.to_string()),
+            "correct",
+            &ready_store(),
+        );
+        assert_eq!(saved["ok"], true, "{saved}");
+        assert_eq!(saved["result"]["mapping"]["preview"], old);
+        let mut invalid = Vec::new();
+        for (field, value) in [
+            ("unreadableLocalCount", serde_json::json!(-1)),
+            ("unreadableLocalCount", serde_json::json!(0)),
+            (
+                "unreadableLocalCount",
+                serde_json::json!(9_007_199_254_740_992_u64),
+            ),
+            (
+                "unreadableLocal",
+                serde_json::json!([{"path":"x", "reason":"locked", "kind":"unknown"}]),
+            ),
+            (
+                "unreadableLocal",
+                serde_json::json!([{"path":"x", "reason":"", "kind":"file"}]),
+            ),
+            (
+                "unreadableLocal",
+                serde_json::json!([{"path":"x", "reason":"x".repeat(201), "kind":"file"}]),
+            ),
+            (
+                "unreadableLocal",
+                serde_json::json!([{"path":"x".repeat(4097), "reason":"locked", "kind":"file"}]),
+            ),
+            (
+                "unreadableLocal",
+                serde_json::json!([{"path":"x", "reason":"locked", "kind":"file", "extra":true}]),
+            ),
+            (
+                "unreadableLocal",
+                serde_json::json!(vec![
+                    serde_json::json!({"path":"x", "reason":"locked", "kind":"file"});
+                    101
+                ]),
+            ),
+        ] {
+            let mut preview = preview_with_scan_issues();
+            preview[field] = value;
+            invalid.push(preview);
+        }
+        for preview in invalid {
+            let store = ready_store();
+            params["mapping"]["preview"] = preview;
+            let saved = handle_line(
+                &request("mapping.upsert", &params.to_string()),
+                "correct",
+                &store,
+            );
+            assert_eq!(saved["ok"], false, "{saved}");
+            let listed = handle_line(&request("mapping.list", "null"), "correct", &store);
+            assert_eq!(listed["result"], serde_json::json!([]));
+        }
+    }
+
     #[test]
     fn file_sync_rpc_initializes_and_reads_durable_state() {
         let store = ready_store();

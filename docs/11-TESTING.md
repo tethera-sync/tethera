@@ -16,6 +16,8 @@ Rust storage tests exercise:
 
 Rust engine/RPC tests exercise authentication before dispatch, unknown-field rejection, structured error codes, migration states, database-unavailable and unsupported-schema health, participant validation, exact acknowledgement matching, active-only reads and the branded data-directory environment fallback.
 
+Mapping RPC regressions cover persistence and queued delivery of bounded unreadable-file details, old previews without the additive fields, and malformed reports rejected without creating a mapping. Comparison-session tests cover large-folder summary reuse, all input-key changes, expiry, cancellation/drop, bounded retention and changed unreadable paths requiring review.
+
 Desktop tests exercise the one-time `state.json` import and cleanup independently from the database implementation. They cover no file, zero mappings, valid data, malformed and duplicate data, unreadable state, import retry after failure, crash after database commit but before cleanup, verified backups, preservation of unrelated settings, SQLite-only startup reads, tombstone filtering, health warnings and mutation gating.
 
 Initial-merge tests cover direction-aware additive planning, fresh-scan convergence gating, large-file eligibility, strict two-pass completion ordering, durable conflict outcome projection, bounded source reads, source mutation detection, full-file SHA-256 verification, incomplete-staging cleanup, atomic no-replace commits, and source/destination symlink escape rejection. Full-integrity manifest tests prove files above the preview hashing ceiling receive digests and crash-residue staging names are never synchronized.

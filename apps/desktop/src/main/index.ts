@@ -45,6 +45,7 @@ import type {
   RecoveryConflict,
   RecoveryState,
   ResolveFileConflictInput,
+  SyncMode,
   UpdateState,
 } from "../shared/contracts"
 import {
@@ -54,11 +55,11 @@ import {
   type MappingStoreHealth,
 } from "./engine-supervisor"
 import {
-  compareManifests, DEFAULT_MAX_MANIFEST_FILES, filesystemSupportsDigestReuse, isManifestPathIgnored, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
+  compareManifests, DEFAULT_MAX_MANIFEST_FILES, filesystemSupportsDigestReuse, isManifestPathIgnored, isScanCancelled, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
 } from "./folder-manifest"
 import { globalScanCoordinator } from "./scan-coordinator"
 import { runPairedScans } from "./paired-scan"
-import { previewScanKey, PreviewScanSessions } from "./preview-scan-session"
+import { previewsEqual, previewScanKey, PreviewScanSessions } from "./preview-scan-session"
 import { ScanLedger, scanStageForKey } from "./scan-ledger"
 import { ScanReuseStore } from "./scan-reuse-store"
 import { formatScanIssuePath, scanIssueReportCovers, scanIssueTotal } from "../shared/folder-scan-issues"
@@ -436,6 +437,8 @@ function abortFolderScans(folderId: string): void {
  * runPairedScans separately.
  */
 function runAdmittedScan<T>(key: string, folderId: string | undefined, signal: AbortSignal | null, walk: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const startedAt = performance.now()
+  const stage = scanStageForKey(key)
   const controller = new AbortController()
   if (signal?.aborted || shutdownScanController.signal.aborted) controller.abort()
   const forwardShutdown = (): void => controller.abort()
@@ -444,9 +447,16 @@ function runAdmittedScan<T>(key: string, folderId: string | undefined, signal: A
   signal?.addEventListener("abort", forwardOuter, { once: true })
   const untrack = trackFolderScan(folderId, controller)
   return globalScanCoordinator.run(key, () => {
+    console.info("[scan] started", { stage })
     const effective = AbortSignal.any([controller.signal, shutdownScanController.signal, ...(signal ? [signal] : [])])
     return walk(effective)
-  }, controller.signal).finally(() => {
+  }, controller.signal).then((result) => {
+    console.info("[scan] completed", { stage, elapsedMs: Math.round(performance.now() - startedAt) })
+    return result
+  }, (error: unknown) => {
+    console.warn("[scan] stopped", { stage, cancelled: controller.signal.aborted || isScanCancelled(error), elapsedMs: Math.round(performance.now() - startedAt) })
+    throw error
+  }).finally(() => {
     shutdownScanController.signal.removeEventListener("abort", forwardShutdown)
     signal?.removeEventListener("abort", forwardOuter)
     untrack()
@@ -476,6 +486,7 @@ function runLocalScan(
     onActivity: options.onActivity,
     onMetrics: (metrics) => {
       scanLedger.record(scanStageForKey(key), key, metrics)
+      console.info("[scan] counters", { stage: scanStageForKey(key), ...metrics })
       options.onMetrics?.(metrics)
     },
     onSettledDigest: options.onSettledDigest,
@@ -1428,29 +1439,6 @@ async function requireExactMappingDeliveryAcknowledgement(record: MappingRecord,
   }
 }
 
-function previewsEqual(left: FolderMappingPreview, right: FolderMappingPreview): boolean {
-  // The bounded issue lists are additive detail added after the original
-  // contract. A preview from an older peer lacks them, so comparing them
-  // would report a change that did not happen; the original counts still
-  // have to match exactly.
-  const canonical = (preview: FolderMappingPreview) => {
-    const {
-      unreadableLocal: _unreadableLocal,
-      unreadableRemote: _unreadableRemote,
-      unreadableLocalCount: _unreadableLocalCount,
-      unreadableRemoteCount: _unreadableRemoteCount,
-      ...rest
-    } = preview
-    return {
-      ...rest,
-      invalidWindowsNames: [...preview.invalidWindowsNames].sort(),
-      caseCollisions: [...preview.caseCollisions].sort(),
-      samples: [...preview.samples].sort((a, b) => `${a.category}:${a.path}`.localeCompare(`${b.category}:${b.path}`)),
-    }
-  }
-  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right))
-}
-
 function emitPreviewProgress(operationId: string | undefined, phase: FolderPreviewProgress["phase"], scannedFiles?: number, activity?: FolderPreviewProgress["activity"], reused?: boolean): void {
   if (!operationId || !mainWindow) return
   const progress: FolderPreviewProgress = { operationId, phase, scannedFiles, activity, ...(reused ? { reused: true } : {}) }
@@ -1469,7 +1457,10 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
   if (peer.status !== "online") throw new Error(`${peer.name} must be online to compare the folders.`)
   const operationId = parsePreviewProgressToken(progressOperationId)
   // Supersession: a repeated preview token cancels the previous scan.
-  if (operationId) previewScanControllers.get(operationId)?.abort()
+  if (operationId) {
+    previewScanControllers.get(operationId)?.abort()
+    previewScanSessions.drop(operationId)
+  }
   const controller = new AbortController()
   if (operationId) previewScanControllers.set(operationId, controller)
   const onShutdown = (): void => controller.abort()
@@ -1490,44 +1481,30 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
       onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
     }, controller.signal)
     scanReuseSeeds.remember(localPath, input.ignorePatterns, settled)
-    if (operationId) {
-      previewScanSessions.record(operationId, localPreviewScanKey(localPath, input.ignorePatterns, scanLimit), localManifest)
-    }
     if (controller.signal.aborted) throw new ScanCancelledError()
     emitPreviewProgress(operationId, "scan-remote")
     const remoteManifest = await requestPeerPreview(requirePeerSessions(), peer, {
       path: input.remotePath,
       ignorePatterns: input.ignorePatterns,
     }, controller.signal, (progress) => emitPreviewProgress(operationId, "scan-remote", progress.scannedFiles, { ...progress, currentPath: "" }))
-    if (operationId) previewScanSessions.record(operationId, remotePreviewScanKey(peer.id, input.remotePath, input.ignorePatterns), remoteManifest)
     if (controller.signal.aborted) throw new ScanCancelledError()
     emitPreviewProgress(operationId, "compare")
     // Truncated previews stay explicit partial results; sync paths fail closed elsewhere.
-    return compareManifests(localManifest, remoteManifest, {
+    const preview = compareManifests(localManifest, remoteManifest, {
       mode: input.mode,
       localPlatform: platform(),
       remotePlatform: peer.platform,
     })
+    if (operationId) previewScanSessions.record(operationId, comparisonSessionKey("outgoing", localPath, input.remotePath, peer, input.ignorePatterns, input.mode, scanLimit), preview)
+    return preview
   } finally {
     shutdownScanController.signal.removeEventListener("abort", onShutdown)
     if (operationId && previewScanControllers.get(operationId) === controller) previewScanControllers.delete(operationId)
   }
 }
 
-function remotePreviewScanKey(peerId: string, remotePath: string, ignorePatterns: string[]): string {
-  return previewScanKey({ kind: "remote", peerId, rootPath: remotePath, ignorePatterns, hashAllFiles: false, maxFiles: null })
-}
-
-/** The lookup side reads the current limit so captures taken under a different limit safely miss. */
-function localPreviewScanKey(localPath: string, ignorePatterns: string[], maxFiles: number | null = currentScanLimit()): string {
-  return previewScanKey({ kind: "local", rootPath: localPath, ignorePatterns, hashAllFiles: false, maxFiles })
-}
-
-/** Both scans captured during a renderer's review step, if still cached and unchanged. */
-function lookupPreviewScanPair(operationId: string, localPath: string, remotePath: string, peerId: string, ignorePatterns: string[]): { local: FileManifest; remote: FileManifest } | undefined {
-  const local = previewScanSessions.lookup(operationId, localPreviewScanKey(localPath, ignorePatterns))
-  const remote = previewScanSessions.lookup(operationId, remotePreviewScanKey(peerId, remotePath, ignorePatterns))
-  return local && remote ? { local, remote } : undefined
+function comparisonSessionKey(direction: "outgoing" | "incoming", localPath: string, remotePath: string, peer: DeviceSummary, ignorePatterns: string[], mode: SyncMode, maxFiles: number | null = currentScanLimit()): string {
+  return previewScanKey({ direction, localPath, remotePath, peerId: peer.id, localPlatform: platform(), remotePlatform: peer.platform, ignorePatterns, mode, maxFiles })
 }
 
 async function requestFolderMapping(input: RequestFolderMappingInput, progressOperationId?: unknown): Promise<AppSnapshot> {
@@ -1538,21 +1515,17 @@ async function requestFolderMapping(input: RequestFolderMappingInput, progressOp
   if (peer.status !== "online") throw new Error(`${peer.name} must be online to approve the mapping.`)
   const operationId = parsePreviewProgressToken(progressOperationId)
   const localPath = path.resolve(input.localPath)
-  // Reuse the scans the renderer just reviewed instead of walking both folder
+  // Reuse the comparison the renderer just reviewed instead of walking both folder
   // trees a second time. The responder still re-scans before approving, so
   // filesystem drift is caught by the consent gate; the merge below scans
   // again before copying anything. A missing or expired capture rescans here.
   const captured = operationId
-    ? lookupPreviewScanPair(operationId, localPath, input.remotePath, peer.id, input.ignorePatterns)
+    ? previewScanSessions.lookup(operationId, comparisonSessionKey("outgoing", localPath, input.remotePath, peer, input.ignorePatterns, input.mode))
     : undefined
   let authoritativePreview: FolderMappingPreview
   if (captured) {
     emitPreviewProgress(operationId, "compare", undefined, undefined, true)
-    authoritativePreview = compareManifests(captured.local, captured.remote, {
-      mode: input.mode,
-      localPlatform: platform(),
-      remotePlatform: peer.platform,
-    })
+    authoritativePreview = captured
   } else {
     authoritativePreview = await previewFolderMapping(input, progressOperationId)
   }
@@ -1631,7 +1604,10 @@ async function buildIncomingMappingPreview(
   if (!peer) throw new Error("The requesting computer is no longer trusted.")
   if (peer.status !== "online") throw new Error(`${peer.name} must be online to compare the folders.`)
   const operationId = parsePreviewProgressToken(progressOperationId)
-  if (operationId) previewScanControllers.get(operationId)?.abort()
+  if (operationId) {
+    previewScanControllers.get(operationId)?.abort()
+    previewScanSessions.drop(operationId)
+  }
   const controller = new AbortController()
   if (operationId) previewScanControllers.set(operationId, controller)
   const onShutdown = (): void => controller.abort()
@@ -1645,7 +1621,6 @@ async function buildIncomingMappingPreview(
       path: request.proposal.initiatorPath,
       ignorePatterns: request.proposal.ignorePatterns,
     }, controller.signal, (progress) => emitPreviewProgress(operationId, "scan-remote", progress.scannedFiles, { ...progress, currentPath: "" }))
-    if (operationId) previewScanSessions.record(operationId, remotePreviewScanKey(peer.id, request.proposal.initiatorPath, request.proposal.ignorePatterns), initiatorManifest)
     if (controller.signal.aborted) throw new ScanCancelledError()
     emitPreviewProgress(operationId, "scan-local", 0)
     // This is the responder's first look at its own destination folder. Its
@@ -1661,14 +1636,15 @@ async function buildIncomingMappingPreview(
       onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
     }, controller.signal)
     scanReuseSeeds.remember(target, request.proposal.ignorePatterns, settled)
-    if (operationId) previewScanSessions.record(operationId, localPreviewScanKey(target, request.proposal.ignorePatterns, scanLimit), responderManifest)
     if (controller.signal.aborted) throw new ScanCancelledError()
     emitPreviewProgress(operationId, "compare")
-    return compareManifests(initiatorManifest, responderManifest, {
+    const preview = compareManifests(initiatorManifest, responderManifest, {
       mode: request.proposal.mode,
       localPlatform: peer.platform,
       remotePlatform: platform(),
     })
+    if (operationId) previewScanSessions.record(operationId, comparisonSessionKey("incoming", target, request.proposal.initiatorPath, peer, request.proposal.ignorePatterns, request.proposal.mode, scanLimit), preview)
+    return preview
   } finally {
     shutdownScanController.signal.removeEventListener("abort", onShutdown)
     if (operationId && previewScanControllers.get(operationId) === controller) previewScanControllers.delete(operationId)
@@ -1705,17 +1681,13 @@ async function approveFolderMapping(input: ApproveFolderMappingInput, progressOp
   const peer = getPairedDevice(request.fromDeviceId)
   if (!peer) throw new Error("The requesting computer is no longer trusted.")
   const operationId = parsePreviewProgressToken(progressOperationId)
-  // Reuse the scans from the refresh step when the destination has not changed
+  // Reuse the comparison from the refresh step when the destination has not changed
   // since; otherwise this is the only scan and no cache entry exists.
   const captured = operationId
-    ? lookupPreviewScanPair(operationId, destinationPath, request.proposal.initiatorPath, peer.id, request.proposal.ignorePatterns)
+    ? previewScanSessions.lookup(operationId, comparisonSessionKey("incoming", destinationPath, request.proposal.initiatorPath, peer, request.proposal.ignorePatterns, request.proposal.mode))
     : undefined
   const refreshedPreview = captured && peer.status === "online"
-    ? (emitPreviewProgress(operationId, "compare", undefined, undefined, true), compareManifests(captured.remote, captured.local, {
-        mode: request.proposal.mode,
-        localPlatform: peer.platform,
-        remotePlatform: platform(),
-      }))
+    ? (emitPreviewProgress(operationId, "compare", undefined, undefined, true), captured)
     : await buildIncomingMappingPreview(request, destinationPath, progressOperationId)
   if (!previewsEqual(refreshedPreview, request.proposal.preview)) {
     snapshot.mappings.incoming = snapshot.mappings.incoming.map((item) =>
@@ -1728,7 +1700,7 @@ async function approveFolderMapping(input: ApproveFolderMappingInput, progressOp
     throw new Error("The folders changed since the preview. Review the updated comparison and approve again.")
   }
 
-  const proposal = request.proposal
+  const proposal = { ...request.proposal, preview: refreshedPreview }
   const localIdentity = requirePairingService().getLocalSessionIdentity()
   const configuration = mappingConfigurationFromProposal(proposal, {
     responderDeviceName: localIdentity.name,
@@ -1746,6 +1718,7 @@ async function approveFolderMapping(input: ApproveFolderMappingInput, progressOp
       ? { ...item, status: "approved-awaiting-delivery", selectedDestinationPath: destinationPath, message: "Approval is being delivered." }
       : item,
   )
+  if (operationId) previewScanSessions.drop(operationId)
   pushActivity("Folder mapping approved", `${proposal.name} is configured locally and waiting for the other computer to acknowledge it.`, "success", folder.id)
   await persistState()
   broadcastSnapshot()
