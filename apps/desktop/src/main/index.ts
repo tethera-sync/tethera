@@ -3041,13 +3041,12 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   const scanLimit = currentScanLimit()
   let localManifest: FileManifest
   let remoteManifest: FileManifest
+  // The caller has already made the single freshness decision (signature and
+  // TTL) that selected these manifests; re-evaluating it here with a second
+  // clock read could accept a reviewer decision the manifests no longer
+  // support. An absent prepared scan always falls through to a fresh walk.
   const prepared = options.prepared
-  const preparedHolds = prepared !== undefined &&
-    prepared.localManifest !== undefined &&
-    prepared.remoteManifest !== undefined &&
-    prepared.signature === initialSyncScanSignature(folder) &&
-    Date.now() - prepared.capturedAt <= PREPARED_INITIAL_SYNC_TTL_MS
-  if (preparedHolds && prepared?.localManifest && prepared.remoteManifest) {
+  if (prepared?.localManifest && prepared.remoteManifest) {
     localManifest = prepared.localManifest
     remoteManifest = prepared.remoteManifest
   } else {
@@ -3365,9 +3364,10 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     let unreadableSkipped: SyncSkip[] = []
     let completedAt = ""
     const prepared = preparedInitialSyncScans.get(folderId)
-    // Continuing is only valid while the scan the user reviewed is still
-    // held. Otherwise the merge rescans and may only proceed if the fresh
-    // report is identical to the one the user accepted.
+    // Single freshness decision: it selects both the manifests that may be
+    // reused and whether the reviewed unreadable report still authorises
+    // skipping. Once false, the pass gets no prepared scan and no blanket
+    // allowance, so a fresh report is checked against the accepted signature.
     const preparedStillHolds = prepared !== undefined &&
       prepared.localManifest !== undefined &&
       prepared.remoteManifest !== undefined &&
@@ -3375,10 +3375,11 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
       Date.now() - prepared.capturedAt <= PREPARED_INITIAL_SYNC_TTL_MS
     const allowUnreadable = acknowledgeUnreadable && preparedStillHolds
     const acknowledgedIssuesSignature = acknowledgeUnreadable ? prepared?.issuesSignature : undefined
+    const reusablePrepared = preparedStillHolds ? prepared : undefined
     let peerAllowUnreadable = allowUnreadable
     const { local: localResult, peer: remoteResult } = await runCoordinatedInitialMerge(
       async () => {
-        const result = await runInitialSyncPass(folder, peer, { allowUnreadable, prepared, acknowledgedIssuesSignature })
+        const result = await runInitialSyncPass(folder, peer, { allowUnreadable, prepared: reusablePrepared, acknowledgedIssuesSignature })
         // The local pass only returns after the unreadable-path decision was
         // accepted (or none were found), so the peer's inverse pass may skip
         // the same acknowledged items instead of failing on them.
