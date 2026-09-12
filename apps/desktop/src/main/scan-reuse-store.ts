@@ -44,7 +44,12 @@ export class ScanReuseStore {
     this.#prune()
     const key = seedKey(rootPath, ignorePatterns)
     const previous = this.#seeds.get(key)
-    if (previous) this.#totalEntries -= previous.digests.size
+    if (previous) {
+      // Drop the replaced seed before eviction, otherwise #evictUntilFits
+      // could evict it a second time and subtract its size twice.
+      this.#totalEntries -= previous.digests.size
+      this.#seeds.delete(key)
+    }
     this.#evictUntilFits(digests.size)
     this.#seeds.set(key, { capturedAt: this.now(), digests: new Map(digests) })
     this.#totalEntries += digests.size

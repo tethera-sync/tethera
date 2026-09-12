@@ -59,6 +59,20 @@ describe("ScanReuseStore", () => {
     expect(store.lookup("/tmp/new", [])?.size).toBe(3)
   })
 
+  test("replacing the oldest seed does not corrupt the entry budget", () => {
+    let now = 1_000
+    const store = new ScanReuseStore(() => now, 60_000, 5)
+    store.remember("/tmp/root", [], entries(3, "a"))
+    now += 1
+    store.remember("/tmp/other", [], entries(2, "b"))
+    now += 1
+    store.remember("/tmp/root", [], entries(4, "c"))
+    // The replaced seed must leave the map before eviction, so the unrelated
+    // older seed is the one evicted and the budget stays exact.
+    expect(store.lookup("/tmp/other", [])).toBeUndefined()
+    expect(store.lookup("/tmp/root", [])?.size).toBe(4)
+  })
+
   test("refuses a seed larger than the whole budget", () => {
     const store = new ScanReuseStore(() => 0, 60_000, 4)
     store.remember("/tmp/huge", [], entries(5))
