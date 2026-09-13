@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState, type ChangeEvent } from "react"
+import { DirectoryMappingNotice } from "./directory-mapping-notice"
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
@@ -455,6 +456,7 @@ function MappingPreviewView({ preview, localName, remoteName }: { preview: Folde
       {preview.truncated ? (
         <Alert><FileWarningIcon /><AlertTitle>Preview limit reached</AlertTitle><AlertDescription>The comparison sampled only part of one or both folders. Each computer applies its own scan limit, and the preview does not say which side stopped first. Check Settings on both computers, or add ignore rules, then compare again. No files have been changed.</AlertDescription></Alert>
       ) : null}
+      <DirectoryMappingNotice mappings={preview.directoryMappings} localName={localName} remoteName={remoteName} />
       {warnings > 0 ? (
         <Alert variant="destructive"><FileWarningIcon /><AlertTitle>Resolve {warnings} cross-platform path problems</AlertTitle><AlertDescription>Windows-invalid names or case-only collisions must be renamed before approval can be requested.</AlertDescription></Alert>
       ) : null}

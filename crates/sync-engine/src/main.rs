@@ -307,6 +307,7 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
         .expect("serialising a shutdown response should not fail"),
         "mapping.upsert" => handle_mapping_upsert(request, mapping_store),
         "mapping.get" => handle_mapping_get(request, mapping_store),
+        "directoryMapping.cleanup" => handle_directory_cleanup(request, mapping_store),
         "mapping.list" => handle_mapping_list(request, mapping_store),
         "mapping.listPendingDelivery" => {
             handle_mapping_list_pending_delivery(request, mapping_store)
@@ -395,6 +396,24 @@ fn rpc_failure_response(id: String, failure: RpcFailure) -> Value {
 
 fn store_error_response(id: String, context: &str, error: &MappingStoreError) -> Value {
     error_response_with_code(id, mapping_error_code(error), format!("{context}: {error}"))
+}
+
+fn handle_directory_cleanup(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: sync_storage::directory_mapping::DirectoryCleanupRequest =
+        match parse_params(request.params, "directoryMapping.cleanup") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.directory_cleanup(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => {
+            store_error_response(request.id, "Unable to record directory cleanup", &error)
+        }
+    }
 }
 
 fn mapping_error_code(error: &MappingStoreError) -> &'static str {

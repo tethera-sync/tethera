@@ -1,6 +1,6 @@
 # Data model
 
-SQLite is local to each device. Schema version `7` is authoritative for mapping configuration, verified file baselines, retry/conflict state, replacement recovery metadata, and staged scan generations. User-file bytes are never stored in SQLite.
+SQLite is local to each device. Schema version `8` is authoritative for mapping configuration, verified file baselines, retry/conflict state, replacement recovery metadata, staged scan generations, and older case-duplicate folder cleanup evidence. User-file bytes are never stored in SQLite.
 
 ## Implemented mapping tables
 
@@ -9,6 +9,8 @@ SQLite is local to each device. Schema version `7` is authoritative for mapping 
 The active configuration row introduced in schema version 1: stable mapping ID, both participant IDs and names, both approved path strings, mode, ignore patterns, history limits, setup status, preview, and created/updated timestamps. Paths are opaque strings and are never opened by the mapping store.
 
 The preview JSON optionally retains `unreadableLocal`, `unreadableRemote`, `unreadableLocalCount` and `unreadableRemoteCount`. Each side has at most 100 display-only issues with a UTF-8 path of at most 4,096 bytes, a nonempty reason of at most 200 UTF-16 code units, and a `file` or `directory` kind. An empty path denotes the scanned root. Totals are nonnegative JavaScript-safe integers, at least as large as the retained list. Old previews omit these fields and round-trip without adding them. This uses the existing JSON column; no schema migration is required. Older builds that reject these fields cannot consume newly saved previews.
+
+The preview JSON may also retain `directoryMappings`: at most 100 approved case-only directory aliases. Each entry names the logical sync `path`, the selected `localPath` and `remotePath` (in initiator/responder orientation), and at most 100 older same-spelling-insensitive sibling paths per side. Every path is relative, case-equivalent to the logical path, free of `\`, `:`, NUL, empty/`.`/`..` components and `.tethera-` components, and nested entries must sit beneath their parent's selected spellings. The engine validates this shape but never opens the paths. Old previews omit the field.
 
 An active row is visible only when it has valid version-2 revision metadata and no terminal tombstone for the same ID.
 
@@ -63,6 +65,7 @@ The active records, any tombstones needed to defeat stale PR #4 rows, outbox ent
 - Version 5 adds the per-folder maximum file-size column.
 - Version 6 additively creates staged scan generations (`scan_generations`) and their ordered entries (`scan_entries`) with mapping/revision/participant binding, open/sealed/aborted lifecycle, idempotent batch ingestion, and keyset paging indexes.
 - Version 7 additively creates the per-mapping scan digest cache (`scan_digest_cache`), a derived performance cache keyed by mapping and relative path.
+- Version 8 additively creates `directory_cleanup`, the durable evidence for moving an approved older case-duplicate folder to the OS trash.
 - Every schema step and `PRAGMA user_version` bump shares one immediate transaction.
 - Malformed version-1 data rolls the whole step back and leaves version 1 intact.
 - A database newer than this build supports is refused without writes.
@@ -119,6 +122,10 @@ planning page reads at most 1,000 paths.
 `scan_digest_cache` stores one row per mapping and relative path: the file's device and inode, size, modification and status-change timestamps in nanoseconds, its digest, and the sweep token it was last recorded under. Device, inode, and the two timestamps are stored as exact decimal-string renderings rather than integers, because they can exceed i64/f64 precision on some platforms; the engine stores and returns them byte-for-byte and never parses them.
 
 This table is a derived performance cache, not authoritative sync state. Losing it costs nothing but re-hashing on the next scan — it holds no information a full rescan cannot reproduce. Rows cascade away when their owning mapping is removed (`ON DELETE CASCADE`). The desktop scanner decides when a cached digest may still be trusted against the current filesystem state; the engine only records and returns exact values. Pruning is by sweep token rather than wall-clock time: the desktop calls `digestCache.prune` only after a complete sweep that re-recorded every eligible file, so a clock jump cannot cause a live entry to be dropped or a stale one to be kept.
+
+## Directory cleanup evidence (version 8)
+
+`directory_cleanup` stores one row per mapping, participant device, and approved older relative directory path: the directory's exact device, inode, and nanosecond modification/status-change timestamps (decimal strings, as JSON) recorded before the trash operation, and a `completed` flag. `directoryMapping.cleanup` accepts a path only when it is listed as an older path for that participant's side of an approved, unpaused, delivered `ready-for-initial-sync` mapping. The identity is recorded once (`INSERT OR IGNORE`), and completion requires the same identity, so a directory recreated after cleanup is never treated as the recorded one. Rows intentionally have no cascading mapping foreign key: cleanup evidence survives mapping removal. The desktop moves directories only through the OS trash; there is no permanent-delete fallback.
 
 ## Not implemented in this schema
 

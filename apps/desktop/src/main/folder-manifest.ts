@@ -9,6 +9,8 @@ import {
 } from "../shared/sync-capacity"
 import { ObservationFingerprint } from "./observation-fingerprint"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
+import { DirectoryPathMapping, planDirectoryMappings, projectDirectoryManifest, type DirectoryObservation } from "./directory-mapping"
+import { z } from "zod"
 
 export const DEFAULT_MAX_MANIFEST_FILES = 10_000
 const MAX_HASH_FILE_BYTES = 16 * 1024 * 1024
@@ -96,6 +98,7 @@ export interface ScanDigestCache {
 }
 
 export interface FileManifest {
+  directories?: DirectoryObservation[]
   rootPath: string
   files: FileManifestEntry[]
   ignored: number
@@ -112,6 +115,10 @@ export interface CompareManifestOptions {
 }
 
 export interface ScanFolderOptions {
+  includeDirectories?: boolean
+  onDirectory?: (entry: DirectoryObservation) => void
+  excludePath?: (path: string, directory: boolean) => boolean
+  mapPath?: (path: string, directory?: boolean) => string
   /** Hash every file for a transfer decision; preview scans retain the bounded fast path. */
   hashAllFiles?: boolean
   /**
@@ -201,6 +208,7 @@ type PendingScanRecord =
   | { kind: "file"; relativePath: string; settled: Promise<InspectionSettlement> }
 
 interface ScanWalkContext {
+  onDirectory?: (entry: DirectoryObservation) => void
   canonicalRoot: string
   matcher: (relativePath: string, directory: boolean) => boolean
   signal: AbortSignal | null
@@ -277,6 +285,11 @@ async function* walkScanRecords(directoryPath: string, relativeDirectory: string
       await closeDirQuietly(directory)
       yield { kind: "unreadable", relativePath: relativeDirectory, reason: "Resolves outside the folder root", entryKind: "directory" }
       return
+    }
+    if (relativeDirectory && context.onDirectory) {
+      const metadata = await lstat(directoryPath)
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error("The directory changed during the scan.")
+      context.onDirectory({ path: relativeDirectory, modifiedMs: metadata.mtimeMs })
     }
   } catch (error) {
     if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
@@ -365,7 +378,8 @@ async function scanFolderEntries(
   if (!rootStat.isDirectory()) throw new Error("The selected path is not a folder.")
   const canonicalRoot = await realpath(root)
 
-  const matcher = createIgnoreMatcher(ignorePatterns)
+  const ignoredByRule = createIgnoreMatcher(ignorePatterns)
+  const matcher = (relativePath: string, directory: boolean): boolean => ignoredByRule(relativePath, directory) || options.excludePath?.(relativePath, directory) === true
   let committedFiles = 0
   let ignored = 0
   let unreadable = 0
@@ -402,6 +416,8 @@ async function scanFolderEntries(
   }
 
   function recordUnreadable(issue: FolderScanIssue): void {
+    if (options.excludePath?.(issue.path, issue.kind === "directory")) return
+    if (options.mapPath && issue.path) issue = { ...issue, path: options.mapPath(issue.path, issue.kind === "directory") }
     unreadable += 1
     if (unreadableEntries.length < MAX_UNREADABLE_REPORTED) unreadableEntries.push(issue)
     try {
@@ -428,7 +444,7 @@ async function scanFolderEntries(
       .finally(() => freeSlots.push(slot))
   }
 
-  const walk = walkScanRecords(root, "", { canonicalRoot, matcher, signal, onListing: (directory) => reportActivity("listing", directory) })
+  const walk = walkScanRecords(root, "", { canonicalRoot, matcher, signal, onDirectory: options.onDirectory, onListing: (directory) => reportActivity("listing", directory) })
   const records = withCachedDigests(walk, digestCache, digestCache ? DIGEST_LOOKUP_BATCH : 1)
   const pending: PendingScanRecord[] = []
   let pendingFiles = 0
@@ -481,7 +497,7 @@ async function scanFolderEntries(
         break
       }
       const { entry, settledIdentity, reused, hashed } = settlement.inspection
-      onEntry(entry)
+      onEntry(options.mapPath ? { ...entry, path: options.mapPath(entry.path) } : entry)
       committedFiles += 1
       if (reused) reusedFiles += 1
       else if (hashed) hashedFiles += 1
@@ -525,14 +541,23 @@ export async function scanFolder(
   options: ScanFolderOptions = {},
 ): Promise<FileManifest> {
   const files: FileManifestEntry[] = []
-  const summary = await scanFolderEntries(rootPath, ignorePatterns, options, (entry) => files.push(entry))
+  const directories: DirectoryObservation[] = []
+  let directoriesTruncated = false
+  const summary = await scanFolderEntries(rootPath, ignorePatterns, {
+    ...options,
+    onDirectory: options.includeDirectories ? (entry) => {
+      if (directories.length < 100_000) directories.push(entry)
+      else directoriesTruncated = true
+    } : options.onDirectory,
+  }, (entry) => files.push(entry))
   return {
     rootPath: summary.rootPath,
     files,
     ignored: summary.ignored,
     unreadable: summary.unreadable,
     unreadableEntries: summary.unreadableEntries,
-    truncated: summary.truncated,
+    truncated: summary.truncated || directoriesTruncated,
+    ...(options.includeDirectories ? { directories } : {}),
   }
 }
 
@@ -581,6 +606,18 @@ export function compareManifests(
   remote: FileManifest,
   options: CompareManifestOptions,
 ): FolderMappingPreview {
+  if (!local.truncated && !remote.truncated && local.directories && remote.directories &&
+      (options.localPlatform === "windows" || options.remotePlatform === "windows")) {
+    const directoryMappings = planDirectoryMappings(local.directories, remote.directories)
+    if (directoryMappings.length > 0) {
+      const localProjection = projectDirectoryManifest(local, new DirectoryPathMapping(directoryMappings, "local"))
+      const remoteProjection = projectDirectoryManifest(remote, new DirectoryPathMapping(directoryMappings, "remote"))
+      return {
+        ...compareManifests({ ...localProjection, directories: undefined }, { ...remoteProjection, directories: undefined }, options),
+        directoryMappings,
+      }
+    }
+  }
   // Two passes over path-indexed maps: no global union set and no global path
   // sort. Counts are identical to the union iteration; sample membership is
   // identical because the bounded top-14 set is order-independent and its
@@ -1153,8 +1190,14 @@ export function parsePeerManifest(value: unknown): FileManifest {
     unreadable,
     unreadableEntries: parsePeerScanIssues(candidate.unreadableEntries),
     truncated: candidate.truncated === true,
+    ...(candidate.directories !== undefined ? { directories: peerDirectoriesSchema.parse(candidate.directories) } : {}),
   }
 }
+
+const peerDirectoriesSchema = z.array(z.object({
+  path: z.string().min(1).max(4096).refine((path) => !path.includes("\\") && !path.includes("\0") && path.split("/").every((part) => part !== "" && part !== "." && part !== "..")),
+  modifiedMs: z.number().finite(),
+}).strict()).max(100_000).refine((entries) => new Set(entries.map((entry) => entry.path)).size === entries.length)
 
 /**
  * Validates the bounded unreadable-path report from an untrusted peer. A
@@ -1192,7 +1235,7 @@ function parsePeerScanIssues(value: unknown): FolderScanIssue[] {
 
 /** Thin manifest-shaped wrapper over the shared estimator; see `../shared/sync-capacity` for the estimate itself. */
 export function estimateManifestEncodedBytes(manifest: FileManifest): number {
-  return estimateEncodedBytesForFiles(manifest.files)
+  return estimateEncodedBytesForFiles(manifest.files) + (manifest.directories ? estimateEncodedBytesForFiles(manifest.directories) : 0)
 }
 
 export function assertManifestWithinLegacyByteBudget(manifest: FileManifest, computer: string): void {

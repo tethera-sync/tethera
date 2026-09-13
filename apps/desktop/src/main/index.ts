@@ -117,6 +117,9 @@ import { requestPeerPreview } from "./peer-preview"
 import { PEER_SCAN_PROGRESS_CAPABILITY, type PeerScanProgress } from "./peer-scan-progress"
 import { folderComparisonResult } from "../shared/folder-comparison-result"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
+import { DirectoryPathMapping } from "./directory-mapping"
+import { cleanupOlderDirectories } from "./directory-cleanup"
+import { DIRECTORY_MAPPING_CAPABILITY, directoryMappingsSchema } from "../shared/directory-mapping"
 import {
   applySettingUpdate,
   isBoundedSkipArray,
@@ -475,6 +478,9 @@ function runLocalScan(
   rootPath: string,
   ignorePatterns: string[],
   options: {
+    includeDirectories?: boolean
+    excludePath?: (path: string, directory: boolean) => boolean
+    mapPath?: (path: string, directory?: boolean) => string
     hashAllFiles?: boolean
     maxFiles?: number | null
     onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void
@@ -488,6 +494,9 @@ function runLocalScan(
   signal: AbortSignal | null,
 ): Promise<FileManifest> {
   return runAdmittedScan(key, options.folderId, signal, (effective) => scanFolder(rootPath, ignorePatterns, {
+    includeDirectories: options.includeDirectories,
+    excludePath: options.excludePath,
+    mapPath: options.mapPath,
     hashAllFiles: options.hashAllFiles,
     maxFiles: options.maxFiles,
     onActivity: options.onActivity,
@@ -527,6 +536,49 @@ async function withFolderDigestCache<T extends { truncated: boolean }>(
 
 type ActiveFolderScanTarget = Pick<FolderSummary, "id" | "localPath" | "ignorePatterns">
 
+const directoryRoutingCache = new WeakMap<MappingRecord, DirectoryPathMapping>()
+
+function directoryRouting(folderId: string): DirectoryPathMapping {
+  const record = mappingRecords.get(folderId)
+  if (!record) throw new Error("This folder is no longer configured.")
+  let routing = directoryRoutingCache.get(record)
+  if (!routing) {
+    routing = new DirectoryPathMapping(directoryMappingsSchema.parse(record.mapping.preview?.directoryMappings ?? []),
+      record.mapping.initiatorDeviceId === getLocalIdentityId() ? "local" : "remote")
+    directoryRoutingCache.set(record, routing)
+  }
+  return routing
+}
+
+function localFilePath(folderId: string, logicalPath: string): string {
+  return directoryRouting(folderId).physicalPath(logicalPath)
+}
+
+async function cleanupFolderDirectories(folder: FolderSummary): Promise<void> {
+  const removed = await cleanupOlderDirectories({
+    rpc: engine,
+    mappingId: folder.id,
+    deviceId: getLocalIdentityId(),
+    root: folder.localPath,
+    routing: directoryRouting(folder.id),
+    otherRoots: snapshot.folders.filter((other) => other.id !== folder.id).map((other) => other.localPath),
+    trashItem: (path) => shell.trashItem(path),
+  })
+  if (removed > 0) pushActivity("Older folders moved to Trash", `${removed} older case-duplicate folder${removed === 1 ? "" : "s"} can be recovered from this computer's Trash or Recycle Bin.`, "success", folder.id)
+}
+
+function directoryScanOptions(folderId: string) {
+  const routing = directoryRouting(folderId)
+  return {
+    excludePath: (path: string, directory: boolean) => routing.logicalPath(path, directory) === undefined,
+    mapPath: (path: string, directory = false) => {
+      const logical = routing.logicalPath(path, directory)
+      if (logical === undefined) throw new Error("The file is outside the selected folder mapping.")
+      return logical
+    },
+  }
+}
+
 interface CachedFolderScanOptions {
   reuse?: ReadonlyMap<string, CachedFileDigest>
   onUnreadable?: (issue: FolderScanIssue) => void
@@ -542,13 +594,13 @@ function runCachedFolderScan(
   options: CachedFolderScanOptions = {},
 ): Promise<FileManifest> {
   return withFolderDigestCache(folder.id, (digestCache) =>
-    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache, ...options }, signal))
+    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache, ...options, ...directoryScanOptions(folder.id) }, signal))
 }
 
 /** The same pass reduced to an observation fingerprint, holding no file list in memory. */
 function runCachedFolderFingerprint(key: string, folder: ActiveFolderScanTarget, maxFiles: number | null, signal: AbortSignal | null): Promise<FolderFingerprint> {
   return withFolderDigestCache(folder.id, (digestCache) =>
-    runAdmittedScan(key, folder.id, signal, (effective) => fingerprintFolder(folder.localPath, folder.ignorePatterns, { maxFiles, signal: effective, digestCache })))
+    runAdmittedScan(key, folder.id, signal, (effective) => fingerprintFolder(folder.localPath, folder.ignorePatterns, { maxFiles, signal: effective, digestCache, ...directoryScanOptions(folder.id) })))
 }
 
 /**
@@ -1497,6 +1549,7 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
     // Local slot is held only for the walk; the subsequent peer wait runs
     // without it so two devices cannot deadlock holding a slot each.
     const localManifest = await runLocalScan(`preview:${localPath}`, localPath, input.ignorePatterns, {
+      includeDirectories: true,
       maxFiles: scanLimit,
       reuse: scanReuseSeeds.lookup(localPath, input.ignorePatterns),
       onSettledDigest: (relativePath, digest) => scanReuseSeeds.collect(settled, relativePath, digest),
@@ -1652,6 +1705,7 @@ async function buildIncomingMappingPreview(
     // the walk, the manifest must not later be reused under the new limit.
     const scanLimit = currentScanLimit()
     const responderManifest = await runLocalScan(`incoming:${target}`, target, request.proposal.ignorePatterns, {
+      includeDirectories: true,
       maxFiles: scanLimit,
       reuse: scanReuseSeeds.lookup(target, request.proposal.ignorePatterns),
       onSettledDigest: (relativePath, digest) => scanReuseSeeds.collect(settled, relativePath, digest),
@@ -2013,7 +2067,7 @@ async function inspectFileConflict(input: ConflictInspectionInput): Promise<Conf
       throw new Error("This file conflict no longer exists.")
     }
     const [local, remoteValue] = await Promise.all([
-      describeConflictCopy(folder.localPath, durable.path, durable.localDigest),
+      describeConflictCopy(folder.localPath, localFilePath(folder.id, durable.path), durable.localDigest),
       requirePeerSessions().request<unknown>(peer.id, {
         type: "continuous-sync-inspect-conflict",
         folderId: folder.id,
@@ -2158,7 +2212,7 @@ async function resolveFileConflict(value: unknown): Promise<AppSnapshot> {
       ) ?? false
       let completed = false
       if (state && !state.conflicts.some((conflict) => conflict.path === input.path)) {
-        const live = await describeTransferFile(folder.localPath, input.path).catch(() => undefined)
+        const live = await describeTransferFile(folder.localPath, localFilePath(folder.id, input.path)).catch(() => undefined)
         completed = live?.digest === selected.digest && live.size === selected.size
       }
       if (!exactWorkExists && !completed) throw retryError
@@ -2784,7 +2838,7 @@ async function pullPlannedFile(
   let journal: ReplacementJournalEntry | undefined
   let expectedDestinationSize: number | undefined
   if (expectedDestinationDigest !== undefined) {
-    const current = await describeTransferFile(folder.localPath, entry.path)
+    const current = await describeTransferFile(folder.localPath, localFilePath(folder.id, entry.path))
     if (current.digest !== expectedDestinationDigest) {
       throw new Error("The destination changed after reconciliation; its local copy was preserved.")
     }
@@ -2837,7 +2891,7 @@ async function pullPlannedFile(
   try {
     await writeFileChunksAtomic(
       folder.localPath,
-      entry.path,
+      localFilePath(folder.id, entry.path),
       descriptor.size,
       descriptor.digest,
       chunks(),
@@ -2918,7 +2972,7 @@ async function reconcileReplacementAfterFailure(
     const inspection = await inspectReplacementRecovery(
       folder.localPath,
       versionArchiveObjectRoot(),
-      entry,
+      { ...entry, path: localFilePath(folder.id, entry.path) },
     )
     return await engine.request<ReplacementJournalEntry>("archive.recover", {
       entryId: entry.id,
@@ -3212,7 +3266,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
       const current = snapshot.folders.find((item) => item.id === folder.id)
       if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
       reportProgress(entry.path, 0, true)
-      const result = await mergeInitialSyncFile(folder.localPath, entry, () =>
+      const result = await mergeInitialSyncFile(folder.localPath, { ...entry, path: localFilePath(folder.id, entry.path) }, () =>
         pullPlannedFile(folder, peer, entry, (fileBytes) => reportProgress(entry.path, fileBytes)),
       )
       checkedFiles += 1
@@ -3221,12 +3275,12 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
         copiedFiles += 1
         copiedBytes += result.bytes
       } else if (result.status === "conflict") {
-        plan.skipped.push(result.skip)
+        plan.skipped.push({ ...result.skip, path: entry.path })
       }
       if (result.status !== "conflict" && transferDigests && entry.digest) {
         try {
-          const identity = await statFileIdentity(resolveWithinRoot(folder.localPath, entry.path))
-          if (identity) transferDigests.record(entry.path, { ...identity, digest: entry.digest })
+          const identity = await statFileIdentity(resolveWithinRoot(folder.localPath, localFilePath(folder.id, entry.path)))
+          if (identity) transferDigests.record(localFilePath(folder.id, entry.path), { ...identity, digest: entry.digest })
         } catch {
           // Losing a cache record only costs one extra read during verification.
         }
@@ -3455,6 +3509,16 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
         console.warn("[initial-sync] unable to renew the peer merge lease", error)
       })
     }, INITIAL_SYNC_HEARTBEAT_MS)
+    if (directoryRouting(folder.id).mappings.length > 0) {
+      if (!(await cachedPeerCapabilities(peer.id)).has(DIRECTORY_MAPPING_CAPABILITY)) {
+        throw new Error("Update Tethera on both computers to use the approved folder-name mapping.")
+      }
+      await cleanupFolderDirectories(folder)
+      const cleanup = await requirePeerSessions().request<unknown>(peer.id, { type: "directory-case-cleanup", folderId }, 5 * 60_000)
+      if (!cleanup || typeof cleanup !== "object" || !("completed" in cleanup) || cleanup.completed !== true) {
+        throw new Error("The other computer did not finish preparing the selected folders.")
+      }
+    }
     let skipped: SyncSkip[] = []
     let unreadableSkipped: SyncSkip[] = []
     let completedAt = ""
@@ -3655,7 +3719,7 @@ function requireSharedFileSource(context: PeerRequestContext, folderId: string, 
   if (folder.mode === "receive-only") {
     throw new Error("This folder is receive-only on this computer and cannot serve files.")
   }
-  if (isManifestPathIgnored(relativePath, folder.ignorePatterns)) {
+  if (isManifestPathIgnored(localFilePath(folder.id, relativePath), folder.ignorePatterns)) {
     throw new Error("The requested file is excluded by this folder's sync rules.")
   }
   if (isTetheraStagingPath(relativePath)) {
@@ -3702,6 +3766,13 @@ async function withPeerFileOperation<T>(context: PeerRequestContext, folderId: s
 }
 
 async function handlePeerRequest(context: PeerRequestContext, request: PeerRequest): Promise<unknown> {
+  if (request.type === "directory-case-cleanup") {
+    const folder = requireSharedInitialSyncFolder(context, typeof request.folderId === "string" ? request.folderId : "")
+    return withPeerFileOperation(context, folder.id, async () => {
+      await cleanupFolderDirectories(folder)
+      return { completed: true }
+    })
+  }
   if (request.type === "browse-directory") {
     return browseHostDirectory(
       typeof request.path === "string" ? request.path : undefined,
@@ -3754,6 +3825,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       })
     }
     const manifest = await runLocalScan("inbound:preview", requestedPath, ignorePatterns, {
+      includeDirectories: request.includeDirectories === true,
       hashAllFiles,
       maxFiles: currentScanLimit(),
       // Read-only lookup only; a peer request never grows the local seed store.
@@ -3787,7 +3859,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     })
   }
   if (request.type === "scan-capabilities") {
-    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY, CONTINUOUS_FINGERPRINT_CAPABILITY] }
+    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY, CONTINUOUS_FINGERPRINT_CAPABILITY, DIRECTORY_MAPPING_CAPABILITY] }
   }
   if (request.type === "scan-generation-read-page") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -3829,7 +3901,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
       const conflict = state.conflicts.find((candidate) => candidate.path === relativePath)
       if (!conflict) throw new Error("This file conflict no longer exists on the paired computer.")
-      return describeConflictCopy(folder.localPath, relativePath, conflict.localDigest)
+      return describeConflictCopy(folder.localPath, localFilePath(folder.id, relativePath), conflict.localDigest)
     }))
   }
   if (request.type === "continuous-sync-resolve-conflict") {
@@ -3864,7 +3936,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     return withPeerFileOperation(context, folderId, () => withConflictHashing(folderId, async () => {
       const choice = parseExactConflictChoice(request)
       requireAllowedConflictDirection(folder.mode, choice.direction)
-      const local = await describeConflictCopy(folder.localPath, relativePath, choice.localDigest)
+      const local = await describeConflictCopy(folder.localPath, localFilePath(folder.id, relativePath), choice.localDigest)
       if (!local.present || local.size !== choice.localSize) {
         throw new Error("The local conflict copy no longer matches the coordinator's exact choice.")
       }
@@ -3930,7 +4002,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
         expectedDestinationDigest: operation.expectedDestinationDigest,
       })
       if (authorization.alreadyVerified) {
-        const current = await describeTransferFile(folder.localPath, operation.path)
+        const current = await describeTransferFile(folder.localPath, localFilePath(folder.id, operation.path))
         if (current.digest !== operation.digest || current.size !== operation.size) {
           throw new Error("The verified baseline no longer matches the live destination file.")
         }
@@ -4185,7 +4257,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const relativePath = typeof request.relativePath === "string" ? request.relativePath : ""
     const folder = requireSharedFileSource(context, folderId, relativePath)
-    return withPeerFileOperation(context, folderId, () => describeTransferFile(folder.localPath, relativePath))
+    return withPeerFileOperation(context, folderId, () => describeTransferFile(folder.localPath, localFilePath(folder.id, relativePath)))
   }
   if (request.type === "pull-file-chunk") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -4197,7 +4269,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const length = typeof request.length === "number" ? request.length : Number.NaN
     const content = await withPeerFileOperation(context, folderId, () => readTransferFileChunk(
         folder.localPath,
-        relativePath,
+        localFilePath(folder.id, relativePath),
         { size: expectedSize, modifiedMs: expectedModifiedMs },
         offset,
         length,
@@ -4279,7 +4351,7 @@ function registerIpc(): void {
     if (!state.conflicts.some((conflict) => conflict.path === input.path)) {
       throw new Error("This file conflict no longer exists.")
     }
-    shell.showItemInFolder(resolveWithinRoot(folder.localPath, input.path))
+    shell.showItemInFolder(resolveWithinRoot(folder.localPath, localFilePath(folder.id, input.path)))
   })
   ipcMain.handle("archive:restore", async (event, entryId: string) => {
     requireTrustedMainRenderer(event)
@@ -4300,7 +4372,7 @@ function registerIpc(): void {
     archiveRestoreInFlight.add(folder.id)
     try {
       const restored = await withContinuousSyncBlocked(folder.id, () =>
-        restoreArchivedVersion(engine, folder.localPath, versionArchiveObjectRoot(), entryId),
+        restoreArchivedVersion(engine, folder.localPath, versionArchiveObjectRoot(), entryId, (path) => localFilePath(folder.id, path)),
       )
       updateFolder(folder.id, {
         status: "needs-attention",

@@ -2,6 +2,7 @@ import { ScanCancelledError, parsePeerManifest, type FileManifest } from "./fold
 import { requestPeerCapabilities, type CapabilityPeerClient } from "./peer-capabilities"
 import { PEER_SCAN_IDLE_TIMEOUT_MS, PEER_SCAN_PROGRESS_CAPABILITY, type PeerScanProgress } from "./peer-scan-progress"
 import { CHUNKED_FRAMES_CAPABILITY } from "./peer-session-service"
+import { DIRECTORY_MAPPING_CAPABILITY } from "../shared/directory-mapping"
 
 /** Negotiate progress and chunked frames before sending a multi-response request to an older app. */
 export async function requestPeerPreview(
@@ -21,10 +22,12 @@ export async function requestPeerPreview(
     const manifest = await client.request(peer.id, {
       type: "scan-manifest",
       ...input,
+      ...(capabilities.has(DIRECTORY_MAPPING_CAPABILITY) ? { includeDirectories: true } : {}),
       ...(supportsProgress ? { reportProgress: true } : {}),
     }, PEER_SCAN_IDLE_TIMEOUT_MS, { signal, ...(supportsProgress ? { onProgress } : {}), ...(chunked ? { chunked: true } : {}) })
     if (signal.aborted) throw new ScanCancelledError()
-    return parsePeerManifest(manifest)
+    const parsed = parsePeerManifest(manifest)
+    return capabilities.has(DIRECTORY_MAPPING_CAPABILITY) ? parsed : { ...parsed, directories: undefined }
   } catch (error) {
     if (signal.aborted) throw new ScanCancelledError("The folder comparison was cancelled.")
     const code = error instanceof Error && "code" in error ? error.code : undefined

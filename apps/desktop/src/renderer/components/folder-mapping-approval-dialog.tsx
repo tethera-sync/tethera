@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react"
+import { DirectoryMappingNotice } from "./directory-mapping-notice"
 import {
   CheckCircle2Icon,
   ComputerIcon,
@@ -218,6 +219,7 @@ export function FolderMappingApprovalDialog({
             <div><span>Already identical</span><strong>{proposal.preview.identicalFiles}</strong></div>
           </div>
 
+          <DirectoryMappingNotice mappings={proposal.preview.directoryMappings} localName="Their computer" remoteName="This computer" />
           {proposal.preview.truncated ? (
             <Alert className="mt-[10px]"><FileWarningIcon /><AlertTitle>Preview limit reached</AlertTitle><AlertDescription>The comparison sampled only part of one or both folders. Each computer applies its own scan limit, and the preview does not say which side stopped first. Check Settings on both computers, or add ignore rules, then refresh the comparison.</AlertDescription></Alert>
           ) : null}

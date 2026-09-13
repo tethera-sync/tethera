@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Schema version this build reads and writes. Version 1 is intentionally left unchanged below.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 200;
@@ -189,6 +189,8 @@ impl MappingConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MappingPreview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_mappings: Option<Vec<crate::directory_mapping::DirectoryMapping>>,
     pub local_files: u64,
     pub remote_files: u64,
     pub identical_files: u64,
@@ -215,6 +217,9 @@ pub struct MappingPreview {
 
 impl MappingPreview {
     fn validate(&self) -> Result<(), MappingStoreError> {
+        crate::directory_mapping::validate_directory_mappings(
+            self.directory_mappings.as_deref().unwrap_or_default(),
+        )?;
         for (issues, count) in [
             (&self.unreadable_local, self.unreadable_local_count),
             (&self.unreadable_remote, self.unreadable_remote_count),
@@ -806,6 +811,22 @@ impl MappingStore {
         }
         if current < 7 {
             self.migrate_v6_to_v7()?;
+        }
+        if current < 8 {
+            let transaction =
+                Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS directory_cleanup (
+                    mapping_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    identity TEXT NOT NULL,
+                    completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+                    PRIMARY KEY (mapping_id, device_id, relative_path)
+                );
+                PRAGMA user_version = 8;",
+            )?;
+            transaction.commit()?;
         }
         Ok(())
     }
@@ -2445,6 +2466,96 @@ mod tests {
         let store = MappingStore::open_in_memory().expect("open");
         complete_empty_import(&store);
         store
+    }
+
+    #[test]
+    fn directory_case_mapping_and_cleanup_survive_reopen_without_touching_paths() {
+        use crate::directory_mapping::{DirectoryCleanupRequest, DirectoryIdentity};
+        let temporary = tempfile::tempdir().expect("temporary database");
+        let database = temporary.path().join("mappings.sqlite3");
+        let store = MappingStore::open(&database).expect("open database");
+        complete_empty_import(&store);
+        let mut mapping = sample("case-folders");
+        mapping.preview = Some(serde_json::from_value(serde_json::json!({
+            "localFiles": 1, "remoteFiles": 1, "identicalFiles": 0, "differentFiles": 1,
+            "localOnlyFiles": 0, "remoteOnlyFiles": 0, "ignoredLocal": 1, "ignoredRemote": 0,
+            "bytesToRemote": 0, "bytesToLocal": 0, "invalidWindowsNames": [], "caseCollisions": [],
+            "truncated": false, "samples": [],
+            "directoryMappings": [{ "path": "Lib", "localPath": "Lib", "remotePath": "lib", "olderLocalPaths": ["lib"], "olderRemotePaths": [] }]
+        })).expect("valid directory preview"));
+        store
+            .upsert_local(&mapping, "linux-box", None, None, NOW)
+            .expect("approved mapping");
+        let identity = DirectoryIdentity {
+            device: "1".to_owned(),
+            inode: "2".to_owned(),
+            modified_ns: "3".to_owned(),
+            changed_ns: "4".to_owned(),
+        };
+        let mut request = DirectoryCleanupRequest {
+            mapping_id: mapping.id.clone(),
+            device_id: "linux-box".to_owned(),
+            path: "lib".to_owned(),
+            identity: Some(identity.clone()),
+            complete: false,
+        };
+        let prepared = store
+            .directory_cleanup(&request)
+            .expect("prepare")
+            .expect("record");
+        assert!(!prepared.completed);
+        drop(store);
+        let store = MappingStore::open(&database).expect("reopen");
+        assert_eq!(
+            store
+                .get(&mapping.id)
+                .expect("get")
+                .expect("record")
+                .mapping
+                .preview,
+            mapping.preview
+        );
+        request.identity = None;
+        assert_eq!(
+            store
+                .directory_cleanup(&request)
+                .expect("read")
+                .expect("intent")
+                .identity,
+            identity
+        );
+        request.identity = Some(identity);
+        request.complete = true;
+        assert!(
+            store
+                .directory_cleanup(&request)
+                .expect("complete")
+                .expect("record")
+                .completed
+        );
+        assert!(
+            store
+                .directory_cleanup(&request)
+                .expect("repeat")
+                .expect("record")
+                .completed
+        );
+        request.path = "Lib".to_owned();
+        assert!(
+            store.directory_cleanup(&request).is_err(),
+            "the selected folder cannot be removed"
+        );
+        request.path = "../lib".to_owned();
+        assert!(
+            store.directory_cleanup(&request).is_err(),
+            "a path escape cannot be removed"
+        );
+        request.path = "lib".to_owned();
+        request.device_id = "stranger".to_owned();
+        assert!(
+            store.directory_cleanup(&request).is_err(),
+            "a third participant has no cleanup authority"
+        );
     }
 
     fn create_local(store: &MappingStore, id: &str) -> MappingRecord {

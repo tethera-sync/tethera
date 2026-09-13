@@ -3,6 +3,7 @@ import { constants } from "node:fs"
 import { mkdir, open, readFile } from "node:fs/promises"
 import path from "node:path"
 import type { FolderMappingPreview, FolderSetupStatus, FolderSummary, SyncMode } from "../shared/contracts"
+import { directoryMappingsSchema } from "../shared/directory-mapping"
 import { isFolderScanIssue, MAX_UNREADABLE_REPORTED } from "./folder-manifest"
 import {
   mappingConfigurationFromLegacyFolder,
@@ -292,6 +293,7 @@ function isPreview(value: unknown): value is FolderMappingPreview {
     typeof value.truncated === "boolean" &&
     isBoundedPathArray(value.invalidWindowsNames) &&
     isBoundedPathArray(value.caseCollisions) &&
+    (value.directoryMappings === undefined || directoryMappingsSchema.safeParse(value.directoryMappings).success) &&
     Array.isArray(value.samples) &&
     value.samples.length <= 10_000 &&
     value.samples.every(
@@ -398,6 +400,7 @@ function sanitisePreviewForBackup(preview: FolderMappingPreview): Record<string,
     bytesToLocal: preview.bytesToLocal,
     invalidWindowsNames: [...preview.invalidWindowsNames],
     caseCollisions: [...preview.caseCollisions],
+    ...(preview.directoryMappings ? { directoryMappings: preview.directoryMappings } : {}),
     truncated: preview.truncated,
     samples: preview.samples.map((sample) => ({
       path: sample.path,
