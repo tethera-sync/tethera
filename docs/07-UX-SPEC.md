@@ -42,7 +42,7 @@ Search path, filter rule/preset, show exact matching pattern, test paths, edit r
 
 ## Recovery
 
-Show durable conflicts and replacement-journal failures first. A two-copy conflict displays both devices, current sizes, modified times and SHA-256 values; only an exact copy allowed by the mapping direction can be selected, and the displaced copy is archived before replacement. Missing-copy conflicts remain read-only. General archive search/grouping, expiry, pinning and permanent deletion are later history-browser work; restore creates a new revision and protects current live content first.
+Show durable conflicts and replacement-journal failures first. A two-copy conflict displays both devices, current sizes, modified times and SHA-256 values; only an exact copy allowed by the mapping direction can be selected, and the displaced copy is archived before replacement. Missing-copy conflicts remain read-only. Archived versions expire automatically under each folder's age and storage limits; general archive search/grouping, pinning and manual permanent deletion are later history-browser work; restore creates a new revision and protects current live content first.
 
 ## Devices
 

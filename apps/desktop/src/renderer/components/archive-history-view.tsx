@@ -48,6 +48,14 @@ export async function loadArchiveHistory(
   }
 }
 
+export function retentionSummary(folder: FolderSummary): string {
+  const age = folder.historyDays ? `for ${folder.historyDays} ${folder.historyDays === 1 ? "day" : "days"}` : undefined
+  const size = folder.historyMaxBytes ? `up to ${formatBytes(folder.historyMaxBytes)}` : undefined
+  if (!age && !size) return `${folder.name} keeps every archived version.`
+  const limits = [age, size].filter((limit) => limit !== undefined).join(" and ")
+  return `${folder.name} keeps archived versions ${limits} on this computer; the oldest are removed first.`
+}
+
 export function ArchiveHistoryView({ snapshot }: { snapshot: AppSnapshot }) {
   const activeFolders = snapshot.folders.filter((folder) => folder.setupStatus === "active")
   const activeFolderToken = activeFolders.map((folder) => folder.id).join("\0")
@@ -162,7 +170,7 @@ export function ArchiveHistoryView({ snapshot }: { snapshot: AppSnapshot }) {
                 ))}
               </NativeSelect>
               <FieldDescription id={folderHelpId} className="mt-2 text-[10.5px] leading-4 text-[var(--muted-foreground)]">
-                {selectedFolder ? `${selectedFolder.name} is active and ready for history browsing.` : "Choose one of the active folders."}
+                {selectedFolder ? retentionSummary(selectedFolder) : "Choose one of the active folders."}
               </FieldDescription>
             </Field>
           </section>

@@ -354,6 +354,10 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
         "archive.recover" => handle_archive_recover(request, mapping_store),
         "archive.prepareRestore" => handle_archive_prepare_restore(request, mapping_store),
         "archive.completeRestore" => handle_archive_complete_restore(request, mapping_store),
+        "archive.listPrunable" => handle_archive_list_prunable(request, mapping_store),
+        "archive.prune" => handle_archive_prune(request, mapping_store),
+        "archive.listObjectDeletions" => handle_archive_list_deletions(request, mapping_store),
+        "archive.completeObjectDeletion" => handle_archive_object_deleted(request, mapping_store),
         "manifest.scan" => handle_manifest_scan(request),
         "manifest.compare" => handle_manifest_compare(request),
         "plan.build" => handle_plan_build(request),
@@ -1424,6 +1428,109 @@ fn handle_archive_complete_restore(request: RpcRequest, mapping_store: &MappingS
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveListPrunableParams {
+    id: String,
+    now: String,
+    limit: u16,
+}
+
+fn handle_archive_list_prunable(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchiveListPrunableParams =
+        match parse_params(request.params, "archive.listPrunable") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.prunable_archive_entries(&params.id, &params.now, params.limit) {
+        Ok(entries) => success_response(request.id, entries),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to list archived versions outside the history limits",
+            &error,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchivePruneParams {
+    id: String,
+    entry_ids: Vec<String>,
+    now: String,
+}
+
+fn handle_archive_prune(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchivePruneParams = match parse_params(request.params, "archive.prune") {
+        Ok(params) => params,
+        Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+    };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.prune_archive_entries(&params.id, &params.entry_ids, &params.now) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(request.id, "Failed to prune archived versions", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveListObjectDeletionsParams {
+    limit: u16,
+}
+
+fn handle_archive_list_deletions(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchiveListObjectDeletionsParams =
+        match parse_params(request.params, "archive.listObjectDeletions") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.pending_archive_object_deletions(params.limit) {
+        Ok(deletions) => success_response(request.id, deletions),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to list archive objects awaiting removal",
+            &error,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveObjectDigestParams {
+    digest: String,
+}
+
+fn handle_archive_object_deleted(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ArchiveObjectDigestParams =
+        match parse_params(request.params, "archive.completeObjectDeletion") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match archive_store(&request.id, mapping_store) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    match store.complete_archive_object_deletion(&params.digest) {
+        Ok(removed) => success_response(request.id, json!({ "removed": removed })),
+        Err(error) => store_error_response(
+            request.id,
+            "Failed to confirm archive object removal",
+            &error,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ManifestScanParams {
     path: String,
     #[serde(default)]
@@ -1653,6 +1760,10 @@ mod tests {
             "archive.recover",
             "archive.prepareRestore",
             "archive.completeRestore",
+            "archive.listPrunable",
+            "archive.prune",
+            "archive.listObjectDeletions",
+            "archive.completeObjectDeletion",
             "manifest.scan",
             "manifest.compare",
             "plan.build",
@@ -2723,6 +2834,75 @@ mod tests {
                 "archive.listVersions should reject params {params}"
             );
             assert_eq!(response["errorCode"], "INVALID_PARAMS");
+        }
+    }
+
+    #[test]
+    fn archive_retention_methods_validate_params_before_reaching_the_store() {
+        let store = ready_store();
+        let digest = "a".repeat(64);
+        for (method, params) in [
+            ("archive.listObjectDeletions", r#"{"limit":1}"#.to_owned()),
+            (
+                "archive.completeObjectDeletion",
+                format!(r#"{{"digest":"{digest}"}}"#),
+            ),
+        ] {
+            let response = handle_line(&request(method, &params), "correct", &store);
+            assert_eq!(response["ok"], true, "{method} should accept {params}");
+        }
+        for (method, params) in [
+            (
+                "archive.listPrunable",
+                r#"{"id":"mapping-1","now":"2026-09-20T10:00:00Z","limit":10}"#,
+            ),
+            (
+                "archive.prune",
+                r#"{"id":"mapping-1","entryIds":["entry-1"],"now":"2026-09-20T10:00:00Z"}"#,
+            ),
+        ] {
+            let response = handle_line(&request(method, params), "correct", &store);
+            assert_eq!(
+                response["errorCode"], "MAPPING_NOT_FOUND",
+                "{method} should reach the store with {params}"
+            );
+        }
+
+        for (method, params) in [
+            (
+                "archive.listPrunable",
+                r#"{"id":"mapping-1","now":"2026-09-20T10:00:00Z"}"#,
+            ),
+            (
+                "archive.listPrunable",
+                r#"{"id":"mapping-1","now":"2026-09-20T10:00:00Z","limit":0}"#,
+            ),
+            (
+                "archive.listPrunable",
+                r#"{"id":"mapping-1","now":"2026-09-20T10:00:00Z","limit":70000}"#,
+            ),
+            (
+                "archive.listPrunable",
+                r#"{"id":"mapping-1","now":"soon","limit":10}"#,
+            ),
+            (
+                "archive.prune",
+                r#"{"id":"mapping-1","entryIds":[],"now":"2026-09-20T10:00:00Z"}"#,
+            ),
+            (
+                "archive.prune",
+                r#"{"id":"mapping-1","entryIds":["a","a"],"now":"2026-09-20T10:00:00Z"}"#,
+            ),
+            ("archive.listObjectDeletions", r#"{"limit":0}"#),
+            ("archive.listObjectDeletions", r#"{"limit":1,"extra":true}"#),
+            (
+                "archive.completeObjectDeletion",
+                r#"{"digest":"not-a-digest"}"#,
+            ),
+        ] {
+            let response = handle_line(&request(method, params), "correct", &store);
+            assert_eq!(response["ok"], false, "{method} should reject {params}");
+            assert_eq!(response["errorCode"], "INVALID_PARAMS", "{method} {params}");
         }
     }
 

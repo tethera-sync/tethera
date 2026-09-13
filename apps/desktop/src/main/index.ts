@@ -174,6 +174,7 @@ import {
   type ReplacementJournalEntry,
 } from "./version-archive"
 import { restoreArchivedVersion } from "./archive-restore"
+import { ARCHIVE_RETENTION_INTERVAL_MS, applyArchiveRetention, type ArchiveRetentionResult } from "./archive-retention"
 import {
   UPDATE_CHECK_INTERVAL_MS,
   UPDATE_STARTUP_DELAY_MS,
@@ -212,6 +213,10 @@ let tray: Tray | null = null
 let isQuitting = false
 let snapshot: AppSnapshot
 let decisionRetryTimer: NodeJS.Timeout | null = null
+let archiveRetentionTimer: NodeJS.Timeout | null = null
+let archiveRetentionPass: Promise<void> | null = null
+/** Last reported retention problem per folder (or `""` for the whole pass), so hourly retries do not repeat it. */
+const archiveRetentionProblems = new Map<string, string>()
 const decisionDeliveriesInFlight = new Set<string>()
 const configurationDeliveriesInFlight = new Set<string>()
 const initialSyncInFlight = new Set<string>()
@@ -1359,6 +1364,8 @@ async function initializeAuthoritativeMappings(health: MappingStoreHealth): Prom
       await persistState()
       broadcastSnapshot()
       void flushPendingConfigurationDeliveries()
+      archiveRetentionTimer ??= setInterval(() => void runArchiveRetention(), ARCHIVE_RETENTION_INTERVAL_MS)
+      void runArchiveRetention()
     } catch (error) {
       if (engine.generation !== generation) return
       const detail = error instanceof Error ? error.message : "The mapping database could not be initialised."
@@ -2993,6 +3000,69 @@ async function reconcileReplacementAfterFailure(
     ))
     throw error
   }
+}
+
+/** Starts one version history cleanup pass, or joins the pass already running. Never rejects. */
+function runArchiveRetention(): Promise<void> {
+  archiveRetentionPass ??= applyArchiveRetentionPass().finally(() => {
+    archiveRetentionPass = null
+  })
+  return archiveRetentionPass
+}
+
+async function applyArchiveRetentionPass(): Promise<void> {
+  if (engine.state.status !== "ready" || snapshot.mappingStore.status !== "ready") return
+  const folders = snapshot.folders
+    .filter((folder) => folder.setupStatus === "active")
+    .map((folder) => ({
+      id: folder.id,
+      localPath: folder.localPath,
+      physicalPath: (logicalPath: string) => localFilePath(folder.id, logicalPath),
+    }))
+  let result: ArchiveRetentionResult
+  try {
+    result = await applyArchiveRetention(engine, versionArchiveObjectRoot(), folders)
+    archiveRetentionProblems.delete("")
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Version history cleanup failed."
+    console.error("[archive] version history cleanup stopped", error)
+    if (archiveRetentionProblems.get("") !== detail) {
+      archiveRetentionProblems.set("", detail)
+      pushActivity("Version history cleanup stopped", `${detail} It will be retried within an hour.`, "warning")
+      broadcastSnapshot()
+    }
+    return
+  }
+  let reported = false
+  for (const outcome of result.folders) {
+    const folder = snapshot.folders.find((candidate) => candidate.id === outcome.folderId)
+    if (!folder) continue
+    if (outcome.status === "failed") {
+      if (archiveRetentionProblems.get(folder.id) === outcome.detail) continue
+      archiveRetentionProblems.set(folder.id, outcome.detail)
+      pushActivity("Version history cleanup stopped", `${folder.name}: ${outcome.detail} It will be retried within an hour.`, "warning", folder.id)
+      reported = true
+      continue
+    }
+    archiveRetentionProblems.delete(folder.id)
+    if (outcome.status === "unavailable") continue
+    if (outcome.prunedVersions > 0) {
+      const versions = outcome.prunedVersions === 1 ? "version" : "versions"
+      pushActivity("Old versions removed", `${folder.name}: removed ${outcome.prunedVersions} archived ${versions} outside the folder's history limits.`, "info", folder.id)
+      reported = true
+    }
+    if (outcome.keptChangedCopies > 0) {
+      const copies = outcome.keptChangedCopies === 1 ? "copy was" : "copies were"
+      pushActivity(
+        "Changed hidden copies kept",
+        `${folder.name}: ${outcome.keptChangedCopies} hidden .tethera-displaced ${copies} edited after being replaced, so they were kept instead of removed.`,
+        "warning",
+        folder.id,
+      )
+      reported = true
+    }
+  }
+  if (reported) broadcastSnapshot()
 }
 
 async function recoverIncompleteReplacements(): Promise<void> {
@@ -4954,6 +5024,7 @@ app.on("will-quit", () => {
   clearInterval(preparedInitialSyncSweepTimer)
   if (updateCheckTimer) clearInterval(updateCheckTimer)
   if (decisionRetryTimer) clearInterval(decisionRetryTimer)
+  if (archiveRetentionTimer) clearInterval(archiveRetentionTimer)
   for (const retry of continuousSyncRetryTimers.values()) clearTimeout(retry)
   continuousSyncRetryTimers.clear()
   for (const monitor of continuousSyncMonitors.values()) monitor.close()
