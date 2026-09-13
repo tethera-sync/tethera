@@ -172,7 +172,7 @@ export function FolderMappingApprovalDialog({
           onOpenChange(nextOpen)
         }}
       >
-        <DialogContent className="mapping-approval-dialog [max-width:min(720px,calc(100%-2rem))]" showCloseButton={!working}>
+        <DialogContent className="mapping-approval-dialog max-w-[min(720px,calc(100%-2rem))]" showCloseButton={!working}>
           <DialogHeader>
             <div className="mapping-approval-heading [display:flex] [align-items:flex-start] [gap:12px]">
               <div className="mapping-approval-icon [display:grid] [place-items:center] [width:42px] [height:42px] [flex:0_0_auto] [border:1px_solid_color-mix(in_oklab,_var(--primary)_33%,_var(--border))] [border-radius:12px] [background:color-mix(in_oklab,_var(--primary)_10%,_var(--surface))] [color:var(--primary)] [&_svg]:[width:20px] [&_svg]:[height:20px]"><ShieldCheckIcon /></div>

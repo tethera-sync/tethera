@@ -23,6 +23,7 @@ import type {
 } from "@shared/contracts"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group"
 import {
   Dialog,
   DialogContent,
@@ -164,7 +165,7 @@ export function FolderPickerDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="folder-picker-dialog w-[min(980px,calc(100vw-36px))] max-w-[980px] p-5">
+      <DialogContent className="folder-picker-dialog max-w-[min(980px,calc(100%-2rem))]">
         <DialogHeader>
           <div className="folder-picker-title-row [display:flex] [align-items:flex-start] [gap:12px]">
             <div className="folder-picker-device-icon [display:grid] [width:38px] [height:38px] [flex:0_0_auto] [place-items:center] [border-radius:11px] [background:color-mix(in_oklab,_var(--primary)_12%,_var(--surface-strong))] [color:var(--primary)] [&_svg]:[width:18px] [&_svg]:[height:18px]">
@@ -179,7 +180,7 @@ export function FolderPickerDialog({
           </div>
         </DialogHeader>
 
-        <div className="folder-picker-shell [display:grid] [grid-template-columns:178px_minmax(0,_1fr)] [height:min(520px,_calc(100vh_-_245px))] [min-height:390px] [overflow:hidden] [margin-top:18px] [border:1px_solid_var(--border)] [border-radius:14px] [background:var(--surface-sunken)] max-[760px]:[grid-template-columns:1fr]">
+        <div className="folder-picker-shell grid h-[min(480px,calc(100dvh-310px))] min-h-56 grid-cols-[178px_minmax(0,1fr)] overflow-hidden rounded-[14px] border border-border bg-[var(--surface-sunken)] max-[760px]:grid-cols-1">
           <aside className="folder-picker-sidebar [overflow-y:auto] [border-right:1px_solid_var(--border)] [background:color-mix(in_oklab,_var(--surface)_60%,_transparent)] [padding:13px_10px] max-[760px]:[display:none]" aria-label="Folder locations">
             <p className="folder-picker-section-label [margin:0_8px_8px] [color:var(--muted-foreground)] [font-size:9px] [font-weight:700] [letter-spacing:0.1em] [text-transform:uppercase]">Locations</p>
             <div className="folder-location-list [display:grid] [gap:2px]">
@@ -238,16 +239,15 @@ export function FolderPickerDialog({
             </div>
 
             <div className="folder-picker-actions [display:flex] [align-items:center] [gap:8px] [border-bottom:1px_solid_var(--border)] [padding:9px_11px] [background:color-mix(in_oklab,_var(--surface)_45%,_transparent)] max-[760px]:[flex-wrap:wrap]">
-              <label className="folder-search [display:flex] [min-width:180px] [flex:1] [align-items:center] [gap:8px] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [padding:0_10px] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[color:var(--muted-foreground)] [&_input]:[width:100%] [&_input]:[height:32px] [&_input]:[border:0] [&_input]:[outline:0] [&_input]:[background:transparent] [&_input]:[font-size:11.5px] [&_input]:[color:var(--foreground)] max-[760px]:[min-width:100%]">
-                <SearchIcon />
-                <Input
+              <InputGroup className="min-w-[180px] flex-1 max-[760px]:basis-full">
+                <InputGroupAddon><SearchIcon /></InputGroupAddon>
+                <InputGroupInput
                   aria-label="Search folders"
-                  className="w-full border-0 bg-transparent outline-none"
                   value={query}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => setQuery(event.target.value)}
                   placeholder="Filter folders in this location"
                 />
-              </label>
+              </InputGroup>
               {!listing?.readOnly ? (
                 <Button variant="outline" size="sm" onClick={() => setCreatingFolder((value) => !value)} disabled={!listing || loading}>
                   <FolderPlusIcon data-icon="inline-start" />
