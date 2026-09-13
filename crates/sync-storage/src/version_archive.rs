@@ -1,14 +1,21 @@
 //! Durable metadata and state transitions for reversible live-file replacement.
 
+use std::collections::HashSet;
+
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::file_sync::{
     upsert_baseline, validate_digest, validate_path, validate_size, validate_timestamp,
 };
-use crate::mapping::{MappingStore, MappingStoreError, check_identifier, check_path};
+use crate::mapping::{
+    MAX_HISTORY_DAYS, MappingStore, MappingStoreError, check_identifier, check_path,
+};
 
 const MAX_ERROR_LENGTH: usize = 2_000;
+const MAX_RETENTION_BATCH: u16 = 1_000;
 const JOURNAL_COLUMNS: &str = "id, mapping_id, relative_path, sync_operation_id, kind,
      old_digest, old_size, replacement_digest, replacement_size,
      archive_digest, archive_object_key, restored_from_journal_id,
@@ -173,6 +180,39 @@ pub struct PrepareRestoreRequest {
     pub created_at: String,
 }
 
+/// An archived version the owning folder's retention policy allows removing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrunableArchiveEntry {
+    pub id: String,
+    pub path: String,
+    pub local_root: String,
+    pub old_digest: String,
+    pub old_size: i64,
+    pub created_at: String,
+}
+
+/// An archive object no journal entry references any more, waiting for its file to be removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveObjectDeletion {
+    pub digest: String,
+    pub object_key: String,
+    pub size: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchivePruneResult {
+    pub pruned_entries: usize,
+    pub queued_object_deletions: usize,
+}
+
+struct RetentionPolicy {
+    oldest_kept: Option<OffsetDateTime>,
+    max_bytes: Option<i64>,
+}
+
 impl MappingStore {
     /// Creates an immutable replacement intent only after matching it to durable sync work.
     ///
@@ -195,6 +235,7 @@ impl MappingStore {
             &request.path,
             &request.id,
         )?;
+        ensure_content_not_queued_for_deletion(&transaction, &request.old_digest)?;
         transaction.execute(
             "INSERT INTO file_replacement_journal (
                 id, mapping_id, relative_path, sync_operation_id, kind,
@@ -295,6 +336,9 @@ impl MappingStore {
             .ok_or_else(|| corrupt("validated archive source lost its size".to_owned()))?;
         require_active_mapping(&transaction, &source.mapping_id)?;
         ensure_no_other_active_entry(&transaction, &source.mapping_id, &source.path, &request.id)?;
+        if let Some(current_digest) = &request.expected_current_digest {
+            ensure_content_not_queued_for_deletion(&transaction, current_digest)?;
+        }
         let state = if request.expected_current_digest.is_some() {
             ReplacementState::Planned
         } else {
@@ -379,6 +423,7 @@ impl MappingStore {
         ) {
             return Err(invalid_transition(entry.state, ReplacementState::Archived));
         }
+        ensure_content_not_queued_for_deletion(&transaction, archive_digest)?;
         transaction.execute(
             "INSERT INTO archive_objects (
                 digest, size, object_key, state, created_at, verified_at, last_error
@@ -538,6 +583,141 @@ impl MappingStore {
         let mut statement = self.connection.prepare(&query)?;
         let rows = statement.query_map(params![mapping_id, limit], entry_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Lists archived versions of one active folder that its retention policy allows removing.
+    ///
+    /// A version leaves once it is older than the folder's `history_days`, or once newer versions
+    /// already fill its `history_max_bytes`. A zero limit disables that dimension. Unfinished
+    /// replacements and the source of an unfinished restore are never listed. Nothing is changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, inactive-mapping, corrupt-metadata, or database error.
+    pub fn prunable_archive_entries(
+        &self,
+        mapping_id: &str,
+        now: &str,
+        limit: u16,
+    ) -> Result<Vec<PrunableArchiveEntry>, MappingStoreError> {
+        check_identifier("id", mapping_id)?;
+        let now = parse_timestamp("now", now)?;
+        validate_retention_limit(limit)?;
+        let limit = usize::from(limit);
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let mut entries = Vec::new();
+        visit_prunable_entries(&transaction, mapping_id, now, |entry| {
+            entries.push(entry);
+            entries.len() < limit
+        })?;
+        transaction.commit()?;
+        Ok(entries)
+    }
+
+    /// Removes the requested versions that the retention policy still allows removing, and queues
+    /// every archive object that no remaining journal entry needs for file deletion.
+    ///
+    /// The policy is evaluated again inside this transaction, so a version that became protected
+    /// or retained after it was listed stays. Content stays queued, and new archive references to
+    /// it are refused, until [`Self::complete_archive_object_deletion`] confirms its file is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, inactive-mapping, corrupt-metadata, or database error.
+    pub fn prune_archive_entries(
+        &self,
+        mapping_id: &str,
+        entry_ids: &[String],
+        now: &str,
+    ) -> Result<ArchivePruneResult, MappingStoreError> {
+        check_identifier("id", mapping_id)?;
+        let now_time = parse_timestamp("now", now)?;
+        if entry_ids.is_empty() || entry_ids.len() > usize::from(MAX_RETENTION_BATCH) {
+            return Err(MappingStoreError::Invalid(format!(
+                "entryIds must contain between 1 and {MAX_RETENTION_BATCH} ids"
+            )));
+        }
+        let mut requested = HashSet::with_capacity(entry_ids.len());
+        for id in entry_ids {
+            check_identifier("entryIds", id)?;
+            if !requested.insert(id.as_str()) {
+                return Err(MappingStoreError::Invalid(
+                    "entryIds must not contain duplicates".to_owned(),
+                ));
+            }
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let mut pruned = Vec::new();
+        visit_prunable_entries(&transaction, mapping_id, now_time, |entry| {
+            if requested.contains(entry.id.as_str()) {
+                pruned.push((entry.id, entry.old_digest));
+            }
+            pruned.len() < requested.len()
+        })?;
+        let mut released_digests = HashSet::new();
+        for (id, digest) in &pruned {
+            transaction.execute(
+                "DELETE FROM file_replacement_journal WHERE id = ?1",
+                params![id],
+            )?;
+            released_digests.insert(digest.as_str());
+        }
+        let mut queued_object_deletions = 0;
+        for digest in released_digests {
+            if queue_unreferenced_object(&transaction, digest, now)? {
+                queued_object_deletions += 1;
+            }
+        }
+        transaction.commit()?;
+        Ok(ArchivePruneResult {
+            pruned_entries: pruned.len(),
+            queued_object_deletions,
+        })
+    }
+
+    /// Lists archive objects whose files still have to be removed, oldest queue entries first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation or database error.
+    pub fn pending_archive_object_deletions(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<ArchiveObjectDeletion>, MappingStoreError> {
+        validate_retention_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT digest, object_key, size FROM archive_object_deletions
+             ORDER BY queued_at, digest
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit], |row| {
+            Ok(ArchiveObjectDeletion {
+                digest: row.get(0)?,
+                object_key: row.get(1)?,
+                size: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Records that a queued archive object's file is gone, so the same content can be archived
+    /// again. Repeating the confirmation is harmless and returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation or database error.
+    pub fn complete_archive_object_deletion(
+        &self,
+        digest: &str,
+    ) -> Result<bool, MappingStoreError> {
+        validate_digest(digest)?;
+        let removed = self.connection.execute(
+            "DELETE FROM archive_object_deletions WHERE digest = ?1",
+            params![digest],
+        )?;
+        Ok(removed == 1)
     }
 
     /// Persists an explicit recovery or integrity failure without discarding archive metadata.
@@ -883,6 +1063,189 @@ fn ensure_no_other_active_entry(
         ));
     }
     Ok(())
+}
+
+/// Refuses a new archive reference to content whose object file is queued for deletion: the
+/// desktop may already have removed that file, so reusing it could record an archive that does
+/// not exist.
+fn ensure_content_not_queued_for_deletion(
+    transaction: &Transaction<'_>,
+    digest: &str,
+) -> Result<(), MappingStoreError> {
+    let queued: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_object_deletions WHERE digest = ?1)",
+        params![digest],
+        |row| row.get(0),
+    )?;
+    if queued {
+        return Err(MappingStoreError::Invalid(
+            "an earlier archived copy of this content is still being removed by version history cleanup; retry shortly"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Streams one active mapping's removable versions, newest first, until `visit` returns `false`.
+///
+/// Versions are kept newest first while they are within the age limit and the distinct archived
+/// bytes kept so far fit the storage cap. Once the cap is exceeded, that version and every older
+/// one are removable, so the oldest versions always leave first. Content shared by several kept
+/// versions is counted once because it is stored once.
+fn visit_prunable_entries(
+    connection: &rusqlite::Connection,
+    mapping_id: &str,
+    now: OffsetDateTime,
+    mut visit: impl FnMut(PrunableArchiveEntry) -> bool,
+) -> Result<(), MappingStoreError> {
+    let policy = retention_policy(connection, mapping_id, now)?;
+    let restore_sources = unfinished_restore_sources(connection)?;
+    let mut statement = connection.prepare(
+        "SELECT id, relative_path, local_root, archive_digest, old_size, created_at
+         FROM file_replacement_journal
+         WHERE mapping_id = ?1 AND archive_digest IS NOT NULL
+           AND state IN ('completed', 'aborted')
+         ORDER BY created_at DESC, id DESC",
+    )?;
+    let mut rows = statement.query(params![mapping_id])?;
+    let mut kept_digests = HashSet::new();
+    let mut kept_bytes: i64 = 0;
+    let mut cap_exceeded = false;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        if restore_sources.contains(&id) {
+            continue;
+        }
+        let old_size: Option<i64> = row.get(4)?;
+        let entry = PrunableArchiveEntry {
+            path: row.get(1)?,
+            local_root: row.get(2)?,
+            old_digest: row.get(3)?,
+            old_size: old_size.ok_or_else(|| {
+                corrupt(format!(
+                    "archived journal entry {id:?} has no archived size"
+                ))
+            })?,
+            created_at: row.get(5)?,
+            id,
+        };
+        let created_at = OffsetDateTime::parse(&entry.created_at, &Rfc3339).map_err(|error| {
+            corrupt(format!(
+                "journal entry {:?} has an invalid creation time: {error}",
+                entry.id
+            ))
+        })?;
+        let expired = policy
+            .oldest_kept
+            .is_some_and(|oldest_kept| created_at < oldest_kept);
+        if !expired && !cap_exceeded {
+            if kept_digests.insert(entry.old_digest.clone()) {
+                kept_bytes = kept_bytes.saturating_add(entry.old_size);
+            }
+            cap_exceeded = policy.max_bytes.is_some_and(|max| kept_bytes > max);
+            if !cap_exceeded {
+                continue;
+            }
+        }
+        if !visit(entry) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn retention_policy(
+    connection: &rusqlite::Connection,
+    mapping_id: &str,
+    now: OffsetDateTime,
+) -> Result<RetentionPolicy, MappingStoreError> {
+    let (days, max_bytes): (i64, i64) = connection
+        .query_row(
+            "SELECT history_days, history_max_bytes FROM folder_mappings
+             WHERE id = ?1 AND setup_status = 'active'",
+            params![mapping_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| MappingStoreError::NotFound(mapping_id.to_owned()))?;
+    if !(0..=MAX_HISTORY_DAYS).contains(&days) || max_bytes < 0 {
+        return Err(MappingStoreError::CorruptMetadata {
+            id: mapping_id.to_owned(),
+            detail: "stored version history limits are out of range".to_owned(),
+        });
+    }
+    let oldest_kept = if days == 0 {
+        None
+    } else {
+        Some(now.checked_sub(time::Duration::days(days)).ok_or_else(|| {
+            MappingStoreError::Invalid("now is outside the supported time range".to_owned())
+        })?)
+    };
+    Ok(RetentionPolicy {
+        oldest_kept,
+        max_bytes: (max_bytes > 0).then_some(max_bytes),
+    })
+}
+
+/// Journal entries an unfinished restore is copying from. Their row is kept until the restore
+/// settles; the object is independently protected through the restore's replacement digest.
+fn unfinished_restore_sources(
+    connection: &rusqlite::Connection,
+) -> Result<HashSet<String>, MappingStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT restored_from_journal_id FROM file_replacement_journal
+         WHERE restored_from_journal_id IS NOT NULL
+           AND state IN ('planned', 'archived', 'installed', 'recovery-required', 'integrity-failed')",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<Result<HashSet<_>, _>>().map_err(Into::into)
+}
+
+/// Moves one archive object into the deletion queue when no journal entry archives it and no
+/// unfinished replacement or restore could still read or re-archive it. Returns whether it moved.
+fn queue_unreferenced_object(
+    transaction: &Transaction<'_>,
+    digest: &str,
+    queued_at: &str,
+) -> Result<bool, MappingStoreError> {
+    let queued = transaction.execute(
+        "INSERT INTO archive_object_deletions (digest, object_key, size, queued_at)
+         SELECT digest, object_key, size, ?2 FROM archive_objects
+         WHERE digest = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM file_replacement_journal WHERE archive_digest = ?1
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM file_replacement_journal
+               WHERE state IN ('planned', 'archived', 'installed', 'recovery-required', 'integrity-failed')
+                 AND (old_digest = ?1 OR replacement_digest = ?1)
+           )
+         ON CONFLICT DO NOTHING",
+        params![digest, queued_at],
+    )?;
+    if queued == 0 {
+        return Ok(false);
+    }
+    transaction.execute(
+        "DELETE FROM archive_objects WHERE digest = ?1",
+        params![digest],
+    )?;
+    Ok(true)
+}
+
+fn validate_retention_limit(limit: u16) -> Result<(), MappingStoreError> {
+    if limit == 0 || limit > MAX_RETENTION_BATCH {
+        return Err(MappingStoreError::Invalid(format!(
+            "limit must be between 1 and {MAX_RETENTION_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_timestamp(field: &str, value: &str) -> Result<OffsetDateTime, MappingStoreError> {
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|error| {
+        MappingStoreError::Invalid(format!("{field} must be an RFC 3339 timestamp: {error}"))
+    })
 }
 
 fn require_active_mapping(
@@ -1506,6 +1869,412 @@ mod tests {
             .archived_versions("mapping-1", None)
             .expect("full history");
         assert_eq!(all, vec![third, second, first]);
+    }
+
+    const RETENTION_NOW: &str = "2026-09-20T10:00:00Z";
+
+    fn set_history_limits(store: &MappingStore, days: i64, max_bytes: i64) {
+        store
+            .connection
+            .execute(
+                "UPDATE folder_mappings SET history_days = ?1, history_max_bytes = ?2
+                 WHERE id = 'mapping-1'",
+                params![days, max_bytes],
+            )
+            .expect("set history limits");
+    }
+
+    fn digest_of(content: char) -> String {
+        content.to_string().repeat(64)
+    }
+
+    /// Completes a replacement of `path` whose archived four-byte previous content is `old`.
+    fn completed_version(
+        store: &MappingStore,
+        id: &str,
+        path: &str,
+        created_at: &str,
+        old: char,
+        new: char,
+    ) -> ReplacementJournalEntry {
+        reconcile(store, path, old, old);
+        let operation_id = reconcile(store, path, old, new).operations[0].id;
+        store
+            .prepare_replacement(&PrepareReplacementRequest {
+                id: id.to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                path: path.to_owned(),
+                sync_operation_id: Some(operation_id),
+                old_digest: digest_of(old),
+                old_size: 4,
+                replacement_digest: digest_of(new),
+                replacement_size: 4,
+                local_root: "/tmp/a".to_owned(),
+                created_at: created_at.to_owned(),
+            })
+            .expect("prepare replacement");
+        store
+            .mark_replacement_archived(
+                id,
+                &digest_of(old),
+                4,
+                &format!("sha256/{old}{old}/{}", digest_of(old)),
+                LATER,
+            )
+            .expect("mark archived");
+        store
+            .mark_replacement_installed(id, LATER)
+            .expect("mark installed");
+        store
+            .complete_file_operation(operation_id, &digest_of(new), 4, LATER, Some(id))
+            .expect("complete replacement");
+        store.replacement_entry(id).expect("completed version")
+    }
+
+    fn prunable_ids(store: &MappingStore) -> Vec<String> {
+        store
+            .prunable_archive_entries("mapping-1", RETENTION_NOW, 100)
+            .expect("list prunable versions")
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    fn archive_object_count(store: &MappingStore, content: char) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_objects WHERE digest = ?1",
+                params![digest_of(content)],
+                |row| row.get(0),
+            )
+            .expect("count archive objects")
+    }
+
+    #[test]
+    fn retention_offers_versions_older_than_the_history_window() {
+        let store = active_store(None);
+        set_history_limits(&store, 30, 0);
+        completed_version(&store, "old", "old.txt", "2026-08-01T10:00:00Z", 'c', '1');
+        completed_version(
+            &store,
+            "boundary",
+            "boundary.txt",
+            "2026-08-21T10:00:00Z",
+            'd',
+            '2',
+        );
+        completed_version(
+            &store,
+            "recent",
+            "recent.txt",
+            "2026-09-10T10:00:00Z",
+            'e',
+            '3',
+        );
+
+        assert_eq!(prunable_ids(&store), vec!["old"]);
+    }
+
+    #[test]
+    fn retention_keeps_the_newest_versions_that_fit_the_storage_cap() {
+        let store = active_store(None);
+        set_history_limits(&store, 0, 8);
+        completed_version(
+            &store,
+            "oldest",
+            "one.txt",
+            "2026-09-01T10:00:00Z",
+            'c',
+            '1',
+        );
+        completed_version(
+            &store,
+            "shared-older",
+            "two.txt",
+            "2026-09-02T10:00:00Z",
+            'd',
+            '2',
+        );
+        completed_version(
+            &store,
+            "shared-newer",
+            "three.txt",
+            "2026-09-03T10:00:00Z",
+            'd',
+            '3',
+        );
+        completed_version(
+            &store,
+            "newest",
+            "four.txt",
+            "2026-09-04T10:00:00Z",
+            'e',
+            '4',
+        );
+
+        // The newest content and the content shared by two versions fill eight bytes exactly.
+        assert_eq!(prunable_ids(&store), vec!["oldest"]);
+
+        set_history_limits(&store, 0, 7);
+        assert_eq!(
+            prunable_ids(&store),
+            vec!["shared-newer", "shared-older", "oldest"]
+        );
+    }
+
+    #[test]
+    fn zero_history_limits_keep_every_version() {
+        let store = active_store(None);
+        set_history_limits(&store, 0, 0);
+        completed_version(
+            &store,
+            "ancient",
+            "one.txt",
+            "2020-01-01T00:00:00Z",
+            'c',
+            '1',
+        );
+
+        assert!(prunable_ids(&store).is_empty());
+    }
+
+    #[test]
+    fn retention_never_offers_unfinished_work_or_the_source_of_an_unfinished_restore() {
+        let store = active_store(None);
+        set_history_limits(&store, 1, 0);
+        let source = completed_version(
+            &store,
+            "source",
+            "restored.txt",
+            "2026-08-01T10:00:00Z",
+            'c',
+            '1',
+        );
+        completed_version(
+            &store,
+            "plain",
+            "plain.txt",
+            "2026-08-01T10:00:00Z",
+            'd',
+            '2',
+        );
+        let restore = store
+            .prepare_restore(&PrepareRestoreRequest {
+                id: "restore-1".to_owned(),
+                source_journal_id: source.id,
+                expected_current_digest: Some(digest_of('1')),
+                expected_current_size: Some(4),
+                local_root: "/tmp/a".to_owned(),
+                created_at: "2026-08-02T10:00:00Z".to_owned(),
+            })
+            .expect("prepare restore");
+        store
+            .mark_replacement_archived(
+                &restore.id,
+                &digest_of('1'),
+                4,
+                &format!("sha256/11/{}", digest_of('1')),
+                LATER,
+            )
+            .expect("archive the current content before restoring");
+
+        assert_eq!(prunable_ids(&store), vec!["plain"]);
+        let result = store
+            .prune_archive_entries(
+                "mapping-1",
+                &["source".to_owned(), "plain".to_owned()],
+                RETENTION_NOW,
+            )
+            .expect("prune");
+        assert_eq!(
+            result,
+            ArchivePruneResult {
+                pruned_entries: 1,
+                queued_object_deletions: 1
+            }
+        );
+        assert_eq!(archive_object_count(&store, 'c'), 1);
+        assert_eq!(archive_object_count(&store, '1'), 1);
+    }
+
+    #[test]
+    fn pruning_removes_only_still_prunable_versions_and_queues_unreferenced_content() {
+        let store = active_store(None);
+        set_history_limits(&store, 30, 0);
+        completed_version(
+            &store,
+            "expired-unique",
+            "one.txt",
+            "2026-07-01T10:00:00Z",
+            'c',
+            '1',
+        );
+        completed_version(
+            &store,
+            "expired-shared",
+            "two.txt",
+            "2026-07-02T10:00:00Z",
+            'd',
+            '2',
+        );
+        let recent = completed_version(
+            &store,
+            "recent-shared",
+            "three.txt",
+            "2026-09-10T10:00:00Z",
+            'd',
+            '3',
+        );
+        let requested = [
+            "expired-unique".to_owned(),
+            "expired-shared".to_owned(),
+            "recent-shared".to_owned(),
+        ];
+
+        let result = store
+            .prune_archive_entries("mapping-1", &requested, RETENTION_NOW)
+            .expect("prune");
+        assert_eq!(
+            result,
+            ArchivePruneResult {
+                pruned_entries: 2,
+                queued_object_deletions: 1
+            }
+        );
+        assert_eq!(
+            store.archived_versions("mapping-1", None).expect("history"),
+            vec![recent]
+        );
+        assert_eq!(
+            store
+                .pending_archive_object_deletions(10)
+                .expect("pending deletions"),
+            vec![ArchiveObjectDeletion {
+                digest: digest_of('c'),
+                object_key: format!("sha256/cc/{}", digest_of('c')),
+                size: 4,
+            }]
+        );
+        assert_eq!(archive_object_count(&store, 'c'), 0);
+        assert_eq!(archive_object_count(&store, 'd'), 1);
+
+        let repeated = store
+            .prune_archive_entries("mapping-1", &requested, RETENTION_NOW)
+            .expect("repeat prune");
+        assert_eq!(
+            repeated,
+            ArchivePruneResult {
+                pruned_entries: 0,
+                queued_object_deletions: 0
+            }
+        );
+    }
+
+    #[test]
+    fn queued_content_is_not_archived_again_until_its_file_deletion_is_confirmed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("mappings.sqlite3");
+        let store = active_store(Some(&database));
+        set_history_limits(&store, 30, 0);
+        completed_version(
+            &store,
+            "expired",
+            "one.txt",
+            "2026-07-01T10:00:00Z",
+            'c',
+            '1',
+        );
+        store
+            .prune_archive_entries("mapping-1", &["expired".to_owned()], RETENTION_NOW)
+            .expect("prune");
+        drop(store);
+
+        // A cleanup pass interrupted before removing the file leaves its queue entry durable.
+        let reopened = MappingStore::open(&database).expect("reopen");
+        assert_eq!(
+            reopened
+                .pending_archive_object_deletions(10)
+                .expect("pending deletions")
+                .len(),
+            1
+        );
+        reconcile(&reopened, "two.txt", 'c', 'c');
+        let operation_id = reconcile(&reopened, "two.txt", 'c', '2').operations[0].id;
+        let request = PrepareReplacementRequest {
+            id: "reuses-queued-content".to_owned(),
+            mapping_id: "mapping-1".to_owned(),
+            path: "two.txt".to_owned(),
+            sync_operation_id: Some(operation_id),
+            old_digest: digest_of('c'),
+            old_size: 4,
+            replacement_digest: digest_of('2'),
+            replacement_size: 4,
+            local_root: "/tmp/a".to_owned(),
+            created_at: LATER.to_owned(),
+        };
+        let error = reopened
+            .prepare_replacement(&request)
+            .expect_err("queued content must not gain a new archive reference");
+        assert!(error.to_string().contains("still being removed"));
+
+        assert!(
+            reopened
+                .complete_archive_object_deletion(&digest_of('c'))
+                .expect("confirm deletion")
+        );
+        assert!(
+            !reopened
+                .complete_archive_object_deletion(&digest_of('c'))
+                .expect("repeat confirmation")
+        );
+        reopened
+            .prepare_replacement(&request)
+            .expect("content can be archived again after deletion");
+    }
+
+    #[test]
+    fn retention_requests_are_validated() {
+        let store = active_store(None);
+        assert!(
+            store
+                .prunable_archive_entries("mapping-1", RETENTION_NOW, 0)
+                .is_err()
+        );
+        assert!(
+            store
+                .prunable_archive_entries("mapping-1", RETENTION_NOW, 1_001)
+                .is_err()
+        );
+        assert!(
+            store
+                .prunable_archive_entries("mapping-1", "yesterday", 1)
+                .is_err()
+        );
+        assert!(matches!(
+            store.prunable_archive_entries("missing", RETENTION_NOW, 1),
+            Err(MappingStoreError::NotFound(_))
+        ));
+        assert!(
+            store
+                .prune_archive_entries("mapping-1", &[], RETENTION_NOW)
+                .is_err()
+        );
+        assert!(
+            store
+                .prune_archive_entries(
+                    "mapping-1",
+                    &["same".to_owned(), "same".to_owned()],
+                    RETENTION_NOW
+                )
+                .is_err()
+        );
+        assert!(store.pending_archive_object_deletions(0).is_err());
+        assert!(
+            store
+                .complete_archive_object_deletion("not-a-digest")
+                .is_err()
+        );
     }
 
     #[test]

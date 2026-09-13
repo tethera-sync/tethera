@@ -7,6 +7,7 @@ import {
   ArchiveMessage,
   ArchiveVersionRow,
   loadArchiveHistory,
+  retentionSummary,
   submitVersionRestore,
   type ArchiveHistoryRequestState,
 } from "../src/renderer/components/archive-history-view"
@@ -67,6 +68,15 @@ function readyRequest({
 }
 
 describe("ArchiveHistoryView", () => {
+  test("describes the folder's history limits, treating a zero limit as unlimited", () => {
+    const folder = activeFolder("folder-1", "Documents")
+    expect(retentionSummary({ ...folder, historyDays: 30, historyMaxBytes: 10 * 1024 ** 3 }))
+      .toBe("Documents keeps archived versions for 30 days and up to 10 GB on this computer; the oldest are removed first.")
+    expect(retentionSummary({ ...folder, historyDays: 1, historyMaxBytes: 0 }))
+      .toBe("Documents keeps archived versions for 1 day on this computer; the oldest are removed first.")
+    expect(retentionSummary({ ...folder, historyDays: 0, historyMaxBytes: 0 })).toBe("Documents keeps every archived version.")
+  })
+
   test("renders a loading state", () => {
     const html = renderToStaticMarkup(
       <ArchiveHistoryContent request={{ status: "loading" }} onRetry={() => undefined} onSelectVersion={() => undefined} />,

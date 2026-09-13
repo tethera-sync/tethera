@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Schema version this build reads and writes. Version 1 is intentionally left unchanged below.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 200;
@@ -28,7 +28,7 @@ const MAX_IGNORE_PATTERNS: usize = 1_000;
 const MAX_IGNORE_PATTERN_LENGTH: usize = 1_024;
 const MAX_PREVIEW_ITEMS: usize = 10_000;
 const MAX_PREVIEW_SERIALIZED_BYTES: usize = 2 * 1024 * 1024;
-const MAX_HISTORY_DAYS: i64 = 3_650;
+pub(crate) const MAX_HISTORY_DAYS: i64 = 3_650;
 const MAX_HISTORY_BYTES: i64 = 1 << 50;
 const MIN_FILE_SIZE_LIMIT_BYTES: i64 = 1_024;
 const MAX_FILE_SIZE_LIMIT_BYTES: i64 = 1 << 40; // 1 TiB
@@ -828,6 +828,28 @@ impl MappingStore {
             )?;
             transaction.commit()?;
         }
+        if current < 9 {
+            self.migrate_v8_to_v9()?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v8_to_v9(&self) -> Result<(), MappingStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS archive_object_deletions (
+                digest TEXT PRIMARY KEY,
+                object_key TEXT NOT NULL UNIQUE,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                queued_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS file_replacement_journal_archive_digest
+                ON file_replacement_journal (archive_digest)
+                WHERE archive_digest IS NOT NULL;
+            PRAGMA user_version = 9;",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2862,6 +2884,55 @@ mod tests {
         assert_eq!(cache_table, 1);
 
         // Reopening an already-migrated database is idempotent.
+        drop(reopened);
+        let reopened_again = MappingStore::open(&path).expect("reopen migrated database");
+        assert_eq!(
+            reopened_again.schema_version().expect("version"),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migrates_schema_v8_to_v9_without_rewriting_existing_mapping_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("mappings.sqlite3");
+        let original = sample("existing-v8-mapping");
+        seed_v1(&path, std::slice::from_ref(&original));
+        drop(MappingStore::open(&path).expect("create representative current schema"));
+
+        let connection = rusqlite::Connection::open(&path).expect("open representative v8");
+        connection
+            .execute_batch(
+                "DROP INDEX IF EXISTS file_replacement_journal_archive_digest;
+                 DROP TABLE IF EXISTS archive_object_deletions;
+                 PRAGMA user_version = 8;",
+            )
+            .expect("downgrade representative schema to v8");
+        drop(connection);
+
+        let reopened = MappingStore::open(&path).expect("migrate v8 to v9");
+        assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
+        let mapping_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM folder_mappings WHERE id = 'existing-v8-mapping'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mapping count");
+        assert_eq!(mapping_count, 1);
+        let retention_schema: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE (type = 'table' AND name = 'archive_object_deletions')
+                    OR (type = 'index' AND name = 'file_replacement_journal_archive_digest')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("retention schema");
+        assert_eq!(retention_schema, 2);
+
         drop(reopened);
         let reopened_again = MappingStore::open(&path).expect("reopen migrated database");
         assert_eq!(

@@ -310,15 +310,15 @@ export function AddFolderDialog({
                 <Field>
                   <FieldLabel>Keep versions for</FieldLabel>
                   <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><Input className="min-w-0 flex-1 border-0 bg-transparent px-2.5 py-[9px] outline-none" type="number" min={1} max={3650} value={historyDays} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryDays(Number(event.target.value))} /><span>days</span></div>
-                  <FieldDescription>Saved with the folder; not enforced yet.</FieldDescription>
+                  <FieldDescription>Older replaced versions are removed.</FieldDescription>
                 </Field>
                 <Field>
                   <FieldLabel>History storage cap</FieldLabel>
                   <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><Input className="min-w-0 flex-1 border-0 bg-transparent px-2.5 py-[9px] outline-none" type="number" min={1} max={4096} value={historyMaxGb} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryMaxGb(Number(event.target.value))} /><span>GB</span></div>
-                  <FieldDescription>Per folder, on each computer; not enforced yet.</FieldDescription>
+                  <FieldDescription>Per folder, on each computer.</FieldDescription>
                 </Field>
               </div>
-              <p className="text-xs text-[var(--muted-foreground)]">Tethera keeps every replaced version for now. Both values are saved with the folder for a future cleanup policy; nothing is pruned or deleted yet, so history disk use is not limited today.</p>
+              <p className="text-xs text-[var(--muted-foreground)]">Tethera checks history every hour. A replaced version is removed once it is older than this, or once newer versions fill the storage cap, oldest first. Unfinished replacements and restores are always kept.</p>
               <Field>
                 <FieldLabel htmlFor="folder-ignore-preset">Add ignore preset</FieldLabel>
                 <NativeSelect id="folder-ignore-preset" className="w-full" value="" onChange={(event: ChangeEvent<HTMLSelectElement>) => {
