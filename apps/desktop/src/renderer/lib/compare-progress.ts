@@ -1,8 +1,18 @@
 import { useEffect, useState } from "react"
-import type { FolderPreviewProgress } from "@shared/contracts"
+import type { FolderPreviewProgress, FolderScanActivity } from "@shared/contracts"
 import { formatBytes } from "./format"
 
 export type ComparePhase = FolderPreviewProgress["phase"]
+
+/** Plain-language name for what a folder scan is doing. */
+export function scanStageLabel(stage: FolderScanActivity["stage"]): string {
+  return {
+    listing: "Listing folders",
+    inspecting: "Checking file metadata",
+    hashing: "Reading file contents to compare",
+    complete: "Scan finished",
+  }[stage]
+}
 
 /** Whole seconds since `active` became true. Resets when the operation ends. */
 export function useElapsedSeconds(active: boolean): number {
@@ -58,7 +68,7 @@ export function comparePhaseText(
   const elapsedSuffix = ` · ${elapsed} elapsed`
   if ((phase === "scan-local" || phase === "scan-remote") && activity) {
     const computer = phase === "scan-local" ? thisComputer : otherComputer
-    const action = { listing: "Listing folders", inspecting: "Checking file metadata", hashing: "Reading file contents to compare", complete: "Scan finished" }[activity.stage]
+    const action = scanStageLabel(activity.stage)
     const reusedCount = activity.reusedFiles ?? 0
     const reusedNote = reusedCount > 0
       ? ` · ${reusedCount.toLocaleString("en-GB")} unchanged files reused without re-reading`

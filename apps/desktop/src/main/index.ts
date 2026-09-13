@@ -33,10 +33,15 @@ import type {
   FolderMappingProposal,
   FolderMappingPreview,
   FolderPreviewProgress,
+  FolderProblem,
+  FolderScanActivity,
   FolderScanIssue,
   FolderScanIssueReport,
   FolderSummary,
+  FolderWork,
+  FolderWorkActivity,
   IncomingMappingRequest,
+  InitialMergeStep,
   MappingState,
   PairingState,
   PreviewFolderMappingInput,
@@ -109,7 +114,7 @@ import { PairingService } from "./pairing-service"
 import { CHUNKED_FRAMES_CAPABILITY, measurePeerRequest, PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
 import { requestPeerCapabilities } from "./peer-capabilities"
 import { requestPeerPreview } from "./peer-preview"
-import { PEER_SCAN_PROGRESS_CAPABILITY } from "./peer-scan-progress"
+import { PEER_SCAN_PROGRESS_CAPABILITY, type PeerScanProgress } from "./peer-scan-progress"
 import { folderComparisonResult } from "../shared/folder-comparison-result"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import {
@@ -546,8 +551,23 @@ function runCachedFolderFingerprint(key: string, folder: ActiveFolderScanTarget,
     runAdmittedScan(key, folder.id, signal, (effective) => fingerprintFolder(folder.localPath, folder.ignorePatterns, { maxFiles, signal: effective, digestCache })))
 }
 
-function requestPeerManifest(peerId: string, payload: PeerRequest, timeoutMs: number, signal: AbortSignal, chunked: boolean): Promise<FileManifest> {
-  return requirePeerSessions().request<unknown>(peerId, payload, timeoutMs, { signal, chunked }).then((raw) => parsePeerManifest(raw))
+/**
+ * `onProgress` opts the scan into advisory peer counters, so pass it only for
+ * a peer advertising `PEER_SCAN_PROGRESS_CAPABILITY`: the request flag and the
+ * listener must be set together.
+ */
+function requestPeerManifest(
+  peerId: string,
+  payload: PeerRequest,
+  timeoutMs: number,
+  signal: AbortSignal,
+  chunked: boolean,
+  onProgress?: (progress: PeerScanProgress) => void,
+): Promise<FileManifest> {
+  const request = onProgress ? { ...payload, reportProgress: true } : payload
+  return requirePeerSessions()
+    .request<unknown>(peerId, request, timeoutMs, { signal, chunked, ...(onProgress ? { onProgress } : {}) })
+    .then((raw) => parsePeerManifest(raw))
 }
 
 /** A peer's optional features change only when its app updates, so a short cache saves a round trip per sync cycle. */
@@ -560,11 +580,6 @@ async function cachedPeerCapabilities(peerId: string): Promise<ReadonlySet<strin
   const capabilities = await requestPeerCapabilities(requirePeerSessions(), peerId)
   peerCapabilityCache.set(peerId, { capabilities, fetchedAt: Date.now() })
   return capabilities
-}
-
-/** Whether manifests and observations can cross to this peer as chunks larger than one frame. */
-async function peerSupportsChunkedFrames(peerId: string): Promise<boolean> {
-  return (await cachedPeerCapabilities(peerId)).has(CHUNKED_FRAMES_CAPABILITY)
 }
 
 /** Per folder, the last continuous reconcile that queued nothing. Lost on restart, so the first cycle always reconciles. */
@@ -889,7 +904,12 @@ function syncPairingSnapshot(): AppSnapshot {
       folder.status === "needs-attention" &&
       (folder.currentAction?.includes("conflict") || folder.currentAction?.includes("retry"))
     ) return folder
-    return { ...folder, status: idleFolderStatus(folder.remoteDeviceId, folder.setupStatus) }
+    // No initial merge holds this folder any more, so only a running sync cycle may still own its progress.
+    return {
+      ...folder,
+      status: idleFolderStatus(folder.remoteDeviceId, folder.setupStatus),
+      ...(continuousSyncInFlight.has(folder.id) ? {} : { work: undefined }),
+    }
   })
   void flushPendingMappingDecisions()
   void flushPendingConfigurationDeliveries()
@@ -1183,8 +1203,8 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
         ...projected,
         ...(runtime
           ? {
-              progress: runtime.progress,
-              bytesPerSecond: runtime.bytesPerSecond,
+              work: runtime.work,
+              problem: runtime.problem,
               fileCount: runtime.fileCount ?? outcome?.fileCount,
               lastSyncedAt: runtime.lastSyncedAt ?? outcome?.completedAt,
               currentAction: runtime.scanIssues
@@ -1782,6 +1802,41 @@ function updateFolder(folderId: string, patch: Partial<FolderSummary>): void {
   snapshot.folders = snapshot.folders.map((item) => (item.id === folderId ? { ...item, ...patch } : item))
 }
 
+function newFolderWork(activity: FolderWorkActivity, initialMerge?: InitialMergeStep): FolderWork {
+  return { startedAt: new Date().toISOString(), activity, ...(initialMerge ? { initialMerge } : {}) }
+}
+
+/** Replaces what a running operation is doing, keeping its start time and merge step unless a new step is given. */
+function setFolderActivity(folderId: string, activity: FolderWorkActivity, initialMerge?: InitialMergeStep): void {
+  const current = snapshot.folders.find((item) => item.id === folderId)?.work
+  if (!current) {
+    updateFolder(folderId, { work: newFolderWork(activity, initialMerge) })
+    return
+  }
+  const step = initialMerge ?? current.initialMerge
+  updateFolder(folderId, { work: { startedAt: current.startedAt, activity, ...(step ? { initialMerge: step } : {}) } })
+}
+
+/**
+ * Merges one computer's live scan counters into the running scan and
+ * broadcasts them. Reports that arrive after the folder moved on to another
+ * activity are dropped so a late callback cannot rewind the progress view.
+ */
+function reportScanCounts(
+  folderId: string,
+  purpose: Extract<FolderWorkActivity, { kind: "scanning" }>["purpose"],
+  side: { local: FolderScanActivity } | { remote: PeerScanProgress },
+): void {
+  const activity = snapshot.folders.find((item) => item.id === folderId)?.work?.activity
+  if (activity?.kind !== "scanning" || activity.purpose !== purpose) return
+  setFolderActivity(folderId, { ...activity, ...side })
+  broadcastSnapshot()
+}
+
+function folderProblem(title: string, detail: string): FolderProblem {
+  return { title, detail, occurredAt: new Date().toISOString() }
+}
+
 function continuousCoordinatorId(record: MappingRecord): string {
   return [record.mapping.initiatorDeviceId, record.mapping.responderDeviceId].sort()[0]
 }
@@ -1817,8 +1872,8 @@ function applyFileSyncStateToFolder(folderId: string, state: FileSyncState, sync
       : state.operations.length > 0
         ? `${state.operations.length} change${state.operations.length === 1 ? " is" : "s are"} waiting to retry.`
         : "Watching for changes.",
-    progress: undefined,
-    bytesPerSecond: undefined,
+    work: undefined,
+    problem: undefined,
     lastSyncedAt: syncedAt ?? folder.lastSyncedAt,
     fileCount: state.baselineCount,
     conflictCount,
@@ -2225,7 +2280,7 @@ async function refreshContinuousSyncMonitors(): Promise<void> {
         monitor.close()
         continuousSyncMonitors.delete(folder.id)
         const message = error instanceof Error ? error.message : "The synchronized folder could not be watched."
-        updateFolder(folder.id, { status: "needs-attention", currentAction: message })
+        updateFolder(folder.id, { status: "needs-attention", currentAction: message, problem: folderProblem("Folder watch failed", message) })
         pushActivity("Folder watch failed", `${folder.name}: ${message}`, "error", folder.id)
         broadcastSnapshot()
       },
@@ -2274,7 +2329,15 @@ async function executeContinuousOperations(
       updateFolder(folder.id, {
         status: "syncing",
         currentAction: `Syncing ${operation.path} (${copiedFiles + 1}/${operations.length})`,
-        progress: totalBytes > 0 ? Math.min(transferred / totalBytes, 1) : 1,
+      })
+      setFolderActivity(folder.id, {
+        kind: "copying",
+        destination: operation.direction === "pull-remote" ? "this-computer" : "other-computer",
+        path: operation.path,
+        completedFiles: copiedFiles,
+        totalFiles: operations.length,
+        transferredBytes: transferred,
+        totalBytes,
         bytesPerSecond: Math.round(transferred / Math.max((Date.now() - startedAt) / 1_000, 0.001)),
       })
       const now = Date.now()
@@ -2394,7 +2457,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
   ) return
   const peer = getPairedDevice(folder.remoteDeviceId)
   if (!peer || peer.status !== "online") {
-    updateFolder(folderId, { status: "offline", progress: undefined, bytesPerSecond: undefined, currentAction: "Waiting for the paired computer to reconnect." })
+    updateFolder(folderId, { status: "offline", work: undefined, currentAction: "Waiting for the paired computer to reconnect." })
     broadcastSnapshot()
     return
   }
@@ -2406,7 +2469,11 @@ async function flushContinuousSync(folderId: string): Promise<void> {
 
   continuousCyclesInProgress += 1
   continuousSyncInFlight.add(folderId)
-  updateFolder(folderId, { status: "syncing", progress: 0, bytesPerSecond: 0, currentAction: `Checking for changes with ${peer.name}…` })
+  updateFolder(folderId, {
+    status: "syncing",
+    work: newFolderWork({ kind: "scanning", purpose: "changes" }),
+    currentAction: `Checking for changes with ${peer.name}…`,
+  })
   broadcastSnapshot()
   let reconciledState: ReconcileFilesResult | undefined
   try {
@@ -2441,7 +2508,9 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     // Only a clean quiet reconcile below may leave a skip record behind.
     quietReconciles.delete(folderId)
     const { local: localManifest, peer: remoteManifest } = await runPairedScans(
-      (signal) => runCachedFolderScan(`continuous:${folderId}`, folder, scanLimit, signal),
+      (signal) => runCachedFolderScan(`continuous:${folderId}`, folder, scanLimit, signal, {
+        onActivity: (activity) => reportScanCounts(folderId, "changes", { local: activity }),
+      }),
       (signal) => knownPeerManifest
         ? Promise.resolve(knownPeerManifest)
         : requestPeerManifest(peer.id, { type: "continuous-sync-scan", folderId }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, signal, chunked),
@@ -2575,25 +2644,24 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       } else {
         updateFolder(folderId, {
           status: online ? "needs-attention" : "offline",
-          progress: undefined,
-          bytesPerSecond: undefined,
+          work: undefined,
           currentAction: online ? `${message} Tethera will retry.` : "Waiting for the paired computer to reconnect.",
+          ...(online ? { problem: folderProblem("Sync interrupted", `${message} Tethera will retry.`) } : {}),
           fileCount: latestState.baselineCount,
         })
       }
     } else if (durableConflicts.length > 0) {
       updateFolder(folderId, {
         status: "needs-attention",
-        progress: undefined,
-        bytesPerSecond: undefined,
+        work: undefined,
         currentAction: conflictSummary(durableConflicts),
       })
     } else {
       updateFolder(folderId, {
         status: online ? "needs-attention" : "offline",
-        progress: undefined,
-        bytesPerSecond: undefined,
+        work: undefined,
         currentAction: online ? `${message} Tethera will retry.` : "Waiting for the paired computer to reconnect.",
+        ...(online ? { problem: folderProblem("Sync interrupted", `${message} Tethera will retry.`) } : {}),
       })
     }
     if (continuousLastErrors.get(folderId) !== message) {
@@ -2918,17 +2986,6 @@ async function recoverIncompleteReplacements(): Promise<void> {
   }
 }
 
-// Main-process copy of the renderer byte formatter. Main must not import
-// renderer modules, but the initial-sync status string is built here so it
-// needs the same human-readable byte shape the comparison view uses.
-function formatScanHashedBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
-  const value = bytes / 1024 ** exponent
-  return `${value >= 10 || exponent === 0 ? Math.round(value) : value.toFixed(1)} ${units[exponent]}`
-}
-
 function initialSyncScanSignature(folder: FolderSummary): string {
   return JSON.stringify([folder.localPath, folder.remotePath, folder.mode, folder.ignorePatterns, folder.maxFileBytes ?? null, currentScanLimit()])
 }
@@ -3007,6 +3064,8 @@ interface InitialSyncRunOptions {
   prepared?: RetainedPreparedScan
   /** Report the user already accepted; a fresh scan matching it proceeds without re-asking. */
   acknowledgedIssuesSignature?: string
+  /** Where this pass sits in the merge, for the progress view. */
+  initialMerge: InitialMergeStep
 }
 
 async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, options: InitialSyncRunOptions): Promise<InitialSyncPassResult> {
@@ -3020,10 +3079,10 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
     currentAction: reuse
       ? `Checking your folder for changes since the comparison; unchanged files keep their verified digests with ${peer.name}…`
       : `Starting a read-only scan on both computers: applying ignore rules and hashing file contents with ${peer.name}…`,
-    progress: undefined,
-    bytesPerSecond: 0,
+    problem: undefined,
     scanIssues: undefined,
   })
+  setFolderActivity(folder.id, { kind: "scanning", purpose: "initial-merge" }, options.initialMerge)
   broadcastSnapshot()
 
   // One limit for the whole pass: rereading the setting after the awaited
@@ -3044,7 +3103,8 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
     remoteManifest = prepared.remoteManifest
     localBlocked = prepared.localUnreadableEntries
   } else {
-    const chunked = await peerSupportsChunkedFrames(peer.id)
+    const capabilities = await cachedPeerCapabilities(peer.id)
+    const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
     let scanning = true
     localBlocked = []
     const result = await runPairedScans(
@@ -3052,12 +3112,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
         reuse,
         onUnreadable: (issue) => localBlocked.push(issue),
         onActivity: (activity) => {
-          if (!scanning) return
-          const action = { listing: "Listing", inspecting: "Checking", hashing: "Hashing", complete: "Local scan complete" }[activity.stage]
-          updateFolder(folder.id, {
-            currentAction: `${action}${activity.currentPath ? `: ${activity.currentPath}` : ""} · ${activity.scannedFiles.toLocaleString("en-GB")} files checked · ${formatScanHashedBytes(activity.hashedBytes)} hashed · ${activity.ignoredEntries.toLocaleString("en-GB")} excluded entries · ${activity.unreadableEntries.toLocaleString("en-GB")} unreadable. Comparing with ${peer.name} before copying.`,
-          })
-          broadcastSnapshot()
+          if (scanning) reportScanCounts(folder.id, "initial-merge", { local: activity })
         },
       }),
       (signal) => requestPeerManifest(peer.id, {
@@ -3066,7 +3121,9 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
         path: folder.remotePath,
         ignorePatterns: folder.ignorePatterns,
         hashAllFiles: true,
-      }, 5 * 60_000, signal, chunked),
+      }, 5 * 60_000, signal, chunked, capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
+        ? (progress) => { if (scanning) reportScanCounts(folder.id, "initial-merge", { remote: progress }) }
+        : undefined),
     ).finally(() => { scanning = false })
     localManifest = result.local
     remoteManifest = result.peer
@@ -3092,8 +3149,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
     })
     updateFolder(folder.id, {
       status: "needs-attention",
-      progress: undefined,
-      bytesPerSecond: undefined,
+      work: undefined,
       scanIssues: issues,
       currentAction: `${issueTotal === 1 ? "1 item" : `${issueTotal.toLocaleString("en-GB")} items`} could not be read. Review the list, then choose Continue anyway to skip them or cancel to fix access.`,
     })
@@ -3125,15 +3181,20 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
     lastBroadcastAt = now
     const transferred = checkedBytes + fileBytes
     const elapsedSeconds = Math.max((now - startedAt) / 1_000, 0.001)
-    const progress = totalBytes > 0
-      ? transferred / totalBytes
-      : totalFiles > 0
-        ? checkedFiles / totalFiles
-        : 1
     updateFolder(folder.id, {
       status: "syncing",
       currentAction: `Checking and copying ${entryPath} (${Math.min(checkedFiles + 1, totalFiles)}/${totalFiles})`,
-      progress: Math.min(progress, 1),
+    })
+    // Identical destinations and preserved conflicts count toward progress but
+    // not throughput, because no bytes were transferred for them.
+    setFolderActivity(folder.id, {
+      kind: "copying",
+      destination: "this-computer",
+      path: entryPath,
+      completedFiles: checkedFiles,
+      totalFiles,
+      transferredBytes: transferred,
+      totalBytes,
       bytesPerSecond: Math.round((copiedBytes + fileBytes) / elapsedSeconds),
     })
     broadcastSnapshot()
@@ -3190,25 +3251,33 @@ async function verifyInitialMergeQuiescent(
   peer: DeviceSummary,
 ): Promise<{ skipped: SyncSkip[]; unreadableSkipped: SyncSkip[] }> {
   updateFolder(folder.id, { currentAction: "Verifying that neither folder changed during the merge…" })
+  // Only the coordinator verifies, and the coordinator always runs the first pass.
+  setFolderActivity(folder.id, { kind: "scanning", purpose: "verify" }, { step: 3, firstPassUpdates: "this-computer" })
   broadcastSnapshot()
   // One limit for the whole check, as above: the scans and their validation
   // must agree even if the setting changes mid-flight.
   const scanLimit = currentScanLimit()
-  const chunked = await peerSupportsChunkedFrames(peer.id)
+  const capabilities = await cachedPeerCapabilities(peer.id)
+  const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
   // Keep the complete local block set for convergence. The peer's list stays
   // bounded by the exchanged report, so a peer with more than the reported
   // number of inaccessible paths fails convergence and retries rather than
   // being pulled into an unreadable path.
   const localBlocked: FolderScanIssue[] = []
   const { local: localManifest, peer: remoteManifest } = await runPairedScans(
-    (signal) => runCachedFolderScan(`verify:${folder.id}`, folder, scanLimit, signal, { onUnreadable: (issue) => localBlocked.push(issue) }),
+    (signal) => runCachedFolderScan(`verify:${folder.id}`, folder, scanLimit, signal, {
+      onUnreadable: (issue) => localBlocked.push(issue),
+      onActivity: (activity) => reportScanCounts(folder.id, "verify", { local: activity }),
+    }),
     (signal) => requestPeerManifest(peer.id, {
       type: "scan-manifest",
       folderId: folder.id,
       path: folder.remotePath,
       ignorePatterns: folder.ignorePatterns,
       hashAllFiles: true,
-    }, 5 * 60_000, signal, chunked),
+    }, 5 * 60_000, signal, chunked, capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
+      ? (progress) => reportScanCounts(folder.id, "verify", { remote: progress })
+      : undefined),
   )
   // The merge already applied the unreadable-path decision; verification must
   // not fail on the same inaccessible items. Fresh issues are reported through
@@ -3286,8 +3355,8 @@ function applyInitialSyncOutcomeStatus(folderId: string): void {
   updateFolder(folderId, {
     setupStatus: "active",
     status: attention ? "needs-attention" : idleFolderStatus(folder.remoteDeviceId, "active"),
-    progress: undefined,
-    bytesPerSecond: undefined,
+    work: undefined,
+    problem: undefined,
     fileCount: outcome.fileCount,
     lastSyncedAt: outcome.completedAt,
     currentAction: attention ?? "Initial merge completed safely on both computers.",
@@ -3322,7 +3391,12 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
       throw new Error("The coordinating computer must be online to start the initial merge.")
     }
     initialSyncForwarded.add(folderId)
-    updateFolder(folderId, { status: "syncing", progress: 0, currentAction: `Asking ${peer.name} to coordinate the initial merge…` })
+    updateFolder(folderId, {
+      status: "syncing",
+      problem: undefined,
+      work: newFolderWork({ kind: "waiting-for-peer" }, { step: 1, firstPassUpdates: "other-computer" }),
+      currentAction: `Asking ${peer.name} to coordinate the initial merge…`,
+    })
     broadcastSnapshot()
     try {
       const response = await requirePeerSessions().request<{ completed: boolean; error?: string }>(
@@ -3335,12 +3409,18 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "The coordinating computer could not start the merge."
-      updateFolder(folderId, { status: "needs-attention", progress: undefined, bytesPerSecond: undefined, currentAction: message })
+      updateFolder(folderId, { status: "needs-attention", work: undefined, currentAction: "Initial merge failed.", problem: folderProblem("Initial merge failed", message) })
       pushActivity("Initial merge failed", `${knownFolder.name}: ${message}`, "error", folderId)
       await persistState()
       broadcastSnapshot()
     } finally {
       initialSyncForwarded.delete(folderId)
+      // The inverse pass runs inside this request and clears its own progress;
+      // anything left is the waiting state set above.
+      if (!initialSyncInFlight.has(folderId)) {
+        updateFolder(folderId, { work: undefined })
+        broadcastSnapshot()
+      }
     }
     return snapshot
   }
@@ -3358,6 +3438,13 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
   try {
     requireMappingMutations()
     const { folder, peer } = requireInitialSyncContext(folderId)
+    updateFolder(folderId, {
+      status: "syncing",
+      problem: undefined,
+      work: newFolderWork({ kind: "preparing" }, { step: 1, firstPassUpdates: "this-computer" }),
+      currentAction: `Preparing ${peer.name} for the initial merge…`,
+    })
+    broadcastSnapshot()
     const preparation = await requirePeerSessions().request<{ prepared: boolean }>(peer.id, {
       type: "initial-sync-prepare",
       folderId,
@@ -3380,9 +3467,15 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     const allowUnreadable = acknowledgeUnreadable && reusablePrepared !== undefined
     const acknowledgedIssuesSignature = acknowledgeUnreadable ? prepared?.issuesSignature : undefined
     const { local: localResult, peer: remoteResult } = await runCoordinatedInitialMerge(
-      () => runInitialSyncPass(folder, peer, { allowUnreadable, prepared: reusablePrepared, acknowledgedIssuesSignature }),
+      () => runInitialSyncPass(folder, peer, {
+        allowUnreadable,
+        prepared: reusablePrepared,
+        acknowledgedIssuesSignature,
+        initialMerge: { step: 1, firstPassUpdates: "this-computer" },
+      }),
       async () => {
         updateFolder(folderId, { currentAction: `Asking ${peer.name} to merge files in the other direction…` })
+        setFolderActivity(folderId, { kind: "waiting-for-peer" }, { step: 2, firstPassUpdates: "this-computer" })
         broadcastSnapshot()
         // The peer applies its own approved-report check. Promoting the local
         // pass's skips into a blanket allowance would let the peer skip
@@ -3398,6 +3491,9 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
       },
       async (local, remote) => {
         const verification = await verifyInitialMergeQuiescent(folder, peer)
+        updateFolder(folderId, { currentAction: "Recording the finished merge on both computers…" })
+        setFolderActivity(folderId, { kind: "finishing" })
+        broadcastSnapshot()
         skipped = uniqueSkips(local.skipped, remote.skipped, verification.skipped)
         unreadableSkipped = uniqueSkips(local.unreadableSkipped, remote.unreadableSkipped, verification.unreadableSkipped)
         const currentRecord = mappingRecords.get(folderId)
@@ -3438,8 +3534,8 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     updateFolder(folderId, {
       setupStatus: "active",
       status: skipped.length > 0 || unreadableSkipped.length > 0 ? "needs-attention" : idleFolderStatus(folder.remoteDeviceId, "active"),
-      progress: undefined,
-      bytesPerSecond: undefined,
+      work: undefined,
+      problem: undefined,
       fileCount: localResult.fileCount,
       lastSyncedAt: completedAt,
       currentAction: initialSyncAttentionSummary(skipped.length, unreadableSkipped.length) ?? "Initial merge completed safely on both computers.",
@@ -3455,9 +3551,9 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
       const message = error instanceof Error ? error.message : "The initial merge failed."
       updateFolder(folderId, {
         status: "needs-attention",
-        progress: undefined,
-        bytesPerSecond: undefined,
-        currentAction: message,
+        work: undefined,
+        currentAction: "Initial merge failed.",
+        problem: folderProblem("Initial merge failed", message),
       })
       pushActivity("Initial merge failed", `${knownFolder.name}: ${message}`, "error", folderId)
     }
@@ -3488,7 +3584,10 @@ async function runPeerInitialSync(context: PeerRequestContext, folderId: string,
   const { folder, peer } = requireInitialSyncContext(folderId, context.peerId)
   initialSyncInFlight.add(folderId)
   try {
-    const result = await runInitialSyncPass(folder, peer, { allowUnreadable })
+    const result = await runInitialSyncPass(folder, peer, {
+      allowUnreadable,
+      initialMerge: { step: 2, firstPassUpdates: "other-computer" },
+    })
     scanReuseSeeds.forget(folder.localPath, folder.ignorePatterns)
     persistInitialSyncOutcome(
       folderId,
@@ -3500,8 +3599,7 @@ async function runPeerInitialSync(context: PeerRequestContext, folderId: string,
     )
     updateFolder(folderId, {
       status: "syncing",
-      progress: undefined,
-      bytesPerSecond: undefined,
+      work: undefined,
       fileCount: result.fileCount,
       currentAction: initialSyncAttentionSummary(result.skipped.length, result.unreadableSkipped.length)
         ?? `Initial files merged; waiting for ${peer.name} to commit completion.`,
@@ -3512,7 +3610,7 @@ async function runPeerInitialSync(context: PeerRequestContext, folderId: string,
       // runInitialSyncPass already projected the review state onto the folder.
     } else {
       const message = error instanceof Error ? error.message : "The peer-initiated merge failed."
-      updateFolder(folderId, { status: "needs-attention", progress: undefined, bytesPerSecond: undefined, currentAction: message })
+      updateFolder(folderId, { status: "needs-attention", work: undefined, currentAction: "Initial merge failed.", problem: folderProblem("Initial merge failed", message) })
       pushActivity("Initial merge failed", `${folder.name}: ${message}`, "error", folderId)
     }
     throw error
@@ -3643,7 +3741,13 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
           folder,
           currentScanLimit(),
           context.signal,
-          { reuse: scanReuseSeeds.lookup(folder.localPath, folder.ignorePatterns) },
+          {
+            reuse: scanReuseSeeds.lookup(folder.localPath, folder.ignorePatterns),
+            // Same strict wire counters as a preview scan; paths never leave this computer.
+            onActivity: context.reportProgress ? ({ stage, scannedFiles, ignoredEntries, unreadableEntries, hashedBytes }) => {
+              context.reportProgress?.({ stage, scannedFiles, ignoredEntries, unreadableEntries, hashedBytes })
+            } : undefined,
+          },
         )
         assertManifestFitsExchange(manifest, "This computer", context.chunkedResponse)
         return manifest
@@ -4009,7 +4113,9 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const coordinatorId = [record.mapping.initiatorDeviceId, record.mapping.responderDeviceId].sort()[0]
     if (context.peerId !== coordinatorId) throw new Error("Only the elected coordinator can prepare this merge.")
     initialSyncPeerLeases.set(folderId, { peerId: context.peerId, expiresAt: Date.now() + INITIAL_SYNC_LEASE_MS })
-    updateFolder(folderId, { status: "syncing", progress: 0, currentAction: `${context.peerName} is coordinating the initial merge…` })
+    updateFolder(folderId, { status: "syncing", problem: undefined, currentAction: `${context.peerName} is coordinating the initial merge…` })
+    // The coordinator runs the first pass, which updates that computer.
+    setFolderActivity(folderId, { kind: "waiting-for-peer" }, { step: 1, firstPassUpdates: "other-computer" })
     broadcastSnapshot()
     return { prepared: true }
   }
@@ -4027,8 +4133,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     if (folder.setupStatus === "ready-for-initial-sync" && !initialSyncInFlight.has(folderId)) {
       updateFolder(folderId, {
         status: "needs-attention",
-        progress: undefined,
-        bytesPerSecond: undefined,
+        work: undefined,
         currentAction: "The initial merge stopped before activation. Retry when both computers are ready.",
       })
       broadcastSnapshot()

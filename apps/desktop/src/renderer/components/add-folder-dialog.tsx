@@ -323,7 +323,10 @@ export function AddFolderDialog({
                 <NativeSelect id="folder-ignore-preset" className="w-full" value="" onChange={(event: ChangeEvent<HTMLSelectElement>) => {
                   const preset = folderIgnorePresets.find((item) => item.id === event.target.value)
                   if (!preset) return
-                  setPatterns((current) => appendIgnorePreset(current, preset.patterns))
+                  const nextPatterns = appendIgnorePreset(patterns, preset.patterns)
+                  // A preset whose rules are all present leaves the reviewed comparison valid.
+                  if (nextPatterns === patterns) return
+                  setPatterns(nextPatterns)
                   invalidatePreview()
                 }} aria-describedby="folder-ignore-preset-help">
                   <NativeSelectOption value="" disabled>Choose a preset…</NativeSelectOption>

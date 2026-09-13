@@ -80,6 +80,15 @@ describe("folder mapping comparison", () => {
     }).caseCollisions).toEqual([])
   })
 
+  test("labels case collisions at the root and below exactly matching parents", () => {
+    const entries = ["README.md", "readme.md", "src/app/Main.ts", "src/app/main.ts", "src/app/other.ts", "src/lib/a.ts"]
+      .map((path) => ({ path, size: 1, modifiedMs: 1 }))
+    expect(folderManifestTestHelpers.findCaseCollisions(entries)).toEqual([
+      "README.md ↔ readme.md",
+      "src/app/Main.ts ↔ src/app/main.ts",
+    ])
+  })
+
   test("full-integrity scans hash files above the preview hashing ceiling", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-test-"))
     try {

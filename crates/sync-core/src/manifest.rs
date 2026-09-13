@@ -624,32 +624,38 @@ pub fn has_windows_invalid_path(relative_path: &str) -> bool {
     })
 }
 
+struct CaseFoldNode<'a> {
+    name: &'a str,
+    children: HashMap<String, CaseFoldNode<'a>>,
+}
+
+/// Stores one node per path component rather than every folded prefix, so
+/// memory stays proportional to the peer-supplied manifest even for deeply
+/// nested paths.
 #[must_use]
 pub fn find_case_collisions<'a>(
     files: impl IntoIterator<Item = &'a FileManifestEntry>,
 ) -> Vec<String> {
-    let mut seen: HashMap<String, &str> = HashMap::new();
+    let mut root: HashMap<String, CaseFoldNode<'a>> = HashMap::new();
     let mut collisions = HashSet::new();
     for entry in files {
-        for end in entry
-            .path
-            .match_indices('/')
-            .map(|(index, _)| index)
-            .chain(std::iter::once(entry.path.len()))
-        {
-            let prefix = &entry.path[..end];
-            let folded = prefix.to_lowercase();
-            match seen.get(folded.as_str()) {
-                Some(&previous) if previous != prefix => {
-                    let label = format!("{previous} ↔ {prefix}");
-                    collisions.insert(label);
-                    break;
-                }
-                Some(_) => {}
-                None => {
-                    seen.insert(folded, prefix);
-                }
+        let mut children = &mut root;
+        let mut parent_end = 0;
+        for segment in entry.path.split('/') {
+            let node = children
+                .entry(segment.to_lowercase())
+                .or_insert_with(|| CaseFoldNode {
+                    name: segment,
+                    children: HashMap::new(),
+                });
+            if node.name != segment {
+                // Every earlier component matched exactly, so both paths share this parent.
+                let parent = &entry.path[..parent_end];
+                collisions.insert(format!("{parent}{} ↔ {parent}{segment}", node.name));
+                break;
             }
+            parent_end += segment.len() + 1;
+            children = &mut node.children;
         }
     }
     let mut collisions: Vec<String> = collisions.into_iter().collect();
