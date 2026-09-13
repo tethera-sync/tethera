@@ -318,7 +318,6 @@ fn collect_platform_issues(
                 invalid_windows_names.insert(entry.path.clone());
             }
         }
-        case_collisions.extend(find_case_collisions(&local.files));
     }
     if options.local_platform == Platform::Windows && options.mode != SyncMode::SendOnly {
         for entry in &remote.files {
@@ -326,7 +325,13 @@ fn collect_platform_issues(
                 invalid_windows_names.insert(entry.path.clone());
             }
         }
-        case_collisions.extend(find_case_collisions(&remote.files));
+    }
+    if (options.remote_platform == Platform::Windows && options.mode != SyncMode::ReceiveOnly)
+        || (options.local_platform == Platform::Windows && options.mode != SyncMode::SendOnly)
+    {
+        case_collisions.extend(find_case_collisions(
+            local.files.iter().chain(&remote.files),
+        ));
     }
 
     let mut invalid_windows_names: Vec<String> = invalid_windows_names.into_iter().collect();
@@ -619,25 +624,42 @@ pub fn has_windows_invalid_path(relative_path: &str) -> bool {
     })
 }
 
+struct CaseFoldNode<'a> {
+    name: &'a str,
+    children: HashMap<String, CaseFoldNode<'a>>,
+}
+
+/// Stores one node per path component rather than every folded prefix, so
+/// memory stays proportional to the peer-supplied manifest even for deeply
+/// nested paths.
 #[must_use]
-pub fn find_case_collisions(files: &[FileManifestEntry]) -> Vec<String> {
-    let mut seen: HashMap<String, &str> = HashMap::new();
-    let mut collisions = Vec::new();
+pub fn find_case_collisions<'a>(
+    files: impl IntoIterator<Item = &'a FileManifestEntry>,
+) -> Vec<String> {
+    let mut root: HashMap<String, CaseFoldNode<'a>> = HashMap::new();
+    let mut collisions = HashSet::new();
     for entry in files {
-        let folded = entry.path.to_lowercase();
-        match seen.get(folded.as_str()) {
-            Some(&previous) if previous != entry.path => {
-                let label = format!("{previous} ↔ {}", entry.path);
-                if !collisions.contains(&label) {
-                    collisions.push(label);
-                }
+        let mut children = &mut root;
+        let mut parent_end = 0;
+        for segment in entry.path.split('/') {
+            let node = children
+                .entry(segment.to_lowercase())
+                .or_insert_with(|| CaseFoldNode {
+                    name: segment,
+                    children: HashMap::new(),
+                });
+            if node.name != segment {
+                // Every earlier component matched exactly, so both paths share this parent.
+                let parent = &entry.path[..parent_end];
+                collisions.insert(format!("{parent}{} ↔ {parent}{segment}", node.name));
+                break;
             }
-            Some(_) => {}
-            None => {
-                seen.insert(folded, &entry.path);
-            }
+            parent_end += segment.len() + 1;
+            children = &mut node.children;
         }
     }
+    let mut collisions: Vec<String> = collisions.into_iter().collect();
+    collisions.sort_unstable();
     collisions
 }
 
@@ -709,6 +731,37 @@ mod tests {
             ]),
             vec!["Readme.md ↔ README.md".to_owned()],
         );
+    }
+
+    #[test]
+    fn detects_directory_casing_across_participants() {
+        let local = manifest(vec![entry(".venv/lib/python3.12/library.so", 1, 1, None)]);
+        let remote = manifest(vec![entry(
+            ".venv/Lib/site-packages/library.pyd",
+            1,
+            1,
+            None,
+        )]);
+        let preview = compare_manifests(
+            &local,
+            &remote,
+            CompareOptions {
+                mode: SyncMode::TwoWay,
+                local_platform: Platform::Linux,
+                remote_platform: Platform::Windows,
+            },
+        );
+        assert_eq!(preview.case_collisions, vec![".venv/lib ↔ .venv/Lib"]);
+        let linux_preview = compare_manifests(
+            &local,
+            &remote,
+            CompareOptions {
+                mode: SyncMode::TwoWay,
+                local_platform: Platform::Linux,
+                remote_platform: Platform::Linux,
+            },
+        );
+        assert!(linux_preview.case_collisions.is_empty());
     }
 
     #[test]

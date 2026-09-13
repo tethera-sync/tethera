@@ -4,7 +4,7 @@ import { createHash, randomBytes } from "node:crypto"
 import path from "node:path"
 import type { FolderScanIssue, SyncMode } from "../shared/contracts"
 import type { FileManifest, FileManifestEntry } from "./folder-manifest"
-import { createScanIssueBlocklist, manifestEntriesMatch } from "./folder-manifest"
+import { createScanIssueBlocklist, findCaseCollisions, manifestEntriesMatch } from "./folder-manifest"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import { describeTransferFile, isSha256HexDigest } from "./file-transfer"
 import { invertMode } from "./mapping-index"
@@ -17,6 +17,53 @@ import {
 import { syncDirectory } from "./fs-durability"
 
 const MIN_FREE_SPACE_AFTER_TRANSFER = 64 * 1024 * 1024
+const INITIAL_CONFLICT_REASON = "Exists on both computers with different content; both copies were preserved for review in Recovery."
+
+class DestinationExistsError extends Error {
+  constructor(relativePath: string, cause: unknown) {
+    super(`A file already exists at ${relativePath}; its local copy was preserved.`, { cause })
+  }
+}
+
+type InitialSyncFileResult =
+  | { status: "copied"; bytes: number }
+  | { status: "identical" }
+  | { status: "conflict"; skip: SyncSkip }
+
+/** Recheck planned additions, including files created while the transfer was in flight. */
+export async function mergeInitialSyncFile(
+  rootPath: string,
+  entry: FileManifestEntry,
+  transfer: () => Promise<{ bytes: number }>,
+): Promise<InitialSyncFileResult> {
+  if (!entry.digest || !isSha256HexDigest(entry.digest)) throw new Error("The initial merge requires a verified source digest.")
+
+  const inspectDestination = async (): Promise<InitialSyncFileResult | undefined> => {
+    let current
+    try {
+      current = await describeTransferFile(rootPath, entry.path)
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined
+      throw error
+    }
+    return current.digest === entry.digest && current.size === entry.size
+      ? { status: "identical" }
+      : { status: "conflict", skip: { path: entry.path, reason: INITIAL_CONFLICT_REASON } }
+  }
+
+  const existing = await inspectDestination()
+  if (existing) return existing
+  try {
+    const { bytes } = await transfer()
+    return { status: "copied", bytes }
+  } catch (error) {
+    if (!(error instanceof DestinationExistsError)) throw error
+    const appeared = await inspectDestination()
+    if (appeared) return appeared
+    // A second concurrent change needs a fresh scan, not an unbounded transfer retry.
+    throw error
+  }
+}
 
 export interface SyncSkip {
   path: string
@@ -70,6 +117,14 @@ export interface SyncPlanOptions {
   destinationBlocked?: readonly FolderScanIssue[]
 }
 
+/** Case-only aliases need an explicit path choice before the exact-path durable index can own them. */
+export function assertInitialMergePathCompatibility(local: FileManifest, remote: FileManifest, hasWindowsPeer: boolean): void {
+  if (!hasWindowsPeer) return
+  const collisions = findCaseCollisions([...local.files, ...remote.files])
+  if (collisions.length === 0) return
+  throw new Error(`Folder names differ only by capitalisation: ${collisions.slice(0, 3).join(", ")}. Windows treats these as the same path. Match the names on both computers or exclude these folders in the ignore rules before merging. Both copies have been preserved.`)
+}
+
 /**
  * Only ever pulls: files that exist on the remote side but not locally are
  * copied down. Files that exist on both sides but differ are left alone
@@ -94,7 +149,7 @@ export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode:
 
     skipped.push({
       path: remoteEntry.path,
-      reason: "Exists on both computers with different content; skipped until conflict resolution is available.",
+      reason: INITIAL_CONFLICT_REASON,
     })
   }
 
@@ -206,7 +261,14 @@ export async function writeFileChunksAtomic(
     await ensureContainedDestinationDirectory(rootPath, directory)
     await assertCanonicalPathInside(rootPath, tempPath)
     if (expectedDestinationDigest === undefined) {
-      await link(tempPath, destination)
+      try {
+        await link(tempPath, destination)
+      } catch (error) {
+        if (!replacement && error instanceof Error && "code" in error && error.code === "EEXIST") {
+          throw new DestinationExistsError(relativePath, error)
+        }
+        throw error
+      }
       if (replacement) {
         await syncDirectory(directory)
         await replacement.markInstalled()

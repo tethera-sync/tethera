@@ -4,7 +4,9 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import {
   assessInitialMergeConvergence,
+  assertInitialMergePathCompatibility,
   computeSyncPlan,
+  mergeInitialSyncFile,
   runCoordinatedInitialMerge,
   writeFileAtomic,
   writeFileChunksAtomic,
@@ -48,7 +50,7 @@ describe("computeSyncPlan", () => {
 
     expect(plan.toPull.map((entry) => entry.path)).toEqual(["new.txt"])
     expect(plan.skipped).toEqual([
-      { path: "changed.txt", reason: "Exists on both computers with different content; skipped until conflict resolution is available." },
+      { path: "changed.txt", reason: "Exists on both computers with different content; both copies were preserved for review in Recovery." },
     ])
   })
 
@@ -101,6 +103,107 @@ describe("computeSyncPlan", () => {
       },
     )
     expect(plan.toPull.map((entry) => entry.path)).toEqual(["free.txt"])
+  })
+})
+
+describe("initial merge path compatibility", () => {
+  const local = manifest([{ path: ".venv/lib/python3.12/library.so", size: 1, modifiedMs: 1, digest: "same" }])
+  const remote = manifest([{ path: ".venv/Lib/python3.12/library.so", size: 1, modifiedMs: 1, digest: "same" }])
+
+  test("explains cross-device directory casing before an existing Windows mapping copies files", () => {
+    expect(() => assertInitialMergePathCompatibility(local, remote, true)).toThrow(".venv/lib ↔ .venv/Lib")
+    expect(() => assertInitialMergePathCompatibility(local, remote, true)).toThrow("ignore rules")
+  })
+
+  test("preserves case-sensitive paths between Linux computers", () => {
+    expect(() => assertInitialMergePathCompatibility(local, remote, false)).not.toThrow()
+  })
+})
+
+describe("mergeInitialSyncFile", () => {
+  const content = Buffer.from("remote content")
+  const entry = { path: "file.txt", size: content.length, modifiedMs: 1, digest: sha256Hex(content) }
+
+  test("accepts an identical destination without transferring it again", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-existing-"))
+    try {
+      await writeFile(path.join(root, entry.path), content)
+      const result = await mergeInitialSyncFile(root, entry, async () => { throw new Error("Must not download an identical file") })
+      expect(result).toEqual({ status: "identical" })
+      expect(await readdir(root)).toEqual([entry.path])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("preserves different existing content regardless of the source timestamp", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-conflict-"))
+    try {
+      await writeFile(path.join(root, entry.path), "local content")
+      const result = await mergeInitialSyncFile(root, { ...entry, modifiedMs: Date.now() + 60_000 }, async () => {
+        throw new Error("Must not overwrite an unbased local version")
+      })
+      expect(result.status).toBe("conflict")
+      expect(await readFile(path.join(root, entry.path), "utf8")).toBe("local content")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  for (const appearedContent of ["remote content", "local content"]) {
+    test(`reconciles a commit collision with ${appearedContent} and continues copying other files`, async () => {
+      const root = await mkdtemp(path.join(tmpdir(), "tethera-commit-race-"))
+      try {
+        const result = await mergeInitialSyncFile(root, entry, async () => {
+          await writeFileChunksAtomic(root, entry.path, entry.size, entry.digest, (async function* () {
+            yield content
+            await writeFile(path.join(root, entry.path), appearedContent)
+          })())
+          return { bytes: content.length }
+        })
+        expect(result.status).toBe(appearedContent === "remote content" ? "identical" : "conflict")
+        const next = { ...entry, path: "next.txt" }
+        expect(await mergeInitialSyncFile(root, next, async () => {
+          await writeFileAtomic(root, next.path, content)
+          return { bytes: content.length }
+        })).toEqual({ status: "copied", bytes: content.length })
+        expect(await readFile(path.join(root, entry.path), "utf8")).toBe(appearedContent)
+        expect((await readdir(root)).sort()).toEqual(["file.txt", "next.txt"])
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  }
+
+  test("does not turn an integrity failure into success when a destination appears", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-integrity-"))
+    try {
+      await expect(mergeInitialSyncFile(root, entry, async () => {
+        await writeFileChunksAtomic(root, entry.path, entry.size, entry.digest, (async function* () {
+          await writeFile(path.join(root, entry.path), content)
+          yield Buffer.from("corrupt")
+        })())
+        return { bytes: content.length }
+      })).rejects.toThrow("integrity verification")
+      expect(await readFile(path.join(root, entry.path))).toEqual(content)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("does not accept an existing destination symlink", async () => {
+    if (process.platform === "win32") return
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-existing-link-"))
+    try {
+      await writeFile(path.join(root, "target.txt"), content)
+      await symlink("target.txt", path.join(root, entry.path))
+      await expect(mergeInitialSyncFile(root, entry, async () => {
+        throw new Error("Must not transfer through a symlink")
+      })).rejects.toThrow("not a regular file")
+      expect(await readFile(path.join(root, "target.txt"))).toEqual(content)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })
 

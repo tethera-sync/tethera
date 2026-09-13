@@ -626,11 +626,13 @@ export function compareManifests(
   const caseCollisions = new Set<string>()
   if (options.remotePlatform === "windows" && options.mode !== "receive-only") {
     for (const entry of local.files) if (hasWindowsInvalidPath(entry.path)) invalidWindowsNames.add(entry.path)
-    for (const collision of findCaseCollisions(local.files)) caseCollisions.add(collision)
   }
   if (options.localPlatform === "windows" && options.mode !== "send-only") {
     for (const entry of remote.files) if (hasWindowsInvalidPath(entry.path)) invalidWindowsNames.add(entry.path)
-    for (const collision of findCaseCollisions(remote.files)) caseCollisions.add(collision)
+  }
+  if ((options.remotePlatform === "windows" && options.mode !== "receive-only") ||
+      (options.localPlatform === "windows" && options.mode !== "send-only")) {
+    for (const collision of findCaseCollisions([...local.files, ...remote.files])) caseCollisions.add(collision)
   }
 
   for (const invalid of [...invalidWindowsNames].slice(0, 4)) addSample(samples, { path: invalid, category: "invalid-name" })
@@ -1050,14 +1052,36 @@ function hasWindowsInvalidPath(relativePath: string): boolean {
   })
 }
 
-function findCaseCollisions(files: FileManifestEntry[]): string[] {
-  const seen = new Map<string, string>()
+interface CaseFoldNode {
+  name: string
+  children: Map<string, CaseFoldNode>
+}
+
+/**
+ * Stores one node per path component rather than every folded prefix, so
+ * memory stays proportional to the peer-supplied manifest even for deeply
+ * nested paths.
+ */
+export function findCaseCollisions(files: FileManifestEntry[]): string[] {
+  const root = new Map<string, CaseFoldNode>()
   const collisions = new Set<string>()
   for (const entry of files) {
-    const folded = entry.path.toLocaleLowerCase("en-US")
-    const previous = seen.get(folded)
-    if (previous && previous !== entry.path) collisions.add(`${previous} ↔ ${entry.path}`)
-    else seen.set(folded, entry.path)
+    let children = root
+    let parentEnd = 0
+    for (const segment of entry.path.split("/")) {
+      const folded = segment.toLocaleLowerCase("en-US")
+      const existing = children.get(folded)
+      if (existing && existing.name !== segment) {
+        // Every earlier component matched exactly, so both paths share this parent.
+        const parent = entry.path.slice(0, parentEnd)
+        collisions.add(`${parent}${existing.name} ↔ ${parent}${segment}`)
+        break
+      }
+      const node = existing ?? { name: segment, children: new Map<string, CaseFoldNode>() }
+      if (!existing) children.set(folded, node)
+      parentEnd += segment.length + 1
+      children = node.children
+    }
   }
   return [...collisions]
 }
