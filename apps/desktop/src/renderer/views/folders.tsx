@@ -5,24 +5,25 @@ import {
   ExternalLinkIcon,
   FolderClockIcon,
   FolderIcon,
+  InfoIcon,
   Link2Icon,
   LockKeyholeIcon,
   PauseIcon,
   PlayIcon,
   RefreshCwIcon,
-  ShieldCheckIcon,
   Trash2Icon,
 } from "lucide-react"
 import type { AppSnapshot, FolderSummary } from "@shared/contracts"
 import type { View } from "@/lib/navigation"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { CompactEmptyState } from "@/components/compact-empty-state"
+import { FolderWorkPanel } from "@/components/folder-work-panel"
 import { InitialSyncIssuesDialog } from "@/components/initial-sync-issues-dialog"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Meter } from "@/components/ui/meter"
 import { StatusPill } from "@/components/ui/status-pill"
-import { formatRate, formatRelative, pretty, prettyMode, statusTone } from "@/lib/format"
+import { formatRelative, pretty, prettyMode, statusTone } from "@/lib/format"
 import { folderStatusLabel, getLocalDevice, getPairedDevices, mappingMutationAvailability, preferredPairedDevice } from "@/lib/snapshot"
 
 type FolderFilter = "all" | "active" | "paused" | "attention"
@@ -265,6 +266,8 @@ function FolderCard({
   // One precedence for every blocked primary action: broker availability wins
   // over the per-folder reason.
   const continueBlockedReason = !mutationsEnabled ? disabledReason : initialSyncBlockedReason
+  const remoteName = remoteDevice?.name ?? "Paired computer"
+  const needsAttention = folder.status === "needs-attention"
 
   return (
     <article className="folder-card [position:relative] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--surface)] [box-shadow:var(--elevation-card)]">
@@ -293,22 +296,31 @@ function FolderCard({
         <div className="path-arrow [display:grid] [place-items:center] [color:var(--primary)] [&_svg]:[width:14px] [&_svg]:[height:14px]">
           <ArrowRightIcon />
         </div>
-        <PathBlock label={remoteDevice?.name ?? "Paired computer"} path={folder.remotePath} />
+        <PathBlock label={remoteName} path={folder.remotePath} />
       </div>
 
-      {folder.progress !== undefined ? (
-        <div className="folder-progress [padding:13px_15px_0]">
-          <Meter
-            label={folder.currentAction ?? "Transferring"}
-            value={folder.progress}
-            readout={folder.bytesPerSecond ? formatRate(folder.bytesPerSecond) : `${Math.round(folder.progress * 100)}%`}
-          />
-        </div>
-      ) : null}
-
-      {folder.currentAction && folder.progress === undefined ? (
-        <div className="folder-action-note [display:flex] [align-items:flex-start] [gap:8px] [margin:12px_15px_0] [border-radius:8px] [background:color-mix(in_oklab,_var(--primary)_9%,_var(--surface))] [padding:8px_10px] [color:var(--muted-foreground)] [font-size:10px] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[flex:0_0_auto] [&_svg]:[margin-top:1px] [&_svg]:[color:var(--primary)] [&>span]:[min-width:0] [&>span]:[overflow-wrap:anywhere]" role={folder.status === "needs-attention" ? "alert" : undefined}>
-          {folder.status === "needs-attention" ? <CircleAlertIcon /> : <ShieldCheckIcon />}
+      {folder.work ? (
+        <FolderWorkPanel
+          work={folder.work}
+          currentAction={folder.currentAction}
+          names={{ thisComputer: localDeviceName, otherComputer: remoteName }}
+        />
+      ) : folder.problem ? (
+        <Alert variant="destructive" className="mx-[15px] mt-3 w-auto">
+          <CircleAlertIcon />
+          <AlertTitle>
+            {folder.problem.title}
+            <span className="font-normal text-[var(--muted-foreground)]"> · {formatRelative(folder.problem.occurredAt)}</span>
+          </AlertTitle>
+          <AlertDescription className="[overflow-wrap:anywhere]">{folder.problem.detail}</AlertDescription>
+        </Alert>
+      ) : folder.currentAction ? (
+        <div
+          className="folder-action-note [display:flex] [align-items:flex-start] [gap:8px] [margin:12px_15px_0] [border-radius:8px] [background:color-mix(in_oklab,_var(--primary)_9%,_var(--surface))] [padding:8px_10px] [color:var(--muted-foreground)] [font-size:10px] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[flex:0_0_auto] [&_svg]:[margin-top:1px] [&_svg]:[color:var(--primary)] [&>span]:[min-width:0] [&>span]:[overflow-wrap:anywhere] data-[attention=true]:[background:color-mix(in_oklab,_var(--warning)_10%,_var(--surface))] data-[attention=true]:[&_svg]:[color:var(--warning)]"
+          data-attention={needsAttention}
+          role={needsAttention ? "alert" : undefined}
+        >
+          {needsAttention ? <CircleAlertIcon /> : <InfoIcon />}
           <span>{folder.currentAction}</span>
         </div>
       ) : null}
@@ -322,10 +334,10 @@ function FolderCard({
       <div className="folder-stats [display:grid] [grid-template-columns:repeat(3,_1fr)] [gap:1px] [margin-top:13px] [background:color-mix(in_oklab,_var(--border)_70%,_transparent)] [&>div]:[background:var(--surface)] [&>div]:[padding:12px_15px] [&_span]:[display:block] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:9.5px] [&_span]:[font-weight:550] [&_strong]:[display:block] [&_strong]:[margin-top:3px] [&_strong]:[font-size:11.5px] [&_strong]:[font-weight:620] [&_strong]:[font-variant-numeric:tabular-nums]">
         <div>
           <span>Files</span>
-          <strong>{folder.fileCount?.toLocaleString("en-GB") ?? "Not scanned"}</strong>
+          <strong>{folder.fileCount?.toLocaleString("en-GB") ?? "Not counted yet"}</strong>
         </div>
         <div>
-          <span>Ignored rules</span>
+          <span>Ignore rules</span>
           <strong>{folder.ignorePatterns.length}</strong>
         </div>
         <div>
@@ -333,13 +345,8 @@ function FolderCard({
           <strong>{folder.lastSyncedAt ? formatRelative(folder.lastSyncedAt) : "Never"}</strong>
         </div>
       </div>
-      {folder.setupStatus === "ready-for-initial-sync" && initialSyncBlockedReason ? (
-        <div className="folder-sync-blocked [padding:0_15px_10px] [color:var(--muted-foreground)] [font-size:10px]" role="status">
-          {initialSyncBlockedReason}
-        </div>
-      ) : null}
 
-      <div className="folder-card-footer [display:flex] [align-items:center] [gap:6px] [border-top:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [padding:10px_12px]">
+      <div className="folder-card-footer [display:flex] [flex-wrap:wrap] [align-items:center] [gap:6px] [border-top:1px_solid_color-mix(in_oklab,_var(--border)_70%,_transparent)] [padding:10px_12px]">
         {folder.setupStatus === "ready-for-initial-sync" ? (
           <Button
             size="sm"
@@ -366,6 +373,11 @@ function FolderCard({
           {paused ? <PlayIcon data-icon="inline-start" /> : <PauseIcon data-icon="inline-start" />}
           {pendingAction === "resume" ? "Resuming…" : pendingAction === "pause" ? "Pausing…" : paused ? "Resume" : "Pause"}
         </Button>
+        {folder.setupStatus === "ready-for-initial-sync" && initialSyncBlockedReason ? (
+          <span className="min-w-0 flex-1 px-1 text-[10.5px] text-[var(--muted-foreground)]" role="status">
+            {initialSyncBlockedReason}
+          </span>
+        ) : null}
         <Button
           className="ml-auto"
           size="icon-sm"
@@ -383,7 +395,7 @@ function FolderCard({
         <InitialSyncIssuesDialog
           folder={folder}
           localName={localDeviceName}
-          remoteName={remoteDevice?.name ?? "Paired computer"}
+          remoteName={remoteName}
           working={pendingAction === "continue-merge" || pendingAction === "dismiss-issues"}
           continueEnabled={continueBlockedReason === undefined}
           continueDisabledReason={continueBlockedReason}
