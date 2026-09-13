@@ -70,9 +70,11 @@ export interface FolderSummary {
   setupStatus?: FolderSetupStatus
   mode: SyncMode
   paused: boolean
-  progress?: number
-  bytesPerSecond?: number
+  /** Present only while an initial merge or sync cycle is running. */
+  work?: FolderWork
   currentAction?: string
+  /** The last failed operation, kept until the next attempt starts or a sync succeeds. */
+  problem?: FolderProblem
   fileCount?: number
   lastSyncedAt?: string
   ignorePatterns: string[]
@@ -284,6 +286,56 @@ export interface FolderScanActivity {
    * being read again. Absent from older producers, which means zero.
    */
   reusedFiles?: number
+}
+
+/** Advisory scan counters from the paired computer, which never shares its paths. */
+export type FolderScanCounts = Omit<FolderScanActivity, "currentPath" | "reusedFiles">
+
+/**
+ * Position within an initial merge. Each pass copies into the computer that
+ * runs it, and the coordinating computer always runs the first pass.
+ */
+export interface InitialMergeStep {
+  step: 1 | 2 | 3
+  firstPassUpdates: "this-computer" | "other-computer"
+}
+
+export type FolderWorkActivity =
+  | { kind: "preparing" }
+  | {
+      kind: "scanning"
+      purpose: "initial-merge" | "verify" | "changes"
+      local?: FolderScanActivity
+      remote?: FolderScanCounts
+    }
+  | {
+      kind: "copying"
+      destination: "this-computer" | "other-computer"
+      path: string
+      completedFiles: number
+      totalFiles: number
+      transferredBytes: number
+      totalBytes: number
+      bytesPerSecond: number
+    }
+  | { kind: "waiting-for-peer" }
+  | { kind: "finishing" }
+
+/**
+ * Structured progress for a running folder operation, so the UI can show the
+ * stage, live counts and transfer rate without parsing `currentAction`.
+ * Produced by Electron main and never persisted.
+ */
+export interface FolderWork {
+  startedAt: string
+  activity: FolderWorkActivity
+  initialMerge?: InitialMergeStep
+}
+
+export interface FolderProblem {
+  title: string
+  detail: string
+  occurredAt: string
 }
 
 /**
