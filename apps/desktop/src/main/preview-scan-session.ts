@@ -65,39 +65,27 @@ export class PreviewScanSessions {
 }
 
 export function previewsEqual(left: FolderMappingPreview, right: FolderMappingPreview): boolean {
-  // The bounded issue lists are additive detail added after the original
-  // contract. A preview from an older peer lacks them, so comparing them
-  // would report a change that did not happen; the original counts still
-  // have to match exactly.
-  const canonical = (preview: FolderMappingPreview) => {
-    const {
-      unreadableLocal: _unreadableLocal,
-      unreadableRemote: _unreadableRemote,
-      unreadableLocalCount: _unreadableLocalCount,
-      unreadableRemoteCount: _unreadableRemoteCount,
-      ...rest
-    } = preview
-    return {
-      ...rest,
-      invalidWindowsNames: [...preview.invalidWindowsNames].sort(),
-      caseCollisions: [...preview.caseCollisions].sort(),
-      samples: [...preview.samples].sort((a, b) => `${a.category}:${a.path}`.localeCompare(`${b.category}:${b.path}`)),
-    }
-  }
-  if (JSON.stringify(canonical(left)) !== JSON.stringify(canonical(right))) return false
-  // Old peers omit these fields. When both scans supply details, a new
-  // inaccessible path must be reviewed even if the aggregate counts match.
-  if (left.unreadableLocal === undefined || right.unreadableLocal === undefined ||
-      left.unreadableRemote === undefined || right.unreadableRemote === undefined) return true
-  const issues = (preview: FolderMappingPreview) => ({
-    local: [...(preview.unreadableLocal ?? [])].sort(compareIssues),
-    remote: [...(preview.unreadableRemote ?? [])].sort(compareIssues),
-    localCount: preview.unreadableLocalCount ?? preview.unreadableLocal?.length ?? 0,
-    remoteCount: preview.unreadableRemoteCount ?? preview.unreadableRemote?.length ?? 0,
-  })
-  return JSON.stringify(issues(left)) === JSON.stringify(issues(right))
+  const canonical = (preview: FolderMappingPreview) => [
+    preview.localFiles, preview.remoteFiles, preview.identicalFiles, preview.differentFiles,
+    preview.localOnlyFiles, preview.remoteOnlyFiles, preview.ignoredLocal, preview.ignoredRemote,
+    preview.bytesToRemote, preview.bytesToLocal, preview.truncated,
+    [...preview.invalidWindowsNames].sort(), [...preview.caseCollisions].sort(),
+    [...preview.samples].sort((a, b) => a.category.localeCompare(b.category) || a.path.localeCompare(b.path) || (a.size ?? 0) - (b.size ?? 0))
+      .map((sample) => [sample.category, sample.path, sample.size ?? null]),
+  ]
+  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right)) &&
+    scanIssuesEqual(left.unreadableLocal, right.unreadableLocal, left.unreadableLocalCount, right.unreadableLocalCount) &&
+    scanIssuesEqual(left.unreadableRemote, right.unreadableRemote, left.unreadableRemoteCount, right.unreadableRemoteCount)
 }
 
-function compareIssues(left: FolderScanIssue, right: FolderScanIssue): number {
-  return left.path.localeCompare(right.path) || left.kind.localeCompare(right.kind) || left.reason.localeCompare(right.reason)
+function scanIssuesEqual(left: FolderScanIssue[] | undefined, right: FolderScanIssue[] | undefined, leftCount: number | undefined, rightCount: number | undefined): boolean {
+  const leftTotal = leftCount ?? left?.length
+  const rightTotal = rightCount ?? right?.length
+  if (leftTotal !== undefined && rightTotal !== undefined && leftTotal !== rightTotal) return false
+  // Legacy omissions only relax the missing side; known counts/details still matter.
+  if (left === undefined || right === undefined) return true
+  const canonical = (issues: FolderScanIssue[]) => [...issues]
+    .sort((a, b) => a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind) || a.reason.localeCompare(b.reason))
+    .map((issue) => [issue.path, issue.kind, issue.reason])
+  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right))
 }

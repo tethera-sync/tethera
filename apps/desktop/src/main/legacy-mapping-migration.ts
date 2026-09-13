@@ -307,8 +307,8 @@ function isPreview(value: unknown): value is FolderMappingPreview {
     // not throw later in `sanitisePreviewForBackup`.
     isOptionalScanIssueArray(value.unreadableLocal) &&
     isOptionalScanIssueArray(value.unreadableRemote) &&
-    isOptionalScanIssueCount(value.unreadableLocalCount) &&
-    isOptionalScanIssueCount(value.unreadableRemoteCount)
+    isOptionalScanIssueCount(value.unreadableLocalCount, value.unreadableLocal) &&
+    isOptionalScanIssueCount(value.unreadableRemoteCount, value.unreadableRemote)
   )
 }
 
@@ -321,9 +321,10 @@ function isOptionalScanIssueArray(value: unknown): boolean {
   )
 }
 
-/** Totals are not capped like the detail list; they only have to be non-negative safe integers. */
-function isOptionalScanIssueCount(value: unknown): boolean {
-  return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+/** Totals are safe integers and must include every retained issue, matching Rust validation. */
+function isOptionalScanIssueCount(value: unknown, issues: unknown): boolean {
+  return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 &&
+    (!Array.isArray(issues) || value >= issues.length))
 }
 
 function sanitiseLegacyFolderForBackup(folder: Record<string, unknown>): Record<string, unknown> {

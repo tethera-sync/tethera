@@ -1477,7 +1477,7 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
     const localManifest = await runLocalScan(`preview:${localPath}`, localPath, input.ignorePatterns, {
       maxFiles: scanLimit,
       reuse: scanReuseSeeds.lookup(localPath, input.ignorePatterns),
-      onSettledDigest: (relativePath, digest) => settled.set(relativePath, digest),
+      onSettledDigest: (relativePath, digest) => scanReuseSeeds.collect(settled, relativePath, digest),
       onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
     }, controller.signal)
     scanReuseSeeds.remember(localPath, input.ignorePatterns, settled)
@@ -1632,7 +1632,7 @@ async function buildIncomingMappingPreview(
     const responderManifest = await runLocalScan(`incoming:${target}`, target, request.proposal.ignorePatterns, {
       maxFiles: scanLimit,
       reuse: scanReuseSeeds.lookup(target, request.proposal.ignorePatterns),
-      onSettledDigest: (relativePath, digest) => settled.set(relativePath, digest),
+      onSettledDigest: (relativePath, digest) => scanReuseSeeds.collect(settled, relativePath, digest),
       onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
     }, controller.signal)
     scanReuseSeeds.remember(target, request.proposal.ignorePatterns, settled)

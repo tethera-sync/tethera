@@ -88,3 +88,15 @@ describe("ScanReuseStore", () => {
     expect(store.lookup("/tmp/root", ["x"])?.size).toBe(1)
   })
 })
+
+test("bounds seeds while collecting and retains useful partial reuse for oversized scans", () => {
+  const store = new ScanReuseStore(() => 0, 60_000, 3)
+  const collected = new Map<string, CachedFileDigest>()
+  for (let index = 0; index < 10; index++) store.collect(collected, `f${index}`, digest(index))
+  expect(collected.size).toBe(3)
+  store.collect(collected, "f0", digest(99))
+  expect(collected.get("f0")).toEqual(digest(99))
+  store.remember("/tmp/root", [], collected)
+  expect(store.lookup("/tmp/root", [])?.size).toBe(3)
+  expect(store.lookup("/tmp/root", [])?.has("f9")).toBe(false)
+})
