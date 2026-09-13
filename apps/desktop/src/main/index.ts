@@ -66,7 +66,9 @@ import { formatScanIssuePath, scanIssueReportCovers, scanIssueTotal } from "../s
 import { SCAN_GENERATION_CAPABILITY, SCAN_PAGE_MAX_ENTRIES } from "./scan-generation"
 import {
   assessInitialMergeConvergence,
+  assertInitialMergePathCompatibility,
   computeSyncPlan,
+  mergeInitialSyncFile,
   type InitialSyncPassResult,
   runCoordinatedInitialMerge,
   type SyncSkip,
@@ -3106,11 +3108,14 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   assertCompleteTransferManifest(localManifest, "This computer", scanLimit, { allowUnreadable: true })
   assertCompleteTransferManifest(remoteManifest, peer.name, undefined, { allowUnreadable: true })
 
+  assertInitialMergePathCompatibility(localManifest, remoteManifest, platform() === "windows" || peer.platform === "windows")
   const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode, { destinationBlocked: localBlocked })
   const totalBytes = plan.toPull.reduce((total, entry) => total + entry.size, 0)
   const totalFiles = plan.toPull.length
   let copiedFiles = 0
   let copiedBytes = 0
+  let checkedFiles = 0
+  let checkedBytes = 0
   const startedAt = Date.now()
   let lastBroadcastAt = 0
 
@@ -3118,18 +3123,18 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
     const now = Date.now()
     if (!force && now - lastBroadcastAt < 100) return
     lastBroadcastAt = now
-    const transferred = copiedBytes + fileBytes
+    const transferred = checkedBytes + fileBytes
     const elapsedSeconds = Math.max((now - startedAt) / 1_000, 0.001)
     const progress = totalBytes > 0
       ? transferred / totalBytes
       : totalFiles > 0
-        ? copiedFiles / totalFiles
+        ? checkedFiles / totalFiles
         : 1
     updateFolder(folder.id, {
       status: "syncing",
-      currentAction: `Copying ${entryPath} (${copiedFiles + 1}/${totalFiles})`,
+      currentAction: `Checking and copying ${entryPath} (${Math.min(checkedFiles + 1, totalFiles)}/${totalFiles})`,
       progress: Math.min(progress, 1),
-      bytesPerSecond: Math.round(transferred / elapsedSeconds),
+      bytesPerSecond: Math.round((copiedBytes + fileBytes) / elapsedSeconds),
     })
     broadcastSnapshot()
   }
@@ -3146,10 +3151,18 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
       const current = snapshot.folders.find((item) => item.id === folder.id)
       if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
       reportProgress(entry.path, 0, true)
-      const { bytes } = await pullPlannedFile(folder, peer, entry, (fileBytes) => reportProgress(entry.path, fileBytes))
-      copiedFiles += 1
-      copiedBytes += bytes
-      if (transferDigests && entry.digest) {
+      const result = await mergeInitialSyncFile(folder.localPath, entry, () =>
+        pullPlannedFile(folder, peer, entry, (fileBytes) => reportProgress(entry.path, fileBytes)),
+      )
+      checkedFiles += 1
+      checkedBytes += entry.size
+      if (result.status === "copied") {
+        copiedFiles += 1
+        copiedBytes += result.bytes
+      } else if (result.status === "conflict") {
+        plan.skipped.push(result.skip)
+      }
+      if (result.status !== "conflict" && transferDigests && entry.digest) {
         try {
           const identity = await statFileIdentity(resolveWithinRoot(folder.localPath, entry.path))
           if (identity) transferDigests.record(entry.path, { ...identity, digest: entry.digest })
@@ -3166,7 +3179,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   return {
     copiedFiles,
     copiedBytes,
-    fileCount: localManifest.files.length + copiedFiles,
+    fileCount: localManifest.files.length + checkedFiles,
     skipped: plan.skipped,
     unreadableSkipped: scanIssueSkips(issues, "This computer", peer.name),
   }
@@ -3204,6 +3217,7 @@ async function verifyInitialMergeQuiescent(
   assertCompleteTransferManifest(remoteManifest, peer.name, undefined, { allowUnreadable: true })
   assertManifestFitsExchange(localManifest, "This computer", chunked)
   assertManifestFitsExchange(remoteManifest, peer.name, chunked)
+  assertInitialMergePathCompatibility(localManifest, remoteManifest, platform() === "windows" || peer.platform === "windows")
   const convergence = assessInitialMergeConvergence(localManifest, remoteManifest, folder.mode, {
     localBlocked,
     remoteBlocked: remoteManifest.unreadableEntries,

@@ -39,8 +39,8 @@ import { cn } from "@/lib/utils"
 import { formatBytes } from "@/lib/format"
 import { formatElapsed, useElapsedSeconds, type ComparePhase } from "@/lib/compare-progress"
 import { emptyScanIssueReport, scanIssueReportFromPreview, scanIssueTotal } from "@shared/folder-scan-issues"
+import { appendIgnorePreset, defaultIgnorePatterns, folderIgnorePresets } from "./folder-ignore-presets"
 
-const defaultIgnorePatterns = [".DS_Store", "Thumbs.db", "desktop.ini", "*.tmp", "~$*"]
 type PickerTarget = "local" | "remote" | null
 type Step = "paths" | "rules" | "preview"
 
@@ -319,9 +319,22 @@ export function AddFolderDialog({
               </div>
               <p className="text-xs text-[var(--muted-foreground)]">Tethera keeps every replaced version for now. Both values are saved with the folder for a future cleanup policy; nothing is pruned or deleted yet, so history disk use is not limited today.</p>
               <Field>
-                <FieldLabel>Ignore patterns</FieldLabel>
-                <Textarea className="min-h-36 resize-y font-mono text-xs" value={patterns} onChange={(event: ChangeEvent<HTMLTextAreaElement>) => { setPatterns(event.target.value); invalidatePreview() }} />
-                <FieldDescription>One glob-style pattern per line. Subfolders sync recursively unless ignored. Exclude large generated folders to keep scans and previews fast.</FieldDescription>
+                <FieldLabel htmlFor="folder-ignore-preset">Add ignore preset</FieldLabel>
+                <NativeSelect id="folder-ignore-preset" className="w-full" value="" onChange={(event: ChangeEvent<HTMLSelectElement>) => {
+                  const preset = folderIgnorePresets.find((item) => item.id === event.target.value)
+                  if (!preset) return
+                  setPatterns((current) => appendIgnorePreset(current, preset.patterns))
+                  invalidatePreview()
+                }} aria-describedby="folder-ignore-preset-help">
+                  <NativeSelectOption value="" disabled>Choose a preset…</NativeSelectOption>
+                  {folderIgnorePresets.map((preset) => <NativeSelectOption key={preset.id} value={preset.id}>{preset.label}</NativeSelectOption>)}
+                </NativeSelect>
+                <FieldDescription id="folder-ignore-preset-help">Adds rules below without replacing yours. Installed dependencies need their own copy on each computer.</FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="folder-ignore-patterns">Ignore patterns</FieldLabel>
+                <Textarea id="folder-ignore-patterns" aria-describedby="folder-ignore-patterns-help" className="min-h-36 resize-y font-mono text-xs" value={patterns} onChange={(event: ChangeEvent<HTMLTextAreaElement>) => { setPatterns(event.target.value); invalidatePreview() }} />
+                <FieldDescription id="folder-ignore-patterns-help">One glob-style pattern per line. Edit or remove any rule before comparing. Ignored folders stay on disk; their contents are not synced.</FieldDescription>
               </Field>
             </fieldset>
           ) : null}

@@ -97,9 +97,15 @@ Evidence order: stable file ID, watcher rename pair, matching digest/size/time p
 
 Use ordered slash-separated relative patterns, expose the matching rule, support a tester, show/remove presets and never ignore all dotfiles implicitly. Rule changes produce a previewed scoped reconciliation, not silent deletion.
 
+New desktop mappings suggest common temporary-file rules plus `node_modules/` and `.venv/`. Optional language presets append editable rules without replacing custom entries; only the reviewed patterns are sent for approval. Existing mappings are not changed by new defaults.
+
 ## Initial merge
 
 Scan without mutation, classify identical/unique/divergent/incompatible entries, estimate bytes and archive impact, preview, revalidate, preserve divergent loser and never interpret absence as historical deletion.
+
+Before a planned addition, recheck the destination. A regular file with the same size and full digest needs no transfer; differing content is preserved and reported as a conflict while other files continue. If an atomic no-replace commit finds a file that appeared during transfer, perform the same comparison after cleaning up staging. Integrity, access and unsafe-path errors still fail closed. Fresh two-sided verification remains required before activation.
+
+When Windows participates, case-only aliases are checked across both manifests, including directory components such as `lib` and `Lib`. They require the user to align the names or change ignore rules before initial merge and again if they appear during final verification. They are not automatically combined or renamed: Linux may hold distinct trees under those names.
 
 Inaccessible files and directories are reported per path with a short reason (for example `Permission denied`) and a true total; the detail list is bounded. A comparison the user approved records those paths. If a later full-integrity scan finds only already-approved inaccessible paths, the merge proceeds and skips them; if it finds new ones, the merge stops and the user chooses between continuing with an explicit skip and cancelling to fix access. Skipped paths are excluded from the plan, can never propagate as deletions or replacements, and are recorded in the structured initial-merge outcome. Truncated or digest-incomplete scans still fail closed.
 

@@ -69,6 +69,17 @@ describe("folder mapping comparison", () => {
     expect(isManifestPathIgnored("src/app.ts", ["node_modules/"])).toBe(false)
   })
 
+  test("reports directory casing across the two computers even when leaf names differ", () => {
+    const local = manifest([{ path: ".venv/lib/python3.12/library.so", size: 1, modifiedMs: 1 }])
+    const remote = manifest([{ path: ".venv/Lib/site-packages/library.pyd", size: 1, modifiedMs: 1 }])
+    expect(folderManifestTestHelpers.compareManifests(local, remote, {
+      mode: "two-way", localPlatform: "linux", remotePlatform: "windows",
+    }).caseCollisions).toEqual([".venv/lib ↔ .venv/Lib"])
+    expect(folderManifestTestHelpers.compareManifests(local, remote, {
+      mode: "two-way", localPlatform: "linux", remotePlatform: "linux",
+    }).caseCollisions).toEqual([])
+  })
+
   test("full-integrity scans hash files above the preview hashing ceiling", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-test-"))
     try {

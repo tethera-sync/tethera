@@ -626,11 +626,13 @@ export function compareManifests(
   const caseCollisions = new Set<string>()
   if (options.remotePlatform === "windows" && options.mode !== "receive-only") {
     for (const entry of local.files) if (hasWindowsInvalidPath(entry.path)) invalidWindowsNames.add(entry.path)
-    for (const collision of findCaseCollisions(local.files)) caseCollisions.add(collision)
   }
   if (options.localPlatform === "windows" && options.mode !== "send-only") {
     for (const entry of remote.files) if (hasWindowsInvalidPath(entry.path)) invalidWindowsNames.add(entry.path)
-    for (const collision of findCaseCollisions(remote.files)) caseCollisions.add(collision)
+  }
+  if ((options.remotePlatform === "windows" && options.mode !== "receive-only") ||
+      (options.localPlatform === "windows" && options.mode !== "send-only")) {
+    for (const collision of findCaseCollisions([...local.files, ...remote.files])) caseCollisions.add(collision)
   }
 
   for (const invalid of [...invalidWindowsNames].slice(0, 4)) addSample(samples, { path: invalid, category: "invalid-name" })
@@ -1050,14 +1052,22 @@ function hasWindowsInvalidPath(relativePath: string): boolean {
   })
 }
 
-function findCaseCollisions(files: FileManifestEntry[]): string[] {
+export function findCaseCollisions(files: FileManifestEntry[]): string[] {
   const seen = new Map<string, string>()
   const collisions = new Set<string>()
   for (const entry of files) {
-    const folded = entry.path.toLocaleLowerCase("en-US")
-    const previous = seen.get(folded)
-    if (previous && previous !== entry.path) collisions.add(`${previous} ↔ ${entry.path}`)
-    else seen.set(folded, entry.path)
+    const segments = entry.path.split("/")
+    let prefix = ""
+    for (const segment of segments) {
+      prefix = prefix ? `${prefix}/${segment}` : segment
+      const folded = prefix.toLocaleLowerCase("en-US")
+      const previous = seen.get(folded)
+      if (previous && previous !== prefix) {
+        collisions.add(`${previous} ↔ ${prefix}`)
+        break
+      }
+      seen.set(folded, prefix)
+    }
   }
   return [...collisions]
 }
