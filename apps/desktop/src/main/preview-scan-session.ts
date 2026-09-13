@@ -70,6 +70,7 @@ export function previewsEqual(left: FolderMappingPreview, right: FolderMappingPr
     preview.localOnlyFiles, preview.remoteOnlyFiles, preview.ignoredLocal, preview.ignoredRemote,
     preview.bytesToRemote, preview.bytesToLocal, preview.truncated,
     [...preview.invalidWindowsNames].sort(), [...preview.caseCollisions].sort(),
+    preview.directoryMappings ?? [],
     [...preview.samples].sort((a, b) => a.category.localeCompare(b.category) || a.path.localeCompare(b.path) || (a.size ?? 0) - (b.size ?? 0))
       .map((sample) => [sample.category, sample.path, sample.size ?? null]),
   ]

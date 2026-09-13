@@ -20,6 +20,7 @@ export async function restoreArchivedVersion(
   liveRoot: string,
   archiveRoot: string,
   sourceJournalId: string,
+  physicalPath: (path: string) => string = (path) => path,
 ): Promise<ReplacementJournalEntry> {
   const source = await rpc.request<ReplacementJournalEntry>("archive.get", { entryId: sourceJournalId })
   if (!source.archiveObjectKey || !source.archiveDigest || source.oldSize == null) {
@@ -57,7 +58,7 @@ export async function restoreArchivedVersion(
 
   let current: Awaited<ReturnType<typeof describeTransferFile>> | undefined
   try {
-    current = await describeTransferFile(liveRoot, source.path)
+    current = await describeTransferFile(liveRoot, physicalPath(source.path))
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
   }
@@ -86,7 +87,7 @@ export async function restoreArchivedVersion(
   }
 
   try {
-    await writeFileChunksAtomic(liveRoot, source.path, archived.size, archived.digest, chunks(), {
+    await writeFileChunksAtomic(liveRoot, physicalPath(source.path), archived.size, archived.digest, chunks(), {
       expectedDestinationDigest: current?.digest,
       expectedDestinationSize: current?.size,
       replacement: {
@@ -116,7 +117,7 @@ export async function restoreArchivedVersion(
   } catch (error) {
     const durable = await rpc.request<ReplacementJournalEntry>("archive.get", { entryId: restore.id })
     if (durable.state === "completed") return durable
-    const inspection = await inspectReplacementRecovery(liveRoot, archiveRoot, durable)
+    const inspection = await inspectReplacementRecovery(liveRoot, archiveRoot, { ...durable, path: physicalPath(durable.path) })
     const recovered = await rpc.request<ReplacementJournalEntry>("archive.recover", {
       entryId: durable.id,
       liveDigest: inspection.liveDigest,

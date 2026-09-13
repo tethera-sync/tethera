@@ -1,3 +1,5 @@
+import type { DirectoryMapping } from "./directory-mapping"
+
 export type OverallStatus =
   | "up-to-date"
   | "syncing"
@@ -247,6 +249,7 @@ export interface FolderScanIssueReport {
 }
 
 export interface FolderMappingPreview {
+  directoryMappings?: DirectoryMapping[]
   localFiles: number
   remoteFiles: number
   identicalFiles: number
