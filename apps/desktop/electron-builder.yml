@@ -44,8 +44,9 @@ linux:
       arch: [x64]
 
 nsis:
-  oneClick: false
-  allowToChangeInstallationDirectory: true
+  # One-click per-user install so updates replace the existing install in
+  # place and never show installer pages, including a directory prompt.
+  oneClick: true
 
 publish:
   - provider: github

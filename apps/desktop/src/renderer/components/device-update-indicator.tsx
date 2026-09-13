@@ -15,6 +15,8 @@ const indicatorButton =
   "device-update-indicator [display:grid] [width:28px] [height:28px] [flex:0_0_auto] [place-items:center] [border:0] [border-radius:7px] [background:transparent] [color:var(--muted-foreground)] [transition:140ms_ease] [&:hover]:[background:var(--accent)] [&:hover]:[color:var(--foreground)] [&_svg]:[width:15px] [&_svg]:[height:15px] [&:disabled]:[opacity:0.7]"
 const indicatorStatus =
   "device-update-status [display:grid] [width:28px] [height:28px] [flex:0_0_auto] [place-items:center] [color:var(--primary)] [&_svg]:[width:15px] [&_svg]:[height:15px]"
+const indicatorProgress =
+  "device-update-progress [display:grid] [width:28px] [height:28px] [flex:0_0_auto] [place-items:center] [color:var(--primary)]"
 const warnTone = "[color:var(--warning)]"
 const successTone = "[color:var(--success)]"
 const errorTone = "[color:var(--destructive)]"
@@ -68,13 +70,32 @@ export function quietCopy(update: UpdateState): { label: string; title: string }
 }
 
 /**
+ * Download arrow whose primary colour fills from the bottom up as `percent`
+ * grows, so the icon itself reports progress.
+ */
+function DownloadProgressIcon({ percent }: { percent: number }) {
+  const filled = Math.min(Math.max(percent, 0), 100)
+  return (
+    <span className="[position:relative] [display:grid] [width:15px] [height:15px]">
+      <DownloadIcon aria-hidden="true" className="[width:15px] [height:15px] [opacity:0.3]" />
+      <DownloadIcon
+        aria-hidden="true"
+        className="[position:absolute] [inset:0] [width:15px] [height:15px] [transition:clip-path_420ms_cubic-bezier(0.32,_0.72,_0,_1)]"
+        style={{ clipPath: `inset(${100 - filled}% 0 0 0)` }}
+      />
+    </span>
+  )
+}
+
+/**
  * Compact update status indicator that lives inline next to the device
  * chip in the sidebar footer.
  *
  * The icon and tone reflect the update state; clicking runs the primary
  * action (check, download, restart, or retry) and the shadcn Tooltip
- * carries the detail. Progress states are status-only. Action failures
- * surface as screen-reader alerts so the tight layout stays intact.
+ * carries the detail. While downloading, the arrow fills from the bottom up
+ * with the progress percentage. Action failures surface as screen-reader
+ * alerts so the tight layout stays intact.
  */
 export function DeviceUpdateIndicator({ update }: { update: UpdateState }) {
   const [working, setWorking] = useState<SidebarUpdateAction | null>(null)
@@ -115,8 +136,8 @@ export function DeviceUpdateIndicator({ update }: { update: UpdateState }) {
       <Tooltip>
         <TooltipTrigger
           render={
-            <span className={indicatorStatus} role="status" aria-label={label}>
-              <DownloadIcon />
+            <span className={indicatorProgress} role="status" aria-label={label}>
+              <DownloadProgressIcon percent={percent} />
             </span>
           }
         />

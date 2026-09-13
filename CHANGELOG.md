@@ -2,6 +2,8 @@
 
 All notable changes to this project, newest first.
 
+- 🐛 Install Windows updates in place without an installer location prompt and restart Tethera automatically after choosing Restart & update.
+- 🎨 Fill the sidebar update icon from the bottom up and show a download progress bar in Settings while an update downloads.
 - 🐛 Report a bounded list of the files and folders that could not be read, with the total count and a short reason, during folder setup and the initial merge, and let you continue while skipping them or cancel to fix access.
 - ✨ Reuse verified file identities across the preview, consent, merge and verification walks so unchanged files are never read twice, label cache-backed steps as reuse instead of another scan, and keep a bounded ledger that makes any duplicate walk visible. Reuse requires a usable file identity and is disabled on FAT/exFAT, where a miss is preferred over an unsafe hit.
 - 🎨 Keep dialogs inside the window with internal scrolling and always-reachable actions.

@@ -56,7 +56,7 @@ describe("DeviceUpdateIndicator", () => {
     expect(html).not.toContain("title=")
   })
 
-  test("downloading stays a status with the percent in its label", () => {
+  test("downloading stays a status with the percent in its label and a bottom-up fill", () => {
     const html = indicatorHtml({
       status: "downloading",
       version: "0.2.0",
@@ -67,6 +67,8 @@ describe("DeviceUpdateIndicator", () => {
     expect(html).toContain('role="status"')
     expect(html).toContain("42")
     expect(html).not.toContain("<button")
+    // The colour overlay is clipped so the bottom 42% of the arrow is filled.
+    expect(html).toContain("clip-path:inset(58%")
   })
 
   test("gates installs behind an explicit restart action", () => {
@@ -97,6 +99,25 @@ describe("DeviceUpdateIndicator", () => {
     expect(available).not.toContain("disabled=")
     const failed = indicatorHtml({ status: "error", message: "No network." })
     expect(failed).not.toContain("disabled=")
+  })
+
+  test("every state renders an icon only, with all copy kept for the tooltip", () => {
+    const states: UpdateState[] = [
+      { status: "idle", currentVersion: "0.1.1" },
+      { status: "checking" },
+      { status: "not-available", currentVersion: "0.1.1", lastCheckedAt: "2026-09-05T12:00:00Z" },
+      { status: "available", version: "0.2.0", currentVersion: "0.1.1" },
+      { status: "downloading", version: "0.2.0", progressPercent: 42 },
+      { status: "downloaded", version: "0.2.0" },
+    ]
+    for (const update of states) {
+      const html = indicatorHtml(update)
+      // Strip tags: nothing readable should remain beside the icon. The copy
+      // lives in the aria-label and the portalled tooltip.
+      const visibleText = html.replace(/<[^>]*>/g, "").replace(/\s+/g, "")
+      expect(visibleText).toBe("")
+      expect(html).toContain("<svg")
+    }
   })
 })
 

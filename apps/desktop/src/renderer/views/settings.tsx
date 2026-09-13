@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
+import { Meter } from "@/components/ui/meter"
 import { StatusPill } from "@/components/ui/status-pill"
 import { Switch } from "@/components/ui/switch"
 import { pretty } from "@/lib/format"
@@ -285,8 +286,8 @@ function updateHeadline(update: UpdateState): { title: string; description: stri
       }
     case "downloading":
       return {
-        title: `Downloading v${update.version}… ${Math.round(update.progressPercent)}%`,
-        description: `${downloadReadout(update)}${checkedSuffix}. Keep Tethera open until it finishes.`,
+        title: `Downloading v${update.version}…`,
+        description: `Keep Tethera open until it finishes${checkedSuffix}.`,
       }
     case "downloaded":
       return {
@@ -375,9 +376,12 @@ function UpdateSettingsRow({ update }: { update: UpdateState }) {
             </Button>
           ) : null}
           {update.status === "downloading" ? (
-            <StatusPill tone="info" pulse>
-              Downloading
-            </StatusPill>
+            <Meter
+              className="w-56"
+              label="Download progress"
+              readout={downloadReadout(update)}
+              value={update.progressPercent / 100}
+            />
           ) : null}
         </div>
       </SettingRow>

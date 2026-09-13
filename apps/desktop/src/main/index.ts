@@ -4778,7 +4778,9 @@ function requestUpdateInstall(): void {
   }
   try {
     isQuitting = true
-    autoUpdater.quitAndInstall()
+    // Silent install with no installer pages, then relaunch the updated app
+    // instead of leaving the user to start Tethera again.
+    autoUpdater.quitAndInstall(true, true)
   } catch (error) {
     isQuitting = false
     console.error("[updater] install failed", error)
