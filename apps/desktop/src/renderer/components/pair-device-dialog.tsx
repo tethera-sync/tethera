@@ -100,7 +100,7 @@ export function PairDeviceDialog({
           Start pairing
         </DialogTrigger>
       ) : null}
-      <DialogContent className="pairing-dialog [width:min(760px,_calc(100vw_-_32px))] [max-width:760px] [max-height:min(860px,_calc(100vh_-_32px))] [overflow-y:auto]">
+      <DialogContent className="pairing-dialog max-w-[min(760px,calc(100%-2rem))]">
         <DialogHeader>
           <div className="pairing-dialog-heading [display:flex] [align-items:flex-start] [gap:12px]">
             <div className="pairing-dialog-icon [display:grid] [width:40px] [height:40px] [flex:0_0_auto] [place-items:center] [border:1px_solid_color-mix(in_oklab,_var(--primary)_26%,_var(--border))] [border-radius:12px] [background:color-mix(in_oklab,_var(--primary)_11%,_var(--surface-strong))] [color:var(--primary)] [&_svg]:[width:20px] [&_svg]:[height:20px]"><ShieldCheckIcon /></div>
