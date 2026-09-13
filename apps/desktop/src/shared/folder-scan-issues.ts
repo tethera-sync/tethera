@@ -1,4 +1,9 @@
-import type { FolderMappingPreview, FolderScanIssue, FolderScanIssueReport } from "./contracts"
+import type { FolderMappingPreview, FolderScanIssue, FolderScanIssueReport, IncomingMappingRequest } from "./contracts"
+
+/** Bind consent to reviewed content, not objects recreated by IPC snapshots. */
+export function folderMappingApprovalKey(request: IncomingMappingRequest, destinationPath: string): string {
+  return JSON.stringify([request.id, request.fromDeviceId, destinationPath, request.proposal])
+}
 
 /** Display label for an issue whose path is the scanned root itself. */
 export const FOLDER_ROOT_ISSUE_PATH = "(folder root)"

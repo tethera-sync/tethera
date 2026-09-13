@@ -39,6 +39,11 @@ export class ScanReuseStore {
     private readonly maxEntries: number = SCAN_REUSE_MAX_ENTRIES,
   ) {}
 
+  /** Bound the in-progress seed too; a partial seed still reuses verified digests. */
+  collect(digests: Map<string, CachedFileDigest>, relativePath: string, digest: CachedFileDigest): void {
+    if (digests.size < this.maxEntries || digests.has(relativePath)) digests.set(relativePath, digest)
+  }
+
   remember(rootPath: string, ignorePatterns: readonly string[], digests: ReadonlyMap<string, CachedFileDigest>): void {
     if (digests.size === 0 || digests.size > this.maxEntries) return
     this.#prune()

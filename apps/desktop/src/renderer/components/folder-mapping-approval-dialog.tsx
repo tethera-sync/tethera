@@ -8,7 +8,7 @@ import {
   ShieldCheckIcon,
   XIcon,
 } from "lucide-react"
-import type { DeviceSummary, FolderMappingPreview, FolderScanActivity, IncomingMappingRequest } from "@shared/contracts"
+import type { DeviceSummary, FolderScanActivity, IncomingMappingRequest } from "@shared/contracts"
 import { CompareStatus } from "@/components/compare-status"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { ScanIssuesAlert } from "@/components/scan-issues-alert"
@@ -25,7 +25,7 @@ import {
 } from "@/components/ui/dialog"
 import { formatBytes } from "@/lib/format"
 import { formatElapsed, useElapsedSeconds, type ComparePhase } from "@/lib/compare-progress"
-import { scanIssueReportFromPreview, scanIssueTotal } from "@shared/folder-scan-issues"
+import { folderMappingApprovalKey, scanIssueReportFromPreview, scanIssueTotal } from "@shared/folder-scan-issues"
 
 export function FolderMappingApprovalDialog({
   request,
@@ -55,9 +55,7 @@ export function FolderMappingApprovalDialog({
   const [action, setAction] = useState<"approve" | "reject" | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [cancelRequested, setCancelRequested] = useState(false)
-  // Acknowledgement is tied to the exact preview object, so a refreshed
-  // comparison resets it without extra effects.
-  const [acknowledgedPreview, setAcknowledgedPreview] = useState<FolderMappingPreview | null>(null)
+  const [acknowledgedReview, setAcknowledgedReview] = useState<string | null>(null)
   // One operation id per request lets approval reuse the scans from the last
   // destination refresh instead of scanning both folders again.
   const comparisonIdRef = useRef<string | null>(null)
@@ -86,7 +84,8 @@ export function FolderMappingApprovalDialog({
   const blockingWarnings = proposal.preview.invalidWindowsNames.length + proposal.preview.caseCollisions.length
   const issueReport = scanIssueReportFromPreview(proposal.preview)
   const issueTotal = scanIssueTotal(issueReport)
-  const issuesAcknowledged = acknowledgedPreview === proposal.preview
+  const reviewKey = folderMappingApprovalKey(request, destinationPath)
+  const issuesAcknowledged = acknowledgedReview === reviewKey
 
   function trackCompareProgress(operationId: string): () => void {
     return window.folderSync.onPreviewProgress((progress) => {
@@ -226,10 +225,10 @@ export function FolderMappingApprovalDialog({
           {issueTotal > 0 ? (
             <ScanIssuesAlert
               report={issueReport}
-              localName={localDevice.name}
-              remoteName={request.fromDeviceName}
+              localName={request.fromDeviceName}
+              remoteName={localDevice.name}
               acknowledged={issuesAcknowledged}
-              onAcknowledgedChange={(value) => setAcknowledgedPreview(value ? proposal.preview : null)}
+              onAcknowledgedChange={(value) => setAcknowledgedReview(value ? reviewKey : null)}
               continueLabel={`Approve anyway and skip ${issueTotal === 1 ? "1 item" : `${issueTotal.toLocaleString("en-GB")} items`}`}
             />
           ) : null}

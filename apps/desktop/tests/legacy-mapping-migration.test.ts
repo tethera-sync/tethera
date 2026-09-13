@@ -231,6 +231,20 @@ describe("legacy state conversion", () => {
       expect(() => bundle(readable(document))).toThrow("malformed comparison preview")
     }
 
+    for (const side of ["Local", "Remote"]) {
+      const document = legacyDocument({
+        mappings: {
+          incoming: [{ id: "mapping-1", proposal: { preview: {
+            ...validPreview,
+            [`unreadable${side}`]: [{ path: "locked", reason: "denied", kind: "file" }],
+            [`unreadable${side}Count`]: 0,
+          } } }],
+          outgoing: [],
+        },
+      })
+      expect(() => bundle(readable(document))).toThrow("malformed comparison preview")
+    }
+
     // An empty path means the scanned root and stays valid; totals are not capped like the detail list.
     const accepted = legacyDocument({
       mappings: {

@@ -86,3 +86,23 @@ describe("reviewed scan issues", () => {
     expect(previewsEqual(reviewed, { ...old, localFiles: old.localFiles + 1 })).toBe(false)
   })
 })
+
+describe("partially populated preview reports", () => {
+  test("checks known local issues even if the remote detail list is absent", () => {
+    const first = { ...preview, unreadableRemote: undefined, unreadableLocal: [{ path: "a", reason: "Locked", kind: "file" as const }] }
+    const changed = { ...first, unreadableLocal: [{ path: "b", reason: "Locked", kind: "file" as const }] }
+    expect(previewsEqual(first, changed)).toBe(false)
+  })
+
+  test("checks known totals even when a legacy peer omitted detail lists", () => {
+    const first = { ...preview, unreadableLocal: undefined, unreadableRemote: undefined, unreadableLocalCount: 1 }
+    expect(previewsEqual(first, { ...first, unreadableLocalCount: 2 })).toBe(false)
+  })
+
+  test("ignores object property insertion order across the wire", () => {
+    const { localFiles, ...rest } = preview
+    expect(previewsEqual(preview, { ...rest, localFiles })).toBe(true)
+    const first = { ...preview, unreadableLocal: [{ path: "a", reason: "Locked", kind: "file" as const }] }
+    expect(previewsEqual(first, { ...first, unreadableLocal: [{ kind: "file", reason: "Locked", path: "a" }] })).toBe(true)
+  })
+})
