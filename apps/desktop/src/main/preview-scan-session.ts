@@ -79,8 +79,8 @@ export function previewsEqual(left: FolderMappingPreview, right: FolderMappingPr
 }
 
 function scanIssuesEqual(left: FolderScanIssue[] | undefined, right: FolderScanIssue[] | undefined, leftCount: number | undefined, rightCount: number | undefined): boolean {
-  const leftTotal = leftCount ?? left?.length ?? 0
-  const rightTotal = rightCount ?? right?.length ?? 0
+  const leftTotal = leftCount ?? left?.length
+  const rightTotal = rightCount ?? right?.length
   if (leftTotal !== undefined && rightTotal !== undefined && leftTotal !== rightTotal) return false
   // Legacy omissions only relax the missing side; known counts/details still matter.
   if (left === undefined || right === undefined) return true
