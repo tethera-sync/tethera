@@ -12,6 +12,7 @@ import {
   identityIsReusable,
   isManifestPathIgnored,
   MAX_UNREADABLE_REPORTED,
+  parsePeerManifest,
   SCAN_FILE_CONCURRENCY,
   scanFolder,
   statFileIdentity,
@@ -704,6 +705,42 @@ describe("unreadable path reporting", () => {
       ...base,
       unreadableEntries: Array.from({ length: 101 }, (_, index) => ({ path: `p${index}`, reason: "r", kind: "file" })),
     })).toThrow("The paired computer returned an invalid folder scan.")
+  })
+})
+
+describe("occupied path reporting", () => {
+  test("records links and folders without synchronized files as occupied paths", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-occupied-scan-test-"))
+    try {
+      await mkdir(path.join(root, "skills", "real"), { recursive: true })
+      await writeFile(path.join(root, "skills", "real", "SKILL.md"), "skill")
+      await mkdir(path.join(root, "empty", "nested"), { recursive: true })
+      await mkdir(path.join(root, "only-ignored"))
+      await writeFile(path.join(root, "only-ignored", "cache.tmp"), "ignored")
+      const linked = process.platform !== "win32"
+      if (linked) await symlink("real", path.join(root, "skills", "linked"), "dir")
+
+      const scanned = await scanFolder(root, ["*.tmp"], { hashAllFiles: true })
+      expect(scanned.files.map((entry) => entry.path)).toEqual(["skills/real/SKILL.md"])
+      expect(scanned.ignored).toBe(linked ? 2 : 1)
+      expect([...(scanned.occupiedPaths ?? [])].sort((left, right) => left.path.localeCompare(right.path))).toEqual([
+        { path: "empty/nested", kind: "directory" },
+        { path: "only-ignored", kind: "directory" },
+        ...(linked ? [{ path: "skills/linked", kind: "special" }] : []),
+      ])
+      expect(parsePeerManifest(JSON.parse(JSON.stringify(scanned))).occupiedPaths).toEqual(scanned.occupiedPaths)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("omits the report when nothing is occupied and rejects a malformed peer report", () => {
+    const peerManifest = { rootPath: "/peer", files: [], ignored: 0, unreadable: 0, unreadableEntries: [], truncated: false }
+    expect(parsePeerManifest(peerManifest).occupiedPaths).toBeUndefined()
+    expect(() => parsePeerManifest({ ...peerManifest, occupiedPaths: "skills" })).toThrow()
+    expect(() => parsePeerManifest({ ...peerManifest, occupiedPaths: [{ path: "", kind: "special" }] })).toThrow()
+    expect(() => parsePeerManifest({ ...peerManifest, occupiedPaths: [{ path: "skills", kind: "file" }] })).toThrow()
+    expect(() => parsePeerManifest({ ...peerManifest, occupiedPaths: [{ path: "skills", kind: "special", target: "/etc" }] })).toThrow()
   })
 })
 

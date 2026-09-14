@@ -97,8 +97,22 @@ export interface ScanDigestCache {
   record(relativePath: string, entry: CachedFileDigest): void
 }
 
+/**
+ * A path a scan found but does not synchronize, which a copy from the other
+ * computer must never write over. A `special` entry is a symbolic link,
+ * junction or other non-file item, so nothing may be written at or beneath it.
+ * A `directory` holds no synchronized file, so only a file at exactly its path
+ * is blocked; folders that do hold files are already implied by `files`.
+ */
+export interface OccupiedPath {
+  path: string
+  kind: "directory" | "special"
+}
+
 export interface FileManifest {
   directories?: DirectoryObservation[]
+  /** Absent from older peers, which then behave as though nothing is occupied. */
+  occupiedPaths?: OccupiedPath[]
   rootPath: string
   files: FileManifestEntry[]
   ignored: number
@@ -189,12 +203,14 @@ export interface ScanMetrics {
 /** One walk observation, yielded in exactly the order the sequential walk encountered it. */
 type ScanRecord =
   | { kind: "ignored" }
+  | { kind: "occupied"; relativePath: string; entryKind: OccupiedPath["kind"] }
   | { kind: "unreadable"; relativePath: string; reason: string; entryKind: "file" | "directory" }
   | { kind: "file"; relativePath: string }
 
 /** A walked record, with any cached digest for a file attached ahead of inspection. */
 type ReadyScanRecord =
   | { kind: "ignored" }
+  | { kind: "occupied"; relativePath: string; entryKind: OccupiedPath["kind"] }
   | { kind: "unreadable"; relativePath: string; reason: string; entryKind: "file" | "directory" }
   | { kind: "file"; relativePath: string; cached?: CachedFileDigest }
 
@@ -204,6 +220,7 @@ type InspectionSettlement =
 
 type PendingScanRecord =
   | { kind: "ignored" }
+  | { kind: "occupied"; relativePath: string; entryKind: OccupiedPath["kind"] }
   | { kind: "unreadable"; relativePath: string; reason: string; entryKind: "file" | "directory" }
   | { kind: "file"; relativePath: string; settled: Promise<InspectionSettlement> }
 
@@ -271,8 +288,11 @@ const knownScanErrorMessages = new Set([
  * Depth-first walk yielding one record per entry. Traversal order, containment
  * checks and skip rules are those of the original recursive scan; counting is
  * left to the consumer so counters advance at the same logical point.
+ *
+ * Resolves to whether the directory yielded any record, so its parent can
+ * report a folder holding nothing synchronized as an occupied path.
  */
-async function* walkScanRecords(directoryPath: string, relativeDirectory: string, context: ScanWalkContext): AsyncGenerator<ScanRecord, void, void> {
+async function* walkScanRecords(directoryPath: string, relativeDirectory: string, context: ScanWalkContext): AsyncGenerator<ScanRecord, boolean, void> {
   const { canonicalRoot, matcher, signal, onListing } = context
   throwIfScanCancelled(signal)
   onListing(relativeDirectory)
@@ -284,7 +304,7 @@ async function* walkScanRecords(directoryPath: string, relativeDirectory: string
     if (!isCanonicalPathInside(canonicalRoot, canonicalDirectory)) {
       await closeDirQuietly(directory)
       yield { kind: "unreadable", relativePath: relativeDirectory, reason: "Resolves outside the folder root", entryKind: "directory" }
-      return
+      return true
     }
     if (relativeDirectory && context.onDirectory) {
       const metadata = await lstat(directoryPath)
@@ -295,23 +315,28 @@ async function* walkScanRecords(directoryPath: string, relativeDirectory: string
     if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
     await closeDirQuietly(directory)
     yield { kind: "unreadable", relativePath: relativeDirectory, reason: describeScanReason(error), entryKind: "directory" }
-    return
+    return true
   }
 
+  let yieldedRecord = false
   try {
     for await (const entry of directory) {
       throwIfScanCancelled(signal)
       onListing(relativeDirectory)
       const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name))
-      if (isTetheraStagingPath(relativePath) || matcher(relativePath, entry.isDirectory()) || entry.isSymbolicLink()) {
+      if (isTetheraStagingPath(relativePath) || matcher(relativePath, entry.isDirectory())) {
         yield { kind: "ignored" }
         continue
       }
+      yieldedRecord = true
       if (entry.isDirectory()) {
-        yield* walkScanRecords(path.join(directoryPath, entry.name), relativePath, context)
+        const nestedYieldedRecord = yield* walkScanRecords(path.join(directoryPath, entry.name), relativePath, context)
+        if (!nestedYieldedRecord) yield { kind: "occupied", relativePath, entryKind: "directory" }
         continue
       }
-      if (entry.isFile()) yield { kind: "file", relativePath }
+      // Symbolic links, junctions and other special entries are never followed
+      // or synchronized, but they still occupy their path on this computer.
+      yield entry.isFile() ? { kind: "file", relativePath } : { kind: "occupied", relativePath, entryKind: "special" }
     }
   } catch (error) {
     // Some runtimes open a directory before failing its first read, so an
@@ -319,9 +344,11 @@ async function* walkScanRecords(directoryPath: string, relativeDirectory: string
     // an unreadable directory, never a reason to abort the whole scan.
     if (isScanCancelled(error) || signal?.aborted) throw new ScanCancelledError()
     yield { kind: "unreadable", relativePath: relativeDirectory, reason: describeScanReason(error), entryKind: "directory" }
+    return true
   } finally {
     await closeDirQuietly(directory)
   }
+  return yieldedRecord
 }
 
 /**
@@ -330,7 +357,7 @@ async function* walkScanRecords(directoryPath: string, relativeDirectory: string
  * With a batch size of one and no cache it passes records straight through.
  */
 async function* withCachedDigests(
-  source: AsyncGenerator<ScanRecord, void, void>,
+  source: AsyncGenerator<ScanRecord, unknown, void>,
   cache: ScanDigestCache | undefined,
   batchSize: number,
 ): AsyncGenerator<ReadyScanRecord, void, void> {
@@ -388,6 +415,7 @@ async function scanFolderEntries(
   let hashedFiles = 0
   let unhashedFiles = 0
   const unreadableEntries: FolderScanIssue[] = []
+  const occupiedPaths: OccupiedPath[] = []
   const maxFiles = resolveScanLimit(options.maxFiles)
   const maxFileBytes = resolveFileSizeLimit(options.maxFileBytes)
   const hashAllFiles = options.hashAllFiles === true
@@ -425,6 +453,14 @@ async function scanFolderEntries(
     } catch {
       // Advisory delivery must never change the scan result.
     }
+  }
+
+  function recordOccupied(occupied: OccupiedPath): void {
+    // A link or special entry is left out exactly like an ignore-rule match.
+    if (occupied.kind === "special") ignored += 1
+    const directory = occupied.kind === "directory"
+    if (options.excludePath?.(occupied.path, directory)) return
+    occupiedPaths.push(options.mapPath ? { ...occupied, path: options.mapPath(occupied.path, directory) } : occupied)
   }
 
   function inspect(relativePath: string, cached: CachedFileDigest | undefined): Promise<InspectionSettlement> {
@@ -470,6 +506,10 @@ async function scanFolderEntries(
       if (!head) break
       if (head.kind === "ignored") {
         ignored += 1
+        continue
+      }
+      if (head.kind === "occupied") {
+        recordOccupied({ path: head.relativePath, kind: head.entryKind })
         continue
       }
       if (head.kind === "unreadable") {
@@ -522,7 +562,7 @@ async function scanFolderEntries(
   } catch {
     // Metrics never change the scan result.
   }
-  return { rootPath: root, files: committedFiles, ignored, unreadable, unreadableEntries, truncated }
+  return { rootPath: root, files: committedFiles, ignored, unreadable, unreadableEntries, occupiedPaths, truncated }
 }
 
 /** Counters of a scan whose entries were streamed to a callback instead of collected. */
@@ -532,6 +572,7 @@ interface ScanSummary {
   ignored: number
   unreadable: number
   unreadableEntries: FolderScanIssue[]
+  occupiedPaths: OccupiedPath[]
   truncated: boolean
 }
 
@@ -558,6 +599,7 @@ export async function scanFolder(
     unreadableEntries: summary.unreadableEntries,
     truncated: summary.truncated || directoriesTruncated,
     ...(options.includeDirectories ? { directories } : {}),
+    ...(summary.occupiedPaths.length > 0 ? { occupiedPaths: summary.occupiedPaths } : {}),
   }
 }
 
@@ -972,6 +1014,47 @@ export function createScanIssueBlocklist(issues: readonly FolderScanIssue[]): (r
   }
 }
 
+/**
+ * Compiles a destination manifest into a predicate for paths a copy must not
+ * write: a folder (implied by anything beneath it, or reported as occupied), a
+ * path at or beneath a link or special entry, or a path beneath a synchronized
+ * file. A synchronized file at exactly the path is not occupancy; planning
+ * compares that pair by content instead.
+ */
+export function createDestinationOccupancyCheck(destination: FileManifest): (relativePath: string) => boolean {
+  const files = new Set(destination.files.map((entry) => entry.path))
+  const directories = new Set<string>()
+  const specials = new Set<string>()
+  // Every ancestor of a recorded directory is recorded too, so the walk up can
+  // stop at the first ancestor that is already known.
+  const addAncestors = (relativePath: string) => {
+    let separator = relativePath.lastIndexOf("/")
+    while (separator !== -1) {
+      const ancestor = relativePath.slice(0, separator)
+      if (directories.has(ancestor)) return
+      directories.add(ancestor)
+      separator = relativePath.lastIndexOf("/", separator - 1)
+    }
+  }
+  for (const entry of destination.files) addAncestors(entry.path)
+  for (const occupied of destination.occupiedPaths ?? []) {
+    if (occupied.kind === "special") specials.add(occupied.path)
+    else directories.add(occupied.path)
+    addAncestors(occupied.path)
+  }
+  if (directories.size === 0 && specials.size === 0) return () => false
+  return (relativePath) => {
+    if (directories.has(relativePath) || specials.has(relativePath)) return true
+    let separator = relativePath.lastIndexOf("/")
+    while (separator !== -1) {
+      const ancestor = relativePath.slice(0, separator)
+      if (files.has(ancestor) || specials.has(ancestor)) return true
+      separator = relativePath.lastIndexOf("/", separator - 1)
+    }
+    return false
+  }
+}
+
 function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
   return a.device === b.device && a.inode === b.inode && a.size === b.size && a.modifiedNs === b.modifiedNs && a.changedNs === b.changedNs
 }
@@ -1191,8 +1274,14 @@ export function parsePeerManifest(value: unknown): FileManifest {
     unreadableEntries: parsePeerScanIssues(candidate.unreadableEntries),
     truncated: candidate.truncated === true,
     ...(candidate.directories !== undefined ? { directories: peerDirectoriesSchema.parse(candidate.directories) } : {}),
+    ...(candidate.occupiedPaths !== undefined ? { occupiedPaths: peerOccupiedPathsSchema.parse(candidate.occupiedPaths) } : {}),
   }
 }
+
+const peerOccupiedPathsSchema = z.array(z.object({
+  path: z.string().min(1).refine((path) => Buffer.byteLength(path, "utf8") <= MAX_MANIFEST_PATH_BYTES && !path.includes("\0")),
+  kind: z.enum(["directory", "special"]),
+}).strict()).max(1_000_000)
 
 const peerDirectoriesSchema = z.array(z.object({
   path: z.string().min(1).max(4096).refine((path) => !path.includes("\\") && !path.includes("\0") && path.split("/").every((part) => part !== "" && part !== "." && part !== "..")),
@@ -1235,7 +1324,9 @@ function parsePeerScanIssues(value: unknown): FolderScanIssue[] {
 
 /** Thin manifest-shaped wrapper over the shared estimator; see `../shared/sync-capacity` for the estimate itself. */
 export function estimateManifestEncodedBytes(manifest: FileManifest): number {
-  return estimateEncodedBytesForFiles(manifest.files) + (manifest.directories ? estimateEncodedBytesForFiles(manifest.directories) : 0)
+  return estimateEncodedBytesForFiles(manifest.files) +
+    (manifest.directories ? estimateEncodedBytesForFiles(manifest.directories) : 0) +
+    (manifest.occupiedPaths ? estimateEncodedBytesForFiles(manifest.occupiedPaths) : 0)
 }
 
 export function assertManifestWithinLegacyByteBudget(manifest: FileManifest, computer: string): void {

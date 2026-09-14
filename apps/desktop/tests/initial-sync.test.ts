@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -11,7 +11,7 @@ import {
   writeFileAtomic,
   writeFileChunksAtomic,
 } from "../src/main/initial-sync"
-import { createScanIssueBlocklist } from "../src/main/folder-manifest"
+import { createScanIssueBlocklist, type FileManifest } from "../src/main/folder-manifest"
 import { archiveObjectPath } from "../src/main/version-archive"
 import { manifest, sha256Hex } from "./helpers"
 
@@ -104,6 +104,31 @@ describe("computeSyncPlan", () => {
     )
     expect(plan.toPull.map((entry) => entry.path)).toEqual(["free.txt"])
   })
+
+  test("leaves out remote-only files whose path is already a folder, link or special entry here", () => {
+    const local: FileManifest = {
+      ...manifest([
+        { path: "build/output.txt", size: 1, modifiedMs: 1, digest: "folder-content" },
+        { path: "notes", size: 1, modifiedMs: 1, digest: "file-as-parent" },
+      ]),
+      occupiedPaths: [
+        { path: ".claude/skills/shadcn", kind: "special" },
+        { path: "empty", kind: "directory" },
+      ],
+    }
+    const plan = computeSyncPlan(local, manifest([
+      { path: ".claude/skills/shadcn", size: 26, modifiedMs: 1, digest: "link-text" },
+      { path: ".claude/skills/shadcn/SKILL.md", size: 4, modifiedMs: 1, digest: "linked-content" },
+      { path: "build", size: 1, modifiedMs: 1, digest: "file-over-folder" },
+      { path: "notes/today.txt", size: 1, modifiedMs: 1, digest: "beneath-file" },
+      { path: "empty", size: 1, modifiedMs: 1, digest: "file-over-empty-folder" },
+      { path: "empty/new.txt", size: 1, modifiedMs: 1, digest: "inside-empty-folder" },
+      { path: ".claude/skills/other.md", size: 1, modifiedMs: 1, digest: "sibling" },
+    ]), "two-way")
+    expect(plan.toPull.map((entry) => entry.path)).toEqual(["empty/new.txt", ".claude/skills/other.md"])
+    expect(plan.occupied).toEqual([".claude/skills/shadcn", ".claude/skills/shadcn/SKILL.md", "build", "notes/today.txt", "empty"])
+    expect(plan.skipped).toEqual([])
+  })
 })
 
 describe("initial merge path compatibility", () => {
@@ -191,16 +216,38 @@ describe("mergeInitialSyncFile", () => {
     }
   })
 
-  test("does not accept an existing destination symlink", async () => {
+  test("leaves out an existing destination symlink without following or replacing it", async () => {
     if (process.platform === "win32") return
     const root = await mkdtemp(path.join(tmpdir(), "tethera-existing-link-"))
     try {
       await writeFile(path.join(root, "target.txt"), content)
       await symlink("target.txt", path.join(root, entry.path))
-      await expect(mergeInitialSyncFile(root, entry, async () => {
+      expect(await mergeInitialSyncFile(root, entry, async () => {
         throw new Error("Must not transfer through a symlink")
-      })).rejects.toThrow("not a regular file")
+      })).toEqual({ status: "occupied" })
       expect(await readFile(path.join(root, "target.txt"))).toEqual(content)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("leaves out a destination that is a folder or sits beneath a file or linked folder", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-occupied-destination-"))
+    try {
+      await mkdir(path.join(root, "folder"))
+      await writeFile(path.join(root, "parent-file"), "local")
+      const noTransfer = async () => {
+        throw new Error("Must not transfer into an occupied path")
+      }
+      expect(await mergeInitialSyncFile(root, { ...entry, path: "folder" }, noTransfer)).toEqual({ status: "occupied" })
+      expect(await mergeInitialSyncFile(root, { ...entry, path: "parent-file/child.txt" }, noTransfer)).toEqual({ status: "occupied" })
+      if (process.platform !== "win32") {
+        await mkdir(path.join(root, "real"))
+        await symlink("real", path.join(root, "linked"), "dir")
+        expect(await mergeInitialSyncFile(root, { ...entry, path: "linked/child.txt" }, noTransfer)).toEqual({ status: "occupied" })
+        expect(await readdir(path.join(root, "real"))).toEqual([])
+      }
+      expect(await readFile(path.join(root, "parent-file"), "utf8")).toBe("local")
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -261,6 +308,15 @@ describe("assessInitialMergeConvergence", () => {
       { localBlocked: [{ path: "locked", reason: "Permission denied", kind: "directory" }] },
     )
     expect(result.complete).toBe(true)
+  })
+
+  test("treats files left out for a path occupied on either computer as converged", () => {
+    const result = assessInitialMergeConvergence(
+      { ...manifest([{ path: "tools/run", size: 1, modifiedMs: 1, digest: "script" }]), occupiedPaths: [{ path: "skills/shadcn", kind: "special" }] },
+      { ...manifest([{ path: "skills/shadcn", size: 26, modifiedMs: 1, digest: "link-text" }]), occupiedPaths: [{ path: "tools/run", kind: "special" }] },
+      "two-way",
+    )
+    expect(result).toEqual({ complete: true, skipped: [] })
   })
 
   test("still blocks when the accepted issue does not cover the one-sided file", () => {

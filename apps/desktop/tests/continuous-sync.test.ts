@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { fingerprintFolder, parsePeerManifest, scanFolder } from "../src/main/folder-manifest"
+import { fingerprintFolder, parsePeerManifest, scanFolder, type FileManifest } from "../src/main/folder-manifest"
 import { fingerprintObservation } from "../src/main/observation-fingerprint"
 import {
   canSkipUnchangedCycle,
@@ -18,9 +18,11 @@ import {
   mirrorConflictChoice,
   observedFiles,
   replayableOperations,
+  syncableObservations,
   type FileSyncConflict,
   type WatchHealthReport,
 } from "../src/main/continuous-sync"
+import { manifest } from "./helpers"
 
 describe("continuous sync helpers", () => {
   test("replays only durable operations whose source and destination are still exact", () => {
@@ -171,6 +173,31 @@ test("FolderChangeMonitor reports a watch-depth degradation instead of silently 
     monitor.close()
     await rm(root, { recursive: true, force: true })
   }
+})
+
+describe("occupied destination paths", () => {
+  test("leaves out one-sided files the receiving computer already uses for a folder or link", () => {
+    const digest = "a".repeat(64)
+    const local: FileManifest = {
+      ...manifest([
+        { path: "shared.txt", size: 1, modifiedMs: 1, digest },
+        { path: "tools/run", size: 1, modifiedMs: 1, digest },
+        { path: "local-only.txt", size: 1, modifiedMs: 1, digest },
+      ]),
+      occupiedPaths: [{ path: "skills/shadcn", kind: "special" }],
+    }
+    const remote = manifest([
+      { path: "shared.txt", size: 1, modifiedMs: 1, digest },
+      { path: "skills/shadcn", size: 1, modifiedMs: 1, digest },
+      { path: "tools", size: 1, modifiedMs: 1, digest },
+      { path: "remote-only.txt", size: 1, modifiedMs: 1, digest },
+    ])
+
+    const result = syncableObservations(local, remote)
+    expect(result.local.map((file) => file.path)).toEqual(["shared.txt", "local-only.txt"])
+    expect(result.remote.map((file) => file.path)).toEqual(["shared.txt", "remote-only.txt"])
+    expect(result.occupiedPaths).toEqual(["tools/run", "skills/shadcn", "tools"])
+  })
 })
 
 describe("idle continuous cycles", () => {

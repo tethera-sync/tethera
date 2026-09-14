@@ -4,7 +4,7 @@ import { createHash, randomBytes } from "node:crypto"
 import path from "node:path"
 import type { FolderScanIssue, SyncMode } from "../shared/contracts"
 import type { FileManifest, FileManifestEntry } from "./folder-manifest"
-import { createScanIssueBlocklist, findCaseCollisions, manifestEntriesMatch } from "./folder-manifest"
+import { createDestinationOccupancyCheck, createScanIssueBlocklist, findCaseCollisions, manifestEntriesMatch } from "./folder-manifest"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import { describeTransferFile, isSha256HexDigest } from "./file-transfer"
 import { invertMode } from "./mapping-index"
@@ -29,6 +29,7 @@ type InitialSyncFileResult =
   | { status: "copied"; bytes: number }
   | { status: "identical" }
   | { status: "conflict"; skip: SyncSkip }
+  | { status: "occupied" }
 
 /** Recheck planned additions, including files created while the transfer was in flight. */
 export async function mergeInitialSyncFile(
@@ -39,6 +40,9 @@ export async function mergeInitialSyncFile(
   if (!entry.digest || !isSha256HexDigest(entry.digest)) throw new Error("The initial merge requires a verified source digest.")
 
   const inspectDestination = async (): Promise<InitialSyncFileResult | undefined> => {
+    // A folder, link or special entry is never replaced or followed. The file
+    // is left out instead of stopping every other transfer in the merge.
+    if (await isDestinationOccupied(rootPath, entry.path)) return { status: "occupied" }
     let current
     try {
       current = await describeTransferFile(rootPath, entry.path)
@@ -65,6 +69,30 @@ export async function mergeInitialSyncFile(
   }
 }
 
+/**
+ * Walks the destination without following links. It is occupied when an
+ * existing ancestor is anything but a real folder, or when the path itself
+ * exists as anything but a regular file. A missing component leaves it free.
+ */
+async function isDestinationOccupied(rootPath: string, relativePath: string): Promise<boolean> {
+  const resolvedRoot = path.resolve(rootPath)
+  const segments = path.relative(resolvedRoot, resolveWithinRoot(rootPath, relativePath)).split(path.sep)
+  let current = resolvedRoot
+  for (const [index, segment] of segments.entries()) {
+    current = path.join(current, segment)
+    let metadata
+    try {
+      metadata = await lstat(current)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
+      throw error
+    }
+    const expectedType = index === segments.length - 1 ? metadata.isFile() : metadata.isDirectory()
+    if (metadata.isSymbolicLink() || !expectedType) return true
+  }
+  return false
+}
+
 export interface SyncSkip {
   path: string
   reason: string
@@ -73,6 +101,8 @@ export interface SyncSkip {
 export interface SyncPlan {
   toPull: FileManifestEntry[]
   skipped: SyncSkip[]
+  /** Remote-only files left out because a folder, link or special entry already uses their path here. */
+  occupied: string[]
 }
 
 export interface InitialSyncPassResult {
@@ -129,19 +159,25 @@ export function assertInitialMergePathCompatibility(local: FileManifest, remote:
  * Only ever pulls: files that exist on the remote side but not locally are
  * copied down. Files that exist on both sides but differ are left alone
  * (skipped, with a reason) rather than guessing a winner — that needs a
- * revision model this codebase doesn't have yet. The coordinator asks the
- * other device to run the inverse pass, which copies this side's local-only files.
+ * revision model this codebase doesn't have yet. A remote-only file whose path
+ * is already a folder, link or special entry here is left out the same way.
+ * The coordinator asks the other device to run the inverse pass, which copies
+ * this side's local-only files.
  */
 export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode: SyncMode, options: SyncPlanOptions = {}): SyncPlan {
   const localByPath = new Map(local.files.map((entry) => [entry.path, entry]))
   const isBlocked = createScanIssueBlocklist(options.destinationBlocked ?? [])
+  const isOccupied = createDestinationOccupancyCheck(local)
   const toPull: FileManifestEntry[] = []
   const skipped: SyncSkip[] = []
+  const occupied: string[] = []
 
   for (const remoteEntry of remote.files) {
     const localEntry = localByPath.get(remoteEntry.path)
     if (!localEntry) {
-      if (mode !== "send-only" && !isBlocked(remoteEntry.path)) toPull.push(remoteEntry)
+      if (mode === "send-only" || isBlocked(remoteEntry.path)) continue
+      if (isOccupied(remoteEntry.path)) occupied.push(remoteEntry.path)
+      else toPull.push(remoteEntry)
       continue
     }
 
@@ -153,7 +189,7 @@ export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode:
     })
   }
 
-  return { toPull, skipped }
+  return { toPull, skipped, occupied }
 }
 
 export interface ConvergenceOptions {

@@ -3,7 +3,7 @@ import { opendir, realpath, stat } from "node:fs/promises"
 import path from "node:path"
 import type { SyncMode } from "../shared/contracts"
 import type { FileManifest } from "./folder-manifest"
-import { isManifestPathIgnored } from "./folder-manifest"
+import { createDestinationOccupancyCheck, isManifestPathIgnored } from "./folder-manifest"
 import { isTetheraStagingPath } from "./path-safety"
 
 const CHANGE_DEBOUNCE_MS = 750
@@ -184,6 +184,31 @@ export function observedFiles(manifest: FileManifest): ObservedFile[] {
     if (!entry.digest) throw new Error(`The full-content scan did not produce a digest for ${entry.path}.`)
     return { path: entry.path, size: entry.size, digest: entry.digest }
   })
+}
+
+/**
+ * Observations for reconciliation, without the one-sided files the other
+ * computer cannot receive because a folder, link or special entry already uses
+ * that path there. A file present on both computers always stays in.
+ */
+export function syncableObservations(local: FileManifest, remote: FileManifest): {
+  local: ObservedFile[]
+  remote: ObservedFile[]
+  occupiedPaths: string[]
+} {
+  const occupiedPaths: string[] = []
+  const receivable = (files: ObservedFile[], destination: FileManifest) => {
+    const destinationPaths = new Set(destination.files.map((entry) => entry.path))
+    const isOccupied = createDestinationOccupancyCheck(destination)
+    return files.filter((file) => {
+      if (destinationPaths.has(file.path) || !isOccupied(file.path)) return true
+      occupiedPaths.push(file.path)
+      return false
+    })
+  }
+  const receivableLocal = receivable(observedFiles(local), remote)
+  const receivableRemote = receivable(observedFiles(remote), local)
+  return { local: receivableLocal, remote: receivableRemote, occupiedPaths }
 }
 
 /**

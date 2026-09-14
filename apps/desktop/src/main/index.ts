@@ -155,6 +155,7 @@ import {
   mirrorConflictChoice,
   observedFiles,
   replayableOperations,
+  syncableObservations,
   type FileSyncConflict,
   type FileSyncDirection,
   type FileSyncOperation,
@@ -234,6 +235,8 @@ const continuousSyncMonitors = new Map<string, FolderChangeMonitor>()
 const continuousSyncRetryTimers = new Map<string, NodeJS.Timeout>()
 const continuousSyncNotificationsInFlight = new Set<string>()
 const continuousConflictFingerprints = new Map<string, string>()
+/** Per folder, the last reported set of files left out because their destination path is occupied. */
+const occupiedPathFingerprints = new Map<string, string>()
 const continuousLastErrors = new Map<string, string>()
 const INITIAL_SYNC_LEASE_MS = 35 * 60_000
 const INITIAL_SYNC_HEARTBEAT_MS = 5 * 60_000
@@ -1240,6 +1243,9 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
   )
   for (const folderId of continuousConflictFingerprints.keys()) {
     if (!mappingRecords.has(folderId)) continuousConflictFingerprints.delete(folderId)
+  }
+  for (const folderId of occupiedPathFingerprints.keys()) {
+    if (!mappingRecords.has(folderId)) occupiedPathFingerprints.delete(folderId)
   }
   for (const folderId of continuousLastErrors.keys()) {
     if (!mappingRecords.has(folderId)) continuousLastErrors.delete(folderId)
@@ -2254,6 +2260,27 @@ function recordContinuousConflicts(folder: FolderSummary, conflicts: FileSyncCon
   }
 }
 
+/** Reports files left out because their destination path is already used, once per distinct set. */
+function recordOccupiedPaths(folder: FolderSummary, paths: readonly string[]): void {
+  const sorted = [...paths].sort()
+  const fingerprint = sorted.join("\n")
+  if ((occupiedPathFingerprints.get(folder.id) ?? "") === fingerprint) return
+  if (!fingerprint) {
+    occupiedPathFingerprints.delete(folder.id)
+    return
+  }
+  occupiedPathFingerprints.set(folder.id, fingerprint)
+  pushActivity(
+    "Some files were left out",
+    `${folder.name}: ${sorted.length} file${sorted.length === 1 ? " was" : "s were"} not copied because a folder, symbolic link or other item already uses the same path on the receiving computer. Nothing was replaced, and everything else kept syncing. Rename one of the two to sync it.`,
+    "warning",
+    folder.id,
+  )
+  for (const occupiedPath of sorted.slice(0, 20)) {
+    pushActivity(`Path already in use: ${occupiedPath}`, "A folder, symbolic link or other item already uses this path on the receiving computer, so this file was left out.", "warning", folder.id)
+  }
+}
+
 async function refreshContinuousSyncState(folderId: string): Promise<void> {
   if (engine.state.status !== "ready" || snapshot.mappingStore.status !== "ready") return
   const folder = snapshot.folders.find((item) => item.id === folderId)
@@ -2355,7 +2382,10 @@ async function refreshContinuousSyncMonitors(): Promise<void> {
     const retry = continuousSyncRetryTimers.get(folderId)
     if (retry) clearTimeout(retry)
     continuousSyncRetryTimers.delete(folderId)
-    if (!mappingRecords.has(folderId)) continuousConflictFingerprints.delete(folderId)
+    if (!mappingRecords.has(folderId)) {
+      continuousConflictFingerprints.delete(folderId)
+      occupiedPathFingerprints.delete(folderId)
+    }
   }
 }
 
@@ -2580,8 +2610,11 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     assertCompleteTransferManifest(remoteManifest, peer.name)
     assertManifestFitsExchange(localManifest, "This computer", chunked)
     assertManifestFitsExchange(remoteManifest, peer.name, chunked)
-    const localObservation = observedFiles(localManifest)
-    const remoteObservation = observedFiles(remoteManifest)
+    // A one-sided file whose path the receiving computer already uses for a
+    // folder, link or special entry can never be written, so it is left out
+    // before reconciling instead of failing every cycle.
+    const { local: localObservation, remote: remoteObservation, occupiedPaths } = syncableObservations(localManifest, remoteManifest)
+    recordOccupiedPaths(folder, occupiedPaths)
 
     const replayable = replayableOperations(
       durableBeforeReconcile.operations,
@@ -2672,8 +2705,9 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     if (result.operations.length === 0 && peerOperations.length === 0 && state.operations.length === 0) {
       quietReconciles.set(folderId, {
         revision: record.revision,
-        localFingerprint: fingerprintObservation(localObservation),
-        remoteFingerprint: fingerprintObservation(remoteObservation),
+        // Later compared with whole-folder fingerprints, so every scanned file counts.
+        localFingerprint: fingerprintObservation(observedFiles(localManifest)),
+        remoteFingerprint: fingerprintObservation(observedFiles(remoteManifest)),
         baselineCount: state.baselineCount,
         conflictKey: conflictKey(state.conflicts),
         reconciledAt: Date.now(),
@@ -3347,8 +3381,10 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
         copiedBytes += result.bytes
       } else if (result.status === "conflict") {
         plan.skipped.push({ ...result.skip, path: entry.path })
+      } else if (result.status === "occupied") {
+        plan.occupied.push(entry.path)
       }
-      if (result.status !== "conflict" && transferDigests && entry.digest) {
+      if ((result.status === "copied" || result.status === "identical") && transferDigests && entry.digest) {
         try {
           const identity = await statFileIdentity(resolveWithinRoot(folder.localPath, localFilePath(folder.id, entry.path)))
           if (identity) transferDigests.record(localFilePath(folder.id, entry.path), { ...identity, digest: entry.digest })
@@ -3361,6 +3397,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   } finally {
     await transferDigests?.finish({ complete: false })
   }
+  recordOccupiedPaths(folder, plan.occupied)
 
   return {
     copiedFiles,
