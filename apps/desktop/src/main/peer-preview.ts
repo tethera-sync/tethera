@@ -1,7 +1,7 @@
 import { ScanCancelledError, parsePeerManifest, type FileManifest } from "./folder-manifest"
 import { requestPeerCapabilities, type CapabilityPeerClient } from "./peer-capabilities"
-import { PEER_SCAN_IDLE_TIMEOUT_MS, PEER_SCAN_PROGRESS_CAPABILITY, type PeerScanProgress } from "./peer-scan-progress"
-import { CHUNKED_FRAMES_CAPABILITY } from "./peer-session-service"
+import { PEER_SCAN_PROGRESS_CAPABILITY, type PeerScanProgress } from "./peer-scan-progress"
+import { CHUNKED_FRAMES_CAPABILITY, NO_PEER_RESPONSE_DEADLINE } from "./peer-session-service"
 import { DIRECTORY_MAPPING_CAPABILITY } from "../shared/directory-mapping"
 
 /** Negotiate progress and chunked frames before sending a multi-response request to an older app. */
@@ -12,33 +12,28 @@ export async function requestPeerPreview(
   signal: AbortSignal,
   onProgress: (progress: PeerScanProgress) => void,
 ): Promise<FileManifest> {
-  let supportsProgress = false
   let scanRequested = false
   try {
     const capabilities = await requestPeerCapabilities(client, peer.id, signal)
-    supportsProgress = capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
+    const supportsProgress = capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
     const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
     scanRequested = true
+    // A scan runs as long as the folder needs; cancelling the comparison or
+    // losing the connection ends it.
     const manifest = await client.request(peer.id, {
       type: "scan-manifest",
       ...input,
       ...(capabilities.has(DIRECTORY_MAPPING_CAPABILITY) ? { includeDirectories: true } : {}),
       ...(supportsProgress ? { reportProgress: true } : {}),
-    }, PEER_SCAN_IDLE_TIMEOUT_MS, { signal, ...(supportsProgress ? { onProgress } : {}), ...(chunked ? { chunked: true } : {}) })
+    }, NO_PEER_RESPONSE_DEADLINE, { signal, ...(supportsProgress ? { onProgress } : {}), ...(chunked ? { chunked: true } : {}) })
     if (signal.aborted) throw new ScanCancelledError()
     const parsed = parsePeerManifest(manifest)
     return capabilities.has(DIRECTORY_MAPPING_CAPABILITY) ? parsed : { ...parsed, directories: undefined }
   } catch (error) {
     if (signal.aborted) throw new ScanCancelledError("The folder comparison was cancelled.")
     const code = error instanceof Error && "code" in error ? error.code : undefined
-    if (code === "PEER_RESPONSE_TIMEOUT" || code === "PEER_SCAN_IDLE_TIMEOUT") {
-      if (!scanRequested) throw new Error(`${peer.name} did not answer the scan-support check. Check that Tethera is running on that computer, then retry.`)
-      throw new Error(supportsProgress
-        ? `${peer.name} stopped reporting scan progress. Check that Tethera is open and the folder is accessible on that computer, then retry.`
-        : `${peer.name} did not finish scanning within five minutes. Update Tethera on both computers for progress-aware comparisons, or compare a smaller folder.`)
-    }
-    if (code === "PEER_SCAN_DEADLINE") {
-      throw new Error(`The scan on ${peer.name} reached the 30-minute limit. Compare smaller folders or exclude generated files, then retry.`)
+    if (code === "PEER_RESPONSE_TIMEOUT" && !scanRequested) {
+      throw new Error(`${peer.name} did not answer the scan-support check. Check that Tethera is running on that computer, then retry.`)
     }
     if (code === "PEER_HANDSHAKE_TIMEOUT") {
       throw new Error(`${peer.name} did not answer the secure connection request. Check that Tethera is running on that computer, then retry.`)

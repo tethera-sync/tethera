@@ -654,7 +654,7 @@ async function requestPeerContinuousScan(
   signal: AbortSignal,
   chunked: boolean,
 ): Promise<FileManifest | { unchanged: true }> {
-  const raw = await requirePeerSessions().request<unknown>(peerId, { type: "continuous-sync-scan", folderId, knownFingerprint }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, { signal, chunked })
+  const raw = await requirePeerSessions().request<unknown>(peerId, { type: "continuous-sync-scan", folderId, knownFingerprint }, NO_PEER_RESPONSE_DEADLINE, { signal, chunked })
   return isUnchangedScanReply(raw) ? raw : parsePeerManifest(raw)
 }
 
@@ -2574,7 +2574,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       }),
       (signal) => knownPeerManifest
         ? Promise.resolve(knownPeerManifest)
-        : requestPeerManifest(peer.id, { type: "continuous-sync-scan", folderId }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, signal, chunked),
+        : requestPeerManifest(peer.id, { type: "continuous-sync-scan", folderId }, NO_PEER_RESPONSE_DEADLINE, signal, chunked),
     )
     assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
     assertCompleteTransferManifest(remoteManifest, peer.name)
@@ -2839,7 +2839,8 @@ async function pullPlannedFile(
     type: "pull-file-descriptor",
     folderId: folder.id,
     relativePath: entry.path,
-  }, 5 * 60_000)
+    // The source hashes the whole file first, which scales with its size.
+  }, NO_PEER_RESPONSE_DEADLINE)
   validateTransferDescriptor(entry, descriptor)
 
   let journal: ReplacementJournalEntry | undefined
@@ -3245,7 +3246,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
         path: folder.remotePath,
         ignorePatterns: folder.ignorePatterns,
         hashAllFiles: true,
-      }, 5 * 60_000, signal, chunked, capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
+      }, NO_PEER_RESPONSE_DEADLINE, signal, chunked, capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
         ? (progress) => { if (scanning) reportScanCounts(folder.id, "initial-merge", { remote: progress }) }
         : undefined),
     ).finally(() => { scanning = false })
@@ -3399,7 +3400,7 @@ async function verifyInitialMergeQuiescent(
       path: folder.remotePath,
       ignorePatterns: folder.ignorePatterns,
       hashAllFiles: true,
-    }, 5 * 60_000, signal, chunked, capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
+    }, NO_PEER_RESPONSE_DEADLINE, signal, chunked, capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
       ? (progress) => reportScanCounts(folder.id, "verify", { remote: progress })
       : undefined),
   )
@@ -3584,7 +3585,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
         throw new Error("Update Tethera on both computers to use the approved folder-name mapping.")
       }
       await cleanupFolderDirectories(folder)
-      const cleanup = await requirePeerSessions().request<unknown>(peer.id, { type: "directory-case-cleanup", folderId }, 5 * 60_000)
+      const cleanup = await requirePeerSessions().request<unknown>(peer.id, { type: "directory-case-cleanup", folderId }, NO_PEER_RESPONSE_DEADLINE)
       if (!cleanup || typeof cleanup !== "object" || !("completed" in cleanup) || cleanup.completed !== true) {
         throw new Error("The other computer did not finish preparing the selected folders.")
       }

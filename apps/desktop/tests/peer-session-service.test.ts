@@ -325,7 +325,6 @@ describe("secure peer-session crypto", () => {
     const requester = new PeerSessionService({
       pairing: fakePairing(requesterIdentity, responderIdentity, responder.port),
       port: 0,
-      testTiming: { scanIdleTimeoutMs: 15 },
       onRequest: async () => undefined,
     })
     try {
@@ -337,46 +336,6 @@ describe("secure peer-session crypto", () => {
       await started.promise
       await expect(request).rejects.toThrow("stopped reporting progress")
       await aborted.promise
-    } finally {
-      await requester.stop()
-      await responder.stop()
-    }
-  })
-
-  test("does not let scan progress extend the receiver deadline", async () => {
-    const requesterIdentity = testIdentity("requester-deadline")
-    const responderIdentity = testIdentity("responder-deadline")
-    const deadlineAborted = deferred()
-    const responder = new PeerSessionService({
-      pairing: fakePairing(responderIdentity, requesterIdentity, 0),
-      port: 0,
-      testTiming: { scanMaximumDurationMs: 35, scanProgressIntervalMs: 5, responseFlushTimeoutMs: 20 },
-      onRequest: async (context) => {
-        const interval = setInterval(() => context.reportProgress?.(TEST_PROGRESS), 5)
-        try {
-          await new Promise<void>((resolve) => context.signal.addEventListener("abort", resolve, { once: true }))
-          deadlineAborted.resolve()
-          throw new Error("scan cancelled")
-        } finally {
-          clearInterval(interval)
-        }
-      },
-    })
-    await responder.start()
-    const requester = new PeerSessionService({
-      pairing: fakePairing(requesterIdentity, responderIdentity, responder.port),
-      port: 0,
-      testTiming: { scanMaximumDurationMs: 35, scanIdleTimeoutMs: 20, responseFlushTimeoutMs: 20 },
-      onRequest: async () => undefined,
-    })
-    try {
-      await expect(requester.request(
-        responderIdentity.id,
-        { type: "scan-manifest", reportProgress: true },
-        20,
-        { onProgress: () => undefined },
-      )).rejects.toThrow("remote scan took too long")
-      await deadlineAborted.promise
     } finally {
       await requester.stop()
       await responder.stop()

@@ -13,12 +13,7 @@ import {
 } from "node:crypto"
 import net, { type Server, type Socket } from "node:net"
 import type { PairingService } from "./pairing-service"
-import {
-  PEER_SCAN_IDLE_TIMEOUT_MS,
-  PEER_SCAN_MAX_DURATION_MS,
-  type PeerScanProgress,
-  parsePeerScanProgress,
-} from "./peer-scan-progress"
+import { type PeerScanProgress, parsePeerScanProgress } from "./peer-scan-progress"
 
 const DEFAULT_SESSION_PORT = 47_656
 // Version 4 adds conflict-scoped inspection and explicit winner selection.
@@ -39,7 +34,6 @@ const MAX_QUEUED_BYTES = 4 * 1024 * 1024
 const MAX_AUTHENTICATED_SESSIONS = 16
 const MAX_AUTHENTICATED_SESSIONS_PER_PEER = 4
 const MAX_PEER_SCAN_PROGRESS_BYTES = 4_096
-const MAX_PEER_SCAN_PROGRESS_MESSAGES = 8_000
 const PEER_SCAN_PROGRESS_INTERVAL_MS = 250
 /** Advertised by peers that accept requests and responses split across several authenticated frames. */
 export const CHUNKED_FRAMES_CAPABILITY = "chunked-frames-v1"
@@ -136,9 +130,6 @@ export interface PeerRequestOptions {
 }
 
 interface PeerSessionTimingOptions {
-  scanMaximumDurationMs?: number
-  scanIdleTimeoutMs?: number
-  responseFlushTimeoutMs?: number
   scanProgressIntervalMs?: number
 }
 
@@ -330,44 +321,21 @@ export class PeerSessionService extends EventEmitter {
     timeoutMs: number,
     options: PeerRequestOptions,
   ): Promise<T> {
-    const timing = this.#timing()
-    const deadline = performance.now() + timing.scanMaximumDurationMs + timing.responseFlushTimeoutMs
-    let expectedSequence = 1
-    while (true) {
-      const remaining = deadline - performance.now()
-      if (remaining <= 0) {
-        throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
-      }
-      const readTimeout = Math.min(timeoutMs, timing.scanIdleTimeoutMs, remaining)
-      let responseFrame: WireMessage
+    // A scan has no overall time limit: each frame renews the wait, so a scan
+    // that keeps reporting progress runs for as long as its folder needs.
+    const readScanFrame = async (): Promise<WireMessage> => {
       try {
-        responseFrame = await connection.read(readTimeout, options.signal)
+        return await connection.read(timeoutMs, options.signal)
       } catch (error) {
-        if (performance.now() >= deadline) {
-          throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
-        }
         throw asPeerPhaseTimeout(error, "The secure peer scan stopped reporting progress.", "PEER_SCAN_IDLE_TIMEOUT")
       }
-      if (performance.now() >= deadline) {
-        throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
-      }
+    }
+    let expectedSequence = 1
+    while (true) {
+      const responseFrame = await readScanFrame()
       if (responseFrame.type === "session-error") throw new Error(responseFrame.reason)
       if (options.chunked && responseFrame.type === "secure-chunk") {
-        const readChunk = async (): Promise<WireMessage> => {
-          const remainingForChunk = deadline - performance.now()
-          if (remainingForChunk <= 0) {
-            throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
-          }
-          try {
-            return await connection.read(Math.min(readTimeout, remainingForChunk), options.signal)
-          } catch (error) {
-            if (performance.now() >= deadline) {
-              throw peerSessionError("The secure peer scan exceeded its maximum duration.", "PEER_SCAN_DEADLINE")
-            }
-            throw asPeerPhaseTimeout(error, "The secure peer scan stopped reporting progress.", "PEER_SCAN_IDLE_TIMEOUT")
-          }
-        }
-        return await parseChunkedTerminalResponse<T>(responseFrame, readChunk, key, sessionId, requestId)
+        return await parseChunkedTerminalResponse<T>(responseFrame, readScanFrame, key, sessionId, requestId)
       }
       if (responseFrame.type !== "secure-frame" || responseFrame.requestId !== requestId) {
         throw new Error("The peer returned an invalid encrypted response.")
@@ -380,7 +348,7 @@ export class PeerSessionService extends EventEmitter {
         if (!response.ok) throw new Error(response.error)
         return response.result as T
       }
-      if (!options.onProgress || expectedSequence > MAX_PEER_SCAN_PROGRESS_MESSAGES) {
+      if (!options.onProgress) {
         throw new Error("The peer returned invalid scan progress.")
       }
       const progress = parsePeerScanProgressEnvelope(value, expectedSequence)
@@ -405,9 +373,6 @@ export class PeerSessionService extends EventEmitter {
     let requestId: string | undefined
     let peerIdForLog: string | undefined
     let authenticatedPeerId: string | undefined
-    let scanDeadline: ReturnType<typeof setTimeout> | undefined
-    let scanCloseDeadline: ReturnType<typeof setTimeout> | undefined
-    let scanDeadlineExpired = false
     try {
       const first = await connection.read(CONNECT_TIMEOUT_MS, handlerController.signal)
       if (first.type !== "session-hello") {
@@ -483,19 +448,7 @@ export class PeerSessionService extends EventEmitter {
       const request = frame.type === "secure-chunk"
         ? await readChunkedMessage<PeerRequest>(frame, readRequestFrame, key, first.sessionId, frame.requestId, "request")
         : decryptFrame<PeerRequest>(key, first.sessionId, "request", frame)
-      const isScanManifest = request.type === "scan-manifest"
-      const canReportProgress = isScanManifest && request.reportProgress === true
-      if (isScanManifest) {
-        const timing = this.#timing()
-        scanDeadline = setTimeout(() => {
-          scanDeadlineExpired = true
-          handlerController.abort()
-          // Give a cooperative scan a bounded chance to return its terminal
-          // deadline error. An uncooperative handler cannot keep the socket
-          // or buffered frames alive beyond the existing flush budget.
-          scanCloseDeadline = setTimeout(() => connection.close(), timing.responseFlushTimeoutMs)
-        }, timing.scanMaximumDurationMs)
-      }
+      const canReportProgress = request.type === "scan-manifest" && request.reportProgress === true
       const context: PeerRequestContext = {
         peerId: peer.id,
         peerName: peer.name,
@@ -509,28 +462,15 @@ export class PeerSessionService extends EventEmitter {
       let response: PeerResponse
       try {
         const result = await this.#options.onRequest(context, request)
-        if (scanDeadlineExpired) {
-          throw peerSessionError(
-            "The remote scan took too long. Try a smaller folder or add ignore rules, then try again.",
-            "PEER_SCAN_DEADLINE",
-          )
-        }
         if (handlerController.signal.aborted) throw new Error("The secure peer request was cancelled.")
         response = { ok: true, result }
       } catch (error) {
-        const responseError = scanDeadlineExpired
-          ? peerSessionError(
-              "The remote scan took too long. Try a smaller folder or add ignore rules, then try again.",
-              "PEER_SCAN_DEADLINE",
-            )
-          : error
-        const detail = boundedPeerError(responseError, "The peer request failed.")
-        const diagnostic = safeErrorDiagnostic(responseError)
+        const detail = boundedPeerError(error, "The peer request failed.")
         console.warn("[peer-session] peer request failed", {
           operation: safeOperationName(request.type),
           requestId: context.requestId,
-          ...(isPeerTimeoutDiagnostic(diagnostic) ? {} : { peerId: context.peerId }),
-          error: diagnostic,
+          peerId: context.peerId,
+          error: safeErrorDiagnostic(error),
         })
         response = { ok: false, error: detail }
       }
@@ -559,8 +499,6 @@ export class PeerSessionService extends EventEmitter {
         })
       }
     } finally {
-      if (scanDeadline) clearTimeout(scanDeadline)
-      if (scanCloseDeadline) clearTimeout(scanCloseDeadline)
       handlerController.abort()
       socket.off("close", abortHandler)
       if (authenticatedPeerId) this.#endAuthenticatedSession(authenticatedPeerId)
@@ -579,7 +517,7 @@ export class PeerSessionService extends EventEmitter {
     let sequence = 0
     const progressIntervalMs = this.#timing().scanProgressIntervalMs
     return (candidate) => {
-      if (signal.aborted || sequence >= MAX_PEER_SCAN_PROGRESS_MESSAGES) return
+      if (signal.aborted) return
       const now = performance.now()
       if (now - lastSentAt < progressIntervalMs) return
       try {
@@ -598,9 +536,6 @@ export class PeerSessionService extends EventEmitter {
 
   #timing(): Required<PeerSessionTimingOptions> {
     return {
-      scanMaximumDurationMs: this.#options.testTiming?.scanMaximumDurationMs ?? PEER_SCAN_MAX_DURATION_MS,
-      scanIdleTimeoutMs: this.#options.testTiming?.scanIdleTimeoutMs ?? PEER_SCAN_IDLE_TIMEOUT_MS,
-      responseFlushTimeoutMs: this.#options.testTiming?.responseFlushTimeoutMs ?? RESPONSE_FLUSH_TIMEOUT_MS,
       scanProgressIntervalMs: this.#options.testTiming?.scanProgressIntervalMs ?? PEER_SCAN_PROGRESS_INTERVAL_MS,
     }
   }
@@ -748,10 +683,6 @@ function asPeerPhaseTimeout(error: unknown, message: string, code: string): Erro
     : error instanceof Error
       ? error
       : new Error(message)
-}
-
-function isPeerTimeoutDiagnostic(diagnostic: { code?: string }): boolean {
-  return diagnostic.code === "PEER_SCAN_DEADLINE"
 }
 
 class JsonLineConnection {

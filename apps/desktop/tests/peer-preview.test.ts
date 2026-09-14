@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { requestPeerPreview } from "../src/main/peer-preview"
 import { PEER_SCAN_PROGRESS_CAPABILITY, parsePeerScanProgress } from "../src/main/peer-scan-progress"
-import { CHUNKED_FRAMES_CAPABILITY, type PeerRequest, type PeerRequestOptions } from "../src/main/peer-session-service"
+import { CHUNKED_FRAMES_CAPABILITY, NO_PEER_RESPONSE_DEADLINE, type PeerRequest, type PeerRequestOptions } from "../src/main/peer-session-service"
 import { folderComparisonResult, unwrapFolderComparisonResult } from "../src/shared/folder-comparison-result"
 
 const peer = { id: "peer", name: "Office PC" }
@@ -73,17 +73,18 @@ describe("peer preview compatibility", () => {
     expect(await requestPeerPreview(client, peer, input, new AbortController().signal, () => {})).toEqual(manifest)
   })
 
-  test("reports recovery guidance specific to legacy and progress-aware timeouts", async () => {
+  test("waits for the remote scan without a time limit, with or without progress support", async () => {
     for (const supported of [false, true]) {
+      let scanTimeout: number | undefined
       const client = {
-        async request(_peerId: string, request: PeerRequest): Promise<unknown> {
+        async request(_peerId: string, request: PeerRequest, timeout?: number): Promise<unknown> {
           if (request.type === "scan-capabilities") return { capabilities: supported ? [PEER_SCAN_PROGRESS_CAPABILITY] : [] }
-          throw Object.assign(new Error("timeout"), { code: "PEER_RESPONSE_TIMEOUT" })
+          scanTimeout = timeout
+          return manifest
         },
       }
-      await expect(requestPeerPreview(client, peer, input, new AbortController().signal, () => {})).rejects.toThrow(
-        supported ? "Office PC stopped reporting scan progress" : "Update Tethera on both computers",
-      )
+      expect(await requestPeerPreview(client, peer, input, new AbortController().signal, () => {})).toEqual(manifest)
+      expect(scanTimeout).toBe(NO_PEER_RESPONSE_DEADLINE)
     }
   })
 
