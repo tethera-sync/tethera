@@ -9,7 +9,7 @@ import type {
   SyncMode,
 } from "../shared/contracts"
 import type { ExactConflictChoice, FileSyncDirection, PeerFileOperationIdentity } from "./continuous-sync"
-import { isSha256HexDigest, type TransferFileDescriptor } from "./file-transfer"
+import { FileChangedError, isSha256HexDigest, type TransferFileDescriptor } from "./file-transfer"
 import { DEFAULT_MAX_MANIFEST_FILES, type FileManifest } from "./folder-manifest"
 import type { InitialSyncPassResult } from "./initial-sync"
 import { isTetheraStagingPath } from "./path-safety"
@@ -319,8 +319,25 @@ export function validateTransferDescriptor(entry: FileManifest["files"][number],
     throw new Error(`The peer returned invalid transfer metadata for ${entry.path}.`)
   }
   if (value.size !== entry.size || value.digest !== entry.digest) {
-    throw new Error(`${entry.path} changed after the folders were compared. Retry the initial merge.`)
+    throw new FileChangedError(`${entry.path} changed after the folders were compared. Retry the initial merge.`)
   }
+}
+
+/** A source's reply, to a requester that sent `reportUnavailable`, for a file that vanished or changed since the scan. */
+export interface SourceUnavailableResponse {
+  unavailable: true
+}
+
+export function isSourceUnavailableResponse(value: unknown): value is SourceUnavailableResponse {
+  return value !== null && typeof value === "object" && (value as { unavailable?: unknown }).unavailable === true
+}
+
+const freeSpaceResponseSchema = z.object({ availableBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) })
+
+export function parseFreeSpaceResponse(value: unknown): number {
+  const parsed = freeSpaceResponseSchema.safeParse(value)
+  if (!parsed.success) throw new Error("The other computer reported its free space in an invalid form. Update Tethera on both computers and retry.")
+  return parsed.data.availableBytes
 }
 
 /** Bounds shared by every persisted or peer-supplied skip list. */

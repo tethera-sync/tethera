@@ -1,12 +1,15 @@
 import { describe, expect, test } from "bun:test"
+import { FileChangedError } from "../src/main/file-transfer"
 import {
   applySettingUpdate,
+  isSourceUnavailableResponse,
   MAX_IGNORE_PATTERN_LENGTH,
   MAX_IGNORE_PATTERNS,
   normalizePersistedScanLimit,
   parseArchiveHistoryRequest,
   parseConflictCopyExpectation,
   parseExactConflictChoice,
+  parseFreeSpaceResponse,
   parsePeerConflictCopy,
   parsePeerFileOperations,
   parsePeerScanManifest,
@@ -345,6 +348,25 @@ describe("peer transfer parsing", () => {
     expect(() => validateTransferDescriptor(entry, { size: 9, modifiedMs: 3, digest: OTHER_DIGEST })).toThrow(
       "docs/plan.txt changed after the folders were compared.",
     )
+  })
+
+  test("reports a stale descriptor as a per-file change, not a failed transfer", () => {
+    expect(() => validateTransferDescriptor(entry, { size: 10, modifiedMs: 3, digest: DIGEST })).toThrow(FileChangedError)
+    expect(() => validateTransferDescriptor(entry, { size: 9, modifiedMs: 3, digest: "tampered" })).not.toThrow(FileChangedError)
+  })
+
+  test("recognises only an explicit unavailable-source reply", () => {
+    expect(isSourceUnavailableResponse({ unavailable: true })).toBe(true)
+    expect(isSourceUnavailableResponse({ unavailable: "true" })).toBe(false)
+    expect(isSourceUnavailableResponse({ size: 9, modifiedMs: 3, digest: DIGEST })).toBe(false)
+    expect(isSourceUnavailableResponse(null)).toBe(false)
+  })
+
+  test("accepts only a whole, non-negative free-space figure from the other computer", () => {
+    expect(parseFreeSpaceResponse({ availableBytes: 2_500_000_000 })).toBe(2_500_000_000)
+    for (const invalid of [{}, { availableBytes: -1 }, { availableBytes: 1.5 }, { availableBytes: "10" }, null]) {
+      expect(() => parseFreeSpaceResponse(invalid)).toThrow("invalid form")
+    }
   })
 
   test("accepts a well-formed initial-merge result", () => {
