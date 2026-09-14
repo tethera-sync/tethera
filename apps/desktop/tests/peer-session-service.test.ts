@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { createPublicKey, generateKeyPairSync, randomBytes, randomUUID, sign, verify, type KeyObject } from "node:crypto"
 import net from "node:net"
 import type { PairingService } from "../src/main/pairing-service"
-import { measurePeerRequest, PeerSessionService, peerSessionTestHelpers } from "../src/main/peer-session-service"
+import { measurePeerRequest, NO_PEER_RESPONSE_DEADLINE, PeerSessionService, peerSessionTestHelpers } from "../src/main/peer-session-service"
 import { MAX_ACTIVE_SCANS, ScanCoordinator } from "../src/main/scan-coordinator"
 
 const LARGE_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -195,6 +195,34 @@ describe("secure peer-session crypto", () => {
     try {
       const response = await requester.request<{ content: string }>(responderIdentity.id, { type: "large-response" }, 5_000)
       expect(response.content).toHaveLength(LARGE_RESPONSE_BYTES)
+    } finally {
+      await requester.stop()
+      await responder.stop()
+    }
+  })
+
+  // Regression: the initial merge waited on the peer's pass with a fixed
+  // 30-minute timeout, so a large folder transfer stopped part way through.
+  test("waits for an operation with no response deadline to finish", async () => {
+    const requesterIdentity = testIdentity("requester-unbounded")
+    const responderIdentity = testIdentity("responder-unbounded")
+    const responder = new PeerSessionService({
+      pairing: fakePairing(responderIdentity, requesterIdentity, 0),
+      port: 0,
+      onRequest: async () => {
+        await delay(50)
+        return { completed: true }
+      },
+    })
+    await responder.start()
+    const requester = new PeerSessionService({
+      pairing: fakePairing(requesterIdentity, responderIdentity, responder.port),
+      port: 0,
+      onRequest: async () => undefined,
+    })
+    try {
+      await expect(requester.request(responderIdentity.id, { type: "long-operation" }, NO_PEER_RESPONSE_DEADLINE))
+        .resolves.toEqual({ completed: true })
     } finally {
       await requester.stop()
       await responder.stop()

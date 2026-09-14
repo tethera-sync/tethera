@@ -111,7 +111,7 @@ import {
   type PersistedInitialSyncOutcome,
 } from "./desktop-state-storage"
 import { PairingService } from "./pairing-service"
-import { CHUNKED_FRAMES_CAPABILITY, measurePeerRequest, PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
+import { CHUNKED_FRAMES_CAPABILITY, measurePeerRequest, NO_PEER_RESPONSE_DEADLINE, PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
 import { requestPeerCapabilities } from "./peer-capabilities"
 import { requestPeerPreview } from "./peer-preview"
 import { PEER_SCAN_PROGRESS_CAPABILITY, type PeerScanProgress } from "./peer-scan-progress"
@@ -3526,7 +3526,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
       const response = await requirePeerSessions().request<{ completed: boolean; error?: string }>(
         peer.id,
         { type: "initial-sync-coordinate", folderId, allowUnreadable: acknowledgeUnreadable },
-        30 * 60_000,
+        NO_PEER_RESPONSE_DEADLINE,
       )
       if (response.completed !== true) {
         throw new Error(response.error ?? "The coordinating computer did not complete the initial merge.")
@@ -3620,7 +3620,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
             type: "initial-sync-run",
             folderId,
             allowUnreadable,
-          }, 30 * 60_000),
+          }, NO_PEER_RESPONSE_DEADLINE),
         )
       },
       async (local, remote) => {

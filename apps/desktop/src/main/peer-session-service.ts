@@ -26,6 +26,12 @@ const PROTOCOL_VERSION = 4
 const CONNECT_TIMEOUT_MS = 10_000
 const REQUEST_TIMEOUT_MS = 45_000
 const RESPONSE_FLUSH_TIMEOUT_MS = 15_000
+// Keepalive probes detect a peer that vanished without closing its socket
+// (sleep, power loss, network drop), so an operation waiting without a
+// response deadline still fails instead of hanging.
+const SOCKET_KEEPALIVE_DELAY_MS = 60_000
+/** For an operation that runs as long as its work takes, such as transferring a large folder. */
+export const NO_PEER_RESPONSE_DEADLINE = Number.POSITIVE_INFINITY
 const CLOCK_SKEW_MS = 2 * 60_000
 const MAX_LINE_BYTES = 16 * 1024 * 1024
 const MAX_QUEUED_MESSAGES = 32
@@ -758,6 +764,7 @@ class JsonLineConnection {
 
   constructor(socket: Socket) {
     this.#socket = socket
+    socket.setKeepAlive(true, SOCKET_KEEPALIVE_DELAY_MS)
     socket.setEncoding("utf8")
     socket.on("data", (chunk: Buffer | string) => this.#onData(typeof chunk === "string" ? chunk : chunk.toString("utf8")))
     socket.on("error", (error) => {
@@ -884,12 +891,15 @@ class JsonLineConnection {
         cleanup()
         reject(new Error("The secure peer request was cancelled."))
       }
-      const timeout = setTimeout(() => {
-        const index = this.#waiters.indexOf(waiter)
-        if (index >= 0) this.#waiters.splice(index, 1)
-        cleanup()
-        reject(new Error("The secure peer request timed out."))
-      }, timeoutMs)
+      // setTimeout would clamp an unbounded wait to 1ms, so arm no timer at all.
+      const timeout = Number.isFinite(timeoutMs)
+        ? setTimeout(() => {
+            const index = this.#waiters.indexOf(waiter)
+            if (index >= 0) this.#waiters.splice(index, 1)
+            cleanup()
+            reject(new Error("The secure peer request timed out."))
+          }, timeoutMs)
+        : undefined
       signal?.addEventListener("abort", onAbort, { once: true })
       waiter.resolve = (message) => {
         cleanup()
