@@ -324,7 +324,17 @@ export class FolderChangeMonitor {
   async start(): Promise<boolean> {
     const rootStat = await stat(this.#rootPath)
     if (!rootStat.isDirectory()) throw new Error("The synchronized folder is no longer available.")
-    const degraded = await this.#refreshWatchers()
+    let degraded: boolean
+    try {
+      degraded = await this.#refreshWatchers()
+    } catch (error) {
+      // A tree above the depth or directory limit cannot be watched natively,
+      // but the periodic fallback scan still covers it. Failing the start
+      // would remove the monitor entirely and leave the folder with no scan.
+      if (!(error instanceof WatchDepthExceededError || error instanceof WatchDirectoryLimitExceededError)) throw error
+      this.#reportRefreshFailure(error)
+      degraded = true
+    }
     if (this.#stopped) return degraded
     this.#fallback = setInterval(() => this.#schedule(true), FALLBACK_SCAN_MS)
     return degraded
