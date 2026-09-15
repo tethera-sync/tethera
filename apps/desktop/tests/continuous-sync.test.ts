@@ -13,6 +13,7 @@ import {
   type FileSyncState,
   type QuietReconcile,
   conflictSummary,
+  describeFolderSyncState,
   findMirroredPeerOperation,
   FolderChangeMonitor,
   mirrorConflictChoice,
@@ -116,6 +117,39 @@ describe("continuous sync helpers", () => {
     expect(summary).toContain("edited on both computers")
     expect(summary).toContain("changed against the one-way direction")
     expect(summary).toContain("neither copy was changed")
+  })
+})
+
+describe("describeFolderSyncState", () => {
+  const empty = { conflicts: [], operations: [], recoveryIssues: [] }
+  const unbased: FileSyncConflict = { mappingId: "m", path: "notes.md", kind: "unbased-divergence", detectedAt: "now" }
+
+  test("treats unchecked initial-merge conflicts as a pending check instead of asking for attention", () => {
+    const summary = describeFolderSyncState({ paused: false, peerOnline: true, state: empty, unverifiedMergeConflicts: 1561 })
+    expect(summary.status).toBe("syncing")
+    expect(summary.currentAction).toBe(
+      "Waiting for the first full check of both computers. 1,561 files differed during the initial merge; any that now match will drop off the list.",
+    )
+    expect(describeFolderSyncState({ paused: false, peerOnline: false, state: empty, unverifiedMergeConflicts: 1561 }).status).toBe("offline")
+    expect(describeFolderSyncState({ paused: true, peerOnline: true, state: empty, unverifiedMergeConflicts: 1561 }).status).toBe("paused")
+  })
+
+  test("asks for attention once a scan records durable conflicts or recovery issues", () => {
+    const conflicted = describeFolderSyncState({ paused: false, peerOnline: true, state: { ...empty, conflicts: [unbased] }, unverifiedMergeConflicts: 0 })
+    expect(conflicted).toEqual({ status: "needs-attention", currentAction: conflictSummary([unbased]) })
+    const recovering = describeFolderSyncState({
+      paused: false,
+      peerOnline: true,
+      state: { ...empty, recoveryIssues: [{ id: "r", path: "notes.md", state: "recovery-required", lastError: "Journal needs repair." }] },
+      unverifiedMergeConflicts: 1561,
+    })
+    expect(recovering).toEqual({ status: "needs-attention", currentAction: "Journal needs repair." })
+  })
+
+  test("reports an idle folder as up to date, or offline without its peer", () => {
+    expect(describeFolderSyncState({ paused: false, peerOnline: true, state: empty, unverifiedMergeConflicts: 0 }))
+      .toEqual({ status: "up-to-date", currentAction: "Watching for changes." })
+    expect(describeFolderSyncState({ paused: false, peerOnline: false, state: empty, unverifiedMergeConflicts: 0 }).status).toBe("offline")
   })
 })
 

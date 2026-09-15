@@ -2,6 +2,9 @@
 
 All notable changes to this project, newest first.
 
+- 🎨 Show "Waiting for the first full check of both computers" instead of asking you to review initial-merge conflicts that the first scan has not checked yet.
+- 🎨 Show live scan progress on the computer being read while the other computer checks a folder for changes.
+- 🎨 Ask before pausing a folder whose check or transfer is still running, and explain when a running check blocks pausing.
 - 🐛 Scan and copy `.asar` files inside synchronized folders (for example packaged Electron apps) instead of reporting them as unreadable.
 - 🐛 Merge files that change while the initial merge runs automatically, and only stop, naming the files, if they keep changing.
 - 🐛 Show a repeated activity event once with a repeat count, so one recurring failure no longer pushes the rest of the history out of the activity log.

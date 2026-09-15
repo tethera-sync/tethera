@@ -315,7 +315,8 @@ export type FolderWorkActivity =
   | { kind: "preparing" }
   | {
       kind: "scanning"
-      purpose: "initial-merge" | "verify" | "changes"
+      /** `peer-changes`: the other computer is reading this folder for its sync check, so only local counts exist. */
+      purpose: "initial-merge" | "verify" | "changes" | "peer-changes"
       local?: FolderScanActivity
       remote?: FolderScanCounts
     }

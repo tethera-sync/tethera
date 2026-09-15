@@ -34,7 +34,9 @@ export function FolderWorkPanel({ work, currentAction, names }: { work: FolderWo
           {detail ? <p className="mt-0.5 text-[10.5px] leading-normal text-[var(--muted-foreground)] [overflow-wrap:anywhere]">{detail}</p> : null}
         </div>
       </div>
-      {activity.kind === "scanning" ? (
+      {activity.kind === "scanning" && activity.purpose === "peer-changes" ? (
+        <ScanSide name={names.thisComputer} counts={activity.local} currentPath={activity.local?.currentPath} />
+      ) : activity.kind === "scanning" ? (
         <div className="grid grid-cols-2 gap-2 max-[520px]:grid-cols-1">
           <ScanSide name={names.thisComputer} counts={activity.local} currentPath={activity.local?.currentPath} />
           <ScanSide name={names.otherComputer} counts={activity.remote} />
