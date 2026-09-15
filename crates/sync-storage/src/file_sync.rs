@@ -2021,8 +2021,11 @@ mod tests {
             .fail_file_operation(999, "peer offline", "2026-08-08T12:01:00Z")
             .expect_err("a missing operation cannot record a failure");
         assert!(
-            matches!(error, MappingStoreError::NotFound(_)),
-            "expected a structured not-found, got {error:?}"
+            matches!(
+                error,
+                MappingStoreError::NotFound(ref id) if id == "file operation 999"
+            ),
+            "expected the operation-specific structured not-found, got {error:?}"
         );
     }
 
