@@ -34,7 +34,7 @@ describe("folders view", () => {
     expect(render(appSnapshot({ devices: [peer], folders: [folder] }))).not.toContain("Live updates are limited")
   })
 
-  test("a sync problem takes precedence over the watch notice", () => {
+  test("shows a sync problem and the watch notice together when both are present", () => {
     const snapshot = appSnapshot({
       devices: [peer],
       folders: [{
@@ -45,6 +45,6 @@ describe("folders view", () => {
     })
     const html = render(snapshot)
     expect(html).toContain("Sync interrupted")
-    expect(html).not.toContain("Live updates are limited")
+    expect(html).toContain("Live updates are limited")
   })
 })
