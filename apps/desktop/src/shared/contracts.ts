@@ -77,6 +77,12 @@ export interface FolderSummary {
   currentAction?: string
   /** The last failed operation, kept until the next attempt starts or a sync succeeds. */
   problem?: FolderProblem
+  /**
+   * Set while the folder's live-change watcher cannot cover the whole tree.
+   * Independent of `problem`, which sync transitions replace: only the
+   * watcher clears this when coverage is restored. Never persisted.
+   */
+  watchDegraded?: { message: string }
   fileCount?: number
   lastSyncedAt?: string
   ignorePatterns: string[]
@@ -599,7 +605,6 @@ export interface TetheraApi {
   rejectFolderMapping(requestId: string): Promise<AppSnapshot>
   startInitialSync(folderId: string, acknowledgeUnreadable?: boolean): Promise<AppSnapshot>
   dismissInitialSyncIssues(folderId: string): Promise<AppSnapshot>
-  addFolder(input: AddFolderInput): Promise<AppSnapshot>
   setFolderPaused(folderId: string, paused: boolean): Promise<AppSnapshot>
   removeFolder(folderId: string): Promise<AppSnapshot>
   revealPath(path: string): Promise<void>

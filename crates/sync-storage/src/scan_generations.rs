@@ -141,7 +141,7 @@ impl MappingStore {
             }
         }
         validate_hash_mode(&request.hash_mode)?;
-        let now = now_rfc3339();
+        let now = now_rfc3339()?;
 
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -178,7 +178,7 @@ impl MappingStore {
         let patterns_json = serde_json::to_string(&request.ignore_patterns).map_err(|error| {
             MappingStoreError::Invalid(format!("ignore rules are not serialisable: {error}"))
         })?;
-        let expires_at = expiry_rfc3339(&now);
+        let expires_at = expiry_rfc3339(&now)?;
         transaction.execute(
             "INSERT INTO scan_generations (
                 generation_id, mapping_id, participant_device_id, mapping_revision,
@@ -262,7 +262,7 @@ impl MappingStore {
                 }
             }
         }
-        let now = now_rfc3339();
+        let now = now_rfc3339()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let meta: (String, i64, String, i64, i64) = transaction
@@ -381,7 +381,7 @@ impl MappingStore {
                 "seal count is outside the supported generation quota".to_owned(),
             ));
         }
-        let now = now_rfc3339();
+        let now = now_rfc3339()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let meta: (String, i64, String, i64) = transaction
@@ -432,7 +432,7 @@ impl MappingStore {
     ) -> Result<GenerationStatus, MappingStoreError> {
         self.ensure_import_completed()?;
         validate_generation_id(generation_id)?;
-        let now = now_rfc3339();
+        let now = now_rfc3339()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let state: Option<String> = transaction
@@ -633,18 +633,30 @@ fn require_current_revision(
     Ok(())
 }
 
-fn now_rfc3339() -> String {
-    time::OffsetDateTime::now_utc()
+fn format_rfc3339(timestamp: time::OffsetDateTime) -> Result<String, MappingStoreError> {
+    timestamp
         .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "2026-01-01T00:00:00Z".to_owned())
+        .map_err(|error| {
+            MappingStoreError::Invalid(format!("the system clock could not be formatted: {error}"))
+        })
 }
 
-fn expiry_rfc3339(now: &str) -> String {
+fn now_rfc3339() -> Result<String, MappingStoreError> {
+    format_rfc3339(time::OffsetDateTime::now_utc())
+}
+
+fn expiry_rfc3339(now: &str) -> Result<String, MappingStoreError> {
     let parsed = time::OffsetDateTime::parse(now, &time::format_description::well_known::Rfc3339)
-        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+        .map_err(|error| {
+        MappingStoreError::Invalid(format!("a generation timestamp is malformed: {error}"))
+    })?;
     (parsed + time::Duration::hours(GENERATION_TTL_HOURS))
         .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| now.to_owned())
+        .map_err(|error| {
+            MappingStoreError::Invalid(format!(
+                "a generation expiry could not be formatted: {error}"
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -973,6 +985,20 @@ mod tests {
             .expect("cleanup");
         assert!(removed >= 1);
         assert!(store.generation_status("gen-1").is_err());
+    }
+
+    #[test]
+    fn an_unformattable_timestamp_is_an_error_never_a_fallback() {
+        // RFC 3339 cannot represent negative years; constructing one here is
+        // the deterministic stand-in for a system clock the formatter rejects.
+        let unformattable = time::Date::from_calendar_date(-1, time::Month::January, 1)
+            .expect("time can hold negative years")
+            .midnight()
+            .assume_utc();
+        assert!(matches!(
+            format_rfc3339(unformattable),
+            Err(MappingStoreError::Invalid(_))
+        ));
     }
 }
 

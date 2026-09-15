@@ -129,7 +129,23 @@ export function FoldersView({ snapshot, onNavigate }: { snapshot: AppSnapshot; o
             description="Tethera is reading the authoritative mapping database. No legacy snapshot is being shown while it loads."
           />
         </section>
-      ) : snapshot.mappingStore.status !== "ready" ? null : snapshot.folders.length === 0 && pairedDevice ? (
+      ) : snapshot.mappingStore.status !== "ready" ? (
+        <section className="card [position:relative] [display:flex] [min-width:0] [flex-direction:column] [overflow:hidden] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--card-sheen)] [box-shadow:var(--elevation-card)]">
+          <CompactEmptyState
+            icon={CircleAlertIcon}
+            title="Folder mappings are unavailable"
+            description={
+              snapshot.mappingStore.detail ??
+              "Tethera could not open the authoritative mapping database."
+            }
+            action={
+              <Button size="sm" variant="outline" onClick={() => onNavigate("settings")}>
+                Open Settings
+              </Button>
+            }
+          />
+        </section>
+      ) : snapshot.folders.length === 0 && pairedDevice ? (
         <section className="large-empty-state [display:grid] [min-height:220px] [place-items:center] [align-content:center] [border:1px_solid_var(--border)] [border-radius:var(--radius-card)] [background:var(--surface)] [padding:32px] [text-align:center] [&_h2]:[margin:13px_0_5px] [&_h2]:[font-size:15px] [&_h2]:[font-weight:640] [&_p]:[max-width:52ch] [&_p]:[margin:0_0_16px] [&_p]:[color:var(--muted-foreground)] [&_p]:[font-size:11px] [&_p]:[line-height:1.55]">
           <div className="large-empty-icon [display:grid] [width:40px] [height:40px] [place-items:center] [border-radius:10px] [background:var(--secondary)] [color:var(--muted-foreground)] [&_svg]:[width:18px] [&_svg]:[height:18px]">
             <FolderIcon />
@@ -305,25 +321,37 @@ function FolderCard({
           currentAction={folder.currentAction}
           names={{ thisComputer: localDeviceName, otherComputer: remoteName }}
         />
-      ) : folder.problem ? (
-        <Alert variant="destructive" className="mx-[15px] mt-3 w-auto">
-          <CircleAlertIcon />
-          <AlertTitle>
-            {folder.problem.title}
-            <span className="font-normal text-[var(--muted-foreground)]"> · {formatRelative(folder.problem.occurredAt)}</span>
-          </AlertTitle>
-          <AlertDescription className="[overflow-wrap:anywhere]">{folder.problem.detail}</AlertDescription>
-        </Alert>
-      ) : folder.currentAction ? (
-        <div
-          className="folder-action-note [display:flex] [align-items:flex-start] [gap:8px] [margin:12px_15px_0] [border-radius:8px] [background:color-mix(in_oklab,_var(--primary)_9%,_var(--surface))] [padding:8px_10px] [color:var(--muted-foreground)] [font-size:10px] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[flex:0_0_auto] [&_svg]:[margin-top:1px] [&_svg]:[color:var(--primary)] [&>span]:[min-width:0] [&>span]:[overflow-wrap:anywhere] data-[attention=true]:[background:color-mix(in_oklab,_var(--warning)_10%,_var(--surface))] data-[attention=true]:[&_svg]:[color:var(--warning)]"
-          data-attention={needsAttention}
-          role={needsAttention ? "alert" : undefined}
-        >
-          {needsAttention ? <CircleAlertIcon /> : <InfoIcon />}
-          <span>{folder.currentAction}</span>
-        </div>
-      ) : null}
+      ) : (
+        <>
+          {folder.problem ? (
+            <Alert variant="destructive" className="mx-[15px] mt-3 w-auto">
+              <CircleAlertIcon />
+              <AlertTitle>
+                {folder.problem.title}
+                <span className="font-normal text-[var(--muted-foreground)]"> · {formatRelative(folder.problem.occurredAt)}</span>
+              </AlertTitle>
+              <AlertDescription className="[overflow-wrap:anywhere]">{folder.problem.detail}</AlertDescription>
+            </Alert>
+          ) : null}
+          {folder.watchDegraded ? (
+            <Alert className="mx-[15px] mt-3 w-auto">
+              <InfoIcon />
+              <AlertTitle>Live updates are limited</AlertTitle>
+              <AlertDescription className="[overflow-wrap:anywhere]">{folder.watchDegraded.message}</AlertDescription>
+            </Alert>
+          ) : null}
+          {!folder.problem && !folder.watchDegraded && folder.currentAction ? (
+            <div
+              className="folder-action-note [display:flex] [align-items:flex-start] [gap:8px] [margin:12px_15px_0] [border-radius:8px] [background:color-mix(in_oklab,_var(--primary)_9%,_var(--surface))] [padding:8px_10px] [color:var(--muted-foreground)] [font-size:10px] [&_svg]:[width:14px] [&_svg]:[height:14px] [&_svg]:[flex:0_0_auto] [&_svg]:[margin-top:1px] [&_svg]:[color:var(--primary)] [&>span]:[min-width:0] [&>span]:[overflow-wrap:anywhere] data-[attention=true]:[background:color-mix(in_oklab,_var(--warning)_10%,_var(--surface))] data-[attention=true]:[&_svg]:[color:var(--warning)]"
+              data-attention={needsAttention}
+              role={needsAttention ? "alert" : undefined}
+            >
+              {needsAttention ? <CircleAlertIcon /> : <InfoIcon />}
+              <span>{folder.currentAction}</span>
+            </div>
+          ) : null}
+        </>
+      )}
 
       {actionError ? (
         <div className="folder-action-error [margin:12px_15px_0] [border-radius:8px] [background:color-mix(in_oklab,_var(--danger)_10%,_var(--surface))] [padding:8px_10px] [color:var(--danger)] [font-size:10px]" role="alert">

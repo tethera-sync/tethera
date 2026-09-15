@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type ChangeEvent } from "react"
+import { useId, useMemo, useRef, useState, type ChangeEvent } from "react"
 import { DirectoryMappingNotice } from "./directory-mapping-notice"
 import {
   ArrowLeftIcon,
@@ -99,6 +99,13 @@ export function AddFolderDialog({
   // comparison resets it without extra effects.
   const [acknowledgedPreview, setAcknowledgedPreview] = useState<FolderMappingPreview | null>(null)
   const [cancelRequested, setCancelRequested] = useState(false)
+  const nameFieldId = useId()
+  const deviceFieldId = useId()
+  const modeFieldId = useId()
+  const historyDaysFieldId = useId()
+  const historyCapFieldId = useId()
+  const localPathFieldId = useId()
+  const remotePathFieldId = useId()
 
   const ignorePatterns = useMemo(
     () => patterns.split("\n").map((pattern) => pattern.trim()).filter(Boolean),
@@ -258,14 +265,15 @@ export function AddFolderDialog({
           {step === "paths" ? (
             <div className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px]">
               <Field>
-                <FieldLabel>Display name</FieldLabel>
-                <Input value={name} onChange={(event: ChangeEvent<HTMLInputElement>) => setName(event.target.value)} placeholder="Projects" />
+                <FieldLabel htmlFor={nameFieldId}>Display name</FieldLabel>
+                <Input id={nameFieldId} value={name} onChange={(event: ChangeEvent<HTMLInputElement>) => setName(event.target.value)} placeholder="Projects" />
                 <FieldDescription>Optional; defaults to the source folder name.</FieldDescription>
               </Field>
               {pairedDevices.length > 1 ? (
                 <Field>
-                  <FieldLabel>Computer to sync with</FieldLabel>
+                  <FieldLabel htmlFor={deviceFieldId}>Computer to sync with</FieldLabel>
                   <NativeSelect
+                    id={deviceFieldId}
                     className="w-full"
                     value={targetDevice?.id ?? ""}
                     disabled={compare !== null}
@@ -284,12 +292,12 @@ export function AddFolderDialog({
               ) : null}
               <div className="mapping-path-fields [display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [gap:14px] max-[760px]:[grid-template-columns:minmax(0,_1fr)]">
                 <Field>
-                  <FieldLabel>{`Folder on ${localDevice.name}`}</FieldLabel>
-                  <PathChooser value={localPath} placeholder="Choose a source folder" onBrowse={() => setPickerTarget("local")} />
+                  <FieldLabel htmlFor={localPathFieldId}>{`Folder on ${localDevice.name}`}</FieldLabel>
+                  <PathChooser id={localPathFieldId} value={localPath} placeholder="Choose a source folder" onBrowse={() => setPickerTarget("local")} />
                 </Field>
                 {targetDevice ? <Field>
-                  <FieldLabel>{`Folder on ${targetDevice.name}`}</FieldLabel>
-                  <PathChooser value={remotePath} placeholder="Choose a destination folder" onBrowse={() => setPickerTarget("remote")} />
+                  <FieldLabel htmlFor={remotePathFieldId}>{`Folder on ${targetDevice.name}`}</FieldLabel>
+                  <PathChooser id={remotePathFieldId} value={remotePath} placeholder="Choose a destination folder" onBrowse={() => setPickerTarget("remote")} />
                   <FieldDescription>Remote browsing is encrypted and returns folder names only.</FieldDescription>
                 </Field> : null}
               </div>
@@ -299,8 +307,8 @@ export function AddFolderDialog({
           {step === "rules" ? (
             <fieldset disabled={compare !== null} className="mapping-step-panel [display:grid] [gap:18px] [margin-top:20px] [border:0] [padding:0] [min-width:0]">
               <Field>
-                <FieldLabel>Sync direction</FieldLabel>
-                <NativeSelect className="w-full" value={mode} onChange={(event: ChangeEvent<HTMLSelectElement>) => { setMode(event.target.value as SyncMode); invalidatePreview() }}>
+                <FieldLabel htmlFor={modeFieldId}>Sync direction</FieldLabel>
+                <NativeSelect id={modeFieldId} className="w-full" value={mode} onChange={(event: ChangeEvent<HTMLSelectElement>) => { setMode(event.target.value as SyncMode); invalidatePreview() }}>
                   <NativeSelectOption value="two-way">Two-way sync</NativeSelectOption>
                   <NativeSelectOption value="send-only">Send from this computer only</NativeSelectOption>
                   <NativeSelectOption value="receive-only">Receive to this computer only</NativeSelectOption>
@@ -308,13 +316,13 @@ export function AddFolderDialog({
               </Field>
               <div className="mapping-settings-grid [display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [gap:14px] max-[760px]:[grid-template-columns:1fr]">
                 <Field>
-                  <FieldLabel>Keep versions for</FieldLabel>
-                  <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><Input className="min-w-0 flex-1 border-0 bg-transparent px-2.5 py-[9px] outline-none" type="number" min={1} max={3650} value={historyDays} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryDays(Number(event.target.value))} /><span>days</span></div>
+                  <FieldLabel htmlFor={historyDaysFieldId}>Keep versions for</FieldLabel>
+                  <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><Input id={historyDaysFieldId} className="min-w-0 flex-1 border-0 bg-transparent px-2.5 py-[9px] outline-none" type="number" min={1} max={3650} value={historyDays} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryDays(Number(event.target.value))} /><span>days</span></div>
                   <FieldDescription>Older replaced versions are removed.</FieldDescription>
                 </Field>
                 <Field>
-                  <FieldLabel>History storage cap</FieldLabel>
-                  <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><Input className="min-w-0 flex-1 border-0 bg-transparent px-2.5 py-[9px] outline-none" type="number" min={1} max={4096} value={historyMaxGb} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryMaxGb(Number(event.target.value))} /><span>GB</span></div>
+                  <FieldLabel htmlFor={historyCapFieldId}>History storage cap</FieldLabel>
+                  <div className="number-field [display:flex] [align-items:center] [overflow:hidden] [border:1px_solid_var(--input)] [border-radius:9px] [background:var(--surface-sunken)] [&:focus-within]:[border-color:var(--ring)] [&:focus-within]:[box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--ring)_16%,_transparent)] [&_span]:[align-self:stretch] [&_span]:[display:grid] [&_span]:[place-items:center] [&_span]:[border-left:1px_solid_var(--border)] [&_span]:[padding:0_12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:11px]"><Input id={historyCapFieldId} className="min-w-0 flex-1 border-0 bg-transparent px-2.5 py-[9px] outline-none" type="number" min={1} max={4096} value={historyMaxGb} onChange={(event: ChangeEvent<HTMLInputElement>) => setHistoryMaxGb(Number(event.target.value))} /><span>GB</span></div>
                   <FieldDescription>Per folder, on each computer.</FieldDescription>
                 </Field>
               </div>
@@ -374,7 +382,7 @@ export function AddFolderDialog({
           {targetDevice && targetDevice.status !== "online" ? <Alert variant="destructive" className="mt-[14px]"><AlertDescription>{targetDevice.name} is offline. Choose an online computer to browse and approve this mapping.</AlertDescription></Alert> : null}
 
           <DialogFooter>
-            {compare && (compare.phase === "scan-local" || compare.phase === "scan-remote") ? <Button variant="outline" disabled={cancelRequested} onClick={() => void cancelComparison()}>{cancelRequested ? "Cancelling…" : "Cancel comparison"}</Button> : null}
+            {compare && compare.phase !== "compare" ? <Button variant="outline" disabled={cancelRequested} onClick={() => void cancelComparison()}>{cancelRequested ? "Cancelling…" : "Cancel comparison"}</Button> : null}
             <Button variant="outline" disabled={compare !== null} onClick={() => {
               if (step === "paths") setOpen(false)
               else setStep(step === "preview" ? "rules" : "paths")
@@ -505,10 +513,10 @@ function PreviewMetric({ label, value, detail }: { label: string; value: number;
   return <div className="preview-metric [display:grid] [gap:3px] [min-width:0] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_strong]:[font-size:22px] [&_strong]:[line-height:1.1] [&_strong]:[font-variant-numeric:tabular-nums] [&_small]:[overflow:hidden] [&_small]:[text-overflow:ellipsis] [&_small]:[color:var(--muted-foreground)] [&_small]:[font-size:9.5px]"><span>{label}</span><strong>{value.toLocaleString("en-GB")}</strong><small>{detail}</small></div>
 }
 
-function PathChooser({ value, placeholder, onBrowse }: { value: string; placeholder: string; onBrowse: () => void }) {
+function PathChooser({ id, value, placeholder, onBrowse }: { id: string; value: string; placeholder: string; onBrowse: () => void }) {
   return (
     <div className="flex gap-2">
-      <Input className="min-w-0 flex-1" value={value} readOnly placeholder={placeholder} title={value} />
+      <Input id={id} className="min-w-0 flex-1" value={value} readOnly placeholder={placeholder} title={value} />
       <Button variant="outline" onClick={onBrowse}><FolderOpenIcon data-icon="inline-start" />Browse</Button>
     </div>
   )

@@ -132,7 +132,7 @@ export function SettingsView({ snapshot }: { snapshot: AppSnapshot }) {
           ) : (
             <Button size="sm" variant="outline" disabled={mappingRetrying || mappingStore.status === "loading"} onClick={() => void retryMappingStore()}>
               <RefreshCwIcon className={mappingRetrying || mappingStore.status === "loading" ? "animate-spin" : undefined} data-icon="inline-start" />
-              {mappingRetrying || mappingStore.status === "loading" ? "Retrying…" : "Retry"}
+              {mappingRetrying ? "Retrying…" : mappingStore.status === "loading" ? "Loading…" : "Retry"}
             </Button>
           )}
         </SettingRow>

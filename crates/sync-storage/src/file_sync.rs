@@ -798,11 +798,15 @@ impl MappingStore {
                 "operation failure detail must not be empty".to_owned(),
             ));
         }
-        let mapping_id: String = self.connection.query_row(
-            "SELECT mapping_id FROM file_sync_operations WHERE id = ?1",
-            params![operation_id],
-            |row| row.get(0),
-        )?;
+        let mapping_id: String = self
+            .connection
+            .query_row(
+                "SELECT mapping_id FROM file_sync_operations WHERE id = ?1",
+                params![operation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| MappingStoreError::NotFound(format!("file operation {operation_id}")))?;
         self.connection.execute(
             "UPDATE file_sync_operations
              SET status = 'failed', attempts = attempts + 1, last_error = ?2, updated_at = ?3
@@ -2008,6 +2012,21 @@ mod tests {
         assert_eq!(repeated.operations[0].attempts, 1);
         assert_eq!(repeated.operations[0].status, "failed");
         assert_eq!(repeated.conflicts[0].detected_at, NOW);
+    }
+
+    #[test]
+    fn failing_a_missing_operation_is_a_structured_not_found() {
+        let store = active_store();
+        let error = store
+            .fail_file_operation(999, "peer offline", "2026-08-08T12:01:00Z")
+            .expect_err("a missing operation cannot record a failure");
+        assert!(
+            matches!(
+                error,
+                MappingStoreError::NotFound(ref id) if id == "file operation 999"
+            ),
+            "expected the operation-specific structured not-found, got {error:?}"
+        );
     }
 
     #[test]

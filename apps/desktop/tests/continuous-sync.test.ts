@@ -138,6 +138,26 @@ test("FolderChangeMonitor reports nested filesystem changes", async () => {
   }
 })
 
+test("FolderChangeMonitor keeps fallback coverage when the tree exceeds the watch depth at start", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "tethera-watch-start-depth-"))
+  const reports: WatchHealthReport[] = []
+  const monitor = new FolderChangeMonitor(root, [], () => {}, (report) => {
+    reports.push(report)
+  })
+  try {
+    const segments = Array.from({ length: 140 }, (_, index) => `d${index}`)
+    await mkdir(path.join(root, ...segments), { recursive: true })
+
+    // A start that cannot watch the tree still resolves so the periodic
+    // fallback scan stays installed, and reports the degraded coverage.
+    await expect(monitor.start()).resolves.toBe(true)
+    expect(reports.some((report) => report.status === "degraded" && report.reason.kind === "watch-depth-exceeded")).toBe(true)
+  } finally {
+    monitor.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("FolderChangeMonitor reports a watch-depth degradation instead of silently losing coverage", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "tethera-watch-depth-"))
   const reports: WatchHealthReport[] = []

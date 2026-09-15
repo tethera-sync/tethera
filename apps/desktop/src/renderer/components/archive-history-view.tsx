@@ -84,11 +84,17 @@ export function ArchiveHistoryView({ snapshot }: { snapshot: AppSnapshot }) {
   useEffect(() => {
     setSelectedEntryId(undefined)
     setRequest({ status: "loading" })
+    // An in-flight refresh for the previous folder is superseded here; without
+    // clearing the flag its spinner would never stop if no new refresh starts.
+    setRefreshing(false)
   }, [selectedFolderId])
 
   const refresh = useCallback(async (options?: { replace?: boolean }) => {
     const folderId = selectedFolderId
-    if (!folderId) return
+    if (!folderId) {
+      setRefreshing(false)
+      return
+    }
     const generation = refreshGeneration.current + 1
     refreshGeneration.current = generation
     const isCurrent = (): boolean => generation === refreshGeneration.current

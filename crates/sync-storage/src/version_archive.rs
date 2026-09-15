@@ -8,7 +8,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::file_sync::{
-    upsert_baseline, validate_digest, validate_path, validate_size, validate_timestamp,
+    require_active_mapping, upsert_baseline, validate_digest, validate_path, validate_size,
+    validate_timestamp,
 };
 use crate::mapping::{
     MAX_HISTORY_DAYS, MappingStore, MappingStoreError, check_identifier, check_path,
@@ -1246,24 +1247,6 @@ fn parse_timestamp(field: &str, value: &str) -> Result<OffsetDateTime, MappingSt
     OffsetDateTime::parse(value, &Rfc3339).map_err(|error| {
         MappingStoreError::Invalid(format!("{field} must be an RFC 3339 timestamp: {error}"))
     })
-}
-
-fn require_active_mapping(
-    transaction: &Transaction<'_>,
-    mapping_id: &str,
-) -> Result<(), MappingStoreError> {
-    let active: bool = transaction.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM folder_mappings WHERE id = ?1 AND setup_status = 'active'
-        )",
-        params![mapping_id],
-        |row| row.get(0),
-    )?;
-    if active {
-        Ok(())
-    } else {
-        Err(MappingStoreError::NotFound(mapping_id.to_owned()))
-    }
 }
 
 fn validate_object_key(digest: &str, object_key: &str) -> Result<(), MappingStoreError> {
