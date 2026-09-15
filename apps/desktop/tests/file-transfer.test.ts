@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
   describeTransferFile,
+  isSourceFileUnavailable,
   readTransferFileChunk,
   TRANSFER_CHUNK_BYTES,
 } from "../src/main/file-transfer"
@@ -51,6 +52,42 @@ describe("bounded transfer file reads", () => {
       await writeFile(path.join(outside, "secret.txt"), "secret")
       await symlink(path.join(outside, "secret.txt"), path.join(root, "escape.txt"))
       await expect(describeTransferFile(root, "escape.txt")).rejects.toThrow("regular file")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  test("classifies a removed, retyped or modified source as a per-file change", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-transfer-test-"))
+    try {
+      await mkdir(path.join(root, "now-a-folder"))
+      await writeFile(path.join(root, "changing.txt"), "before")
+      const descriptor = await describeTransferFile(root, "changing.txt")
+      await writeFile(path.join(root, "changing.txt"), "after and larger")
+
+      const failures = await Promise.all([
+        describeTransferFile(root, "removed.txt").catch((error: unknown) => error),
+        describeTransferFile(root, "now-a-folder").catch((error: unknown) => error),
+        describeTransferFile(root, "changing.txt/beneath-a-file").catch((error: unknown) => error),
+        readTransferFileChunk(root, "changing.txt", descriptor, 0, descriptor.size).catch((error: unknown) => error),
+      ])
+      for (const failure of failures) expect(isSourceFileUnavailable(failure)).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("never reports a folder link escaping the approved folder as a changed file", async () => {
+    if (process.platform === "win32") return
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-transfer-test-"))
+    const outside = await mkdtemp(path.join(tmpdir(), "tethera-transfer-outside-"))
+    try {
+      await writeFile(path.join(outside, "secret.txt"), "secret")
+      await symlink(outside, path.join(root, "linked"))
+      const failure = await describeTransferFile(root, "linked/secret.txt").catch((error: unknown) => error)
+      expect(failure).toBeInstanceOf(Error)
+      expect(isSourceFileUnavailable(failure)).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
       await rm(outside, { recursive: true, force: true })

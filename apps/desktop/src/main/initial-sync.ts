@@ -6,7 +6,8 @@ import type { FolderScanIssue, SyncMode } from "../shared/contracts"
 import type { FileManifest, FileManifestEntry } from "./folder-manifest"
 import { createDestinationOccupancyCheck, createScanIssueBlocklist, findCaseCollisions, manifestEntriesMatch } from "./folder-manifest"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
-import { describeTransferFile, isSha256HexDigest } from "./file-transfer"
+import { describeTransferFile, FileChangedError, isSha256HexDigest } from "./file-transfer"
+import { formatBytes } from "../shared/byte-format"
 import { invertMode } from "./mapping-index"
 import {
   archiveDisplacedFile,
@@ -17,6 +18,9 @@ import {
 import { syncDirectory } from "./fs-durability"
 
 const MIN_FREE_SPACE_AFTER_TRANSFER = 64 * 1024 * 1024
+/** Kept spare once a whole merge has landed, so the operating system and other apps keep working. */
+const INITIAL_MERGE_FREE_SPACE_RESERVE = 1024 ** 3
+export const INITIAL_MERGE_FREE_SPACE_CAPABILITY = "initial-merge-free-space-v1"
 const INITIAL_CONFLICT_REASON = "Exists on both computers with different content; both copies were preserved for review in Recovery."
 
 class DestinationExistsError extends Error {
@@ -30,6 +34,7 @@ type InitialSyncFileResult =
   | { status: "identical" }
   | { status: "conflict"; skip: SyncSkip }
   | { status: "occupied" }
+  | { status: "source-changed" }
 
 /** Recheck planned additions, including files created while the transfer was in flight. */
 export async function mergeInitialSyncFile(
@@ -61,6 +66,10 @@ export async function mergeInitialSyncFile(
     const { bytes } = await transfer()
     return { status: "copied", bytes }
   } catch (error) {
+    // The source was removed or edited after the scan. Leaving this file out
+    // lets the rest of the merge finish; final verification still requires
+    // any newer copy before activation.
+    if (error instanceof FileChangedError) return { status: "source-changed" }
     if (!(error instanceof DestinationExistsError)) throw error
     const appeared = await inspectDestination()
     if (appeared) return appeared
@@ -192,6 +201,29 @@ export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode:
   return { toPull, skipped, occupied }
 }
 
+export function plannedBytes(entries: readonly FileManifestEntry[]): number {
+  return entries.reduce((total, entry) => total + entry.size, 0)
+}
+
+export async function availableDiskBytes(directory: string): Promise<number> {
+  const filesystem = await statfs(directory)
+  return filesystem.bavail * filesystem.bsize
+}
+
+/**
+ * Stops a merge before its first copy when a computer cannot hold everything
+ * planned for it. The per-file check during transfer protects only one file,
+ * so on its own a large merge fills the disk and fails partway through.
+ */
+export function assertInitialMergeCapacity(computer: string, requiredBytes: number, availableBytes: number): void {
+  if (availableBytes - requiredBytes >= INITIAL_MERGE_FREE_SPACE_RESERVE) return
+  throw new Error(
+    `${computer} needs ${formatBytes(requiredBytes + INITIAL_MERGE_FREE_SPACE_RESERVE)} of free space for this merge ` +
+    `(including ${formatBytes(INITIAL_MERGE_FREE_SPACE_RESERVE)} kept spare) but has ${formatBytes(availableBytes)}. ` +
+    "Free up space or add ignore rules for large build or cache folders, then retry.",
+  )
+}
+
 export interface ConvergenceOptions {
   /** Inaccessible paths on this computer, already accepted by the user. */
   localBlocked?: readonly FolderScanIssue[]
@@ -254,9 +286,7 @@ export async function writeFileChunksAtomic(
   const destination = resolveWithinRoot(rootPath, relativePath)
   const directory = path.dirname(destination)
   await ensureContainedDestinationDirectory(rootPath, directory)
-  const filesystem = await statfs(directory)
-  const availableBytes = filesystem.bavail * filesystem.bsize
-  if (availableBytes - expectedSize < MIN_FREE_SPACE_AFTER_TRANSFER) {
+  if (await availableDiskBytes(directory) - expectedSize < MIN_FREE_SPACE_AFTER_TRANSFER) {
     throw new Error("This computer does not have enough free space to stage the synchronized file safely.")
   }
   const tempPath = replacement
@@ -357,6 +387,14 @@ export async function writeFileChunksAtomic(
     await assertCanonicalPathInside(rootPath, destination)
     committed = true
     if (!replacement) await syncDirectory(directory)
+  } catch (error) {
+    // Another program can use the space checked above before the copy
+    // finishes; say so instead of surfacing a bare system error code.
+    const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined
+    if (code === "ENOSPC" || code === "EDQUOT") {
+      throw new Error("This computer ran out of free space while saving a synchronized file. Free up space, then retry.", { cause: error })
+    }
+    throw error
   } finally {
     try {
       await handle.close()

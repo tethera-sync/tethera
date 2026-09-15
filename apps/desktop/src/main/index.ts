@@ -71,9 +71,13 @@ import { formatScanIssuePath, scanIssueReportCovers, scanIssueTotal } from "../s
 import { SCAN_GENERATION_CAPABILITY, SCAN_PAGE_MAX_ENTRIES } from "./scan-generation"
 import {
   assessInitialMergeConvergence,
+  assertInitialMergeCapacity,
   assertInitialMergePathCompatibility,
+  availableDiskBytes,
   computeSyncPlan,
+  INITIAL_MERGE_FREE_SPACE_CAPABILITY,
   mergeInitialSyncFile,
+  plannedBytes,
   type InitialSyncPassResult,
   runCoordinatedInitialMerge,
   type SyncSkip,
@@ -81,6 +85,8 @@ import {
 } from "./initial-sync"
 import {
   describeTransferFile,
+  FileChangedError,
+  isSourceFileUnavailable,
   readTransferFileChunk,
   TRANSFER_CHUNK_BYTES,
   type TransferFileDescriptor,
@@ -123,12 +129,14 @@ import { DIRECTORY_MAPPING_CAPABILITY, directoryMappingsSchema } from "../shared
 import {
   applySettingUpdate,
   isBoundedSkipArray,
+  isSourceUnavailableResponse,
   MAX_PERSISTED_SKIP_REASON_LENGTH,
   normalizePersistedScanLimit,
   parseArchiveHistoryRequest,
   parseBrowseDirectoryInput,
   parseCreateDirectoryInput,
   parseExactConflictChoice,
+  parseFreeSpaceResponse,
   parsePeerConflictCopy,
   parsePeerFileOperations,
   parsePeerScanManifest,
@@ -144,6 +152,7 @@ import {
   validatePeerOperationId,
   validateTransferDescriptor,
   type PeerConflictCopy,
+  type SourceUnavailableResponse,
 } from "./ipc-validation"
 import {
   canSkipUnchangedCycle,
@@ -2938,13 +2947,18 @@ async function pullPlannedFile(
   expectedDestinationDigest?: string,
   syncOperationId?: number,
 ): Promise<PlannedFileResult> {
-  const descriptor = await requirePeerSessions().request<TransferFileDescriptor>(peer.id, {
+  const described = await requirePeerSessions().request<TransferFileDescriptor | SourceUnavailableResponse>(peer.id, {
     type: "pull-file-descriptor",
     folderId: folder.id,
     relativePath: entry.path,
+    reportUnavailable: true,
     // The source hashes the whole file first, which scales with its size.
   }, NO_PEER_RESPONSE_DEADLINE)
-  validateTransferDescriptor(entry, descriptor)
+  if (isSourceUnavailableResponse(described)) {
+    throw new FileChangedError(`${entry.path} changed or was removed on ${peer.name} after the folders were compared.`)
+  }
+  validateTransferDescriptor(entry, described)
+  const descriptor: TransferFileDescriptor = described
 
   let journal: ReplacementJournalEntry | undefined
   let expectedDestinationSize: number | undefined
@@ -2980,7 +2994,7 @@ async function pullPlannedFile(
     let offset = 0
     while (offset < descriptor.size) {
       const length = Math.min(TRANSFER_CHUNK_BYTES, descriptor.size - offset)
-      const response = await requirePeerSessions().request<TransferChunkResponse>(peer.id, {
+      const response = await requirePeerSessions().request<TransferChunkResponse | SourceUnavailableResponse>(peer.id, {
         type: "pull-file-chunk",
         folderId: folder.id,
         relativePath: entry.path,
@@ -2988,7 +3002,11 @@ async function pullPlannedFile(
         expectedModifiedMs: descriptor.modifiedMs,
         offset,
         length,
+        reportUnavailable: true,
       })
+      if (isSourceUnavailableResponse(response)) {
+        throw new FileChangedError(`${entry.path} changed or was removed on ${peer.name} while it was being copied.`)
+      }
       if (response.offset !== offset || typeof response.contentBase64 !== "string") {
         throw new Error(`The peer returned an invalid chunk for ${entry.path}.`)
       }
@@ -3449,7 +3467,12 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
 
   assertInitialMergePathCompatibility(localManifest, remoteManifest, platform() === "windows" || peer.platform === "windows")
   const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode, { destinationBlocked: localBlocked })
-  const totalBytes = plan.toPull.reduce((total, entry) => total + entry.size, 0)
+  const totalBytes = plannedBytes(plan.toPull)
+  assertInitialMergeCapacity("This computer", totalBytes, await availableDiskBytes(folder.localPath))
+  // The coordinator's first pass is the last point before either computer
+  // copies anything, so it also confirms the other computer can hold the
+  // inverse pass. That pass repeats its own check against a fresh plan.
+  if (options.initialMerge.step === 1) await assertPeerCapacityForInverseMerge(folder, peer, localManifest, remoteManifest)
   const totalFiles = plan.toPull.length
   let copiedFiles = 0
   let copiedBytes = 0
@@ -3539,6 +3562,24 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
     skipped: plan.skipped,
     unreadableSkipped: scanIssueSkips(issues, "This computer", peer.name),
   }
+}
+
+async function assertPeerCapacityForInverseMerge(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  localManifest: FileManifest,
+  remoteManifest: FileManifest,
+): Promise<void> {
+  // An older peer falls back to its per-file free-space check while copying.
+  if (!(await cachedPeerCapabilities(peer.id)).has(INITIAL_MERGE_FREE_SPACE_CAPABILITY)) return
+  const inverse = computeSyncPlan(remoteManifest, localManifest, invertMode(folder.mode), {
+    destinationBlocked: remoteManifest.unreadableEntries,
+  })
+  if (inverse.toPull.length === 0) return
+  const availableBytes = parseFreeSpaceResponse(
+    await requirePeerSessions().request<unknown>(peer.id, { type: "initial-sync-free-space", folderId: folder.id }),
+  )
+  assertInitialMergeCapacity(peer.name, plannedBytes(inverse.toPull), availableBytes)
 }
 
 async function verifyInitialMergeQuiescent(
@@ -3704,8 +3745,10 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "The coordinating computer could not start the merge."
+      // This computer's own inverse pass may already have reported this exact failure.
+      const alreadyReported = snapshot.folders.find((item) => item.id === folderId)?.problem?.detail === message
       updateFolder(folderId, { status: "needs-attention", work: undefined, currentAction: "Initial merge failed.", problem: folderProblem("Initial merge failed", message) })
-      pushActivity("Initial merge failed", `${knownFolder.name}: ${message}`, "error", folderId)
+      if (!alreadyReported) pushActivity("Initial merge failed", `${knownFolder.name}: ${message}`, "error", folderId)
       await persistState()
       broadcastSnapshot()
     } finally {
@@ -3993,6 +4036,25 @@ function requireContinuousSyncNotification(context: PeerRequestContext, folderId
   }
 }
 
+/**
+ * A requester that sends `reportUnavailable` learns that one file vanished or
+ * changed here since the scan, instead of an error that stops its whole merge.
+ * A missing folder root is not a per-file condition and still fails.
+ */
+async function readSharedSource<T>(
+  folder: FolderSummary,
+  reportUnavailable: boolean,
+  read: () => Promise<T>,
+): Promise<T | SourceUnavailableResponse> {
+  try {
+    return await read()
+  } catch (error) {
+    if (!reportUnavailable || !isSourceFileUnavailable(error)) throw error
+    if (!(await stat(folder.localPath)).isDirectory()) throw error
+    return { unavailable: true }
+  }
+}
+
 async function withPeerFileOperation<T>(context: PeerRequestContext, folderId: string, operation: () => Promise<T>): Promise<T> {
   const key = `${context.peerId}:${folderId}`
   if (peerFileOperationsInFlight.has(key)) {
@@ -4100,7 +4162,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     })
   }
   if (request.type === "scan-capabilities") {
-    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY, CONTINUOUS_FINGERPRINT_CAPABILITY, DIRECTORY_MAPPING_CAPABILITY] }
+    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY, CONTINUOUS_FINGERPRINT_CAPABILITY, DIRECTORY_MAPPING_CAPABILITY, INITIAL_MERGE_FREE_SPACE_CAPABILITY] }
   }
   if (request.type === "scan-generation-read-page") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -4448,6 +4510,11 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     initialSyncPeerLeases.set(folderId, { peerId: context.peerId, expiresAt: Date.now() + INITIAL_SYNC_LEASE_MS })
     return { renewed: true }
   }
+  if (request.type === "initial-sync-free-space") {
+    const folder = requireSharedInitialSyncFolder(context, typeof request.folderId === "string" ? request.folderId : "")
+    if (!hasInitialSyncPeerLease(folder.id, context.peerId)) throw new Error("The initial-merge lease is no longer active.")
+    return { availableBytes: await availableDiskBytes(folder.localPath) }
+  }
   if (request.type === "initial-sync-release") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const folder = requireSharedFolder(context, folderId)
@@ -4478,7 +4545,8 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const completedRecord = mappingRecords.get(folderId)
     if (completedRecord?.mapping.setupStatus !== "active" || completedRecord.pendingDelivery) {
       const current = snapshot.folders.find((item) => item.id === folderId)
-      return { completed: false, error: current?.currentAction ?? "The coordinating computer did not complete activation." }
+      // A failed merge keeps its reason in the problem; the action line only says that it failed.
+      return { completed: false, error: current?.problem?.detail ?? current?.currentAction ?? "The coordinating computer did not complete activation." }
     }
     return { completed: true }
   }
@@ -4507,7 +4575,11 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const relativePath = typeof request.relativePath === "string" ? request.relativePath : ""
     const folder = requireSharedFileSource(context, folderId, relativePath)
-    return withPeerFileOperation(context, folderId, () => describeTransferFile(folder.localPath, localFilePath(folder.id, relativePath)))
+    return withPeerFileOperation(context, folderId, () => readSharedSource(
+      folder,
+      request.reportUnavailable === true,
+      () => describeTransferFile(folder.localPath, localFilePath(folder.id, relativePath)),
+    ))
   }
   if (request.type === "pull-file-chunk") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -4517,13 +4589,18 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const expectedModifiedMs = typeof request.expectedModifiedMs === "number" ? request.expectedModifiedMs : Number.NaN
     const offset = typeof request.offset === "number" ? request.offset : Number.NaN
     const length = typeof request.length === "number" ? request.length : Number.NaN
-    const content = await withPeerFileOperation(context, folderId, () => readTransferFileChunk(
+    const content = await withPeerFileOperation(context, folderId, () => readSharedSource(
+      folder,
+      request.reportUnavailable === true,
+      () => readTransferFileChunk(
         folder.localPath,
         localFilePath(folder.id, relativePath),
         { size: expectedSize, modifiedMs: expectedModifiedMs },
         offset,
         length,
-      ))
+      ),
+    ))
+    if (isSourceUnavailableResponse(content)) return content
     return { offset, contentBase64: content.toString("base64") } satisfies TransferChunkResponse
   }
   if (request.type === "mapping-decision") {

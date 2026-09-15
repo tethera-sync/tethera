@@ -13,6 +13,20 @@ export function isSha256HexDigest(value: unknown): value is string {
   return typeof value === "string" && SHA256_HEX_PATTERN.test(value)
 }
 
+/**
+ * The file was removed, replaced or modified after it was described. Unlike an
+ * unsafe path or an I/O failure, this concerns one file: a fresh scan decides
+ * whether anything is still missing.
+ */
+export class FileChangedError extends Error {}
+
+/** A vanished or changed source file; a path escaping the folder is never reported this way. */
+export function isSourceFileUnavailable(error: unknown): boolean {
+  if (error instanceof FileChangedError) return true
+  const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined
+  return code === "ENOENT" || code === "ENOTDIR"
+}
+
 export interface TransferFileDescriptor {
   size: number
   modifiedMs: number
@@ -36,7 +50,7 @@ export async function describeTransferFile(rootPath: string, relativePath: strin
     let offset = 0
     while (offset < initial.size) {
       const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, initial.size - offset), offset)
-      if (bytesRead === 0) throw new Error("The shared file changed while its transfer digest was being prepared.")
+      if (bytesRead === 0) throw new FileChangedError("The shared file changed while its transfer digest was being prepared.")
       hash.update(buffer.subarray(0, bytesRead))
       offset += bytesRead
     }
@@ -72,7 +86,7 @@ export async function readTransferFileChunk(
     let bytesRead = 0
     while (bytesRead < length) {
       const result = await handle.read(buffer, bytesRead, length - bytesRead, offset + bytesRead)
-      if (result.bytesRead === 0) throw new Error("The shared file changed during transfer.")
+      if (result.bytesRead === 0) throw new FileChangedError("The shared file changed during transfer.")
       bytesRead += result.bytesRead
     }
     const after = await handle.stat()
@@ -86,7 +100,7 @@ export async function readTransferFileChunk(
 async function openContainedRegularFile(rootPath: string, relativePath: string) {
   const absolutePath = resolveWithinRoot(rootPath, relativePath)
   const entry = await lstat(absolutePath)
-  if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("The requested path is not a regular file.")
+  if (entry.isSymbolicLink() || !entry.isFile()) throw new FileChangedError("The requested path is not a regular file.")
 
   const [canonicalRoot, canonicalFile] = await Promise.all([realpath(rootPath), realpath(absolutePath)])
   const relative = path.relative(canonicalRoot, canonicalFile)
@@ -98,11 +112,11 @@ async function openContainedRegularFile(rootPath: string, relativePath: string) 
   const initial = await handle.stat()
   if (!initial.isFile()) {
     await handle.close()
-    throw new Error("The requested path is not a regular file.")
+    throw new FileChangedError("The requested path is not a regular file.")
   }
   if (entry.dev !== initial.dev || entry.ino !== initial.ino) {
     await handle.close()
-    throw new Error("The requested file changed while it was being opened.")
+    throw new FileChangedError("The requested file changed while it was being opened.")
   }
   return { absolutePath, handle, initial }
 }
@@ -113,7 +127,7 @@ function assertExpectedIdentity(
   filePath: string,
 ): void {
   if (actual.size !== expected.size || actual.mtimeMs !== expected.modifiedMs) {
-    throw new Error(`The shared file changed before its next chunk could be read: ${path.basename(filePath)}`)
+    throw new FileChangedError(`The shared file changed before its next chunk could be read: ${path.basename(filePath)}`)
   }
 }
 
@@ -123,6 +137,6 @@ function assertStableIdentity(
   filePath: string,
 ): void {
   if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
-    throw new Error(`The shared file changed while it was being read: ${path.basename(filePath)}`)
+    throw new FileChangedError(`The shared file changed while it was being read: ${path.basename(filePath)}`)
   }
 }

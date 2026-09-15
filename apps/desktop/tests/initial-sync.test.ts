@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { FileChangedError } from "../src/main/file-transfer"
 import {
   assessInitialMergeConvergence,
+  assertInitialMergeCapacity,
   assertInitialMergePathCompatibility,
   computeSyncPlan,
   mergeInitialSyncFile,
@@ -131,6 +133,24 @@ describe("computeSyncPlan", () => {
   })
 })
 
+describe("assertInitialMergeCapacity", () => {
+  const GIB = 1024 ** 3
+
+  test("allows a merge that still leaves the spare reserve free", () => {
+    expect(() => assertInitialMergeCapacity("This computer", 3 * GIB, 4 * GIB)).not.toThrow()
+  })
+
+  test("stops before copying when the planned files would not fit", () => {
+    expect(() => assertInitialMergeCapacity("tommys-laptop", 31.7 * GIB, 2.5 * GIB)).toThrow(
+      "tommys-laptop needs 33 GB of free space for this merge (including 1.0 GB kept spare) but has 2.5 GB.",
+    )
+  })
+
+  test("refuses a merge that would eat into the spare reserve", () => {
+    expect(() => assertInitialMergeCapacity("This computer", 3.5 * GIB, 4 * GIB)).toThrow("Free up space")
+  })
+})
+
 describe("initial merge path compatibility", () => {
   const local = manifest([{ path: ".venv/lib/python3.12/library.so", size: 1, modifiedMs: 1, digest: "same" }])
   const remote = manifest([{ path: ".venv/Lib/python3.12/library.so", size: 1, modifiedMs: 1, digest: "same" }])
@@ -199,6 +219,19 @@ describe("mergeInitialSyncFile", () => {
       }
     })
   }
+
+  test("leaves out a file removed or edited at the source without touching the destination", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-source-changed-"))
+    try {
+      const result = await mergeInitialSyncFile(root, entry, async () => {
+        throw new FileChangedError("file.txt changed or was removed on the other computer after the folders were compared.")
+      })
+      expect(result).toEqual({ status: "source-changed" })
+      expect(await readdir(root)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 
   test("does not turn an integrity failure into success when a destination appears", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-integrity-"))
@@ -471,6 +504,21 @@ describe("writeFileChunksAtomic", () => {
     } finally {
       await rm(root, { recursive: true, force: true })
       await rm(archiveRoot, { recursive: true, force: true })
+    }
+  })
+
+  test("explains running out of space mid-copy and removes the staging file", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-chunk-test-"))
+    try {
+      await expect(
+        writeFileChunksAtomic(root, "large.bin", 4, "0".repeat(64), async function* () {
+          yield Buffer.from("ab")
+          throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" })
+        }()),
+      ).rejects.toThrow("This computer ran out of free space while saving a synchronized file.")
+      expect(await readdir(root)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
     }
   })
 })
