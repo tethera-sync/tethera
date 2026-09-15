@@ -126,6 +126,8 @@ import {
   MAX_PERSISTED_SKIP_REASON_LENGTH,
   normalizePersistedScanLimit,
   parseArchiveHistoryRequest,
+  parseBrowseDirectoryInput,
+  parseCreateDirectoryInput,
   parseExactConflictChoice,
   parsePeerConflictCopy,
   parsePeerFileOperations,
@@ -238,6 +240,13 @@ const continuousConflictFingerprints = new Map<string, string>()
 /** Per folder, the last reported set of files left out because their destination path is occupied. */
 const occupiedPathFingerprints = new Map<string, string>()
 const continuousLastErrors = new Map<string, string>()
+/**
+ * Installed replacement journals whose durable commit failed. The engine
+ * refuses to reconcile a mapping while any journal is active, so each entry is
+ * retried on the folder's next cycle until it is rolled forward or reports a
+ * state that needs the user. Startup recovery remains the crash-safe backstop.
+ */
+const pendingInstalledReplacements = new Map<string, string>()
 const INITIAL_SYNC_LEASE_MS = 35 * 60_000
 const INITIAL_SYNC_HEARTBEAT_MS = 5 * 60_000
 const MAX_CONCURRENT_CONTINUOUS_CYCLES = 2
@@ -971,7 +980,7 @@ function syncPairingSnapshot(): AppSnapshot {
       ...(continuousSyncInFlight.has(folder.id) ? {} : { work: undefined }),
     }
   })
-  void flushPendingMappingDecisions()
+  void flushPendingMappingDecisions().catch((error) => console.warn("[mapping-index] unable to deliver pending mapping decisions", error))
   void flushPendingConfigurationDeliveries()
   void refreshContinuousSyncMonitors()
   for (const folder of snapshot.folders) {
@@ -1001,7 +1010,7 @@ async function startNetworkServices(): Promise<void> {
   pairing.on("paired", (device: { id: string; name: string }) => {
     pushActivity("Device paired", `${device.name} is now a trusted Tethera device.`, "success")
     syncPairingSnapshot()
-    void persistState()
+    void persistState().catch((error) => console.error("[pairing] unable to persist the paired device state", error))
   })
   pairing.on("revoked", (device: { id: string; name: string }) => {
     snapshot.folders = snapshot.folders.map((folder) =>
@@ -1009,7 +1018,7 @@ async function startNetworkServices(): Promise<void> {
     )
     pushActivity("Device trust removed", `${device.name} can no longer access this Tethera installation.`, "warning")
     syncPairingSnapshot()
-    void persistState()
+    void persistState().catch((error) => console.error("[pairing] unable to persist the revoked device state", error))
   })
   pairing.on("error-state", (error: Error) => {
     pushActivity("Pairing service problem", error.message, "error")
@@ -1024,7 +1033,7 @@ async function startNetworkServices(): Promise<void> {
   })
   await peerSessions.start()
   decisionRetryTimer = setInterval(() => {
-    void flushPendingMappingDecisions()
+    void flushPendingMappingDecisions().catch((error) => console.warn("[mapping-index] unable to deliver pending mapping decisions", error))
     void flushPendingConfigurationDeliveries()
   }, 5_000)
   syncPairingSnapshot()
@@ -1250,6 +1259,9 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
   for (const folderId of continuousLastErrors.keys()) {
     if (!mappingRecords.has(folderId)) continuousLastErrors.delete(folderId)
   }
+  for (const folderId of pendingInstalledReplacements.keys()) {
+    if (!mappingRecords.has(folderId)) pendingInstalledReplacements.delete(folderId)
+  }
   const previous = new Map(snapshot.folders.map((folder) => [folder.id, folder]))
   const localDeviceId = getLocalIdentityId()
   snapshot.folders = records.flatMap((record) => {
@@ -1268,6 +1280,7 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
           ? {
               work: runtime.work,
               problem: runtime.problem,
+              watchDegraded: runtime.watchDegraded,
               fileCount: runtime.fileCount ?? outcome?.fileCount,
               lastSyncedAt: runtime.lastSyncedAt ?? outcome?.completedAt,
               currentAction: runtime.scanIssues
@@ -1495,11 +1508,18 @@ async function flushPendingConfigurationDeliveries(): Promise<void> {
     }
   }
   if (acknowledgedAny) {
-    await refreshAuthoritativeMappings()
-    for (const mappingId of acknowledgedMappings) applyInitialSyncOutcomeStatus(mappingId)
-    await refreshContinuousSyncMonitors()
-    await persistState()
-    broadcastSnapshot()
+    try {
+      await refreshAuthoritativeMappings()
+      for (const mappingId of acknowledgedMappings) applyInitialSyncOutcomeStatus(mappingId)
+      await refreshContinuousSyncMonitors()
+      await persistState()
+      broadcastSnapshot()
+    } catch (error) {
+      // Every caller treats delivery as best-effort and the acknowledgement is
+      // already durable in SQLite, so surface the local refresh failure here
+      // instead of rejecting a fire-and-forget call.
+      console.warn("[mapping-index] acknowledged deliveries could not be applied locally", error)
+    }
   } else if (previousPendingCount !== snapshot.mappingStore.pendingDeliveryCount) {
     broadcastSnapshot()
   }
@@ -2341,6 +2361,13 @@ async function notifyContinuousSyncCoordinator(folderId: string): Promise<void> 
   }
 }
 
+/** Drops a stale watcher-coverage alert once no monitor owns the folder. */
+function clearWatchDegraded(folderId: string): void {
+  if (snapshot.folders.some((item) => item.id === folderId && item.watchDegraded)) {
+    updateFolder(folderId, { watchDegraded: undefined })
+  }
+}
+
 async function refreshContinuousSyncMonitors(): Promise<void> {
   if (!snapshot) return
   const wanted = new Set<string>()
@@ -2357,12 +2384,42 @@ async function refreshContinuousSyncMonitors(): Promise<void> {
     ) continue
     wanted.add(folder.id)
     if (continuousSyncMonitors.has(folder.id)) continue
-    const monitor = new FolderChangeMonitor(folder.localPath, folder.ignorePatterns, () => {
-      void notifyContinuousSyncCoordinator(folder.id)
-    })
+    const monitor = new FolderChangeMonitor(
+      folder.localPath,
+      folder.ignorePatterns,
+      () => {
+        void notifyContinuousSyncCoordinator(folder.id)
+      },
+      (report) => {
+        const current = snapshot.folders.find((item) => item.id === folder.id)
+        if (!current) return
+        if (report.status === "degraded") {
+          const summary =
+            report.reason.kind === "watcher-rejected"
+              ? "The operating system would not let Tethera watch every folder for live changes."
+              : report.reason.message
+          updateFolder(folder.id, {
+            watchDegraded: {
+              message: `${summary} Changes are still found by the periodic scan, but they can take longer to appear.`,
+            },
+          })
+          pushActivity("Folder watch degraded", `${current.name}: ${report.reason.message}`, "warning", folder.id)
+        } else {
+          if (!current.watchDegraded) return
+          updateFolder(folder.id, { watchDegraded: undefined })
+          pushActivity("Folder watch restored", `${current.name}: live change detection is active again.`, "info", folder.id)
+        }
+        broadcastSnapshot()
+      },
+    )
     continuousSyncMonitors.set(folder.id, monitor)
     void monitor.start().then(
-      () => void notifyContinuousSyncCoordinator(folder.id),
+      (degraded) => {
+        // A clean start clears coverage state left by a previous monitor
+        // instance; a degraded start has already reported through the callback.
+        if (!degraded) clearWatchDegraded(folder.id)
+        void notifyContinuousSyncCoordinator(folder.id)
+      },
       (error: unknown) => {
         if (continuousSyncMonitors.get(folder.id) !== monitor) return
         monitor.close()
@@ -2378,6 +2435,8 @@ async function refreshContinuousSyncMonitors(): Promise<void> {
     if (wanted.has(folderId)) continue
     monitor.close()
     continuousSyncMonitors.delete(folderId)
+    // No monitor means no coverage claim to show.
+    clearWatchDegraded(folderId)
     continuousSyncQueued.delete(folderId)
     const retry = continuousSyncRetryTimers.get(folderId)
     if (retry) clearTimeout(retry)
@@ -2457,13 +2516,15 @@ async function executeContinuousOperations(
           operation.id,
         )
         if (!transfer.completedDuringRecovery) {
-          await engine.request("fileSync.complete", {
-            operationId: operation.id,
-            digest: operation.sourceDigest,
-            size: operation.sourceSize,
-            verifiedAt: new Date().toISOString(),
-            replacementJournalId: transfer.replacementJournalId,
-          })
+          await completeInstalledTransfer(folder, transfer.replacementJournalId, () =>
+            engine.request("fileSync.complete", {
+              operationId: operation.id,
+              digest: operation.sourceDigest,
+              size: operation.sourceSize,
+              verifiedAt: new Date().toISOString(),
+              replacementJournalId: transfer.replacementJournalId,
+            }),
+          )
         }
         await requirePeerSessions().request(peer.id, {
           type: "continuous-sync-verified",
@@ -2726,6 +2787,12 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     recordContinuousConflicts(folder, state.conflicts)
   } catch (error) {
     const message = error instanceof Error ? error.message : "Continuous synchronization failed."
+    // A pending roll-forward is retried before the failure is projected, so the
+    // state read below already reflects a recovery that succeeded this cycle.
+    const pendingJournalId = pendingInstalledReplacements.get(folderId)
+    if (pendingJournalId !== undefined) {
+      await tryRollForwardInstalledReplacement(folder, pendingJournalId)
+    }
     const online = getPairedDevice(folder.remoteDeviceId)?.status === "online"
     const durableConflicts = reconciledState?.conflicts ?? []
     const latestState = await engine.request<FileSyncState>("fileSync.getState", { id: folderId }).catch((stateError) => {
@@ -2786,6 +2853,8 @@ function blockContinuousSync(folderId: string): () => void {
   const monitor = continuousSyncMonitors.get(folderId)
   monitor?.close()
   continuousSyncMonitors.delete(folderId)
+  // No monitor means no coverage claim to show while the folder is blocked.
+  clearWatchDegraded(folderId)
   return () => {
     continuousSyncBlocked.delete(folderId)
     void refreshContinuousSyncMonitors()
@@ -3034,6 +3103,61 @@ async function reconcileReplacementAfterFailure(
       recordError,
     ))
     throw error
+  }
+}
+
+/**
+ * Commits a transfer whose file is already installed and verified.
+ *
+ * An `installed` replacement journal blocks every later reconcile for the
+ * folder, so if the durable commit fails the journal is rolled forward before
+ * the error propagates. A roll-forward that fails is remembered and retried on
+ * the folder's next cycle, because otherwise a transient engine failure would
+ * leave the folder retrying against a blocked journal until the next start.
+ */
+async function completeInstalledTransfer<T>(
+  folder: FolderSummary,
+  replacementJournalId: string | undefined,
+  commit: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await commit()
+  } catch (error) {
+    if (replacementJournalId !== undefined) {
+      pendingInstalledReplacements.set(folder.id, replacementJournalId)
+      await tryRollForwardInstalledReplacement(folder, replacementJournalId)
+    }
+    throw error
+  }
+}
+
+async function tryRollForwardInstalledReplacement(folder: FolderSummary, journalId: string): Promise<void> {
+  try {
+    const entry = await engine.request<ReplacementJournalEntry>("archive.get", { entryId: journalId })
+    if (entry.state === "completed" || entry.state === "aborted") {
+      // Startup recovery or a later commit already finished it.
+      pendingInstalledReplacements.delete(folder.id)
+      return
+    }
+    const recovered = await reconcileReplacementAfterFailure(folder, entry, false)
+    if (recovered.state !== "completed" && recovered.state !== "aborted") {
+      // The folder now reports the issue through `fileSync.getState`, so the
+      // normal recovery UI owns it instead of this automatic retry.
+      console.warn(
+        `[continuous-sync] replacement ${journalId} needs manual recovery: ${recovered.lastError ?? recovered.state}`,
+      )
+    }
+    pendingInstalledReplacements.delete(folder.id)
+  } catch (recoveryError) {
+    if (recoveryError instanceof EngineRpcError && recoveryError.code === "MAPPING_NOT_FOUND") {
+      // The journal (or its mapping) no longer exists, so there is nothing left
+      // to roll forward.
+      pendingInstalledReplacements.delete(folder.id)
+      return
+    }
+    // Keep the pending entry so the folder's next cycle retries once the
+    // transient failure (for example an engine restart) has cleared.
+    console.warn(`[continuous-sync] unable to roll forward replacement ${journalId}; it will be retried`, recoveryError)
   }
 }
 
@@ -3331,6 +3455,10 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   let copiedBytes = 0
   let checkedFiles = 0
   let checkedBytes = 0
+  // Files this pass leaves present even though the pre-merge scan did not list
+  // them (a transfer finished, or a copy appeared mid-merge). An occupied path
+  // holds no file, so it is never counted.
+  let addedFiles = 0
   const startedAt = Date.now()
   let lastBroadcastAt = 0
 
@@ -3379,10 +3507,15 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
       if (result.status === "copied") {
         copiedFiles += 1
         copiedBytes += result.bytes
+        addedFiles += 1
       } else if (result.status === "conflict") {
         plan.skipped.push({ ...result.skip, path: entry.path })
+        addedFiles += 1
       } else if (result.status === "occupied") {
         plan.occupied.push(entry.path)
+      } else {
+        // The pre-merge scan missed a file that now matches the source exactly.
+        addedFiles += 1
       }
       if ((result.status === "copied" || result.status === "identical") && transferDigests && entry.digest) {
         try {
@@ -3402,7 +3535,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   return {
     copiedFiles,
     copiedBytes,
-    fileCount: localManifest.files.length + checkedFiles,
+    fileCount: localManifest.files.length + addedFiles,
     skipped: plan.skipped,
     unreadableSkipped: scanIssueSkips(issues, "This computer", peer.name),
   }
@@ -4068,20 +4201,27 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
   if (request.type === "continuous-sync-observe") {
     requireMappingMutations()
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
-    requireSharedActiveFolder(context, folderId)
+    // The direction is this computer's approved policy. The coordinator sends
+    // its inverse view of the mapping, but a peer-supplied mode must never
+    // decide how local durable state is reconciled; a disagreement means the
+    // shared configuration drifted, so the cycle fails closed instead.
+    const folder = requireSharedActiveFolder(context, folderId)
+    if (request.mode !== folder.mode) {
+      throw new Error("The synchronization direction no longer matches this folder's approved configuration.")
+    }
     return withPeerFileOperation(context, folderId, async () => {
       const state = await engine.request<ReconcileFilesResult>("fileSync.reconcile", {
         mappingId: folderId,
         local: request.local,
         remote: request.remote,
-        mode: request.mode,
+        mode: folder.mode,
         observedAt: request.observedAt,
         queueOperations: true,
       }, 5 * 60_000)
       await retireInitialConflictProjection(folderId, state)
       applyFileSyncStateToFolder(folderId, state, new Date().toISOString())
-      const folder = snapshot.folders.find((item) => item.id === folderId)
-      if (folder) recordContinuousConflicts(folder, state.conflicts)
+      const current = snapshot.folders.find((item) => item.id === folderId)
+      if (current) recordContinuousConflicts(current, state.conflicts)
       broadcastSnapshot()
       return state
     })
@@ -4140,15 +4280,17 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
         )
         const state = transfer.completedDuringRecovery
           ? await engine.request<FileSyncState>("fileSync.getState", { id: operation.folderId })
-          : await engine.request<FileSyncState>("fileSync.applyVerified", {
-              operationId: authorization.operationId,
-              mappingId: operation.folderId,
-              path: operation.path,
-              digest: operation.digest,
-              size: operation.size,
-              verifiedAt: new Date().toISOString(),
-              replacementJournalId: transfer.replacementJournalId,
-            })
+          : await completeInstalledTransfer(folder, transfer.replacementJournalId, () =>
+              engine.request<FileSyncState>("fileSync.applyVerified", {
+                operationId: authorization.operationId,
+                mappingId: operation.folderId,
+                path: operation.path,
+                digest: operation.digest,
+                size: operation.size,
+                verifiedAt: new Date().toISOString(),
+                replacementJournalId: transfer.replacementJournalId,
+              }),
+            )
         await retireInitialConflictProjection(operation.folderId, state)
         applyFileSyncStateToFolder(operation.folderId, state, new Date().toISOString())
         broadcastSnapshot()
@@ -4424,8 +4566,12 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
 }
 
 function registerIpc(): void {
-  ipcMain.handle("app:get-snapshot", () => snapshot)
-  ipcMain.handle("mapping-store:retry", async () => {
+  ipcMain.handle("app:get-snapshot", (event) => {
+    requireTrustedMainRenderer(event)
+    return snapshot
+  })
+  ipcMain.handle("mapping-store:retry", async (event) => {
+    requireTrustedMainRenderer(event)
     if (archiveRestoreInFlight.size > 0 || hasConflictResolutionInFlight()) {
       throw new Error("Wait for the current recovery operation to finish before restarting storage.")
     }
@@ -4464,7 +4610,7 @@ function registerIpc(): void {
   ipcMain.handle("archive:restore", async (event, entryId: string) => {
     requireTrustedMainRenderer(event)
     requireMappingMutations()
-    if (typeof entryId !== "string" || !entryId) throw new Error("Choose an archived version to restore.")
+    if (typeof entryId !== "string" || !entryId || entryId.length > 200) throw new Error("Choose an archived version to restore.")
     const source = await engine.request<ReplacementJournalEntry>("archive.get", { entryId })
     const folder = snapshot.folders.find((candidate) => candidate.id === source.mappingId)
     if (!folder) throw new Error("The archived version's folder mapping is no longer active.")
@@ -4508,10 +4654,22 @@ function registerIpc(): void {
     }
     return listArchivedVersions(engine, folder.id, folder.name)
   })
-  ipcMain.handle("app:pause-all", () => setAllPaused(true))
-  ipcMain.handle("app:resume-all", () => setAllPaused(false))
-  ipcMain.handle("filesystem:browse-directory", (_event, input: BrowseDirectoryInput) => browseDirectory(input))
-  ipcMain.handle("filesystem:create-directory", (_event, input: CreateDirectoryInput) => createLocalDirectory(input))
+  ipcMain.handle("app:pause-all", (event) => {
+    requireTrustedMainRenderer(event)
+    return setAllPaused(true)
+  })
+  ipcMain.handle("app:resume-all", (event) => {
+    requireTrustedMainRenderer(event)
+    return setAllPaused(false)
+  })
+  ipcMain.handle("filesystem:browse-directory", (event, input: unknown) => {
+    requireTrustedMainRenderer(event)
+    return browseDirectory(parseBrowseDirectoryInput(input))
+  })
+  ipcMain.handle("filesystem:create-directory", (event, input: unknown) => {
+    requireTrustedMainRenderer(event)
+    return createLocalDirectory(parseCreateDirectoryInput(input))
+  })
   ipcMain.handle("folders:preview-mapping", (event, input: PreviewFolderMappingInput, progressOperationId: unknown) => {
     requireTrustedMainRenderer(event)
     return folderComparisonResult(() => previewFolderMapping(input, progressOperationId))
@@ -4534,17 +4692,23 @@ function registerIpc(): void {
     if (!operationId) throw new Error("Choose an active comparison to cancel.")
     previewScanControllers.get(operationId)?.abort()
   })
-  ipcMain.handle("folders:reject-mapping", (_event, requestId: string) => rejectFolderMapping(requestId))
-  ipcMain.handle("folders:start-initial-sync", (_event, folderId: string, acknowledgeUnreadable: unknown) =>
-    startInitialSync(folderId, acknowledgeUnreadable === true))
-  ipcMain.handle("folders:dismiss-initial-sync-issues", (_event, folderId: string) => dismissInitialSyncIssues(folderId))
-
-  ipcMain.handle("folders:add", async (_event: Electron.IpcMainInvokeEvent, _input: AddFolderInput) => {
-    throw new Error("Folder mappings now require an initial comparison and approval on the other computer.")
+  ipcMain.handle("folders:reject-mapping", (event, requestId: string) => {
+    requireTrustedMainRenderer(event)
+    return rejectFolderMapping(requestId)
+  })
+  ipcMain.handle("folders:start-initial-sync", (event, folderId: string, acknowledgeUnreadable: unknown) => {
+    requireTrustedMainRenderer(event)
+    return startInitialSync(folderId, acknowledgeUnreadable === true)
+  })
+  ipcMain.handle("folders:dismiss-initial-sync-issues", (event, folderId: string) => {
+    requireTrustedMainRenderer(event)
+    return dismissInitialSyncIssues(folderId)
   })
 
-  ipcMain.handle("folders:set-paused", async (_event: Electron.IpcMainInvokeEvent, folderId: string, paused: boolean) => {
+  ipcMain.handle("folders:set-paused", async (event: Electron.IpcMainInvokeEvent, folderId: string, paused: boolean) => {
+    requireTrustedMainRenderer(event)
     requireMappingMutations()
+    if (typeof paused !== "boolean") throw new Error("The pause state is invalid.")
     const release = blockContinuousSync(folderId)
     try {
       if (paused && (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasConflictResolutionInFlight(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId))) {
@@ -4579,7 +4743,8 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle("folders:remove", async (_event: Electron.IpcMainInvokeEvent, folderId: string) => {
+  ipcMain.handle("folders:remove", async (event: Electron.IpcMainInvokeEvent, folderId: string) => {
+    requireTrustedMainRenderer(event)
     requireMappingMutations()
     const release = blockContinuousSync(folderId)
     try {
@@ -4613,47 +4778,61 @@ function registerIpc(): void {
 
   ipcMain.handle("shell:reveal-path", async (event: Electron.IpcMainInvokeEvent, targetPath: unknown) => {
     requireTrustedMainRenderer(event)
-    await shell.openPath(parseRevealPath(targetPath))
+    // Reveal, never launch: `openPath` would execute a file (or a file-manager
+    // handler) chosen by renderer input, while `showItemInFolder` only selects
+    // the item in the desktop's file manager.
+    shell.showItemInFolder(parseRevealPath(targetPath))
   })
 
-  ipcMain.handle("settings:update", async (event: Electron.IpcMainInvokeEvent, key: unknown, value: unknown) =>
-    mutate(() => {
+  ipcMain.handle("settings:update", async (event: Electron.IpcMainInvokeEvent, key: unknown, value: unknown) => {
+    requireTrustedMainRenderer(event)
+    return mutate(() => {
       const update = parseSettingUpdate(key, value)
       snapshot.settings = applySettingUpdate(snapshot.settings, update)
       if (update.key === "launchAtLogin") app.setLoginItemSettings({ openAtLogin: update.value, openAsHidden: snapshot.settings.startMinimised })
       if (update.key === "startMinimised" && snapshot.settings.launchAtLogin) app.setLoginItemSettings({ openAtLogin: true, openAsHidden: update.value })
-    }),
-  )
+    })
+  })
 
-  ipcMain.handle("pairing:set-available", (_event, enabled: boolean) => {
+  ipcMain.handle("pairing:set-available", (event, enabled: boolean) => {
+    requireTrustedMainRenderer(event)
     requirePairingService().setPairingAvailable(Boolean(enabled))
     return syncPairingSnapshot()
   })
-  ipcMain.handle("pairing:start", (_event, deviceId: string) => {
+  ipcMain.handle("pairing:start", (event, deviceId: string) => {
+    requireTrustedMainRenderer(event)
     requirePairingService().startPairing(deviceId)
     return syncPairingSnapshot()
   })
-  ipcMain.handle("pairing:confirm", (_event, sessionId: string) => {
+  ipcMain.handle("pairing:confirm", (event, sessionId: string) => {
+    requireTrustedMainRenderer(event)
     requirePairingService().confirmPairing(sessionId)
     return syncPairingSnapshot()
   })
-  ipcMain.handle("pairing:cancel", (_event, sessionId: string) => {
+  ipcMain.handle("pairing:cancel", (event, sessionId: string) => {
+    requireTrustedMainRenderer(event)
     requirePairingService().cancelPairing(sessionId)
     return syncPairingSnapshot()
   })
-  ipcMain.handle("pairing:approve", (_event, requestId: string) => {
+  ipcMain.handle("pairing:approve", (event, requestId: string) => {
+    requireTrustedMainRenderer(event)
     requirePairingService().approvePairing(requestId)
     return syncPairingSnapshot()
   })
-  ipcMain.handle("pairing:reject", (_event, requestId: string) => {
+  ipcMain.handle("pairing:reject", (event, requestId: string) => {
+    requireTrustedMainRenderer(event)
     requirePairingService().rejectPairing(requestId)
     return syncPairingSnapshot()
   })
-  ipcMain.handle("pairing:revoke", async (_event, deviceId: string) => {
+  ipcMain.handle("pairing:revoke", async (event, deviceId: string) => {
+    requireTrustedMainRenderer(event)
     await requirePairingService().revokeDevice(deviceId)
     return syncPairingSnapshot()
   })
-  ipcMain.handle("window:show", () => showMainWindow())
+  ipcMain.handle("window:show", (event) => {
+    requireTrustedMainRenderer(event)
+    return showMainWindow()
+  })
   ipcMain.handle("updates:check", async (event) => {
     requireTrustedMainRenderer(event)
     await requestUpdateCheck("ipc")
@@ -5014,8 +5193,8 @@ function rebuildTrayMenu(): void {
     { label: "Open Tethera", click: showMainWindow },
     { type: "separator" },
     snapshot.paused
-      ? { label: "Resume all", click: () => void setAllPaused(false) }
-      : { label: "Pause all", click: () => void setAllPaused(true) },
+      ? { label: "Resume all", click: () => void setAllPaused(false).catch((error) => console.warn("[tray] unable to resume syncing", error)) }
+      : { label: "Pause all", click: () => void setAllPaused(true).catch((error) => console.warn("[tray] unable to pause syncing", error)) },
     { type: "separator" },
     updateTrayEntry(),
     { type: "separator" },

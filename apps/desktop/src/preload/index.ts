@@ -1,7 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron"
 import { unwrapFolderComparisonResult, type FolderComparisonResult } from "../shared/folder-comparison-result"
 import type {
-  AddFolderInput,
   AppSettingKey,
   AppSettings,
   AppSnapshot,
@@ -44,7 +43,6 @@ const api: TetheraApi = {
   startInitialSync: (folderId: string, acknowledgeUnreadable?: boolean) =>
     ipcRenderer.invoke("folders:start-initial-sync", folderId, acknowledgeUnreadable === true),
   dismissInitialSyncIssues: (folderId: string) => ipcRenderer.invoke("folders:dismiss-initial-sync-issues", folderId),
-  addFolder: (input: AddFolderInput) => ipcRenderer.invoke("folders:add", input),
   setFolderPaused: (folderId: string, paused: boolean) => ipcRenderer.invoke("folders:set-paused", folderId, paused),
   removeFolder: (folderId: string) => ipcRenderer.invoke("folders:remove", folderId),
   revealPath: (path: string) => ipcRenderer.invoke("shell:reveal-path", path),

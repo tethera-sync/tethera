@@ -2,9 +2,11 @@ import { z } from "zod"
 import type {
   AddFolderInput,
   AppSettings,
+  BrowseDirectoryInput,
   ConflictCopyExpectation,
   ConflictInspection,
   ConflictInspectionInput,
+  CreateDirectoryInput,
   ResolveFileConflictInput,
   SyncMode,
 } from "../shared/contracts"
@@ -64,6 +66,52 @@ export const revealPathSchema = pathString
 export function parseRevealPath(value: unknown): string {
   const parsed = revealPathSchema.safeParse(value)
   if (!parsed.success) throw new Error("The selected path is invalid.")
+  return parsed.data
+}
+
+/** The browser may omit or blank the starting path to mean "this computer's home folder". */
+const optionalBrowsePath = z
+  .string()
+  .max(MAX_SCAN_PATH_LENGTH)
+  .refine((value) => !value.includes("\0"), "The folder path is invalid.")
+  .optional()
+
+const deviceIdString = z
+  .string()
+  .min(1)
+  .max(200)
+  .refine((value) => !value.includes("\0"), "The folder browser request is invalid.")
+
+const browseDirectoryInputSchema = z.object({
+  deviceId: deviceIdString,
+  path: optionalBrowsePath,
+  includeHidden: z.boolean().optional(),
+})
+
+const createDirectoryInputSchema = z.object({
+  deviceId: deviceIdString,
+  parentPath: pathString,
+  name: z
+    .string()
+    .min(1)
+    .max(255)
+    .refine((value) => !value.includes("\0")),
+})
+
+/**
+ * Validates the folder-picker payloads before they reach the filesystem. The
+ * picker is intentionally free to browse anywhere, so these bounds exist to
+ * keep the request shape and length predictable, not to confine the path.
+ */
+export function parseBrowseDirectoryInput(value: unknown): BrowseDirectoryInput {
+  const parsed = browseDirectoryInputSchema.safeParse(value)
+  if (!parsed.success) throw new Error("The folder browser request is invalid.")
+  return parsed.data
+}
+
+export function parseCreateDirectoryInput(value: unknown): CreateDirectoryInput {
+  const parsed = createDirectoryInputSchema.safeParse(value)
+  if (!parsed.success) throw new Error("The new folder request is invalid.")
   return parsed.data
 }
 

@@ -32,11 +32,13 @@ export function CompareStatus({
   return (
     <div
       className="compare-status [display:flex] [align-items:flex-start] [gap:10px] [margin-top:14px] [border:1px_solid_color-mix(in_oklab,_var(--primary)_30%,_var(--border))] [border-radius:10px] [background:color-mix(in_oklab,_var(--primary)_8%,_var(--surface))] [padding:11px_12px] [&>svg]:[width:17px] [&>svg]:[height:17px] [&>svg]:[flex:0_0_auto] [&>svg]:[margin-top:1px] [&>svg]:[color:var(--primary)] [&>div]:[display:grid] [&>div]:[gap:2px] [&_strong]:[font-size:11px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_span]:[line-height:1.5]"
-      role="status"
     >
-      <RefreshCwIcon className="animate-spin motion-reduce:animate-none" />
+      <RefreshCwIcon aria-hidden="true" className="animate-spin motion-reduce:animate-none" />
       <div className="min-w-0 flex-1">
-        <strong>{text.headline}</strong>
+        {/* Only the phase headline is a live region: the detail and elapsed
+            text change every second and would otherwise be re-announced
+            continuously for screen-reader users. */}
+        <strong role="status">{text.headline}</strong>
         <span>
           {purpose === "verify" && !reused ? "Verifying both folders before approval. " : ""}
           {text.detail}

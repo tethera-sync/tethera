@@ -5,7 +5,9 @@ import {
   MAX_IGNORE_PATTERNS,
   normalizePersistedScanLimit,
   parseArchiveHistoryRequest,
+  parseBrowseDirectoryInput,
   parseConflictCopyExpectation,
+  parseCreateDirectoryInput,
   parseExactConflictChoice,
   parsePeerConflictCopy,
   parsePeerFileOperations,
@@ -52,6 +54,51 @@ describe("reveal-path validation", () => {
     expect(() => parseRevealPath(42)).toThrow("The selected path is invalid.")
     expect(() => parseRevealPath("a".repeat(4097))).toThrow("The selected path is invalid.")
     expect(() => parseRevealPath("/tmp/bad\0path")).toThrow("The selected path is invalid.")
+  })
+})
+
+describe("folder browser input validation", () => {
+  test("accepts the shapes the folder picker sends", () => {
+    expect(parseBrowseDirectoryInput({ deviceId: "local-device" })).toEqual({ deviceId: "local-device" })
+    expect(parseBrowseDirectoryInput({ deviceId: "local-device", path: "", includeHidden: true })).toEqual({
+      deviceId: "local-device",
+      path: "",
+      includeHidden: true,
+    })
+    expect(parseBrowseDirectoryInput({ deviceId: "peer-1", path: "C:\\Users\\tommy" })).toEqual({
+      deviceId: "peer-1",
+      path: "C:\\Users\\tommy",
+    })
+  })
+
+  test("rejects missing, mistyped, unbounded, and NUL-carrying requests", () => {
+    expect(() => parseBrowseDirectoryInput(null)).toThrow("The folder browser request is invalid.")
+    expect(() => parseBrowseDirectoryInput({})).toThrow("The folder browser request is invalid.")
+    expect(() => parseBrowseDirectoryInput({ deviceId: "" })).toThrow("The folder browser request is invalid.")
+    expect(() => parseBrowseDirectoryInput({ deviceId: "a".repeat(201) })).toThrow("The folder browser request is invalid.")
+    expect(() => parseBrowseDirectoryInput({ deviceId: "local-device", path: "a".repeat(4097) })).toThrow(
+      "The folder browser request is invalid.",
+    )
+    expect(() => parseBrowseDirectoryInput({ deviceId: "local-device", path: "/tmp/bad\0path" })).toThrow(
+      "The folder browser request is invalid.",
+    )
+  })
+
+  test("accepts a valid create request and rejects unbounded names", () => {
+    expect(parseCreateDirectoryInput({ deviceId: "local-device", parentPath: "/home/tommy", name: "Projects" })).toEqual({
+      deviceId: "local-device",
+      parentPath: "/home/tommy",
+      name: "Projects",
+    })
+    expect(() => parseCreateDirectoryInput({ deviceId: "local-device", parentPath: "", name: "Projects" })).toThrow(
+      "The new folder request is invalid.",
+    )
+    expect(() =>
+      parseCreateDirectoryInput({ deviceId: "local-device", parentPath: "/home/tommy", name: "a".repeat(256) }),
+    ).toThrow("The new folder request is invalid.")
+    expect(() =>
+      parseCreateDirectoryInput({ deviceId: "local-device", parentPath: "/home/tommy", name: "bad\0name" }),
+    ).toThrow("The new folder request is invalid.")
   })
 })
 

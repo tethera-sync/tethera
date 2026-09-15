@@ -302,7 +302,7 @@ export class FolderChangeMonitor {
   #debounce: NodeJS.Timeout | null = null
   #fallback: NodeJS.Timeout | null = null
   #stopped = false
-  #refreshing: Promise<void> | null = null
+  #refreshing: Promise<boolean> | null = null
   /** Cancels an in-flight directory collection when the monitor closes. */
   #collectionController: AbortController | null = null
   /** The currently reported degradation, so an unchanged condition is not re-reported. `null` while watching normally. */
@@ -320,12 +320,14 @@ export class FolderChangeMonitor {
     this.#onWatchHealth = onWatchHealth
   }
 
-  async start(): Promise<void> {
+  /** Resolves once the initial directory walk finished. `true` when at least one directory could not be watched natively. */
+  async start(): Promise<boolean> {
     const rootStat = await stat(this.#rootPath)
     if (!rootStat.isDirectory()) throw new Error("The synchronized folder is no longer available.")
-    await this.#refreshWatchers()
-    if (this.#stopped) return
+    const degraded = await this.#refreshWatchers()
+    if (this.#stopped) return degraded
     this.#fallback = setInterval(() => this.#schedule(true), FALLBACK_SCAN_MS)
+    return degraded
   }
 
   close(): void {
@@ -347,7 +349,12 @@ export class FolderChangeMonitor {
       this.#debounce = null
       if (refreshDirectories) {
         void this.#refreshWatchers()
-          .then(() => this.#reportRecovered())
+          // A refresh that completed without rejecting a directory genuinely
+          // restores full coverage; reporting recovery when the same pass just
+          // rejected watch() would mask a still-degraded tree.
+          .then((degraded) => {
+            if (!degraded) this.#reportRecovered()
+          })
           .catch((error: unknown) => this.#reportRefreshFailure(error))
       }
       this.#onChange()
@@ -358,9 +365,8 @@ export class FolderChangeMonitor {
     // One refresh over a large tree can hit the same condition for thousands of
     // directories (an exhausted OS watch-descriptor limit rejects every one), so
     // only a change in condition is reported rather than every occurrence.
-    const key = reason.kind === "watcher-rejected" ? `${reason.kind}:${reason.directory}` : reason.kind
-    if (this.#degradedKey === key) return
-    this.#degradedKey = key
+    if (this.#degradedKey === reason.kind) return
+    this.#degradedKey = reason.kind
     this.#onWatchHealth?.({ status: "degraded", reason })
   }
 
@@ -385,7 +391,7 @@ export class FolderChangeMonitor {
     console.warn(`[continuous-sync] Unable to refresh watchers for ${this.#rootPath}`, error)
   }
 
-  async #refreshWatchers(): Promise<void> {
+  async #refreshWatchers(): Promise<boolean> {
     if (this.#refreshing) return await this.#refreshing
     this.#refreshing = this.#replaceWatchers().finally(() => {
       this.#refreshing = null
@@ -393,13 +399,14 @@ export class FolderChangeMonitor {
     return await this.#refreshing
   }
 
-  async #replaceWatchers(): Promise<void> {
+  async #replaceWatchers(): Promise<boolean> {
     const controller = new AbortController()
     this.#collectionController?.abort()
     this.#collectionController = controller
+    let degraded = false
     try {
       const directories = await collectWatchDirectories(this.#rootPath, this.#ignorePatterns, controller.signal)
-      if (this.#stopped || controller.signal.aborted) return
+      if (this.#stopped || controller.signal.aborted) return true
       const wanted = new Set(directories)
       for (const [directory, watcher] of this.#watchers) {
         if (!wanted.has(directory)) {
@@ -408,7 +415,7 @@ export class FolderChangeMonitor {
         }
       }
       for (const directory of directories) {
-        if (this.#stopped || controller.signal.aborted) return
+        if (this.#stopped || controller.signal.aborted) return true
         if (this.#watchers.has(directory)) continue
         try {
           const watcher = watch(directory, { persistent: false }, (event) => this.#schedule(event === "rename"))
@@ -422,6 +429,7 @@ export class FolderChangeMonitor {
           // e.g. ENOSPC once the OS's native watch-descriptor limit is exhausted
           // (common on large trees). The directory is left unwatched; report it
           // rather than silently losing coverage of that subtree.
+          degraded = true
           this.#reportDegraded({
             kind: "watcher-rejected",
             directory,
@@ -433,11 +441,12 @@ export class FolderChangeMonitor {
     } catch (error) {
       // A close() during collection aborts the walk; a stopped monitor swallows
       // it instead of reporting a refresh failure for a scan it no longer wants.
-      if (controller.signal.aborted || this.#stopped) return
+      if (controller.signal.aborted || this.#stopped) return true
       throw error
     } finally {
       if (this.#collectionController === controller) this.#collectionController = null
     }
+    return degraded
   }
 }
 

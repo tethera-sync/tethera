@@ -18,12 +18,11 @@ import {
   statFileIdentity,
   type CachedFileDigest,
   type FileIdentity,
-  type FolderScanIssue,
   type ScanDigestCache,
   type ScanMetrics,
 } from "../src/main/folder-manifest"
 import { manifest, testWithReuse } from "./helpers"
-import type { FolderScanActivity } from "../src/shared/contracts"
+import type { FolderScanActivity, FolderScanIssue } from "../src/shared/contracts"
 
 describe("folder mapping comparison", () => {
   test("classifies identical, one-sided and different files", () => {

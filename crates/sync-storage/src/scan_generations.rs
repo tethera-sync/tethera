@@ -141,7 +141,7 @@ impl MappingStore {
             }
         }
         validate_hash_mode(&request.hash_mode)?;
-        let now = now_rfc3339();
+        let now = now_rfc3339()?;
 
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -178,7 +178,7 @@ impl MappingStore {
         let patterns_json = serde_json::to_string(&request.ignore_patterns).map_err(|error| {
             MappingStoreError::Invalid(format!("ignore rules are not serialisable: {error}"))
         })?;
-        let expires_at = expiry_rfc3339(&now);
+        let expires_at = expiry_rfc3339(&now)?;
         transaction.execute(
             "INSERT INTO scan_generations (
                 generation_id, mapping_id, participant_device_id, mapping_revision,
@@ -262,7 +262,7 @@ impl MappingStore {
                 }
             }
         }
-        let now = now_rfc3339();
+        let now = now_rfc3339()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let meta: (String, i64, String, i64, i64) = transaction
@@ -381,7 +381,7 @@ impl MappingStore {
                 "seal count is outside the supported generation quota".to_owned(),
             ));
         }
-        let now = now_rfc3339();
+        let now = now_rfc3339()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let meta: (String, i64, String, i64) = transaction
@@ -432,7 +432,7 @@ impl MappingStore {
     ) -> Result<GenerationStatus, MappingStoreError> {
         self.ensure_import_completed()?;
         validate_generation_id(generation_id)?;
-        let now = now_rfc3339();
+        let now = now_rfc3339()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let state: Option<String> = transaction
@@ -633,18 +633,26 @@ fn require_current_revision(
     Ok(())
 }
 
-fn now_rfc3339() -> String {
+fn now_rfc3339() -> Result<String, MappingStoreError> {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "2026-01-01T00:00:00Z".to_owned())
+        .map_err(|error| {
+            MappingStoreError::Invalid(format!("the system clock could not be formatted: {error}"))
+        })
 }
 
-fn expiry_rfc3339(now: &str) -> String {
+fn expiry_rfc3339(now: &str) -> Result<String, MappingStoreError> {
     let parsed = time::OffsetDateTime::parse(now, &time::format_description::well_known::Rfc3339)
-        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+        .map_err(|error| {
+        MappingStoreError::Invalid(format!("a generation timestamp is malformed: {error}"))
+    })?;
     (parsed + time::Duration::hours(GENERATION_TTL_HOURS))
         .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| now.to_owned())
+        .map_err(|error| {
+            MappingStoreError::Invalid(format!(
+                "a generation expiry could not be formatted: {error}"
+            ))
+        })
 }
 
 #[cfg(test)]
