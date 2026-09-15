@@ -633,12 +633,16 @@ fn require_current_revision(
     Ok(())
 }
 
-fn now_rfc3339() -> Result<String, MappingStoreError> {
-    time::OffsetDateTime::now_utc()
+fn format_rfc3339(timestamp: time::OffsetDateTime) -> Result<String, MappingStoreError> {
+    timestamp
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|error| {
             MappingStoreError::Invalid(format!("the system clock could not be formatted: {error}"))
         })
+}
+
+fn now_rfc3339() -> Result<String, MappingStoreError> {
+    format_rfc3339(time::OffsetDateTime::now_utc())
 }
 
 fn expiry_rfc3339(now: &str) -> Result<String, MappingStoreError> {
@@ -981,6 +985,20 @@ mod tests {
             .expect("cleanup");
         assert!(removed >= 1);
         assert!(store.generation_status("gen-1").is_err());
+    }
+
+    #[test]
+    fn an_unformattable_timestamp_is_an_error_never_a_fallback() {
+        // RFC 3339 cannot represent negative years; constructing one here is
+        // the deterministic stand-in for a system clock the formatter rejects.
+        let unformattable = time::Date::from_calendar_date(-1, time::Month::January, 1)
+            .expect("time can hold negative years")
+            .midnight()
+            .assume_utc();
+        assert!(matches!(
+            format_rfc3339(unformattable),
+            Err(MappingStoreError::Invalid(_))
+        ));
     }
 }
 
