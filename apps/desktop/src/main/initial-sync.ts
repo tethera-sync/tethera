@@ -1,5 +1,4 @@
-import { constants } from "node:fs"
-import { link, lstat, mkdir, open, realpath, rename, statfs, unlink } from "node:fs/promises"
+import { constants, link, lstat, mkdir, open, realpath, rename, statfs, unlink } from "./synced-fs"
 import { createHash, randomBytes } from "node:crypto"
 import path from "node:path"
 import type { FolderScanIssue, SyncMode } from "../shared/contracts"
@@ -22,6 +21,27 @@ const MIN_FREE_SPACE_AFTER_TRANSFER = 64 * 1024 * 1024
 const INITIAL_MERGE_FREE_SPACE_RESERVE = 1024 ** 3
 export const INITIAL_MERGE_FREE_SPACE_CAPABILITY = "initial-merge-free-space-v1"
 const INITIAL_CONFLICT_REASON = "Exists on both computers with different content; both copies were preserved for review in Recovery."
+/** Merge attempts before files that keep changing stop the merge instead of being merged again. */
+const MAX_INITIAL_MERGE_ATTEMPTS = 3
+
+/** Final verification still found files on only one computer: they appeared or changed during the copy. */
+export class InitialMergeChangedError extends Error {
+  readonly pendingPaths: readonly string[]
+
+  constructor(pendingPaths: readonly string[]) {
+    super(
+      `Files kept changing while the initial merge ran (${describePathSample(pendingPaths)}). The copied files are safe. ` +
+      "Close programs that are writing to these files or add ignore rules for them, then retry.",
+    )
+    this.pendingPaths = pendingPaths
+  }
+}
+
+export function describePathSample(paths: readonly string[]): string {
+  const shown = paths.slice(0, 3).join(", ")
+  const remaining = paths.length - 3
+  return remaining > 0 ? `${shown} and ${remaining.toLocaleString("en-GB")} more` : shown
+}
 
 class DestinationExistsError extends Error {
   constructor(relativePath: string, cause: unknown) {
@@ -124,8 +144,9 @@ export interface InitialSyncPassResult {
 }
 
 export interface InitialMergeConvergence {
-  complete: boolean
   skipped: SyncSkip[]
+  /** Transferable files still present on only one computer. Empty once the merge has converged. */
+  pendingPaths: string[]
 }
 
 export interface AtomicChunkWriteOptions {
@@ -135,16 +156,48 @@ export interface AtomicChunkWriteOptions {
   replacement?: DurableReplacementHooks
 }
 
-/** Runs the inverse pass and completion commit strictly after the first pass succeeds. */
+export interface CoordinatedInitialMergeOptions {
+  maxAttempts?: number
+  /** Called before both passes run again for files that changed during the previous attempt. */
+  onRetry?: (error: InitialMergeChangedError) => void
+}
+
+/**
+ * Runs the inverse pass and completion commit strictly after the first pass
+ * succeeds. When completion finds files that changed during the copy, both
+ * passes run again so those files are merged too; completion still has to
+ * verify the folders before anything is committed.
+ */
 export async function runCoordinatedInitialMerge(
-  runLocalPass: () => Promise<InitialSyncPassResult>,
+  runLocalPass: (attempt: number) => Promise<InitialSyncPassResult>,
   runPeerPass: () => Promise<InitialSyncPassResult>,
   commitCompletion: (local: InitialSyncPassResult, peer: InitialSyncPassResult) => Promise<void>,
+  options: CoordinatedInitialMergeOptions = {},
 ): Promise<{ local: InitialSyncPassResult; peer: InitialSyncPassResult }> {
-  const local = await runLocalPass()
-  const peer = await runPeerPass()
-  await commitCompletion(local, peer)
-  return { local, peer }
+  const maxAttempts = options.maxAttempts ?? MAX_INITIAL_MERGE_ATTEMPTS
+  let local: InitialSyncPassResult | undefined
+  let peer: InitialSyncPassResult | undefined
+  for (let attempt = 1; ; attempt += 1) {
+    local = withEarlierCopies(await runLocalPass(attempt), local)
+    peer = withEarlierCopies(await runPeerPass(), peer)
+    try {
+      await commitCompletion(local, peer)
+      return { local, peer }
+    } catch (error) {
+      if (!(error instanceof InitialMergeChangedError) || attempt >= maxAttempts) throw error
+      options.onRetry?.(error)
+    }
+  }
+}
+
+/** A later pass rescans everything, so only its copy counts accumulate; its skips and file count replace the earlier ones. */
+function withEarlierCopies(latest: InitialSyncPassResult, earlier: InitialSyncPassResult | undefined): InitialSyncPassResult {
+  if (!earlier) return latest
+  return {
+    ...latest,
+    copiedFiles: earlier.copiedFiles + latest.copiedFiles,
+    copiedBytes: earlier.copiedBytes + latest.copiedBytes,
+  }
 }
 
 export interface SyncPlanOptions {
@@ -243,9 +296,10 @@ export function assessInitialMergeConvergence(
   const peerPlan = computeSyncPlan(remote, local, inverseMode, { destinationBlocked: options.remoteBlocked })
   const byPath = new Map<string, SyncSkip>()
   for (const skip of [...localPlan.skipped, ...peerPlan.skipped]) byPath.set(`${skip.path}\0${skip.reason}`, skip)
+  const pendingPaths = new Set([...localPlan.toPull, ...peerPlan.toPull].map((entry) => entry.path))
   return {
-    complete: localPlan.toPull.length === 0 && peerPlan.toPull.length === 0,
     skipped: [...byPath.values()],
+    pendingPaths: [...pendingPaths].sort(),
   }
 }
 

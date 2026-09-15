@@ -1,4 +1,4 @@
-import { lstat, realpath } from "node:fs/promises"
+import { lstat, realpath } from "./synced-fs"
 import path from "node:path"
 import { z } from "zod"
 import type { DirectoryPathMapping } from "./directory-mapping"

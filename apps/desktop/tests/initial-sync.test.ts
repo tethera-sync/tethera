@@ -8,6 +8,7 @@ import {
   assertInitialMergeCapacity,
   assertInitialMergePathCompatibility,
   computeSyncPlan,
+  InitialMergeChangedError,
   mergeInitialSyncFile,
   runCoordinatedInitialMerge,
   writeFileAtomic,
@@ -311,6 +312,53 @@ describe("runCoordinatedInitialMerge", () => {
     ).rejects.toThrow("peer disconnected")
     expect(committed).toBe(false)
   })
+
+  test("runs both passes again when files changed during the copy and counts every copy", async () => {
+    const attempts: number[] = []
+    const retried: string[][] = []
+    let verifications = 0
+    const merged = await runCoordinatedInitialMerge(
+      async (attempt) => { attempts.push(attempt); return result },
+      async () => ({ ...result, copiedFiles: 2, skipped: [{ path: `conflict-${attempts.length}`, reason: "different" }] }),
+      async () => {
+        verifications += 1
+        if (verifications === 1) throw new InitialMergeChangedError([".git/index.lock"])
+      },
+      { onRetry: (error) => retried.push([...error.pendingPaths]) },
+    )
+    expect(attempts).toEqual([1, 2])
+    expect(retried).toEqual([[".git/index.lock"]])
+    expect(merged.local.copiedFiles).toBe(2)
+    expect(merged.local.copiedBytes).toBe(10)
+    expect(merged.peer.copiedFiles).toBe(4)
+    // The latest pass rescanned everything, so its skips replace the earlier ones.
+    expect(merged.peer.skipped).toEqual([{ path: "conflict-2", reason: "different" }])
+  })
+
+  test("stops with the changing files once the attempts are used up", async () => {
+    let attempts = 0
+    await expect(
+      runCoordinatedInitialMerge(
+        async () => { attempts += 1; return result },
+        async () => result,
+        async () => { throw new InitialMergeChangedError(["world/region/r.0.0.mca", "a", "b", "c"]) },
+        { maxAttempts: 2 },
+      ),
+    ).rejects.toThrow("Files kept changing while the initial merge ran (world/region/r.0.0.mca, a, b and 1 more)")
+    expect(attempts).toBe(2)
+  })
+
+  test("does not repeat the merge for other completion failures", async () => {
+    let attempts = 0
+    await expect(
+      runCoordinatedInitialMerge(
+        async () => { attempts += 1; return result },
+        async () => result,
+        async () => { throw new Error("The peer did not confirm its durable initial-merge outcome.") },
+      ),
+    ).rejects.toThrow("durable initial-merge outcome")
+    expect(attempts).toBe(1)
+  })
 })
 
 describe("assessInitialMergeConvergence", () => {
@@ -320,7 +368,7 @@ describe("assessInitialMergeConvergence", () => {
       manifest([]),
       "two-way",
     )
-    expect(result.complete).toBe(false)
+    expect(result.pendingPaths).toEqual(["local.txt"])
   })
 
   test("allows activation while preserving a same-path conflict", () => {
@@ -329,7 +377,7 @@ describe("assessInitialMergeConvergence", () => {
       manifest([{ path: "notes.txt", size: 2, modifiedMs: 1, digest: "remote" }]),
       "two-way",
     )
-    expect(result.complete).toBe(true)
+    expect(result.pendingPaths).toEqual([])
     expect(result.skipped.map((skip) => skip.path)).toEqual(["notes.txt"])
   })
 
@@ -340,7 +388,7 @@ describe("assessInitialMergeConvergence", () => {
       "two-way",
       { localBlocked: [{ path: "locked", reason: "Permission denied", kind: "directory" }] },
     )
-    expect(result.complete).toBe(true)
+    expect(result.pendingPaths).toEqual([])
   })
 
   test("treats files left out for a path occupied on either computer as converged", () => {
@@ -349,7 +397,7 @@ describe("assessInitialMergeConvergence", () => {
       { ...manifest([{ path: "skills/shadcn", size: 26, modifiedMs: 1, digest: "link-text" }]), occupiedPaths: [{ path: "tools/run", kind: "special" }] },
       "two-way",
     )
-    expect(result).toEqual({ complete: true, skipped: [] })
+    expect(result).toEqual({ skipped: [], pendingPaths: [] })
   })
 
   test("still blocks when the accepted issue does not cover the one-sided file", () => {
@@ -359,7 +407,7 @@ describe("assessInitialMergeConvergence", () => {
       "two-way",
       { localBlocked: [{ path: "locked", reason: "Permission denied", kind: "directory" }] },
     )
-    expect(result.complete).toBe(false)
+    expect(result.pendingPaths).toEqual(["other/new.txt"])
   })
 })
 

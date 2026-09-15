@@ -1,4 +1,4 @@
-import { opendir, realpath, stat } from "node:fs/promises"
+import { opendir, realpath, stat } from "./synced-fs"
 import path from "node:path"
 import { createIgnoreMatcher } from "./folder-manifest"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"

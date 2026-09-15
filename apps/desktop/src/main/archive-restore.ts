@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { realpath } from "node:fs/promises"
+import { realpath } from "./synced-fs"
 import { describeTransferFile, readTransferFileChunk, TRANSFER_CHUNK_BYTES } from "./file-transfer"
 import { writeFileChunksAtomic } from "./initial-sync"
 import {

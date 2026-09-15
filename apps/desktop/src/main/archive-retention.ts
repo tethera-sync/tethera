@@ -1,4 +1,4 @@
-import { lstat, realpath, unlink } from "node:fs/promises"
+import { lstat, realpath, unlink } from "./synced-fs"
 import path from "node:path"
 import { z } from "zod"
 import { describeTransferFile, isSha256HexDigest } from "./file-transfer"

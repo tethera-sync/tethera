@@ -2,6 +2,9 @@
 
 All notable changes to this project, newest first.
 
+- 🐛 Scan and copy `.asar` files inside synchronized folders (for example packaged Electron apps) instead of reporting them as unreadable.
+- 🐛 Merge files that change while the initial merge runs automatically, and only stop, naming the files, if they keep changing.
+- 🐛 Show a repeated activity event once with a repeat count, so one recurring failure no longer pushes the rest of the history out of the activity log.
 - 🔒 Restrict every desktop action to Tethera's own window, validate folder-browser requests, and reveal folders in the file manager instead of opening them.
 - 🔒 Honour each computer's own approved sync direction for continuous sync and stop a cycle when the two computers disagree.
 - 🐛 Keep a folder syncing after a file replacement installs but its bookkeeping update fails, instead of blocking that folder until Tethera restarts.

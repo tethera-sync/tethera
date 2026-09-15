@@ -1,6 +1,5 @@
-import { constants } from "node:fs"
+import { chmod, constants, link, lstat, mkdir, open, realpath, rename, unlink } from "./synced-fs"
 import { createHash } from "node:crypto"
-import { chmod, link, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises"
 import path from "node:path"
 import { describeTransferFile, isSha256HexDigest, readTransferFileChunk, TRANSFER_CHUNK_BYTES } from "./file-transfer"
 import { syncDirectory } from "./fs-durability"

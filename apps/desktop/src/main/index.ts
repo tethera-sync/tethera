@@ -12,7 +12,7 @@ import { autoUpdater } from "electron-updater"
 import { execFile } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
-import { mkdir, readdir, realpath, stat } from "node:fs/promises"
+import { mkdir, readdir, realpath, stat } from "./synced-fs"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -75,7 +75,9 @@ import {
   assertInitialMergePathCompatibility,
   availableDiskBytes,
   computeSyncPlan,
+  describePathSample,
   INITIAL_MERGE_FREE_SPACE_CAPABILITY,
+  InitialMergeChangedError,
   mergeInitialSyncFile,
   plannedBytes,
   type InitialSyncPassResult,
@@ -83,6 +85,7 @@ import {
   type SyncSkip,
   writeFileChunksAtomic,
 } from "./initial-sync"
+import { appendActivity } from "./activity-log"
 import {
   describeTransferFile,
   FileChangedError,
@@ -922,17 +925,7 @@ function pushActivity(
   level: "info" | "success" | "warning" | "error" = "info",
   folderId?: string,
 ): void {
-  snapshot.activity = [
-    {
-      id: randomUUID(),
-      title,
-      detail,
-      level,
-      folderId,
-      occurredAt: new Date().toISOString(),
-    },
-    ...snapshot.activity,
-  ].slice(0, 100)
+  snapshot.activity = appendActivity(snapshot.activity, { title, detail, level, folderId, occurredAt: new Date().toISOString() })
 }
 
 function broadcastSnapshot(): AppSnapshot {
@@ -3627,9 +3620,7 @@ async function verifyInitialMergeQuiescent(
     localBlocked,
     remoteBlocked: remoteManifest.unreadableEntries,
   })
-  if (!convergence.complete) {
-    throw new Error("A folder changed while the initial merge was running. The copied files are safe; retry to include the new changes.")
-  }
+  if (convergence.pendingPaths.length > 0) throw new InitialMergeChangedError(convergence.pendingPaths)
   return {
     skipped: convergence.skipped,
     unreadableSkipped: scanIssueSkips(scanIssueReportOf(localManifest, remoteManifest), "This computer", peer.name),
@@ -3815,9 +3806,11 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     const allowUnreadable = acknowledgeUnreadable && reusablePrepared !== undefined
     const acknowledgedIssuesSignature = acknowledgeUnreadable ? prepared?.issuesSignature : undefined
     const { local: localResult, peer: remoteResult } = await runCoordinatedInitialMerge(
-      () => runInitialSyncPass(folder, peer, {
-        allowUnreadable,
-        prepared: reusablePrepared,
+      // A repeat attempt must walk both folders again, so only the first may
+      // reuse the prepared scan and its blanket unreadable allowance.
+      (attempt) => runInitialSyncPass(folder, peer, {
+        allowUnreadable: attempt === 1 && allowUnreadable,
+        prepared: attempt === 1 ? reusablePrepared : undefined,
         acknowledgedIssuesSignature,
         initialMerge: { step: 1, firstPassUpdates: "this-computer" },
       }),
@@ -3877,6 +3870,18 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
           currentRecord.revision,
         )
         await requireExactMappingDeliveryAcknowledgement(completionRecord, targetDeviceId)
+      },
+      {
+        onRetry: (error) => {
+          updateFolder(folderId, { currentAction: "Some files changed during the merge; checking both computers again…" })
+          pushActivity(
+            "Merging files that changed",
+            `${folder.name}: ${describePathSample(error.pendingPaths)} changed during the merge, so both computers are being checked again.`,
+            "info",
+            folderId,
+          )
+          broadcastSnapshot()
+        },
       },
     )
     updateFolder(folderId, {
