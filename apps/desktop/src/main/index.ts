@@ -3814,19 +3814,20 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
         acknowledgedIssuesSignature,
         initialMerge: { step: 1, firstPassUpdates: "this-computer" },
       }),
-      async () => {
+      async (attempt) => {
         updateFolder(folderId, { currentAction: `Asking ${peer.name} to merge files in the other direction…` })
         setFolderActivity(folderId, { kind: "waiting-for-peer" }, { step: 2, firstPassUpdates: "this-computer" })
         broadcastSnapshot()
         // The peer applies its own approved-report check. Promoting the local
         // pass's skips into a blanket allowance would let the peer skip
         // unreadable paths discovered after the coordinator's scan without
-        // the coordinator (or the peer's user) seeing them.
+        // the coordinator (or the peer's user) seeing them. A repeat attempt
+        // rescans later than the reviewed report, so it gets no allowance either.
         return validateInitialSyncPassResult(
           await requirePeerSessions().request<InitialSyncPassResult>(peer.id, {
             type: "initial-sync-run",
             folderId,
-            allowUnreadable,
+            allowUnreadable: attempt === 1 && allowUnreadable,
           }, NO_PEER_RESPONSE_DEADLINE),
         )
       },

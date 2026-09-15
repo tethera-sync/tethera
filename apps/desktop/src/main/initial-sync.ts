@@ -170,7 +170,7 @@ export interface CoordinatedInitialMergeOptions {
  */
 export async function runCoordinatedInitialMerge(
   runLocalPass: (attempt: number) => Promise<InitialSyncPassResult>,
-  runPeerPass: () => Promise<InitialSyncPassResult>,
+  runPeerPass: (attempt: number) => Promise<InitialSyncPassResult>,
   commitCompletion: (local: InitialSyncPassResult, peer: InitialSyncPassResult) => Promise<void>,
   options: CoordinatedInitialMergeOptions = {},
 ): Promise<{ local: InitialSyncPassResult; peer: InitialSyncPassResult }> {
@@ -179,7 +179,7 @@ export async function runCoordinatedInitialMerge(
   let peer: InitialSyncPassResult | undefined
   for (let attempt = 1; ; attempt += 1) {
     local = withEarlierCopies(await runLocalPass(attempt), local)
-    peer = withEarlierCopies(await runPeerPass(), peer)
+    peer = withEarlierCopies(await runPeerPass(attempt), peer)
     try {
       await commitCompletion(local, peer)
       return { local, peer }

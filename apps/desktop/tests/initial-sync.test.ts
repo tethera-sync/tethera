@@ -315,11 +315,15 @@ describe("runCoordinatedInitialMerge", () => {
 
   test("runs both passes again when files changed during the copy and counts every copy", async () => {
     const attempts: number[] = []
+    const peerAttempts: number[] = []
     const retried: string[][] = []
     let verifications = 0
     const merged = await runCoordinatedInitialMerge(
       async (attempt) => { attempts.push(attempt); return result },
-      async () => ({ ...result, copiedFiles: 2, skipped: [{ path: `conflict-${attempts.length}`, reason: "different" }] }),
+      async (attempt) => {
+        peerAttempts.push(attempt)
+        return { ...result, copiedFiles: 2, skipped: [{ path: `conflict-${attempt}`, reason: "different" }] }
+      },
       async () => {
         verifications += 1
         if (verifications === 1) throw new InitialMergeChangedError([".git/index.lock"])
@@ -327,6 +331,7 @@ describe("runCoordinatedInitialMerge", () => {
       { onRetry: (error) => retried.push([...error.pendingPaths]) },
     )
     expect(attempts).toEqual([1, 2])
+    expect(peerAttempts).toEqual([1, 2])
     expect(retried).toEqual([[".git/index.lock"]])
     expect(merged.local.copiedFiles).toBe(2)
     expect(merged.local.copiedBytes).toBe(10)
