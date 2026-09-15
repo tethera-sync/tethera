@@ -104,6 +104,8 @@ export function AddFolderDialog({
   const modeFieldId = useId()
   const historyDaysFieldId = useId()
   const historyCapFieldId = useId()
+  const localPathFieldId = useId()
+  const remotePathFieldId = useId()
 
   const ignorePatterns = useMemo(
     () => patterns.split("\n").map((pattern) => pattern.trim()).filter(Boolean),
@@ -290,12 +292,12 @@ export function AddFolderDialog({
               ) : null}
               <div className="mapping-path-fields [display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [gap:14px] max-[760px]:[grid-template-columns:minmax(0,_1fr)]">
                 <Field>
-                  <FieldLabel>{`Folder on ${localDevice.name}`}</FieldLabel>
-                  <PathChooser value={localPath} placeholder="Choose a source folder" onBrowse={() => setPickerTarget("local")} />
+                  <FieldLabel htmlFor={localPathFieldId}>{`Folder on ${localDevice.name}`}</FieldLabel>
+                  <PathChooser id={localPathFieldId} value={localPath} placeholder="Choose a source folder" onBrowse={() => setPickerTarget("local")} />
                 </Field>
                 {targetDevice ? <Field>
-                  <FieldLabel>{`Folder on ${targetDevice.name}`}</FieldLabel>
-                  <PathChooser value={remotePath} placeholder="Choose a destination folder" onBrowse={() => setPickerTarget("remote")} />
+                  <FieldLabel htmlFor={remotePathFieldId}>{`Folder on ${targetDevice.name}`}</FieldLabel>
+                  <PathChooser id={remotePathFieldId} value={remotePath} placeholder="Choose a destination folder" onBrowse={() => setPickerTarget("remote")} />
                   <FieldDescription>Remote browsing is encrypted and returns folder names only.</FieldDescription>
                 </Field> : null}
               </div>
@@ -511,10 +513,10 @@ function PreviewMetric({ label, value, detail }: { label: string; value: number;
   return <div className="preview-metric [display:grid] [gap:3px] [min-width:0] [border:1px_solid_var(--border)] [border-radius:var(--radius-tile)] [background:var(--surface)] [padding:12px] [&_span]:[color:var(--muted-foreground)] [&_span]:[font-size:10px] [&_strong]:[font-size:22px] [&_strong]:[line-height:1.1] [&_strong]:[font-variant-numeric:tabular-nums] [&_small]:[overflow:hidden] [&_small]:[text-overflow:ellipsis] [&_small]:[color:var(--muted-foreground)] [&_small]:[font-size:9.5px]"><span>{label}</span><strong>{value.toLocaleString("en-GB")}</strong><small>{detail}</small></div>
 }
 
-function PathChooser({ value, placeholder, onBrowse }: { value: string; placeholder: string; onBrowse: () => void }) {
+function PathChooser({ id, value, placeholder, onBrowse }: { id: string; value: string; placeholder: string; onBrowse: () => void }) {
   return (
     <div className="flex gap-2">
-      <Input className="min-w-0 flex-1" value={value} readOnly placeholder={placeholder} title={value} />
+      <Input id={id} className="min-w-0 flex-1" value={value} readOnly placeholder={placeholder} title={value} />
       <Button variant="outline" onClick={onBrowse}><FolderOpenIcon data-icon="inline-start" />Browse</Button>
     </div>
   )
