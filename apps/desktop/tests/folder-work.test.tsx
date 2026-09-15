@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { renderToStaticMarkup } from "react-dom/server"
 import { FolderWorkPanel } from "../src/renderer/components/folder-work-panel"
-import { copyProgress, initialMergeSteps } from "../src/renderer/lib/folder-work"
+import { copyProgress, initialMergeSteps, pauseConfirmationMessage } from "../src/renderer/lib/folder-work"
 import { FoldersView } from "../src/renderer/views/folders"
 import type { FolderSummary, FolderWork, FolderWorkActivity } from "../src/shared/contracts"
 import { appSnapshot } from "./helpers"
@@ -63,6 +63,29 @@ describe("folder work panel", () => {
     expect(html).toContain("2 unreadable")
     expect(html).toContain("Live counts have not arrived yet")
     expect(html).toContain('aria-current="step"')
+  })
+
+  test("shows only this computer's counts while the other computer checks this folder", () => {
+    const work: FolderWork = {
+      startedAt: new Date().toISOString(),
+      activity: {
+        kind: "scanning",
+        purpose: "peer-changes",
+        local: { stage: "hashing", currentPath: "src/index.ts", scannedFiles: 7000, ignoredEntries: 624, unreadableEntries: 0, hashedBytes: 0 },
+      },
+    }
+    const html = renderToStaticMarkup(<FolderWorkPanel work={work} names={names} />)
+    expect(html).toContain("Laptop is checking this folder")
+    expect(html).toContain("7,000 files checked")
+    expect(html).not.toContain("Live counts have not arrived yet")
+  })
+})
+
+describe("pause confirmation", () => {
+  test("asks before pausing only while folder work is running", () => {
+    expect(pauseConfirmationMessage(undefined)).toBeUndefined()
+    const work: FolderWork = { startedAt: new Date().toISOString(), activity: { kind: "scanning", purpose: "changes" } }
+    expect(pauseConfirmationMessage(work)).toContain("Pausing stops that work")
   })
 })
 

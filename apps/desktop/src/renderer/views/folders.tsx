@@ -23,6 +23,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { StatusPill } from "@/components/ui/status-pill"
+import { pauseConfirmationMessage } from "@/lib/folder-work"
 import { formatRelative, pretty, prettyMode, statusTone } from "@/lib/format"
 import { folderStatusLabel, getLocalDevice, getPairedDevices, mappingMutationAvailability, preferredPairedDevice } from "@/lib/snapshot"
 
@@ -244,6 +245,9 @@ function FolderCard({
   }
 
   async function setPaused() {
+    if (pendingActionRef.current) return
+    const warning = paused ? undefined : pauseConfirmationMessage(folder.work)
+    if (warning && !window.confirm(warning)) return
     await runAction(paused ? "resume" : "pause", () => window.folderSync.setFolderPaused(folder.id, !paused), `Unable to ${paused ? "resume" : "pause"} this folder.`)
   }
 
