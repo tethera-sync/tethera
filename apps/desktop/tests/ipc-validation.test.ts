@@ -93,6 +93,9 @@ describe("folder browser input validation", () => {
     expect(() => parseCreateDirectoryInput({ deviceId: "local-device", parentPath: "", name: "Projects" })).toThrow(
       "The new folder request is invalid.",
     )
+    expect(() => parseCreateDirectoryInput({ deviceId: "local-device", parentPath: "   ", name: "Projects" })).toThrow(
+      "The new folder request is invalid.",
+    )
     expect(() =>
       parseCreateDirectoryInput({ deviceId: "local-device", parentPath: "/home/tommy", name: "a".repeat(256) }),
     ).toThrow("The new folder request is invalid.")

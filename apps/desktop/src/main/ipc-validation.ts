@@ -90,7 +90,7 @@ const browseDirectoryInputSchema = z.object({
 
 const createDirectoryInputSchema = z.object({
   deviceId: deviceIdString,
-  parentPath: pathString,
+  parentPath: pathString.refine((value) => value.trim().length > 0, "The parent path is invalid."),
   name: z
     .string()
     .min(1)
