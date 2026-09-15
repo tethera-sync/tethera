@@ -4794,9 +4794,10 @@ function registerIpc(): void {
     })
   })
 
-  ipcMain.handle("pairing:set-available", (event, enabled: boolean) => {
+  ipcMain.handle("pairing:set-available", (event, enabled: unknown) => {
     requireTrustedMainRenderer(event)
-    requirePairingService().setPairingAvailable(Boolean(enabled))
+    if (typeof enabled !== "boolean") throw new Error("The pairing availability state is invalid.")
+    requirePairingService().setPairingAvailable(enabled)
     return syncPairingSnapshot()
   })
   ipcMain.handle("pairing:start", (event, deviceId: string) => {
