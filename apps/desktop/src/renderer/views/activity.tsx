@@ -42,7 +42,12 @@ export function ActivityRow({ event, showDate = false }: { event: ActivityEvent;
         <Icon />
       </div>
       <div className="min-w-0 flex-1">
-        <p className="text-[12.5px] font-semibold">{event.title}</p>
+        <p className="text-[12.5px] font-semibold">
+          {event.title}
+          {event.repeatCount ? (
+            <span className="ml-1.5 font-normal text-[var(--muted-foreground)]">· {event.repeatCount.toLocaleString("en-GB")} times</span>
+          ) : null}
+        </p>
         <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--muted-foreground)]">{event.detail}</p>
       </div>
       <time className="shrink-0 text-[10px] tabular-nums text-[var(--muted-foreground)]" dateTime={event.occurredAt}>

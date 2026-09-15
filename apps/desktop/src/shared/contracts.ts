@@ -156,6 +156,8 @@ export interface ActivityEvent {
   detail: string
   occurredAt: string
   folderId?: string
+  /** How many times this event occurred in a row; absent for a single occurrence. `occurredAt` is the latest. */
+  repeatCount?: number
 }
 
 export interface AppSettings {

@@ -1,4 +1,5 @@
-import { lstat, realpath, unlink } from "node:fs/promises"
+import type { BigIntStats } from "node:fs"
+import { lstat, realpath, unlink } from "./synced-fs"
 import path from "node:path"
 import { z } from "zod"
 import { describeTransferFile, isSha256HexDigest } from "./file-transfer"
@@ -173,9 +174,9 @@ async function removeDisplacedCopy(
 ): Promise<"removed" | "absent" | "kept"> {
   const relativePath = displacedFilePath(physicalPath, entry.id)
   const absolutePath = resolveWithinRoot(liveRoot, relativePath)
-  let before: Awaited<ReturnType<typeof lstat>>
+  let before: BigIntStats
   try {
-    before = await lstat(absolutePath)
+    before = await lstat(absolutePath, { bigint: true })
   } catch (error) {
     if (isMissingPathError(error)) return "absent"
     throw error
@@ -191,12 +192,16 @@ async function removeDisplacedCopy(
   if (parentRelative.startsWith("..") || path.isAbsolute(parentRelative)) {
     throw new Error("A displaced copy's folder no longer belongs to the configured folder root.")
   }
-  const current = await lstat(absolutePath)
+  // Exact 64-bit identities: numeric NTFS file ids can round, and a zero id (FAT/exFAT on
+  // Windows) cannot tell two files apart, so an unverifiable identity keeps the copy.
+  const current = await lstat(absolutePath, { bigint: true })
   if (
+    before.dev === 0n ||
+    before.ino === 0n ||
     current.dev !== before.dev ||
     current.ino !== before.ino ||
     current.size !== before.size ||
-    current.mtimeMs !== before.mtimeMs
+    current.mtimeNs !== before.mtimeNs
   ) {
     return "kept"
   }

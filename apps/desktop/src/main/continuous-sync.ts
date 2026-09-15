@@ -1,5 +1,5 @@
-import { watch, type FSWatcher } from "node:fs"
-import { opendir, realpath, stat } from "node:fs/promises"
+import type { FSWatcher } from "node:fs"
+import { opendir, realpath, stat, watch } from "./synced-fs"
 import path from "node:path"
 import type { SyncMode } from "../shared/contracts"
 import type { FileManifest } from "./folder-manifest"

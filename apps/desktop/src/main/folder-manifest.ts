@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import type { BigIntStats } from "node:fs"
-import { lstat, open, opendir, realpath, stat, statfs } from "node:fs/promises"
+import { lstat, open, opendir, realpath, stat, statfs } from "./synced-fs"
 import path from "node:path"
 import type { FolderMappingPreview, FolderScanActivity, FolderScanIssue, MappingPreviewItem, SyncMode } from "../shared/contracts"
 import {

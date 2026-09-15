@@ -1,4 +1,4 @@
-import { open } from "node:fs/promises"
+import { open } from "./synced-fs"
 
 /**
  * Fsyncs a directory so atomic file commits survive a crash.
