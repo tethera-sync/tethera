@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import type { FolderScanCounts, FolderWorkActivity, InitialMergeStep } from "@shared/contracts"
+import type { FolderScanCounts, FolderWork, FolderWorkActivity, InitialMergeStep } from "@shared/contracts"
 import { formatElapsed } from "./compare-progress"
 import { formatBytes, formatRate } from "./format"
 import { clamp01 } from "./utils"
@@ -30,6 +30,7 @@ export function folderWorkHeadline(activity: FolderWorkActivity, names: Computer
     case "scanning":
       if (activity.purpose === "verify") return "Verifying that both folders match…"
       if (activity.purpose === "changes") return "Looking for changes on both computers…"
+      if (activity.purpose === "peer-changes") return `${names.otherComputer} is checking this folder…`
       return "Scanning both folders…"
     case "copying":
       return `Copying files to ${activity.destination === "this-computer" ? names.thisComputer : names.otherComputer}…`
@@ -47,7 +48,14 @@ export function folderWorkDetail(activity: FolderWorkActivity, currentAction: st
   if (activity.kind !== "scanning") return currentAction
   if (activity.purpose === "verify") return "Both folders are read again to confirm nothing changed while files were copied."
   if (activity.purpose === "changes") return "Both folders are compared with the last verified sync."
+  if (activity.purpose === "peer-changes") return "This folder is read so both computers can be compared. Conflicts update when the comparison finishes."
   return "Listing files, applying ignore rules and reading contents on both computers. Nothing is copied until both scans finish."
+}
+
+/** The confirmation to show before pausing a folder whose sync work is still running, if any. */
+export function pauseConfirmationMessage(work: FolderWork | undefined): string | undefined {
+  if (!work) return undefined
+  return "Tethera is still working on this folder. Pausing stops that work, and it has to start again when you resume. Pause anyway?"
 }
 
 export interface InitialMergeStepView {

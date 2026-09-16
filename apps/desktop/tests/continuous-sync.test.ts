@@ -13,6 +13,8 @@ import {
   type FileSyncState,
   type QuietReconcile,
   conflictSummary,
+  describeFolderSyncState,
+  describeInitialMergeOutcome,
   findMirroredPeerOperation,
   FolderChangeMonitor,
   mirrorConflictChoice,
@@ -116,6 +118,72 @@ describe("continuous sync helpers", () => {
     expect(summary).toContain("edited on both computers")
     expect(summary).toContain("changed against the one-way direction")
     expect(summary).toContain("neither copy was changed")
+  })
+})
+
+describe("describeFolderSyncState", () => {
+  const empty = { conflicts: [], operations: [], recoveryIssues: [] }
+  const unbased: FileSyncConflict = { mappingId: "m", path: "notes.md", kind: "unbased-divergence", detectedAt: "now" }
+
+  test("treats unchecked initial-merge conflicts as a pending check instead of asking for attention", () => {
+    const summary = describeFolderSyncState({ paused: false, peerOnline: true, state: empty, unverifiedMergeConflicts: 1561 })
+    expect(summary.status).toBe("syncing")
+    expect(summary.currentAction).toBe(
+      "Waiting for the first full check of both computers. 1,561 files differed during the initial merge; any that now match will drop off the list.",
+    )
+    expect(describeFolderSyncState({ paused: false, peerOnline: false, state: empty, unverifiedMergeConflicts: 1561 }).status).toBe("offline")
+    expect(describeFolderSyncState({ paused: true, peerOnline: true, state: empty, unverifiedMergeConflicts: 1561 }).status).toBe("paused")
+  })
+
+  test("asks for attention once a scan records durable conflicts or recovery issues", () => {
+    const conflicted = describeFolderSyncState({ paused: false, peerOnline: true, state: { ...empty, conflicts: [unbased] }, unverifiedMergeConflicts: 0 })
+    expect(conflicted).toEqual({ status: "needs-attention", currentAction: conflictSummary([unbased]) })
+    const recovering = describeFolderSyncState({
+      paused: false,
+      peerOnline: true,
+      state: { ...empty, recoveryIssues: [{ id: "r", path: "notes.md", state: "recovery-required", lastError: "Journal needs repair." }] },
+      unverifiedMergeConflicts: 1561,
+    })
+    expect(recovering).toEqual({ status: "needs-attention", currentAction: "Journal needs repair." })
+  })
+
+  test("reports an idle folder as up to date, or offline without its peer", () => {
+    expect(describeFolderSyncState({ paused: false, peerOnline: true, state: empty, unverifiedMergeConflicts: 0 }))
+      .toEqual({ status: "up-to-date", currentAction: "Watching for changes." })
+    expect(describeFolderSyncState({ paused: false, peerOnline: false, state: empty, unverifiedMergeConflicts: 0 }).status).toBe("offline")
+  })
+
+  test("reports durable work waiting to retry as syncing, not up to date", () => {
+    const operation: FileSyncOperation = {
+      id: 1, mappingId: "m", path: "notes.md", direction: "push-local", sourceDigest: "a".repeat(64), sourceSize: 1,
+      status: "failed", attempts: 1, createdAt: "now", updatedAt: "now",
+    }
+    expect(describeFolderSyncState({ paused: false, peerOnline: true, state: { ...empty, operations: [operation] }, unverifiedMergeConflicts: 0 }))
+      .toEqual({ status: "syncing", currentAction: "1 change is waiting to retry." })
+  })
+})
+
+describe("describeInitialMergeOutcome", () => {
+  test("shows the merge's conflicts as a pending check, not as attention", () => {
+    expect(describeInitialMergeOutcome({ paused: false, peerOnline: true, conflicts: 1561, unreadableSkipped: 0 })).toEqual({
+      status: "syncing",
+      currentAction: "Waiting for the first full check of both computers. 1,561 files differed during the initial merge; any that now match will drop off the list.",
+    })
+    expect(describeInitialMergeOutcome({ paused: true, peerOnline: true, conflicts: 1561, unreadableSkipped: 0 }).status).toBe("paused")
+  })
+
+  test("keeps skipped inaccessible items as needing attention alongside the pending check", () => {
+    const outcome = describeInitialMergeOutcome({ paused: false, peerOnline: true, conflicts: 1561, unreadableSkipped: 20 })
+    expect(outcome.status).toBe("needs-attention")
+    expect(outcome.currentAction).toStartWith("20 inaccessible items were skipped and need attention; affected paths were left untouched. Waiting for the first full check")
+    expect(describeInitialMergeOutcome({ paused: false, peerOnline: true, conflicts: 0, unreadableSkipped: 1 }).currentAction)
+      .toBe("1 inaccessible item was skipped and needs attention; affected paths were left untouched.")
+  })
+
+  test("reports a clean merge as up to date, or offline without the peer", () => {
+    expect(describeInitialMergeOutcome({ paused: false, peerOnline: true, conflicts: 0, unreadableSkipped: 0 }))
+      .toEqual({ status: "up-to-date", currentAction: "Initial merge completed safely on both computers." })
+    expect(describeInitialMergeOutcome({ paused: false, peerOnline: false, conflicts: 0, unreadableSkipped: 0 }).status).toBe("offline")
   })
 })
 

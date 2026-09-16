@@ -164,6 +164,9 @@ import {
   isUnchangedScanReply,
   type QuietReconcile,
   conflictSummary,
+  describeFolderSyncState,
+  describeInitialMergeOutcome,
+  unverifiedMergeConflictsAction,
   findMirroredPeerOperation,
   FolderChangeMonitor,
   mirrorConflictChoice,
@@ -1271,8 +1274,9 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
     if (!projected) return []
     const runtime = previous.get(projected.id)
     const outcome = initialSyncOutcomes[projected.id]
-    const conflicts = outcome?.conflicts ?? []
-    const conflictCount = Math.max(runtime?.conflictCount ?? 0, conflicts.length)
+    // The first two-sided scan retires the initial merge's conflicts, so any that remain are unchecked.
+    const unverifiedConflicts = outcome?.conflicts.length ?? 0
+    const conflictCount = Math.max(runtime?.conflictCount ?? 0, unverifiedConflicts)
     const recoveryIssueCount = runtime?.recoveryIssueCount ?? 0
     const peer = projected.remoteDeviceId ? getPairedDevice(projected.remoteDeviceId) : undefined
     return [
@@ -1297,19 +1301,17 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
           : {
               fileCount: outcome?.fileCount,
               lastSyncedAt: outcome?.completedAt,
-              currentAction: conflicts.length > 0
-                ? `${conflicts.length} same-path conflict${conflicts.length === 1 ? " needs" : "s need"} attention; neither copy was changed.`
-                : projected.currentAction,
+              currentAction: unverifiedConflicts > 0 ? unverifiedMergeConflictsAction(unverifiedConflicts) : projected.currentAction,
               conflictCount,
             }),
         status:
           projected.paused || snapshot.paused
             ? "paused"
-            : record.pendingDelivery || conflictCount > 0 || recoveryIssueCount > 0
+            : !peer || record.pendingDelivery || recoveryIssueCount > 0 || conflictCount > unverifiedConflicts
               ? "needs-attention"
-              : peer
-                ? idleFolderStatus(projected.remoteDeviceId, projected.setupStatus)
-                : "needs-attention",
+              : unverifiedConflicts > 0
+                ? peer.status === "online" ? "syncing" : "offline"
+                : idleFolderStatus(projected.remoteDeviceId, projected.setupStatus),
       },
     ]
   })
@@ -1942,29 +1944,20 @@ function applyFileSyncStateToFolder(folderId: string, state: FileSyncState, sync
   const legacyConflictCount = (initialSyncOutcomes[folderId]?.conflicts ?? [])
     .filter((conflict) => !durablePaths.has(conflict.path)).length
   const conflictCount = state.conflicts.length + legacyConflictCount
-  const hasConflicts = conflictCount > 0
-  const hasRecoveryIssues = state.recoveryIssues.length > 0
+  const { status, currentAction } = describeFolderSyncState({
+    paused: folder.paused || snapshot.paused,
+    peerOnline: peer?.status === "online",
+    state,
+    unverifiedMergeConflicts: legacyConflictCount,
+  })
   updateFolder(folderId, {
-    status: folder.paused || snapshot.paused
-      ? "paused"
-      : hasConflicts || hasRecoveryIssues
-        ? "needs-attention"
-        : peer?.status === "online"
-          ? "up-to-date"
-          : "offline",
-    currentAction: hasRecoveryIssues
-      ? state.recoveryIssues[0]?.lastError ?? `${state.recoveryIssues.length} file replacement${state.recoveryIssues.length === 1 ? " requires" : "s require"} recovery.`
-      : hasConflicts
-      ? state.conflicts.length > 0
-        ? conflictSummary(state.conflicts)
-        : `${legacyConflictCount} initial-merge conflict${legacyConflictCount === 1 ? " needs" : "s need"} an authoritative two-sided scan.`
-      : state.operations.length > 0
-        ? `${state.operations.length} change${state.operations.length === 1 ? " is" : "s are"} waiting to retry.`
-        : "Watching for changes.",
+    status,
+    currentAction,
     work: undefined,
     problem: undefined,
     lastSyncedAt: syncedAt ?? folder.lastSyncedAt,
-    fileCount: state.baselineCount,
+    // Baselines only exist after the first two-sided scan; until then keep the initial merge's count.
+    fileCount: state.initialized ? state.baselineCount : folder.fileCount,
     conflictCount,
     recoveryIssueCount: state.recoveryIssues.length,
   })
@@ -3676,17 +3669,23 @@ function applyInitialSyncOutcomeStatus(folderId: string): void {
   const outcome = initialSyncOutcomes[folderId]
   const folder = snapshot.folders.find((item) => item.id === folderId)
   if (!outcome || !folder) return
-  const conflicts = outcome.conflicts
-  const unreadable = outcome.unreadableSkipped ?? []
-  const attention = initialSyncAttentionSummary(conflicts.length, unreadable.length)
+  const peer = getPairedDevice(folder.remoteDeviceId)
+  const paused = folder.paused || snapshot.paused
+  const { status, currentAction } = describeInitialMergeOutcome({
+    paused,
+    peerOnline: peer?.status === "online",
+    // The first two-sided scan retires these, so any that remain are unchecked.
+    conflicts: outcome.conflicts.length,
+    unreadableSkipped: outcome.unreadableSkipped?.length ?? 0,
+  })
   updateFolder(folderId, {
     setupStatus: "active",
-    status: attention ? "needs-attention" : idleFolderStatus(folder.remoteDeviceId, "active"),
+    status: !peer && !paused ? "needs-attention" : status,
     work: undefined,
     problem: undefined,
     fileCount: outcome.fileCount,
     lastSyncedAt: outcome.completedAt,
-    currentAction: attention ?? "Initial merge completed safely on both computers.",
+    currentAction,
   })
 }
 
@@ -3885,15 +3884,8 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
         },
       },
     )
-    updateFolder(folderId, {
-      setupStatus: "active",
-      status: skipped.length > 0 || unreadableSkipped.length > 0 ? "needs-attention" : idleFolderStatus(folder.remoteDeviceId, "active"),
-      work: undefined,
-      problem: undefined,
-      fileCount: localResult.fileCount,
-      lastSyncedAt: completedAt,
-      currentAction: initialSyncAttentionSummary(skipped.length, unreadableSkipped.length) ?? "Initial merge completed safely on both computers.",
-    })
+    // The completion commit recorded this same outcome durably before activation.
+    applyInitialSyncOutcomeStatus(folderId)
     recordInitialSyncOutcome(folder, localResult.copiedFiles + remoteResult.copiedFiles, skipped, unreadableSkipped)
     // The durable digest cache now holds everything the merge verified; the
     // pre-mapping seed has done its job.
@@ -4154,17 +4146,35 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     // A malformed fingerprint is treated as absent, never as a match.
     const knownFingerprint = isObservationFingerprint(request.knownFingerprint) ? request.knownFingerprint : undefined
     return withPeerFileOperation(context, folderId, async () => {
-      const scanLimit = currentScanLimit()
-      if (knownFingerprint !== undefined) {
-        const pass = await runCachedFolderFingerprint(`inbound:${folderId}`, folder, scanLimit, context.signal)
-        if (!pass.truncated && pass.unreadable === 0 && pass.fingerprint === knownFingerprint) {
-          const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
-          if (state.operations.length === 0 && state.recoveryIssues.length === 0) return { unchanged: true }
+      // The coordinator runs the comparison, so without this the folder here
+      // would show nothing while a long first scan reads every file.
+      const coordinatorName = getPairedDevice(context.peerId)?.name ?? "The paired computer"
+      updateFolder(folderId, {
+        status: "syncing",
+        work: newFolderWork({ kind: "scanning", purpose: "peer-changes" }),
+        currentAction: `${coordinatorName} is checking this folder for changes…`,
+      })
+      broadcastSnapshot()
+      try {
+        const scanLimit = currentScanLimit()
+        if (knownFingerprint !== undefined) {
+          const pass = await runCachedFolderFingerprint(`inbound:${folderId}`, folder, scanLimit, context.signal)
+          if (!pass.truncated && pass.unreadable === 0 && pass.fingerprint === knownFingerprint) {
+            const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+            if (state.operations.length === 0 && state.recoveryIssues.length === 0) return { unchanged: true }
+          }
         }
+        const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, scanLimit, context.signal, {
+          onActivity: (activity) => reportScanCounts(folderId, "peer-changes", { local: activity }),
+        })
+        assertManifestFitsExchange(manifest, "This computer", context.chunkedResponse)
+        return manifest
+      } finally {
+        // The comparison result arrives in a later request; until then show the durable state again.
+        updateFolder(folderId, { work: undefined })
+        await refreshContinuousSyncState(folderId)
+        broadcastSnapshot()
       }
-      const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, scanLimit, context.signal)
-      assertManifestFitsExchange(manifest, "This computer", context.chunkedResponse)
-      return manifest
     })
   }
   if (request.type === "scan-capabilities") {
@@ -4792,9 +4802,13 @@ function registerIpc(): void {
     requireTrustedMainRenderer(event)
     requireMappingMutations()
     if (typeof paused !== "boolean") throw new Error("The pause state is invalid.")
+    // Refuse before blocking: blocking aborts the running check this refusal is meant to leave alone.
+    if (paused && continuousSyncInFlight.has(folderId)) {
+      throw new Error("Tethera is checking this folder with the other computer right now. Pause it again once the check finishes.")
+    }
     const release = blockContinuousSync(folderId)
     try {
-      if (paused && (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasConflictResolutionInFlight(folderId) || hasInitialSyncPeerLease(folderId) || continuousSyncInFlight.has(folderId))) {
+      if (paused && (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasConflictResolutionInFlight(folderId) || hasInitialSyncPeerLease(folderId))) {
         throw new Error("Wait for the active file transfer to finish before pausing this folder.")
       }
       const record = mappingRecords.get(folderId)

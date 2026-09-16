@@ -1,7 +1,7 @@
 import type { FSWatcher } from "node:fs"
 import { opendir, realpath, stat, watch } from "./synced-fs"
 import path from "node:path"
-import type { SyncMode } from "../shared/contracts"
+import type { OverallStatus, SyncMode } from "../shared/contracts"
 import type { FileManifest } from "./folder-manifest"
 import { createDestinationOccupancyCheck, isManifestPathIgnored } from "./folder-manifest"
 import { isTetheraStagingPath } from "./path-safety"
@@ -287,6 +287,80 @@ export function conflictSummary(conflicts: FileSyncConflict[]): string {
     directionBlocked > 0 ? `${directionBlocked} changed against the one-way direction` : "",
   ].filter(Boolean)
   return `${conflicts.length} conflict${conflicts.length === 1 ? " needs" : "s need"} attention${details.length > 0 ? ` (${details.join(", ")})` : ""}; neither copy was changed.`
+}
+
+/** Summary for conflicts the initial merge reported that no two-sided scan has checked yet. */
+export function unverifiedMergeConflictsAction(count: number): string {
+  return `Waiting for the first full check of both computers. ${count.toLocaleString("en-GB")} file${count === 1 ? "" : "s"} differed during the initial merge; any that now match will drop off the list.`
+}
+
+export interface FolderSyncStateInput {
+  paused: boolean
+  peerOnline: boolean
+  state: Pick<FileSyncState, "conflicts" | "operations" | "recoveryIssues">
+  /** Initial-merge conflicts that the first two-sided scan has not replaced yet. */
+  unverifiedMergeConflicts: number
+}
+
+/**
+ * Status and one-line summary for an active folder. Initial-merge conflicts are only a pending
+ * check until the first two-sided scan replaces them with durable results, so they do not ask
+ * the user to act; durable conflicts and recovery issues do.
+ */
+export function describeFolderSyncState(
+  { paused, peerOnline, state, unverifiedMergeConflicts }: FolderSyncStateInput,
+): { status: OverallStatus; currentAction: string } {
+  const { conflicts, operations, recoveryIssues } = state
+  const status: OverallStatus = paused
+    ? "paused"
+    : conflicts.length > 0 || recoveryIssues.length > 0
+      ? "needs-attention"
+      : !peerOnline
+        ? "offline"
+        : unverifiedMergeConflicts > 0 || operations.length > 0 ? "syncing" : "up-to-date"
+  if (recoveryIssues.length > 0) {
+    const count = recoveryIssues.length
+    return { status, currentAction: recoveryIssues[0]?.lastError ?? `${count} file replacement${count === 1 ? " requires" : "s require"} recovery.` }
+  }
+  if (conflicts.length > 0) return { status, currentAction: conflictSummary(conflicts) }
+  if (unverifiedMergeConflicts > 0) return { status, currentAction: unverifiedMergeConflictsAction(unverifiedMergeConflicts) }
+  if (operations.length > 0) {
+    return { status, currentAction: `${operations.length} change${operations.length === 1 ? " is" : "s are"} waiting to retry.` }
+  }
+  return { status, currentAction: "Watching for changes." }
+}
+
+export interface InitialMergeOutcomeInput {
+  paused: boolean
+  peerOnline: boolean
+  /** Same-path conflicts the merge left untouched; unchecked until the first two-sided scan. */
+  conflicts: number
+  /** Inaccessible items the user chose to skip. */
+  unreadableSkipped: number
+}
+
+/**
+ * Status right after an initial merge, before live sync has run its first two-sided scan.
+ * Skipped inaccessible items need the user; the merge's conflicts are still a pending check.
+ */
+export function describeInitialMergeOutcome(
+  { paused, peerOnline, conflicts, unreadableSkipped }: InitialMergeOutcomeInput,
+): { status: OverallStatus; currentAction: string } {
+  const pending = describeFolderSyncState({
+    paused,
+    peerOnline,
+    state: { conflicts: [], operations: [], recoveryIssues: [] },
+    unverifiedMergeConflicts: conflicts,
+  })
+  if (unreadableSkipped === 0) {
+    return conflicts > 0 ? pending : { status: pending.status, currentAction: "Initial merge completed safely on both computers." }
+  }
+  const one = unreadableSkipped === 1
+  const skipped = `${unreadableSkipped.toLocaleString("en-GB")} inaccessible item${one ? " was" : "s were"} skipped and need${one ? "s" : ""} attention; affected paths were left untouched.`
+  return {
+    status: paused ? "paused" : "needs-attention",
+    currentAction: conflicts > 0 ? `${skipped} ${pending.currentAction}` : skipped,
+  }
 }
 
 /**
