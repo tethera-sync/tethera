@@ -317,7 +317,7 @@ export function describeFolderSyncState(
       ? "needs-attention"
       : !peerOnline
         ? "offline"
-        : unverifiedMergeConflicts > 0 ? "syncing" : "up-to-date"
+        : unverifiedMergeConflicts > 0 || operations.length > 0 ? "syncing" : "up-to-date"
   if (recoveryIssues.length > 0) {
     const count = recoveryIssues.length
     return { status, currentAction: recoveryIssues[0]?.lastError ?? `${count} file replacement${count === 1 ? " requires" : "s require"} recovery.` }

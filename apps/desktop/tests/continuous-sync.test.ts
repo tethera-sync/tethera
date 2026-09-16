@@ -151,6 +151,15 @@ describe("describeFolderSyncState", () => {
       .toEqual({ status: "up-to-date", currentAction: "Watching for changes." })
     expect(describeFolderSyncState({ paused: false, peerOnline: false, state: empty, unverifiedMergeConflicts: 0 }).status).toBe("offline")
   })
+
+  test("reports durable work waiting to retry as syncing, not up to date", () => {
+    const operation: FileSyncOperation = {
+      id: 1, mappingId: "m", path: "notes.md", direction: "push-local", sourceDigest: "a".repeat(64), sourceSize: 1,
+      status: "failed", attempts: 1, createdAt: "now", updatedAt: "now",
+    }
+    expect(describeFolderSyncState({ paused: false, peerOnline: true, state: { ...empty, operations: [operation] }, unverifiedMergeConflicts: 0 }))
+      .toEqual({ status: "syncing", currentAction: "1 change is waiting to retry." })
+  })
 })
 
 test("FolderChangeMonitor reports nested filesystem changes", async () => {

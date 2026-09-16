@@ -4802,11 +4802,12 @@ function registerIpc(): void {
     requireTrustedMainRenderer(event)
     requireMappingMutations()
     if (typeof paused !== "boolean") throw new Error("The pause state is invalid.")
+    // Refuse before blocking: blocking aborts the running check this refusal is meant to leave alone.
+    if (paused && continuousSyncInFlight.has(folderId)) {
+      throw new Error("Tethera is checking this folder with the other computer right now. Pause it again once the check finishes.")
+    }
     const release = blockContinuousSync(folderId)
     try {
-      if (paused && continuousSyncInFlight.has(folderId)) {
-        throw new Error("Tethera is checking this folder with the other computer right now. Pause it again once the check finishes.")
-      }
       if (paused && (initialSyncInFlight.has(folderId) || initialSyncForwarded.has(folderId) || archiveRestoreInFlight.has(folderId) || hasConflictResolutionInFlight(folderId) || hasInitialSyncPeerLease(folderId))) {
         throw new Error("Wait for the active file transfer to finish before pausing this folder.")
       }
