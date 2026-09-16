@@ -58,7 +58,6 @@ const emptySnapshot: AppSnapshot = {
     startMinimised: false,
     pauseOnMetered: true,
     theme: "system",
-    maxScanFiles: 10_000,
   },
   update: { status: "idle" },
 }

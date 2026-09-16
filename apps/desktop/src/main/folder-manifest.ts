@@ -12,7 +12,6 @@ import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import { DirectoryPathMapping, planDirectoryMappings, projectDirectoryManifest, type DirectoryObservation } from "./directory-mapping"
 import { z } from "zod"
 
-export const DEFAULT_MAX_MANIFEST_FILES = 10_000
 const MAX_HASH_FILE_BYTES = 16 * 1024 * 1024
 const MAX_SAMPLE_ITEMS = 14
 const SCAN_ACTIVITY_INTERVAL_MS = 250
@@ -136,13 +135,6 @@ export interface ScanFolderOptions {
   /** Hash every file for a transfer decision; preview scans retain the bounded fast path. */
   hashAllFiles?: boolean
   /**
-   * Ceiling on collected files before the manifest reports `truncated`.
-   * `undefined` (the default) resolves to `DEFAULT_MAX_MANIFEST_FILES`;
-   * `null` removes the ceiling for an explicitly opted-in unbounded scan.
-   * A number must be a positive safe integer; anything else fails closed.
-   */
-  maxFiles?: number | null
-  /**
    * Per-file size ceiling. A file larger than this is excluded from the
    * manifest and counted as `ignored`, exactly like an ignore-pattern match,
    * so it is never previewed, transferred, or served to a peer.
@@ -197,7 +189,6 @@ export interface ScanMetrics {
   unhashedFiles: number
   ignored: number
   unreadable: number
-  truncated: boolean
 }
 
 /** One walk observation, yielded in exactly the order the sequential walk encountered it. */
@@ -410,13 +401,11 @@ async function scanFolderEntries(
   let committedFiles = 0
   let ignored = 0
   let unreadable = 0
-  let truncated = false
   let reusedFiles = 0
   let hashedFiles = 0
   let unhashedFiles = 0
   const unreadableEntries: FolderScanIssue[] = []
   const occupiedPaths: OccupiedPath[] = []
-  const maxFiles = resolveScanLimit(options.maxFiles)
   const maxFileBytes = resolveFileSizeLimit(options.maxFileBytes)
   const hashAllFiles = options.hashAllFiles === true
   // A root on FAT/exFAT (or a filesystem that cannot be identified) never
@@ -525,16 +514,10 @@ async function scanFolderEntries(
         recordUnreadable({ path: head.relativePath, reason: describeScanReason(settlement.error), kind: "file" })
         continue
       }
-      // Oversize files are excluded like an ignore-pattern match, so they must not
-      // consume the file ceiling: counting them would report `truncated` for a scan
-      // that actually omitted nothing, and a truncated scan blocks the merge entirely.
+      // Oversize files are excluded like an ignore-pattern match.
       if (settlement.inspection.outcome === "excluded-oversize") {
         ignored += 1
         continue
-      }
-      if (committedFiles >= maxFiles) {
-        truncated = true
-        break
       }
       const { entry, settledIdentity, reused, hashed } = settlement.inspection
       onEntry(options.mapPath ? { ...entry, path: options.mapPath(entry.path) } : entry)
@@ -558,11 +541,11 @@ async function scanFolderEntries(
   reportActivity("complete", "", true)
   // Advisory only: a throwing metrics listener must not fail the scan itself.
   try {
-    options.onMetrics?.({ files: committedFiles, reusedFiles, hashedFiles, unhashedFiles, ignored, unreadable, truncated })
+    options.onMetrics?.({ files: committedFiles, reusedFiles, hashedFiles, unhashedFiles, ignored, unreadable })
   } catch {
     // Metrics never change the scan result.
   }
-  return { rootPath: root, files: committedFiles, ignored, unreadable, unreadableEntries, occupiedPaths, truncated }
+  return { rootPath: root, files: committedFiles, ignored, unreadable, unreadableEntries, occupiedPaths }
 }
 
 /** Counters of a scan whose entries were streamed to a callback instead of collected. */
@@ -573,7 +556,6 @@ interface ScanSummary {
   unreadable: number
   unreadableEntries: FolderScanIssue[]
   occupiedPaths: OccupiedPath[]
-  truncated: boolean
 }
 
 export async function scanFolder(
@@ -597,7 +579,7 @@ export async function scanFolder(
     ignored: summary.ignored,
     unreadable: summary.unreadable,
     unreadableEntries: summary.unreadableEntries,
-    truncated: summary.truncated || directoriesTruncated,
+    truncated: directoriesTruncated,
     ...(options.includeDirectories ? { directories } : {}),
     ...(summary.occupiedPaths.length > 0 ? { occupiedPaths: summary.occupiedPaths } : {}),
   }
@@ -609,7 +591,6 @@ export interface FolderFingerprint {
   files: number
   ignored: number
   unreadable: number
-  truncated: boolean
 }
 
 /**
@@ -628,7 +609,7 @@ export async function fingerprintFolder(
     if (entry.digest === undefined) throw new Error("A full-integrity scan produced a file without a digest.")
     fingerprint.add(entry.path, entry.size, entry.digest)
   })
-  return { fingerprint: fingerprint.value(), files: summary.files, ignored: summary.ignored, unreadable: summary.unreadable, truncated: summary.truncated }
+  return { fingerprint: fingerprint.value(), files: summary.files, ignored: summary.ignored, unreadable: summary.unreadable }
 }
 
 /**
@@ -763,13 +744,6 @@ export function resolveFileSizeLimit(maxFileBytes: number | null | undefined): n
   return maxFileBytes
 }
 
-function resolveScanLimit(maxFiles: number | null | undefined): number {
-  if (maxFiles === undefined) return DEFAULT_MAX_MANIFEST_FILES
-  if (maxFiles === null) return Number.POSITIVE_INFINITY
-  if (!Number.isSafeInteger(maxFiles) || maxFiles < 1) throw new Error("The scan limit is invalid.")
-  return maxFiles
-}
-
 /**
  * Compiles one ignore-file line into its regex rule(s), mirroring
  * `sync-core::manifest::build_rule` so both scanners prune the same trees.
@@ -819,14 +793,21 @@ export function createIgnoreMatcher(patterns: string[]): (relativePath: string, 
 
 /** Applies manifest ignore rules to a direct file request, including ignored parent folders. */
 export function isManifestPathIgnored(relativePath: string, patterns: string[]): boolean {
-  const normalized = normalizeRelative(relativePath)
+  return createManifestPathIgnoreCheck(patterns)(relativePath)
+}
+
+/** {@link isManifestPathIgnored} with the rules compiled once, for callers that check many paths. */
+export function createManifestPathIgnoreCheck(patterns: string[]): (relativePath: string) => boolean {
   const matcher = createIgnoreMatcher(patterns)
-  if (matcher(normalized, false)) return true
-  const segments = normalized.split("/")
-  for (let index = 1; index < segments.length; index += 1) {
-    if (matcher(segments.slice(0, index).join("/"), true)) return true
+  return (relativePath) => {
+    const normalized = normalizeRelative(relativePath)
+    if (matcher(normalized, false)) return true
+    const segments = normalized.split("/")
+    for (let index = 1; index < segments.length; index += 1) {
+      if (matcher(segments.slice(0, index).join("/"), true)) return true
+    }
+    return false
   }
-  return false
 }
 
 /**

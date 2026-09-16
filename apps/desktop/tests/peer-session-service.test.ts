@@ -463,6 +463,21 @@ describe("chunked secure frames", () => {
     await expect(reassemble([{ ...first, totalBytes: 300 * 1024 * 1024, count: 300 }], requestId)).rejects.toThrow("invalid chunked message")
   })
 
+  test("streams a large structured message with multibyte text across chunk boundaries", async () => {
+    const requestId = randomUUID()
+    const files = Array.from({ length: 40_000 }, (_, index) => ({ path: `dossier-界-${index}/😀-${index}.txt`, size: index, digest: "c".repeat(64) }))
+    const value = { type: "continuous-sync-observe", local: files, remote: files }
+    const chunks = encrypt(value, requestId)
+    expect(chunks).toHaveLength(Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / (1024 * 1024)))
+    expect(await reassemble(chunks, requestId)).toEqual(value)
+  })
+
+  test("refuses to finish a message whose content changed between measuring and sending", () => {
+    let calls = 0
+    const shifting = { toJSON: () => (calls++ === 0 ? "short" : "x".repeat(2 * 1024 * 1024)) }
+    expect(() => encrypt({ type: "bulk", shifting }, randomUUID())).toThrow("changed while it was being sent")
+  })
+
   test("measures a chunked request as plaintext against the exchange limit", () => {
     const request = { type: "continuous-sync-observe", payload: "x".repeat(20 * 1024 * 1024) }
     expect(measurePeerRequest(request).fits).toBe(false)

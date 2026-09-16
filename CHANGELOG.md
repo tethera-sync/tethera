@@ -2,6 +2,9 @@
 
 All notable changes to this project, newest first.
 
+- ✨ Scan whole folders with no file-count limit. The Scan file limit setting is gone, and a sync check now accepts up to 1,000,000 files per computer instead of rejecting folders above 10,000.
+- ✨ Watch every folder for live changes: one native watcher on Windows and macOS, and no 10,000-folder cap on Linux.
+- ⚡ Stream large sync messages to the engine and the other computer instead of building them in memory, holding about 170 MB less during a 250,000-file sync check.
 - 🎨 Show "Waiting for the first full check of both computers" instead of asking you to review initial-merge conflicts that the first scan has not checked yet.
 - 🎨 Show live scan progress on the computer being read while the other computer checks a folder for changes.
 - 🎨 Ask before pausing a folder whose check or transfer is still running, and explain when a running check blocks pausing.

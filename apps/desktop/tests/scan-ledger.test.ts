@@ -3,7 +3,7 @@ import type { ScanMetrics } from "../src/main/folder-manifest"
 import { ScanLedger, scanStageForKey } from "../src/main/scan-ledger"
 
 function metrics(overrides: Partial<ScanMetrics> = {}): ScanMetrics {
-  return { files: 0, reusedFiles: 0, hashedFiles: 0, unhashedFiles: 0, ignored: 0, unreadable: 0, truncated: false, ...overrides }
+  return { files: 0, reusedFiles: 0, hashedFiles: 0, unhashedFiles: 0, ignored: 0, unreadable: 0, ...overrides }
 }
 
 describe("scanStageForKey", () => {

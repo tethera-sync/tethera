@@ -12,7 +12,6 @@ export interface PreviewScanKeyInput {
   remotePlatform: string
   ignorePatterns: string[]
   mode: SyncMode
-  maxFiles: number | null
   direction: "outgoing" | "incoming"
 }
 
@@ -20,7 +19,7 @@ export interface PreviewScanKeyInput {
 export function previewScanKey(input: PreviewScanKeyInput): string {
   return JSON.stringify([
     input.direction, input.peerId, input.localPath, input.remotePath,
-    input.localPlatform, input.remotePlatform, input.ignorePatterns, input.mode, input.maxFiles,
+    input.localPlatform, input.remotePlatform, input.ignorePatterns, input.mode,
   ])
 }
 

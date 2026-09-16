@@ -19,7 +19,7 @@ export function appSnapshot(overrides: Partial<AppSnapshot> = {}): AppSnapshot {
     folders: [], devices: [], activity: [],
     pairing: { localFingerprint: "test-device", acceptingPairing: false, discoveredDevices: [], incomingRequests: [] },
     mappings: { incoming: [], outgoing: [] },
-    settings: { closeToTray: true, launchAtLogin: false, startMinimised: false, pauseOnMetered: true, theme: "system", maxScanFiles: 10_000 },
+    settings: { closeToTray: true, launchAtLogin: false, startMinimised: false, pauseOnMetered: true, theme: "system" },
     update: { status: "idle" },
     ...overrides,
   }
