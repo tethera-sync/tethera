@@ -468,6 +468,13 @@ describe("peer transfer parsing", () => {
     ).toEqual([{ id: 1, path: "a.txt", direction: "pull-remote", sourceDigest: DIGEST, sourceSize: 5, expectedDestinationDigest: undefined }])
   })
 
+  test("accepts an operation list larger than the old 10,000 cap", () => {
+    const operations = Array.from({ length: 10_001 }, (_, index) => ({
+      id: index + 1, path: `file-${index}.txt`, direction: "pull-remote", sourceDigest: DIGEST, sourceSize: 1,
+    }))
+    expect(parsePeerFileOperations({ operations })).toHaveLength(10_001)
+  })
+
   test("rejects unbounded lists and malformed operations", () => {
     expect(() => parsePeerFileOperations({ operations: new Array(1_000_001).fill({}) })).toThrow(
       "The paired computer returned invalid durable operation state.",

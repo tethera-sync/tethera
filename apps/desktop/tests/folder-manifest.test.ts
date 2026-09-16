@@ -255,14 +255,16 @@ describe("folder mapping comparison", () => {
     expect(loneSurrogate("a.txt", false)).toBe(false)
   })
 
-  test("collects every file, with no scan file ceiling", async () => {
+  test("collects every file past the old 10,000-file ceiling", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-ceiling-test-"))
     try {
-      for (let index = 0; index < 5; index += 1) {
-        await writeFile(path.join(root, `file-${index}.txt`), "data")
+      const count = 10_001
+      for (let start = 0; start < count; start += 500) {
+        await Promise.all(Array.from({ length: Math.min(500, count - start) }, (_, offset) =>
+          writeFile(path.join(root, `file-${start + offset}.txt`), "data")))
       }
       const result = await scanFolder(root, [])
-      expect(result.files).toHaveLength(5)
+      expect(result.files).toHaveLength(count)
       expect(result.truncated).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })

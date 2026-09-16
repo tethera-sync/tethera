@@ -29,6 +29,18 @@ describe("jsonPieces", () => {
     expect(pieces.join("")).toBe(JSON.stringify({ files }))
   })
 
+  test("slices long strings, alone or inside records, without splitting a surrogate pair", () => {
+    // The emoji's high surrogate is the last character of the first 64K slice.
+    const long = `${"a".repeat(64 * 1024 - 1)}😀${"b\"\\".repeat(40_000)}界`
+    const escapedLength = JSON.stringify(long).length
+    for (const value of [long, { path: long, size: 1 }, [{ path: long }]]) {
+      const pieces = [...jsonPieces(value, 4_096)]
+      expect(pieces.join("")).toBe(JSON.stringify(value))
+      expect(Math.max(...pieces.map((piece) => piece.length))).toBeLessThan(escapedLength / 2)
+      expect(jsonByteLength(value)).toBe(Buffer.byteLength(JSON.stringify(value), "utf8"))
+    }
+  })
+
   test("refuses a value that has no JSON representation", () => {
     expect(() => [...jsonPieces(undefined)]).toThrow("no JSON representation")
   })

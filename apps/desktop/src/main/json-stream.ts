@@ -7,9 +7,12 @@
  * text in bounded pieces instead. They follow `JSON.stringify` for the plain
  * data Tethera sends: objects, arrays, strings, numbers, booleans and null,
  * including `toJSON`, omitted object members and `undefined` array items.
+ * A long string is escaped in slices, so no single piece grows with it.
  */
 
 const DEFAULT_PIECE_CHARS = 64 * 1024
+/** Strings longer than this are escaped slice by slice rather than in one call. */
+const STRING_SLICE_CHARS = 64 * 1024
 
 /** `JSON.stringify(value)` in pieces of roughly `pieceChars` characters. */
 export function* jsonPieces(value: unknown, pieceChars = DEFAULT_PIECE_CHARS): Generator<string, void, void> {
@@ -61,8 +64,33 @@ function* valueTokens(value: unknown): Generator<string, void, void> {
     yield "}"
     return
   }
+  if (typeof value === "string" && value.length > STRING_SLICE_CHARS) {
+    yield* stringTokens(value)
+    return
+  }
   // Primitives: JSON.stringify handles escaping, and turns NaN and Infinity into null.
   yield JSON.stringify(value)
+}
+
+/** A long string's JSON text in escaped slices. A surrogate pair is never split, since a lone half is escaped differently. */
+function* stringTokens(value: string): Generator<string, void, void> {
+  yield '"'
+  let start = 0
+  while (start < value.length) {
+    let end = Math.min(value.length, start + STRING_SLICE_CHARS)
+    if (end < value.length && isHighSurrogate(value.charCodeAt(end - 1)) && isLowSurrogate(value.charCodeAt(end))) end -= 1
+    yield JSON.stringify(value.slice(start, end)).slice(1, -1)
+    start = end
+  }
+  yield '"'
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff
 }
 
 function resolveJsonValue(value: unknown, key: string): unknown {
@@ -81,6 +109,7 @@ function isFlatRecord(value: unknown): boolean {
   if ("toJSON" in value) return false
   for (const member of Object.values(value)) {
     if (typeof member === "object" && member !== null) return false
+    if (typeof member === "string" && member.length > STRING_SLICE_CHARS) return false
   }
   return true
 }
