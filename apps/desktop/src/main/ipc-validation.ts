@@ -12,7 +12,7 @@ import type {
 } from "../shared/contracts"
 import type { ExactConflictChoice, FileSyncDirection, PeerFileOperationIdentity } from "./continuous-sync"
 import { FileChangedError, isSha256HexDigest, type TransferFileDescriptor } from "./file-transfer"
-import { DEFAULT_MAX_MANIFEST_FILES, type FileManifest } from "./folder-manifest"
+import type { FileManifest } from "./folder-manifest"
 import type { InitialSyncPassResult } from "./initial-sync"
 import { isTetheraStagingPath } from "./path-safety"
 import type { PeerRequest } from "./peer-session-service"
@@ -30,14 +30,6 @@ import { MAX_LEGACY_MANIFEST_ENCODED_BYTES } from "../shared/sync-capacity"
 export const MAX_SCAN_PATH_LENGTH = 4096
 export const MAX_IGNORE_PATTERNS = 256
 export const MAX_IGNORE_PATTERN_LENGTH = 512
-/**
- * Bounds for the configurable scan-file ceiling. The lower bound keeps a
- * degenerate limit from truncating every real folder; the upper bound keeps
- * an explicitly raised in-memory single-pass manifest within plausible
- * memory. `null` (no limit) bypasses both by explicit opt-in.
- */
-export const MIN_SCAN_FILES = 1_000
-export const MAX_SCAN_FILES = 1_000_000
 export { MAX_LEGACY_MANIFEST_ENCODED_BYTES }
 
 const pathString = z
@@ -127,10 +119,6 @@ const settingUpdateSchema = z.discriminatedUnion("key", [
   z.object({ key: z.literal("startMinimised"), value: z.boolean() }),
   z.object({ key: z.literal("pauseOnMetered"), value: z.boolean() }),
   z.object({ key: z.literal("theme"), value: z.enum(["system", "light", "dark"]) }),
-  z.object({
-    key: z.literal("maxScanFiles"),
-    value: z.union([z.number().int().min(MIN_SCAN_FILES).max(MAX_SCAN_FILES), z.null()]),
-  }),
 ])
 
 export type SettingUpdate = z.infer<typeof settingUpdateSchema>
@@ -154,8 +142,6 @@ export function applySettingUpdate(settings: AppSettings, update: SettingUpdate)
       return { ...settings, pauseOnMetered: update.value }
     case "theme":
       return { ...settings, theme: update.value }
-    case "maxScanFiles":
-      return { ...settings, maxScanFiles: update.value }
     default: {
       const unexpected: never = update
       throw new Error(`Unsupported setting: ${JSON.stringify(unexpected)}`)
@@ -164,22 +150,20 @@ export function applySettingUpdate(settings: AppSettings, update: SettingUpdate)
 }
 
 /**
- * Returns a safe scan ceiling for an untrusted persisted value. Valid
- * numbers and `null` pass through; a missing, mistyped, or out-of-range
- * value from an older or hand-edited `state.json` falls back to the
- * default instead of changing what scans collect.
+ * Rebuilds settings from an untrusted persisted value. A known setting is kept
+ * only when it passes the same validation as a live update; anything missing,
+ * mistyped or retired (such as the old scan file limit) falls back to the
+ * default or is dropped.
  */
-export function normalizePersistedScanLimit(value: unknown): number | null {
-  if (value === null) return null
-  if (
-    typeof value === "number" &&
-    Number.isInteger(value) &&
-    value >= MIN_SCAN_FILES &&
-    value <= MAX_SCAN_FILES
-  ) {
-    return value
+export function restorePersistedSettings(value: unknown, defaults: AppSettings): AppSettings {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return { ...defaults }
+  const stored = new Map<string, unknown>(Object.entries(value))
+  let settings = { ...defaults }
+  for (const key of Object.keys(defaults)) {
+    const parsed = settingUpdateSchema.safeParse({ key, value: stored.get(key) })
+    if (parsed.success) settings = applySettingUpdate(settings, parsed.data)
   }
-  return DEFAULT_MAX_MANIFEST_FILES
+  return settings
 }
 
 /** Validates a folder-mapping draft before any preview, scan, or peer request. Moved out of `index.ts` unchanged apart from sharing the envelope constants above. */
@@ -456,12 +440,15 @@ export function validateContinuousOperationRequest(request: PeerRequest): {
   return { folderId, path: relativePath, digest, size, expectedDestinationDigest }
 }
 
+/** Matches the largest file list a sync check accepts, so a big change set is never refused. */
+const MAX_PEER_OPERATIONS = 1_000_000
+
 export function parsePeerFileOperations(value: unknown): PeerFileOperationIdentity[] {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("The paired computer returned invalid durable operation state.")
   }
   const operations = (value as { operations?: unknown }).operations
-  if (!Array.isArray(operations) || operations.length > 10_000) {
+  if (!Array.isArray(operations) || operations.length > MAX_PEER_OPERATIONS) {
     throw new Error("The paired computer returned invalid durable operation state.")
   }
   return operations.map((value) => {

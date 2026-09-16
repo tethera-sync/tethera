@@ -13,7 +13,9 @@ use crate::version_archive::{
     require_installed_sync_entry,
 };
 
-const MAX_FILES: usize = 10_000;
+/// Largest observation accepted per side, matching the desktop's bound on a
+/// paired computer's file list.
+const MAX_FILES: usize = 1_000_000;
 const MAX_PATH_LENGTH: usize = 4_096;
 const MAX_ERROR_LENGTH: usize = 2_000;
 
@@ -1831,6 +1833,48 @@ mod tests {
                 .is_empty(),
             "{participant} retained a conflict after exact completion"
         );
+    }
+
+    fn numbered_files(count: usize) -> Vec<ObservedFile> {
+        (0..count)
+            .map(|index| ObservedFile {
+                path: format!("dir-{}/file-{index}.txt", index % 100),
+                size: 4,
+                digest: format!("{index:064x}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reconciles_more_than_ten_thousand_files_per_side() {
+        let store = active_store();
+        let files = numbered_files(10_001);
+        let result = reconcile(&store, files.clone(), files);
+        assert_eq!(result.baseline_count, 10_001);
+        assert!(result.operations.is_empty());
+        assert!(result.conflicts.is_empty());
+    }
+
+    #[test]
+    #[ignore = "opt-in timing: cargo test -p sync-storage --release -- --ignored reconcile_scale_timing"]
+    fn reconcile_scale_timing() {
+        let count = std::env::var("TETHERA_RECONCILE_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(250_000);
+        let store = active_store();
+        let files = numbered_files(count);
+        let started = std::time::Instant::now();
+        let seeded = reconcile(&store, files.clone(), files.clone());
+        let seeding = started.elapsed();
+        let started = std::time::Instant::now();
+        let unchanged = reconcile(&store, files.clone(), files);
+        eprintln!(
+            "[reconcile-scale] files={count} seeding={seeding:?} unchanged={:?}",
+            started.elapsed()
+        );
+        assert_eq!(usize::try_from(seeded.baseline_count).ok(), Some(count));
+        assert_eq!(usize::try_from(unchanged.baseline_count).ok(), Some(count));
     }
 
     #[test]

@@ -54,7 +54,7 @@ Older version-4 peers that lack this capability retain the single-response five-
 
 - Files up to 16 MiB are SHA-256 hashed in this development slice.
 - Larger files use size and close timestamp equality for the preview only.
-- The preview is capped at the scanning computer's configured scan-file limit (10,000 files by default) per side.
+- The preview has no file-count limit. It is bounded by the 256 MiB chunked exchange between updated peers or the 16 MiB frame with an older peer; an older peer may still stop at its own scan-file limit and mark its scan truncated.
 - It reports local-only, remote-only, identical and different paths.
 - It estimates additive transfer direction and size from the selected sync mode; same-path differences are excluded because this slice leaves them untouched.
 - It detects Windows-invalid names and case-only collisions and blocks approval until they are resolved.

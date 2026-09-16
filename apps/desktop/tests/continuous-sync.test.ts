@@ -263,6 +263,29 @@ test("FolderChangeMonitor reports a watch-depth degradation instead of silently 
   }
 })
 
+test("FolderChangeMonitor can cover the whole tree with one recursive watcher that skips ignored paths", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "tethera-watch-recursive-"))
+  let changes = 0
+  const monitor = new FolderChangeMonitor(root, ["**/node_modules/**"], () => {
+    changes += 1
+  }, undefined, { recursive: true })
+  try {
+    await mkdir(path.join(root, "node_modules", "pkg"), { recursive: true })
+    await mkdir(path.join(root, "src", "deep"), { recursive: true })
+    expect(await monitor.start()).toBe(false)
+    await writeFile(path.join(root, "node_modules", "pkg", "index.js"), "ignored")
+    await Bun.sleep(1_500)
+    expect(changes).toBe(0)
+    await writeFile(path.join(root, "src", "deep", "notes.txt"), "changed")
+    const deadline = Date.now() + 5_000
+    while (changes === 0 && Date.now() < deadline) await Bun.sleep(50)
+    expect(changes).toBeGreaterThan(0)
+  } finally {
+    monitor.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 describe("occupied destination paths", () => {
   test("leaves out one-sided files the receiving computer already uses for a folder or link", () => {
     const digest = "a".repeat(64)
@@ -353,8 +376,8 @@ describe("idle-cycle fingerprints across the wire", () => {
       await writeFile(path.join(root, "naïve", "café.txt"), "café")
       await writeFile(path.join(root, "naïve", "déjà vu", "日本語.bin"), Buffer.alloc(300_000, 7))
       await writeFile(path.join(root, "empty.txt"), "")
-      const streamed = await fingerprintFolder(root, [], { maxFiles: null })
-      const sent = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null })
+      const streamed = await fingerprintFolder(root, [])
+      const sent = await scanFolder(root, [], { hashAllFiles: true })
       // As the coordinator receives it: serialized, then validated.
       const received = parsePeerManifest(JSON.parse(JSON.stringify(sent)))
       expect(fingerprintObservation(observedFiles(received))).toBe(streamed.fingerprint)

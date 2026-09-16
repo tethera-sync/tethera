@@ -3,16 +3,14 @@ import { opendir, realpath, stat, watch } from "./synced-fs"
 import path from "node:path"
 import type { OverallStatus, SyncMode } from "../shared/contracts"
 import type { FileManifest } from "./folder-manifest"
-import { createDestinationOccupancyCheck, isManifestPathIgnored } from "./folder-manifest"
+import { createDestinationOccupancyCheck, createManifestPathIgnoreCheck } from "./folder-manifest"
 import { isTetheraStagingPath } from "./path-safety"
 
 const CHANGE_DEBOUNCE_MS = 750
 const FALLBACK_SCAN_MS = 5 * 60_000
-const MAX_WATCH_DIRECTORIES = 10_000
 const MAX_WATCH_DEPTH = 128
-
-/** Thrown by {@link collectWatchDirectories} when the tree has too many directories to watch individually. */
-class WatchDirectoryLimitExceededError extends Error {}
+/** Windows and macOS watch a whole tree natively with one handle; Linux needs one watch per directory. */
+const NATIVE_RECURSIVE_WATCH = process.platform === "win32" || process.platform === "darwin"
 
 /** Thrown by {@link collectWatchDirectories} when the tree is nested deeper than the watcher will follow. */
 class WatchDepthExceededError extends Error {}
@@ -28,7 +26,6 @@ async function closeDirQuietly(directory: { close: () => unknown }): Promise<voi
 }
 
 export type WatchDegradationReason =
-  | { kind: "watch-limit-exceeded"; message: string }
   | { kind: "watch-depth-exceeded"; message: string }
   | { kind: "watcher-rejected"; directory: string; message: string }
 
@@ -363,15 +360,24 @@ export function describeInitialMergeOutcome(
   }
 }
 
+export interface FolderChangeMonitorOptions {
+  /** One recursive watcher for the whole tree instead of one per directory. Defaults to platforms that do this natively. */
+  recursive?: boolean
+}
+
 /**
- * Watches every real directory below an approved mapping root. Native notifications trigger a
- * debounced reconciliation and a periodic full scan catches coalesced or unsupported events.
+ * Watches an approved mapping root: with one native recursive watcher where the platform
+ * provides it, otherwise with one watcher per included directory, however many there are.
+ * Native notifications trigger a debounced reconciliation and a periodic full scan catches
+ * coalesced, dropped or unsupported events.
  */
 export class FolderChangeMonitor {
   readonly #rootPath: string
   readonly #ignorePatterns: string[]
   readonly #onChange: () => void
   readonly #onWatchHealth?: (report: WatchHealthReport) => void
+  readonly #recursive: boolean
+  readonly #isIgnored: (relativePath: string) => boolean
   readonly #watchers = new Map<string, FSWatcher>()
   #debounce: NodeJS.Timeout | null = null
   #fallback: NodeJS.Timeout | null = null
@@ -387,11 +393,14 @@ export class FolderChangeMonitor {
     ignorePatterns: string[],
     onChange: () => void,
     onWatchHealth?: (report: WatchHealthReport) => void,
+    options: FolderChangeMonitorOptions = {},
   ) {
     this.#rootPath = path.resolve(rootPath)
     this.#ignorePatterns = [...ignorePatterns]
     this.#onChange = onChange
     this.#onWatchHealth = onWatchHealth
+    this.#recursive = options.recursive ?? NATIVE_RECURSIVE_WATCH
+    this.#isIgnored = createManifestPathIgnoreCheck(this.#ignorePatterns)
   }
 
   /** Resolves once the initial directory walk finished. `true` when at least one directory could not be watched natively. */
@@ -399,15 +408,19 @@ export class FolderChangeMonitor {
     const rootStat = await stat(this.#rootPath)
     if (!rootStat.isDirectory()) throw new Error("The synchronized folder is no longer available.")
     let degraded: boolean
-    try {
-      degraded = await this.#refreshWatchers()
-    } catch (error) {
-      // A tree above the depth or directory limit cannot be watched natively,
-      // but the periodic fallback scan still covers it. Failing the start
-      // would remove the monitor entirely and leave the folder with no scan.
-      if (!(error instanceof WatchDepthExceededError || error instanceof WatchDirectoryLimitExceededError)) throw error
-      this.#reportRefreshFailure(error)
-      degraded = true
+    if (this.#recursive) {
+      degraded = !this.#watchRecursively()
+    } else {
+      try {
+        degraded = await this.#refreshWatchers()
+      } catch (error) {
+        // A tree nested past the depth limit cannot be watched natively, but
+        // the periodic fallback scan still covers it. Failing the start would
+        // remove the monitor entirely and leave the folder with no scan.
+        if (!(error instanceof WatchDepthExceededError)) throw error
+        this.#reportRefreshFailure(error)
+        degraded = true
+      }
     }
     if (this.#stopped) return degraded
     this.#fallback = setInterval(() => this.#schedule(true), FALLBACK_SCAN_MS)
@@ -431,7 +444,9 @@ export class FolderChangeMonitor {
     if (this.#debounce) clearTimeout(this.#debounce)
     this.#debounce = setTimeout(() => {
       this.#debounce = null
-      if (refreshDirectories) {
+      if (refreshDirectories && this.#recursive) {
+        this.#restoreRecursiveWatcher()
+      } else if (refreshDirectories) {
         void this.#refreshWatchers()
           // A refresh that completed without rejecting a directory genuinely
           // restores full coverage; reporting recovery when the same pass just
@@ -465,14 +480,47 @@ export class FolderChangeMonitor {
       this.#reportDegraded({ kind: "watch-depth-exceeded", message: error.message })
       return
     }
-    if (error instanceof WatchDirectoryLimitExceededError) {
-      this.#reportDegraded({ kind: "watch-limit-exceeded", message: error.message })
-      return
-    }
     // Not a known degraded-watch condition (e.g. the root vanished mid-scan);
     // surface it for diagnosis instead of swallowing it, since `start()`'s
     // own directory check is what normally catches an unavailable root.
     console.warn(`[continuous-sync] Unable to refresh watchers for ${this.#rootPath}`, error)
+  }
+
+  /** Starts the single recursive watcher. Returns whether it is watching; a refusal is reported as degraded coverage. */
+  #watchRecursively(): boolean {
+    try {
+      const watcher = watch(this.#rootPath, { persistent: false, recursive: true }, (_event, filename) => {
+        if (filename !== null && this.#isExcludedChange(filename)) return
+        this.#schedule(false)
+      })
+      watcher.on("error", (error: Error) => {
+        watcher.close()
+        this.#watchers.delete(this.#rootPath)
+        this.#reportDegraded({ kind: "watcher-rejected", directory: this.#rootPath, message: error.message })
+        this.#schedule(false)
+      })
+      this.#watchers.set(this.#rootPath, watcher)
+      return true
+    } catch (error) {
+      this.#reportDegraded({
+        kind: "watcher-rejected",
+        directory: this.#rootPath,
+        message: error instanceof Error ? error.message : String(error),
+      })
+      return false
+    }
+  }
+
+  /** Run by the periodic scan: brings back a recursive watcher the platform dropped. */
+  #restoreRecursiveWatcher(): void {
+    if (this.#stopped || this.#watchers.has(this.#rootPath)) return
+    if (this.#watchRecursively()) this.#reportRecovered()
+  }
+
+  /** A recursive watcher also reports ignored trees and Tethera's own staging files, which never need a sync check. */
+  #isExcludedChange(filename: string): boolean {
+    const relativePath = filename.replaceAll("\\", "/")
+    return isTetheraStagingPath(relativePath) || this.#isIgnored(relativePath)
   }
 
   async #refreshWatchers(): Promise<boolean> {
@@ -538,16 +586,12 @@ export async function collectWatchDirectories(rootPath: string, ignorePatterns: 
   const canonicalRoot = await realpath(rootPath)
   if (signal?.aborted) throw new Error("The watcher collection was cancelled.")
   const directories: string[] = []
+  const isIgnored = createManifestPathIgnoreCheck(ignorePatterns)
 
   async function visit(directoryPath: string, relativeDirectory: string, depth: number): Promise<void> {
     if (signal?.aborted) throw new Error("The watcher collection was cancelled.")
     if (depth > MAX_WATCH_DEPTH) {
       throw new WatchDepthExceededError(`The synchronized folder exceeds the ${MAX_WATCH_DEPTH}-level watch limit.`)
-    }
-    if (directories.length >= MAX_WATCH_DIRECTORIES) {
-      throw new WatchDirectoryLimitExceededError(
-        `The synchronized folder exceeds the ${MAX_WATCH_DIRECTORIES.toLocaleString("en-US")}-directory watch limit.`,
-      )
     }
     const canonicalDirectory = await realpath(directoryPath)
     if (signal?.aborted) throw new Error("The watcher collection was cancelled.")
@@ -560,7 +604,7 @@ export async function collectWatchDirectories(rootPath: string, ignorePatterns: 
         if (signal?.aborted) throw new Error("The watcher collection was cancelled.")
         if (!entry.isDirectory() || entry.isSymbolicLink()) continue
         const relativePath = path.join(relativeDirectory, entry.name).replaceAll("\\", "/")
-        if (isTetheraStagingPath(relativePath) || isManifestPathIgnored(`${relativePath}/placeholder`, ignorePatterns)) {
+        if (isTetheraStagingPath(relativePath) || isIgnored(`${relativePath}/placeholder`)) {
           continue
         }
         await visit(path.join(directoryPath, entry.name), relativePath, depth + 1)

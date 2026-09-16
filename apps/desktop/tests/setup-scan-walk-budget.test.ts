@@ -62,7 +62,6 @@ describe("folder setup walk budget", () => {
         remotePlatform: "windows",
         mode: "two-way",
         ignorePatterns: [],
-        maxFiles: null,
       })
       sessions.record("operation-1", scanKey, compareManifests(preview.manifest, preview.manifest, { mode: "two-way", localPlatform: "linux", remotePlatform: "windows" }))
       expect(sessions.lookup("operation-1", scanKey)).toBeDefined()

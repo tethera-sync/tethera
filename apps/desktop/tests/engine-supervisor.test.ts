@@ -105,6 +105,33 @@ function serialFixtureScript(): string {
   ].join(";")
 }
 
+/** Answers each request at once with how many files its params listed. */
+function fileCountFixtureScript(): string {
+  return [
+    "let buffer = ''",
+    "function respond(request, result) {",
+    "  process.stdout.write(JSON.stringify({ id: request.id, ok: true, result }) + '\\n')",
+    "}",
+    "process.stdin.on('data', (chunk) => {",
+    "  buffer += chunk.toString()",
+    "  let newline",
+    "  while ((newline = buffer.indexOf('\\n')) >= 0) {",
+    "    const line = buffer.slice(0, newline)",
+    "    buffer = buffer.slice(newline + 1)",
+    "    if (!line) continue",
+    "    const request = JSON.parse(line)",
+    "    if (request.method === 'health') {",
+    "      respond(request, { name: 'fixture', version: '1', protocol: '4', mappingStore: { status: 'ready', schemaVersion: 4, journalMode: 'wal', migrationState: 'completed', mutationsEnabled: true } })",
+    "      continue",
+    "    }",
+    "    const files = request.params && Array.isArray(request.params.files) ? request.params.files.length : 0",
+    "    respond(request, { method: request.method, files })",
+    "  }",
+    "})",
+    "setInterval(() => {}, 1000)",
+  ].join(";")
+}
+
 describe("engine mapping-store health contract", () => {
   test("accepts the bounded authoritative health shape", () => {
     expect(
@@ -250,6 +277,21 @@ describe("engine mapping-store health contract", () => {
       expect(warnings.some((call) => String(call[0]).includes("unknown or already-settled"))).toBe(true)
     } finally {
       console.warn = originalWarn
+      await supervisor.stop()
+    }
+  })
+
+  test("writes a request far larger than the pipe buffer whole, without interleaving the next request", async () => {
+    const supervisor = new EngineSupervisor()
+    try {
+      const ready = waitForReady(supervisor)
+      supervisor.start({ command: resolveNodeExecutable(), args: ["-e", fileCountFixtureScript(), "fixture"] })
+      await ready
+      const files = Array.from({ length: 100_000 }, (_, index) => ({ path: `dir-${index % 100}/file-${index}.txt`, size: index, digest: "e".repeat(64) }))
+      const large = supervisor.request<{ method: string; files: number }>("large", { files }, 10_000)
+      const small = supervisor.request<{ method: string; files: number }>("small", { files: [] }, 10_000)
+      expect(await Promise.all([large, small])).toEqual([{ method: "large", files: 100_000 }, { method: "small", files: 0 }])
+    } finally {
       await supervisor.stop()
     }
   })

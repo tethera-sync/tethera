@@ -2,6 +2,8 @@ import { EventEmitter } from "node:events"
 import { randomBytes, randomUUID } from "node:crypto"
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import readline from "node:readline"
+import type { Writable } from "node:stream"
+import { jsonPieces } from "./json-stream"
 
 export type EngineState =
   | { status: "starting"; message: string }
@@ -56,6 +58,7 @@ export class EngineRpcError extends Error {
 export class EngineSupervisor extends EventEmitter {
   #child: ChildProcessWithoutNullStreams | null = null
   #sessionToken: string | null = null
+  #writeTail: Promise<void> = Promise.resolve()
   #launchOptions: EngineLaunchOptions | null = null
   #generation = 0
   #restartPromise: Promise<void> | null = null
@@ -161,7 +164,7 @@ export class EngineSupervisor extends EventEmitter {
     }
 
     const id = randomUUID()
-    const body = JSON.stringify({ id, method, params, sessionToken: this.#sessionToken })
+    const message = { id, method, params, sessionToken: this.#sessionToken }
 
     return await new Promise<T>((resolve, reject) => {
       this.#pending.set(id, {
@@ -182,10 +185,12 @@ export class EngineSupervisor extends EventEmitter {
         reject(new Error("Rust sync engine stopped while sending the request."))
         return
       }
-      child.stdin.write(`${body}\n`, "utf8", (error?: Error | null) => {
-        if (!error) return
-        this.#handleChildTermination(child, `Unable to send Rust engine request: ${method}`, error, true)
-      })
+      // Requests share one pipe, so each line is written whole before the next begins.
+      this.#writeTail = this.#writeTail
+        .then(() => writeJsonLine(child.stdin, message))
+        .catch((error: unknown) => {
+          this.#handleChildTermination(child, `Unable to send Rust engine request: ${method}`, error, true)
+        })
     })
   }
 
@@ -315,6 +320,26 @@ export class EngineSupervisor extends EventEmitter {
     this.#state = state
     this.emit("state", state)
   }
+}
+
+/**
+ * Writes one request line in pieces, each only after the previous one has been
+ * handed to the pipe, so a request listing a large folder is never built as one
+ * string and never piles up in the pipe buffer. A write failure is reported by
+ * the pipe's own callback, after the process has reported why it went away.
+ */
+async function writeJsonLine(stream: Writable, value: unknown): Promise<void> {
+  for (const piece of jsonPieces(value)) await writePiece(stream, piece)
+  await writePiece(stream, "\n")
+}
+
+function writePiece(stream: Writable, piece: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    stream.write(piece, "utf8", (error?: Error | null) => {
+      if (error) reject(error)
+      else resolve()
+    })
+  })
 }
 
 export function parseMappingStoreHealth(value: unknown): MappingStoreHealth {

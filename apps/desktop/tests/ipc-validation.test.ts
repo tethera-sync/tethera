@@ -5,7 +5,6 @@ import {
   isSourceUnavailableResponse,
   MAX_IGNORE_PATTERN_LENGTH,
   MAX_IGNORE_PATTERNS,
-  normalizePersistedScanLimit,
   parseArchiveHistoryRequest,
   parseBrowseDirectoryInput,
   parseConflictCopyExpectation,
@@ -20,6 +19,7 @@ import {
   parseSettingUpdate,
   requireAllowedConflictDirection,
   requireUnchangedInspectedCopies,
+  restorePersistedSettings,
   validateConflictInput,
   validateContinuousOperationRequest,
   validateInitialSyncPassResult,
@@ -43,7 +43,6 @@ const settings: AppSettings = {
   startMinimised: false,
   pauseOnMetered: true,
   theme: "system",
-  maxScanFiles: 10_000,
 }
 
 describe("reveal-path validation", () => {
@@ -129,16 +128,6 @@ describe("settings-update validation", () => {
     expect(parseSettingUpdate("startMinimised", true)).toEqual({ key: "startMinimised", value: true })
     expect(parseSettingUpdate("pauseOnMetered", false)).toEqual({ key: "pauseOnMetered", value: false })
     expect(parseSettingUpdate("theme", "dark")).toEqual({ key: "theme", value: "dark" })
-    expect(parseSettingUpdate("maxScanFiles", 10_000)).toEqual({ key: "maxScanFiles", value: 10_000 })
-    expect(parseSettingUpdate("maxScanFiles", null)).toEqual({ key: "maxScanFiles", value: null })
-  })
-
-  test("rejects scan limits outside the supported envelope", () => {
-    expect(() => parseSettingUpdate("maxScanFiles", 999)).toThrow("The requested setting change is invalid.")
-    expect(() => parseSettingUpdate("maxScanFiles", 1_000_001)).toThrow("The requested setting change is invalid.")
-    expect(() => parseSettingUpdate("maxScanFiles", 10.5)).toThrow("The requested setting change is invalid.")
-    expect(() => parseSettingUpdate("maxScanFiles", "10000")).toThrow("The requested setting change is invalid.")
-    expect(() => parseSettingUpdate("maxScanFiles", undefined)).toThrow("The requested setting change is invalid.")
   })
 
   test("rejects unknown keys and mistyped values", () => {
@@ -155,23 +144,14 @@ describe("settings-update validation", () => {
       ...settings,
       launchAtLogin: true,
     })
-    expect(applySettingUpdate(settings, { key: "maxScanFiles", value: null })).toEqual({
-      ...settings,
-      maxScanFiles: null,
-    })
-    expect(applySettingUpdate(settings, { key: "maxScanFiles", value: 50_000 })).toEqual({
-      ...settings,
-      maxScanFiles: 50_000,
-    })
   })
 
-  test("falls back to the default scan limit for missing or corrupt persisted values", () => {
-    expect(normalizePersistedScanLimit(undefined)).toBe(10_000)
-    expect(normalizePersistedScanLimit("10000")).toBe(10_000)
-    expect(normalizePersistedScanLimit(999)).toBe(10_000)
-    expect(normalizePersistedScanLimit(1_000_001)).toBe(10_000)
-    expect(normalizePersistedScanLimit(null)).toBeNull()
-    expect(normalizePersistedScanLimit(50_000)).toBe(50_000)
+  test("restores valid persisted settings and drops retired or corrupt ones", () => {
+    expect(restorePersistedSettings({ ...settings, theme: "dark", closeToTray: false, maxScanFiles: 50_000 }, settings))
+      .toEqual({ ...settings, theme: "dark", closeToTray: false })
+    expect(restorePersistedSettings({ theme: "neon", launchAtLogin: "yes" }, settings)).toEqual(settings)
+    expect(restorePersistedSettings(undefined, settings)).toEqual(settings)
+    expect(restorePersistedSettings(["dark"], settings)).toEqual(settings)
   })
 })
 
@@ -489,7 +469,7 @@ describe("peer transfer parsing", () => {
   })
 
   test("rejects unbounded lists and malformed operations", () => {
-    expect(() => parsePeerFileOperations({ operations: new Array(10_001).fill({}) })).toThrow(
+    expect(() => parsePeerFileOperations({ operations: new Array(1_000_001).fill({}) })).toThrow(
       "The paired computer returned invalid durable operation state.",
     )
     expect(() =>

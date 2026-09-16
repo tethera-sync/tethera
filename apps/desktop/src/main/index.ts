@@ -60,7 +60,7 @@ import {
   type MappingStoreHealth,
 } from "./engine-supervisor"
 import {
-  compareManifests, DEFAULT_MAX_MANIFEST_FILES, filesystemSupportsDigestReuse, isManifestPathIgnored, isScanCancelled, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
+  compareManifests, filesystemSupportsDigestReuse, isManifestPathIgnored, isScanCancelled, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
 } from "./folder-manifest"
 import { globalScanCoordinator } from "./scan-coordinator"
 import { runPairedScans } from "./paired-scan"
@@ -134,7 +134,7 @@ import {
   isBoundedSkipArray,
   isSourceUnavailableResponse,
   MAX_PERSISTED_SKIP_REASON_LENGTH,
-  normalizePersistedScanLimit,
+  restorePersistedSettings,
   parseArchiveHistoryRequest,
   parseBrowseDirectoryInput,
   parseCreateDirectoryInput,
@@ -335,16 +335,6 @@ const defaultSettings: AppSettings = {
   startMinimised: false,
   pauseOnMetered: true,
   theme: "system",
-  maxScanFiles: DEFAULT_MAX_MANIFEST_FILES,
-}
-
-/**
- * The scan ceiling in force on this machine. Every local scan — including
- * scans run on a peer's behalf — uses this value; a peer never supplies
- * its own limit, so a paired device cannot dictate our memory allocation.
- */
-function currentScanLimit(): number | null {
-  return snapshot.settings.maxScanFiles
 }
 
 /**
@@ -514,7 +504,6 @@ function runLocalScan(
     excludePath?: (path: string, directory: boolean) => boolean
     mapPath?: (path: string, directory?: boolean) => string
     hashAllFiles?: boolean
-    maxFiles?: number | null
     onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void
     onMetrics?: (metrics: ScanMetrics) => void
     onSettledDigest?: (relativePath: string, digest: CachedFileDigest) => void
@@ -530,7 +519,6 @@ function runLocalScan(
     excludePath: options.excludePath,
     mapPath: options.mapPath,
     hashAllFiles: options.hashAllFiles,
-    maxFiles: options.maxFiles,
     onActivity: options.onActivity,
     onMetrics: (metrics) => {
       scanLedger.record(scanStageForKey(key), key, metrics)
@@ -552,7 +540,7 @@ const digestCacheVerifier = new DigestCacheVerifier()
  * cache, so files whose exact identity is unchanged since an earlier sweep
  * are not read again.
  */
-async function withFolderDigestCache<T extends { truncated: boolean }>(
+async function withFolderDigestCache<T>(
   folderId: string,
   pass: (digestCache: ScanDigestCache) => Promise<T>,
 ): Promise<T> {
@@ -560,9 +548,9 @@ async function withFolderDigestCache<T extends { truncated: boolean }>(
   const deep = digestCacheVerifier.requiresDeepSweep(folderId, startedAt)
   const digestCache = new EngineScanDigestCache(engine, folderId, { deep })
   const result = await pass(digestCache)
-  const complete = !result.truncated
-  await digestCache.finish({ complete })
-  if (deep && complete) digestCacheVerifier.completedDeepSweep(folderId, startedAt)
+  // Scans are never cut short, so a pass that returns covered the whole folder.
+  await digestCache.finish({ complete: true })
+  if (deep) digestCacheVerifier.completedDeepSweep(folderId, startedAt)
   return result
 }
 
@@ -621,18 +609,17 @@ interface CachedFolderScanOptions {
 function runCachedFolderScan(
   key: string,
   folder: ActiveFolderScanTarget,
-  maxFiles: number | null,
   signal: AbortSignal | null,
   options: CachedFolderScanOptions = {},
 ): Promise<FileManifest> {
   return withFolderDigestCache(folder.id, (digestCache) =>
-    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, maxFiles, folderId: folder.id, digestCache, ...options, ...directoryScanOptions(folder.id) }, signal))
+    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, folderId: folder.id, digestCache, ...options, ...directoryScanOptions(folder.id) }, signal))
 }
 
 /** The same pass reduced to an observation fingerprint, holding no file list in memory. */
-function runCachedFolderFingerprint(key: string, folder: ActiveFolderScanTarget, maxFiles: number | null, signal: AbortSignal | null): Promise<FolderFingerprint> {
+function runCachedFolderFingerprint(key: string, folder: ActiveFolderScanTarget, signal: AbortSignal | null): Promise<FolderFingerprint> {
   return withFolderDigestCache(folder.id, (digestCache) =>
-    runAdmittedScan(key, folder.id, signal, (effective) => fingerprintFolder(folder.localPath, folder.ignorePatterns, { maxFiles, signal: effective, digestCache, ...directoryScanOptions(folder.id) })))
+    runAdmittedScan(key, folder.id, signal, (effective) => fingerprintFolder(folder.localPath, folder.ignorePatterns, { signal: effective, digestCache, ...directoryScanOptions(folder.id) })))
 }
 
 /**
@@ -820,11 +807,7 @@ async function loadState(): Promise<void> {
         incoming: parsed.mappings?.incoming ?? [],
         outgoing: parsed.mappings?.outgoing ?? [],
       },
-      settings: {
-        ...defaultSettings,
-        ...(parsed.settings ?? {}),
-        maxScanFiles: normalizePersistedScanLimit((parsed.settings as Partial<AppSettings> | undefined)?.maxScanFiles),
-      },
+      settings: restorePersistedSettings(parsed.settings, defaultSettings),
       update: idleUpdateStateWithVersion(),
     }
   } else {
@@ -1578,7 +1561,6 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
   shutdownScanController.signal.addEventListener("abort", onShutdown, { once: true })
   try {
     const localPath = path.resolve(input.localPath)
-    const scanLimit = currentScanLimit()
     // Settled identities from this scan let the consent and merge walks reuse
     // digests for unchanged files instead of reading them again.
     const settled = new Map<string, CachedFileDigest>()
@@ -1587,7 +1569,6 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
     // without it so two devices cannot deadlock holding a slot each.
     const localManifest = await runLocalScan(`preview:${localPath}`, localPath, input.ignorePatterns, {
       includeDirectories: true,
-      maxFiles: scanLimit,
       reuse: scanReuseSeeds.lookup(localPath, input.ignorePatterns),
       onSettledDigest: (relativePath, digest) => scanReuseSeeds.collect(settled, relativePath, digest),
       onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
@@ -1607,7 +1588,7 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
       localPlatform: platform(),
       remotePlatform: peer.platform,
     })
-    if (operationId) previewScanSessions.record(operationId, comparisonSessionKey("outgoing", localPath, input.remotePath, peer, input.ignorePatterns, input.mode, scanLimit), preview)
+    if (operationId) previewScanSessions.record(operationId, comparisonSessionKey("outgoing", localPath, input.remotePath, peer, input.ignorePatterns, input.mode), preview)
     return preview
   } finally {
     shutdownScanController.signal.removeEventListener("abort", onShutdown)
@@ -1615,8 +1596,8 @@ async function previewFolderMapping(input: PreviewFolderMappingInput, progressOp
   }
 }
 
-function comparisonSessionKey(direction: "outgoing" | "incoming", localPath: string, remotePath: string, peer: DeviceSummary, ignorePatterns: string[], mode: SyncMode, maxFiles: number | null = currentScanLimit()): string {
-  return previewScanKey({ direction, localPath, remotePath, peerId: peer.id, localPlatform: platform(), remotePlatform: peer.platform, ignorePatterns, mode, maxFiles })
+function comparisonSessionKey(direction: "outgoing" | "incoming", localPath: string, remotePath: string, peer: DeviceSummary, ignorePatterns: string[], mode: SyncMode): string {
+  return previewScanKey({ direction, localPath, remotePath, peerId: peer.id, localPlatform: platform(), remotePlatform: peer.platform, ignorePatterns, mode })
 }
 
 async function requestFolderMapping(input: RequestFolderMappingInput, progressOperationId?: unknown): Promise<AppSnapshot> {
@@ -1738,12 +1719,8 @@ async function buildIncomingMappingPreview(
     // This is the responder's first look at its own destination folder. Its
     // settled identities seed the local inverse merge walk after approval.
     const settled = new Map<string, CachedFileDigest>()
-    // One limit for the scan and its cache key: if the setting changes during
-    // the walk, the manifest must not later be reused under the new limit.
-    const scanLimit = currentScanLimit()
     const responderManifest = await runLocalScan(`incoming:${target}`, target, request.proposal.ignorePatterns, {
       includeDirectories: true,
-      maxFiles: scanLimit,
       reuse: scanReuseSeeds.lookup(target, request.proposal.ignorePatterns),
       onSettledDigest: (relativePath, digest) => scanReuseSeeds.collect(settled, relativePath, digest),
       onActivity: (activity) => emitPreviewProgress(operationId, "scan-local", activity.scannedFiles, activity),
@@ -1756,7 +1733,7 @@ async function buildIncomingMappingPreview(
       localPlatform: peer.platform,
       remotePlatform: platform(),
     })
-    if (operationId) previewScanSessions.record(operationId, comparisonSessionKey("incoming", target, request.proposal.initiatorPath, peer, request.proposal.ignorePatterns, request.proposal.mode, scanLimit), preview)
+    if (operationId) previewScanSessions.record(operationId, comparisonSessionKey("incoming", target, request.proposal.initiatorPath, peer, request.proposal.ignorePatterns, request.proposal.mode), preview)
     return preview
   } finally {
     shutdownScanController.signal.removeEventListener("abort", onShutdown)
@@ -2630,9 +2607,6 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       throw new Error("A replacement recovery issue must be repaired before this folder can synchronize.")
     }
     const observedAt = new Date().toISOString()
-    // One limit for the whole flow: rereading the setting after the awaited
-    // scans could validate against a ceiling the scans never used.
-    const scanLimit = currentScanLimit()
     const capabilities = await cachedPeerCapabilities(peer.id)
     const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
     const quiet = quietReconciles.get(folderId)
@@ -2640,10 +2614,10 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     if (capabilities.has(CONTINUOUS_FINGERPRINT_CAPABILITY) && canSkipUnchangedCycle(quiet, durableBeforeReconcile, record.revision, Date.now())) {
       // Cheap first pass: fingerprints only, with no file list held on either computer.
       const { local: localPass, peer: peerReply } = await runPairedScans(
-        (signal) => runCachedFolderFingerprint(`continuous:${folderId}`, folder, scanLimit, signal),
+        (signal) => runCachedFolderFingerprint(`continuous:${folderId}`, folder, signal),
         (signal) => requestPeerContinuousScan(peer.id, folderId, quiet.remoteFingerprint, signal, chunked),
       )
-      const localUnchanged = !localPass.truncated && localPass.unreadable === 0 && localPass.fingerprint === quiet.localFingerprint
+      const localUnchanged = localPass.unreadable === 0 && localPass.fingerprint === quiet.localFingerprint
       if (localUnchanged && isUnchangedScanReply(peerReply)) {
         applyFileSyncStateToFolder(folderId, durableBeforeReconcile, new Date().toISOString())
         continuousLastErrors.delete(folderId)
@@ -2655,14 +2629,14 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     // Only a clean quiet reconcile below may leave a skip record behind.
     quietReconciles.delete(folderId)
     const { local: localManifest, peer: remoteManifest } = await runPairedScans(
-      (signal) => runCachedFolderScan(`continuous:${folderId}`, folder, scanLimit, signal, {
+      (signal) => runCachedFolderScan(`continuous:${folderId}`, folder, signal, {
         onActivity: (activity) => reportScanCounts(folderId, "changes", { local: activity }),
       }),
       (signal) => knownPeerManifest
         ? Promise.resolve(knownPeerManifest)
         : requestPeerManifest(peer.id, { type: "continuous-sync-scan", folderId }, NO_PEER_RESPONSE_DEADLINE, signal, chunked),
     )
-    assertCompleteTransferManifest(localManifest, "This computer", scanLimit)
+    assertCompleteTransferManifest(localManifest, "This computer")
     assertCompleteTransferManifest(remoteManifest, peer.name)
     assertManifestFitsExchange(localManifest, "This computer", chunked)
     assertManifestFitsExchange(remoteManifest, peer.name, chunked)
@@ -2882,29 +2856,19 @@ function requireInitialSyncContext(folderId: string, expectedPeerId?: string): {
 }
 
 /**
- * Fails closed on a truncated or unreadable transfer manifest. Local scans
- * pass this machine's limit so the error can name the number; peer scans
- * pass nothing — the peer's limit is its own business and is never supplied
- * by (or requested from) the peer — so the error points at that computer's
- * Settings instead of inventing a number.
+ * Fails closed on a truncated or unreadable transfer manifest. Scans are never
+ * cut short any more, so a truncated manifest comes from an older Tethera that
+ * still stops at its scan file limit.
  *
  * `allowUnreadable` is used only by the initial merge after the user has been
  * shown exactly which paths are inaccessible and chosen to continue. The
  * blocked paths are excluded from the plan by the caller and reported in the
  * merge outcome, never silently dropped.
  */
-function assertCompleteTransferManifest(manifest: FileManifest, computer: string, originScanLimit?: number | null, options: { allowUnreadable?: boolean } = {}): void {
+function assertCompleteTransferManifest(manifest: FileManifest, computer: string, options: { allowUnreadable?: boolean } = {}): void {
   if (manifest.truncated) {
-    if (originScanLimit === undefined) {
-      throw new Error(
-        `${computer}'s folder exceeded its configured scan limit. Raise the limit in Settings on ${computer} or add ignore rules, then retry. No incomplete merge was marked active.`,
-      )
-    }
-    const ceiling = originScanLimit === null
-      ? "the configured scan limit"
-      : `the configured scan limit of ${originScanLimit.toLocaleString("en-GB")} files`
     throw new Error(
-      `${computer}'s folder lists more than ${ceiling}. Raise the limit in Settings or add ignore rules, then retry. No incomplete merge was marked active.`,
+      `${computer}'s folder scan stopped early, which older versions of Tethera do at their scan file limit. Update Tethera on both computers, then retry. No incomplete merge was marked active.`,
     )
   }
   if (!options.allowUnreadable && manifest.unreadable > 0) {
@@ -3274,7 +3238,7 @@ async function recoverIncompleteReplacements(): Promise<void> {
 }
 
 function initialSyncScanSignature(folder: FolderSummary): string {
-  return JSON.stringify([folder.localPath, folder.remotePath, folder.mode, folder.ignorePatterns, folder.maxFileBytes ?? null, currentScanLimit()])
+  return JSON.stringify([folder.localPath, folder.remotePath, folder.mode, folder.ignorePatterns, folder.maxFileBytes ?? null])
 }
 
 function scanIssueReportOf(localManifest: FileManifest, remoteManifest: FileManifest): FolderScanIssueReport {
@@ -3372,9 +3336,6 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   setFolderActivity(folder.id, { kind: "scanning", purpose: "initial-merge" }, options.initialMerge)
   broadcastSnapshot()
 
-  // One limit for the whole pass: rereading the setting after the awaited
-  // scans could validate against a ceiling the scans never used.
-  const scanLimit = currentScanLimit()
   let localManifest: FileManifest
   let remoteManifest: FileManifest
   // The caller already paired these manifests with the freshness decision and
@@ -3395,7 +3356,7 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
     let scanning = true
     localBlocked = []
     const result = await runPairedScans(
-      (signal) => runCachedFolderScan(`initial:${folder.id}`, folder, scanLimit, signal, {
+      (signal) => runCachedFolderScan(`initial:${folder.id}`, folder, signal, {
         reuse,
         onUnreadable: (issue) => localBlocked.push(issue),
         onActivity: (activity) => {
@@ -3448,8 +3409,8 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   // The decision above already accounted for unreadable items; blocked paths
   // are excluded from the plan and reported in the outcome rather than
   // failing the whole merge.
-  assertCompleteTransferManifest(localManifest, "This computer", scanLimit, { allowUnreadable: true })
-  assertCompleteTransferManifest(remoteManifest, peer.name, undefined, { allowUnreadable: true })
+  assertCompleteTransferManifest(localManifest, "This computer", { allowUnreadable: true })
+  assertCompleteTransferManifest(remoteManifest, peer.name, { allowUnreadable: true })
 
   assertInitialMergePathCompatibility(localManifest, remoteManifest, platform() === "windows" || peer.platform === "windows")
   const plan = computeSyncPlan(localManifest, remoteManifest, folder.mode, { destinationBlocked: localBlocked })
@@ -3576,9 +3537,6 @@ async function verifyInitialMergeQuiescent(
   // Only the coordinator verifies, and the coordinator always runs the first pass.
   setFolderActivity(folder.id, { kind: "scanning", purpose: "verify" }, { step: 3, firstPassUpdates: "this-computer" })
   broadcastSnapshot()
-  // One limit for the whole check, as above: the scans and their validation
-  // must agree even if the setting changes mid-flight.
-  const scanLimit = currentScanLimit()
   const capabilities = await cachedPeerCapabilities(peer.id)
   const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
   // Keep the complete local block set for convergence. The peer's list stays
@@ -3587,7 +3545,7 @@ async function verifyInitialMergeQuiescent(
   // being pulled into an unreadable path.
   const localBlocked: FolderScanIssue[] = []
   const { local: localManifest, peer: remoteManifest } = await runPairedScans(
-    (signal) => runCachedFolderScan(`verify:${folder.id}`, folder, scanLimit, signal, {
+    (signal) => runCachedFolderScan(`verify:${folder.id}`, folder, signal, {
       onUnreadable: (issue) => localBlocked.push(issue),
       onActivity: (activity) => reportScanCounts(folder.id, "verify", { local: activity }),
     }),
@@ -3604,8 +3562,8 @@ async function verifyInitialMergeQuiescent(
   // The merge already applied the unreadable-path decision; verification must
   // not fail on the same inaccessible items. Fresh issues are reported through
   // the outcome instead of being silently dropped.
-  assertCompleteTransferManifest(localManifest, "This computer", scanLimit, { allowUnreadable: true })
-  assertCompleteTransferManifest(remoteManifest, peer.name, undefined, { allowUnreadable: true })
+  assertCompleteTransferManifest(localManifest, "This computer", { allowUnreadable: true })
+  assertCompleteTransferManifest(remoteManifest, peer.name, { allowUnreadable: true })
   assertManifestFitsExchange(localManifest, "This computer", chunked)
   assertManifestFitsExchange(remoteManifest, peer.name, chunked)
   assertInitialMergePathCompatibility(localManifest, remoteManifest, platform() === "windows" || peer.platform === "windows")
@@ -4111,7 +4069,6 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
         const manifest = await runCachedFolderScan(
           `inbound:${folderId}`,
           folder,
-          currentScanLimit(),
           context.signal,
           {
             reuse: scanReuseSeeds.lookup(folder.localPath, folder.ignorePatterns),
@@ -4128,7 +4085,6 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const manifest = await runLocalScan("inbound:preview", requestedPath, ignorePatterns, {
       includeDirectories: request.includeDirectories === true,
       hashAllFiles,
-      maxFiles: currentScanLimit(),
       // Read-only lookup only; a peer request never grows the local seed store.
       reuse: scanReuseSeeds.lookup(path.resolve(requestedPath), ignorePatterns),
       // The wire progress schema is strict and older peers reject unknown
@@ -4156,15 +4112,14 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       })
       broadcastSnapshot()
       try {
-        const scanLimit = currentScanLimit()
         if (knownFingerprint !== undefined) {
-          const pass = await runCachedFolderFingerprint(`inbound:${folderId}`, folder, scanLimit, context.signal)
-          if (!pass.truncated && pass.unreadable === 0 && pass.fingerprint === knownFingerprint) {
+          const pass = await runCachedFolderFingerprint(`inbound:${folderId}`, folder, context.signal)
+          if (pass.unreadable === 0 && pass.fingerprint === knownFingerprint) {
             const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
             if (state.operations.length === 0 && state.recoveryIssues.length === 0) return { unchanged: true }
           }
         }
-        const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, scanLimit, context.signal, {
+        const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, context.signal, {
           onActivity: (activity) => reportScanCounts(folderId, "peer-changes", { local: activity }),
         })
         assertManifestFitsExchange(manifest, "This computer", context.chunkedResponse)

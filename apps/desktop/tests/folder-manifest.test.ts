@@ -140,17 +140,14 @@ describe("folder mapping comparison", () => {
     }
   })
 
-  test("oversize files do not consume the scan file ceiling", async () => {
+  test("excludes oversize files like ignored files", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-ceiling-test-"))
     try {
       await writeFile(path.join(root, "a-keep.bin"), "x".repeat(10))
       await writeFile(path.join(root, "b-huge.bin"), "x".repeat(4_096))
       await writeFile(path.join(root, "c-huge.bin"), "x".repeat(4_096))
 
-      // Only one file is collectable, so a ceiling of one must not report a
-      // truncated scan: nothing was omitted for ceiling reasons, and a
-      // truncated manifest would block the merge entirely.
-      const result = await scanFolder(root, [], { maxFiles: 1, maxFileBytes: 1_024 })
+      const result = await scanFolder(root, [], { maxFileBytes: 1_024 })
       expect(result.files.map((entry) => entry.path)).toEqual(["a-keep.bin"])
       expect(result.ignored).toBe(2)
       expect(result.truncated).toBe(false)
@@ -227,7 +224,7 @@ describe("folder mapping comparison", () => {
       await writeFile(path.join(root, "keep-a.txt"), "a")
       await writeFile(path.join(root, "keep-b.txt"), "b")
 
-      const result = await scanFolder(root, ["**/node_modules/**"], { maxFiles: 2 })
+      const result = await scanFolder(root, ["**/node_modules/**"])
 
       expect(result.files.map((entry) => entry.path).sort()).toEqual(["keep-a.txt", "keep-b.txt"])
       expect(result.ignored).toBe(2)
@@ -258,31 +255,15 @@ describe("folder mapping comparison", () => {
     expect(loneSurrogate("a.txt", false)).toBe(false)
   })
 
-  test("honours an explicit scan ceiling and an explicit opt-out of it", async () => {
+  test("collects every file, with no scan file ceiling", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-ceiling-test-"))
     try {
       for (let index = 0; index < 5; index += 1) {
         await writeFile(path.join(root, `file-${index}.txt`), "data")
       }
-      const limited = await scanFolder(root, [], { maxFiles: 3 })
-      expect(limited.files).toHaveLength(3)
-      expect(limited.truncated).toBe(true)
-      const unlimited = await scanFolder(root, [], { maxFiles: null })
-      expect(unlimited.files).toHaveLength(5)
-      expect(unlimited.truncated).toBe(false)
-      const byDefault = await scanFolder(root, [])
-      expect(byDefault.files).toHaveLength(5)
-      expect(byDefault.truncated).toBe(false)
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  test("rejects a non-positive scan ceiling instead of silently truncating everything", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-ceiling-invalid-test-"))
-    try {
-      await writeFile(path.join(root, "file.txt"), "data")
-      await expect(scanFolder(root, [], { maxFiles: 0 })).rejects.toThrow("The scan limit is invalid.")
+      const result = await scanFolder(root, [])
+      expect(result.files).toHaveLength(5)
+      expect(result.truncated).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -396,7 +377,7 @@ async function sequentialWalkOrder(root: string, relative = ""): Promise<string[
  * Enough small files to keep every inspection slot busy, with multi-MiB files
  * spread through the tree so inspections finish out of walk order.
  */
-async function buildMixedTree(root: string): Promise<{ largeFiles: string[] }> {
+async function buildMixedTree(root: string): Promise<void> {
   const largeFiles = ["large-root.bin", "a/large-a.bin", "a/deep/large-deep.bin"]
   await mkdir(path.join(root, "a", "deep"), { recursive: true })
   await mkdir(path.join(root, "b"), { recursive: true })
@@ -406,7 +387,6 @@ async function buildMixedTree(root: string): Promise<{ largeFiles: string[] }> {
   })
   await Promise.all(smallFiles.map((relativePath) => writeFile(path.join(root, relativePath), `content ${relativePath}`)))
   await Promise.all(largeFiles.map((relativePath) => writeFile(path.join(root, relativePath), Buffer.alloc(6 * 1024 * 1024, 1))))
-  return { largeFiles }
 }
 
 describe("concurrent scan parity", () => {
@@ -415,7 +395,7 @@ describe("concurrent scan parity", () => {
     try {
       await buildMixedTree(root)
       const expected = await sequentialWalkOrder(root)
-      const result = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null })
+      const result = await scanFolder(root, [], { hashAllFiles: true })
       expect(result.files.map((entry) => entry.path)).toEqual(expected)
       expect(result.files.every((entry) => /^[a-f0-9]{64}$/.test(entry.digest ?? ""))).toBe(true)
       expect(result.truncated).toBe(false)
@@ -425,25 +405,6 @@ describe("concurrent scan parity", () => {
     }
   })
 
-  test("truncates at exactly the file a sequential scan would stop at", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-truncation-test-"))
-    try {
-      const { largeFiles } = await buildMixedTree(root)
-      const expected = await sequentialWalkOrder(root)
-      const limit = SCAN_FILE_CONCURRENCY + 3
-      const limited = await scanFolder(root, [], { hashAllFiles: true, maxFiles: limit })
-      expect(limited.truncated).toBe(true)
-      expect(limited.files.map((entry) => entry.path)).toEqual(expected.slice(0, limit))
-
-      // Oversize exclusions must not consume the ceiling, even while later files are in flight.
-      const withoutLarge = expected.filter((relativePath) => !largeFiles.includes(relativePath))
-      const sizeLimited = await scanFolder(root, [], { hashAllFiles: true, maxFiles: limit, maxFileBytes: 1024 * 1024 })
-      expect(sizeLimited.truncated).toBe(true)
-      expect(sizeLimited.files.map((entry) => entry.path)).toEqual(withoutLarge.slice(0, limit))
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
 })
 
 function sha256(content: string): string {
@@ -535,13 +496,13 @@ describe("scan digest cache", () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-digest-parity-test-"))
     try {
       await buildMixedTree(root)
-      const uncached = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null })
+      const uncached = await scanFolder(root, [], { hashAllFiles: true })
       const seed = new Map<string, CachedFileDigest>()
       for (const entry of uncached.files) {
         seed.set(entry.path, { ...(await identityOf(path.join(root, entry.path))), digest: entry.digest ?? "" })
       }
       const { cache } = fakeDigestCache(seed)
-      const cached = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null, digestCache: cache })
+      const cached = await scanFolder(root, [], { hashAllFiles: true, digestCache: cache })
       expect(cached).toEqual(uncached)
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -554,7 +515,7 @@ describe("scan digest cache", () => {
       const fileCount = 600
       await Promise.all(Array.from({ length: fileCount }, (_, index) => writeFile(path.join(root, `file-${index}.txt`), `${index}`)))
       const { cache, lookups } = fakeDigestCache()
-      await scanFolder(root, [], { hashAllFiles: true, maxFiles: null, digestCache: cache })
+      await scanFolder(root, [], { hashAllFiles: true, digestCache: cache })
       const looked = lookups.flat()
       expect(looked).toHaveLength(fileCount)
       expect(new Set(looked).size).toBe(fileCount)
@@ -586,16 +547,16 @@ describe("folder fingerprint", () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-fingerprint-parity-test-"))
     try {
       await buildMixedTree(root)
-      const manifest = await scanFolder(root, [], { hashAllFiles: true, maxFiles: null })
-      const pass = await fingerprintFolder(root, [], { maxFiles: null })
+      const manifest = await scanFolder(root, [], { hashAllFiles: true })
+      const pass = await fingerprintFolder(root, [])
       expect(pass.fingerprint).toBe(fingerprintObservation(manifest.files.map(({ path: filePath, size, digest }) => ({ path: filePath, size, digest: digest ?? "" }))))
-      expect(pass).toMatchObject({ files: manifest.files.length, ignored: manifest.ignored, unreadable: manifest.unreadable, truncated: false })
+      expect(pass).toMatchObject({ files: manifest.files.length, ignored: manifest.ignored, unreadable: manifest.unreadable })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
   })
 
-  test("changes when one file's bytes change at the same size, and reports truncation like a scan", async () => {
+  test("changes when one file's bytes change at the same size", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "tethera-fingerprint-change-test-"))
     try {
       await writeFile(path.join(root, "a.txt"), "before")
@@ -604,8 +565,6 @@ describe("folder fingerprint", () => {
       await writeFile(path.join(root, "a.txt"), "after!")
       const second = await fingerprintFolder(root, [])
       expect(second.fingerprint).not.toBe(first.fingerprint)
-      const limited = await fingerprintFolder(root, [], { maxFiles: 1 })
-      expect(limited.truncated).toBe(true)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

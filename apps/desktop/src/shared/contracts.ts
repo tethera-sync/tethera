@@ -166,12 +166,6 @@ export interface AppSettings {
   startMinimised: boolean
   pauseOnMetered: boolean
   theme: ThemePreference
-  /**
-   * Ceiling on files collected by one folder scan before it reports
-   * `truncated`. `null` removes the ceiling for an explicitly opted-in
-   * unbounded scan; the default is 10,000.
-   */
-  maxScanFiles: number | null
 }
 
 export type UpdateStatus =

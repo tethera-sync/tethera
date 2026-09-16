@@ -5,7 +5,7 @@ import { manifest } from "./helpers"
 
 const baseInput: PreviewScanKeyInput = {
   direction: "outgoing", localPath: "/tmp/root", remotePath: "D:\\coding", peerId: "peer-1",
-  localPlatform: "linux", remotePlatform: "windows", ignorePatterns: ["*.tmp"], mode: "two-way", maxFiles: null,
+  localPlatform: "linux", remotePlatform: "windows", ignorePatterns: ["*.tmp"], mode: "two-way",
 }
 const key = previewScanKey(baseInput)
 const preview = compareManifests(manifest([]), manifest([]), { mode: "two-way", localPlatform: "linux", remotePlatform: "windows" })
@@ -32,7 +32,7 @@ describe("PreviewScanSessions", () => {
     const changes: Partial<PreviewScanKeyInput>[] = [
       { direction: "incoming" }, { localPath: "/tmp/other" }, { remotePath: "E:\\coding" },
       { peerId: "peer-2" }, { localPlatform: "windows" }, { remotePlatform: "linux" },
-      { ignorePatterns: ["*.bak"] }, { mode: "send-only" }, { maxFiles: 5_000 },
+      { ignorePatterns: ["*.bak"] }, { mode: "send-only" },
     ]
     for (const change of changes) {
       expect(sessions.lookup("op-1", previewScanKey({ ...baseInput, ...change }))).toBeUndefined()

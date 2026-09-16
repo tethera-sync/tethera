@@ -12,6 +12,7 @@ import {
   type KeyObject,
 } from "node:crypto"
 import net, { type Server, type Socket } from "node:net"
+import { jsonByteLength, jsonPieces } from "./json-stream"
 import type { PairingService } from "./pairing-service"
 import { type PeerScanProgress, parsePeerScanProgress } from "./peer-scan-progress"
 
@@ -912,7 +913,7 @@ class JsonLineConnection {
  * measured as plaintext against the chunked-exchange limit.
  */
 export function measurePeerRequest(request: PeerRequest, options: { chunked?: boolean } = {}): { bytes: number; limit: number; fits: boolean } {
-  const plaintextBytes = Buffer.byteLength(JSON.stringify(request), "utf8")
+  const plaintextBytes = jsonByteLength(request)
   if (options.chunked) {
     return { bytes: plaintextBytes, limit: MAX_CHUNKED_MESSAGE_BYTES, fits: plaintextBytes <= MAX_CHUNKED_MESSAGE_BYTES }
   }
@@ -1033,29 +1034,61 @@ function* encryptChunks(
   direction: "request" | "response",
   value: unknown,
 ): Generator<SecureChunk, void, void> {
-  const plaintext = Buffer.from(JSON.stringify(value), "utf8")
-  if (plaintext.length > MAX_CHUNKED_MESSAGE_BYTES) {
+  // Every chunk authenticates the total size, so the message is measured in a
+  // first pass and sealed from a second one; neither holds it whole. The
+  // second pass must reproduce the measured bytes exactly.
+  const totalBytes = jsonByteLength(value)
+  if (totalBytes > MAX_CHUNKED_MESSAGE_BYTES) {
     throw peerSessionError(
-      `The secure message is ${(plaintext.length / 1_048_576).toFixed(1)} MiB, above the ${MAX_CHUNKED_MESSAGE_BYTES / 1_048_576} MiB limit for one peer exchange.`,
+      `The secure message is ${(totalBytes / 1_048_576).toFixed(1)} MiB, above the ${MAX_CHUNKED_MESSAGE_BYTES / 1_048_576} MiB limit for one peer exchange.`,
       "PEER_MESSAGE_TOO_LARGE",
     )
   }
-  const count = Math.ceil(plaintext.length / CHUNK_PLAINTEXT_BYTES)
-  for (let index = 0; index < count; index += 1) {
-    const header = { index, count, totalBytes: plaintext.length }
-    const iv = randomBytes(GCM_IV_BYTES)
-    const cipher = createCipheriv("aes-256-gcm", key, iv)
-    cipher.setAAD(chunkAad(sessionId, requestId, direction, header))
-    const slice = plaintext.subarray(index * CHUNK_PLAINTEXT_BYTES, (index + 1) * CHUNK_PLAINTEXT_BYTES)
-    const ciphertext = Buffer.concat([cipher.update(slice), cipher.final()])
-    yield {
-      type: "secure-chunk",
-      requestId,
-      ...header,
-      iv: iv.toString("base64"),
-      ciphertext: ciphertext.toString("base64"),
-      tag: cipher.getAuthTag().toString("base64"),
+  const count = Math.ceil(totalBytes / CHUNK_PLAINTEXT_BYTES)
+  const chunkSize = (index: number): number => Math.min(CHUNK_PLAINTEXT_BYTES, totalBytes - index * CHUNK_PLAINTEXT_BYTES)
+  let index = 0
+  let plaintext = Buffer.allocUnsafe(chunkSize(0))
+  let filled = 0
+  for (const piece of jsonPieces(value)) {
+    let bytes = Buffer.from(piece, "utf8")
+    while (bytes.length > 0) {
+      if (index >= count) throw changedWhileSending()
+      const copied = bytes.copy(plaintext, filled)
+      filled += copied
+      bytes = bytes.subarray(copied)
+      if (filled < plaintext.length) continue
+      yield sealChunk(key, sessionId, requestId, direction, { index, count, totalBytes }, plaintext)
+      index += 1
+      filled = 0
+      if (index < count) plaintext = Buffer.allocUnsafe(chunkSize(index))
     }
+  }
+  if (index !== count) throw changedWhileSending()
+}
+
+function changedWhileSending(): Error {
+  return peerSessionError("The secure message changed while it was being sent.", "PEER_MESSAGE_CHANGED")
+}
+
+function sealChunk(
+  key: Buffer,
+  sessionId: string,
+  requestId: string,
+  direction: "request" | "response",
+  header: { index: number; count: number; totalBytes: number },
+  plaintext: Buffer,
+): SecureChunk {
+  const iv = randomBytes(GCM_IV_BYTES)
+  const cipher = createCipheriv("aes-256-gcm", key, iv)
+  cipher.setAAD(chunkAad(sessionId, requestId, direction, header))
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()])
+  return {
+    type: "secure-chunk",
+    requestId,
+    ...header,
+    iv: iv.toString("base64"),
+    ciphertext: ciphertext.toString("base64"),
+    tag: cipher.getAuthTag().toString("base64"),
   }
 }
 
@@ -1115,7 +1148,10 @@ async function readChunkedMessage<T>(
     offset += decrypted.length
   }
   if (!plaintext || offset !== totalBytes) throw new Error("The peer sent an invalid chunked message.")
-  return JSON.parse(plaintext.toString("utf8")) as T
+  // Decode, then release the byte copy before parsing so both are never held at once.
+  const text = plaintext.toString("utf8")
+  plaintext = undefined
+  return JSON.parse(text) as T
 }
 
 function waitForConnect(socket: Socket, timeoutMs: number): Promise<void> {
