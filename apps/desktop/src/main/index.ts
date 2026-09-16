@@ -165,6 +165,7 @@ import {
   type QuietReconcile,
   conflictSummary,
   describeFolderSyncState,
+  describeInitialMergeOutcome,
   unverifiedMergeConflictsAction,
   findMirroredPeerOperation,
   FolderChangeMonitor,
@@ -3668,17 +3669,23 @@ function applyInitialSyncOutcomeStatus(folderId: string): void {
   const outcome = initialSyncOutcomes[folderId]
   const folder = snapshot.folders.find((item) => item.id === folderId)
   if (!outcome || !folder) return
-  const conflicts = outcome.conflicts
-  const unreadable = outcome.unreadableSkipped ?? []
-  const attention = initialSyncAttentionSummary(conflicts.length, unreadable.length)
+  const peer = getPairedDevice(folder.remoteDeviceId)
+  const paused = folder.paused || snapshot.paused
+  const { status, currentAction } = describeInitialMergeOutcome({
+    paused,
+    peerOnline: peer?.status === "online",
+    // The first two-sided scan retires these, so any that remain are unchecked.
+    conflicts: outcome.conflicts.length,
+    unreadableSkipped: outcome.unreadableSkipped?.length ?? 0,
+  })
   updateFolder(folderId, {
     setupStatus: "active",
-    status: attention ? "needs-attention" : idleFolderStatus(folder.remoteDeviceId, "active"),
+    status: !peer && !paused ? "needs-attention" : status,
     work: undefined,
     problem: undefined,
     fileCount: outcome.fileCount,
     lastSyncedAt: outcome.completedAt,
-    currentAction: attention ?? "Initial merge completed safely on both computers.",
+    currentAction,
   })
 }
 
@@ -3877,15 +3884,8 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
         },
       },
     )
-    updateFolder(folderId, {
-      setupStatus: "active",
-      status: skipped.length > 0 || unreadableSkipped.length > 0 ? "needs-attention" : idleFolderStatus(folder.remoteDeviceId, "active"),
-      work: undefined,
-      problem: undefined,
-      fileCount: localResult.fileCount,
-      lastSyncedAt: completedAt,
-      currentAction: initialSyncAttentionSummary(skipped.length, unreadableSkipped.length) ?? "Initial merge completed safely on both computers.",
-    })
+    // The completion commit recorded this same outcome durably before activation.
+    applyInitialSyncOutcomeStatus(folderId)
     recordInitialSyncOutcome(folder, localResult.copiedFiles + remoteResult.copiedFiles, skipped, unreadableSkipped)
     // The durable digest cache now holds everything the merge verified; the
     // pre-mapping seed has done its job.

@@ -14,6 +14,7 @@ import {
   type QuietReconcile,
   conflictSummary,
   describeFolderSyncState,
+  describeInitialMergeOutcome,
   findMirroredPeerOperation,
   FolderChangeMonitor,
   mirrorConflictChoice,
@@ -159,6 +160,30 @@ describe("describeFolderSyncState", () => {
     }
     expect(describeFolderSyncState({ paused: false, peerOnline: true, state: { ...empty, operations: [operation] }, unverifiedMergeConflicts: 0 }))
       .toEqual({ status: "syncing", currentAction: "1 change is waiting to retry." })
+  })
+})
+
+describe("describeInitialMergeOutcome", () => {
+  test("shows the merge's conflicts as a pending check, not as attention", () => {
+    expect(describeInitialMergeOutcome({ paused: false, peerOnline: true, conflicts: 1561, unreadableSkipped: 0 })).toEqual({
+      status: "syncing",
+      currentAction: "Waiting for the first full check of both computers. 1,561 files differed during the initial merge; any that now match will drop off the list.",
+    })
+    expect(describeInitialMergeOutcome({ paused: true, peerOnline: true, conflicts: 1561, unreadableSkipped: 0 }).status).toBe("paused")
+  })
+
+  test("keeps skipped inaccessible items as needing attention alongside the pending check", () => {
+    const outcome = describeInitialMergeOutcome({ paused: false, peerOnline: true, conflicts: 1561, unreadableSkipped: 20 })
+    expect(outcome.status).toBe("needs-attention")
+    expect(outcome.currentAction).toStartWith("20 inaccessible items were skipped and need attention; affected paths were left untouched. Waiting for the first full check")
+    expect(describeInitialMergeOutcome({ paused: false, peerOnline: true, conflicts: 0, unreadableSkipped: 1 }).currentAction)
+      .toBe("1 inaccessible item was skipped and needs attention; affected paths were left untouched.")
+  })
+
+  test("reports a clean merge as up to date, or offline without the peer", () => {
+    expect(describeInitialMergeOutcome({ paused: false, peerOnline: true, conflicts: 0, unreadableSkipped: 0 }))
+      .toEqual({ status: "up-to-date", currentAction: "Initial merge completed safely on both computers." })
+    expect(describeInitialMergeOutcome({ paused: false, peerOnline: false, conflicts: 0, unreadableSkipped: 0 }).status).toBe("offline")
   })
 })
 

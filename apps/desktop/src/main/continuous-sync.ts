@@ -330,6 +330,39 @@ export function describeFolderSyncState(
   return { status, currentAction: "Watching for changes." }
 }
 
+export interface InitialMergeOutcomeInput {
+  paused: boolean
+  peerOnline: boolean
+  /** Same-path conflicts the merge left untouched; unchecked until the first two-sided scan. */
+  conflicts: number
+  /** Inaccessible items the user chose to skip. */
+  unreadableSkipped: number
+}
+
+/**
+ * Status right after an initial merge, before live sync has run its first two-sided scan.
+ * Skipped inaccessible items need the user; the merge's conflicts are still a pending check.
+ */
+export function describeInitialMergeOutcome(
+  { paused, peerOnline, conflicts, unreadableSkipped }: InitialMergeOutcomeInput,
+): { status: OverallStatus; currentAction: string } {
+  const pending = describeFolderSyncState({
+    paused,
+    peerOnline,
+    state: { conflicts: [], operations: [], recoveryIssues: [] },
+    unverifiedMergeConflicts: conflicts,
+  })
+  if (unreadableSkipped === 0) {
+    return conflicts > 0 ? pending : { status: pending.status, currentAction: "Initial merge completed safely on both computers." }
+  }
+  const one = unreadableSkipped === 1
+  const skipped = `${unreadableSkipped.toLocaleString("en-GB")} inaccessible item${one ? " was" : "s were"} skipped and need${one ? "s" : ""} attention; affected paths were left untouched.`
+  return {
+    status: paused ? "paused" : "needs-attention",
+    currentAction: conflicts > 0 ? `${skipped} ${pending.currentAction}` : skipped,
+  }
+}
+
 /**
  * Watches every real directory below an approved mapping root. Native notifications trigger a
  * debounced reconciliation and a periodic full scan catches coalesced or unsupported events.
