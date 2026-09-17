@@ -14,5 +14,6 @@ Folders use <type>/<YYYY-MM-DD>-<slug>. Primary artifacts are HTML with machine-
 
 ## Artifacts
 
+- 2026-09-17 · plan · [generation-wiring](plans/2026-09-17-generation-wiring/plan.html) — wire continuous reconciliation through sealed scan generations
 - 2026-09-10 · investigation · [large-scan-memory](investigations/2026-09-10-large-scan-memory/investigation.html) — memory pressure, cancellation and staged large-folder scans
 - 2026-09-08 · audit · [bugs-and-improvements](audits/2026-09-08-bugs-and-improvements/audit.html) — watcher reliability, path correctness, IPC guards and archive browsing

@@ -334,7 +334,9 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
         "scanGeneration.seal" => handle_scan_generation_seal(request, mapping_store),
         "scanGeneration.abort" => handle_scan_generation_abort(request, mapping_store),
         "scanGeneration.readPage" => handle_scan_generation_read_page(request, mapping_store),
+        "scanGeneration.release" => handle_scan_generation_release(request, mapping_store),
         "scanGeneration.cleanup" => handle_scan_generation_cleanup(request, mapping_store),
+        "scanGeneration.purge" => handle_scan_generation_purge(request, mapping_store),
         "digestCache.lookup" => handle_digest_cache_lookup(request, mapping_store),
         "digestCache.record" => handle_digest_cache_record(request, mapping_store),
         "digestCache.prune" => handle_digest_cache_prune(request, mapping_store),
@@ -922,6 +924,28 @@ fn handle_scan_generation_read_page(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScanGenerationReleaseParams {
+    generation_id: String,
+}
+
+fn handle_scan_generation_release(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    let params: ScanGenerationReleaseParams =
+        match parse_params(request.params, "scanGeneration.release") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.release_scan_generation(&params.generation_id) {
+        Ok(()) => success_response(request.id, serde_json::json!({ "released": true })),
+        Err(error) => store_error_response(request.id, "Failed to release scan generation", &error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScanGenerationCleanupParams {
     now: String,
 }
@@ -939,6 +963,20 @@ fn handle_scan_generation_cleanup(request: RpcRequest, mapping_store: &MappingSt
     match store.cleanup_scan_generations(&params.now) {
         Ok(removed) => success_response(request.id, serde_json::json!({ "removed": removed })),
         Err(error) => store_error_response(request.id, "Failed to clean scan generations", &error),
+    }
+}
+
+fn handle_scan_generation_purge(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
+    if let Err(message) = require_no_params(request.params.as_ref(), "scanGeneration.purge") {
+        return error_response_with_code(request.id, "INVALID_PARAMS", message);
+    }
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.purge_scan_generations() {
+        Ok(removed) => success_response(request.id, serde_json::json!({ "removed": removed })),
+        Err(error) => store_error_response(request.id, "Failed to purge scan generations", &error),
     }
 }
 
@@ -1740,7 +1778,9 @@ mod tests {
             "scanGeneration.seal",
             "scanGeneration.abort",
             "scanGeneration.readPage",
+            "scanGeneration.release",
             "scanGeneration.cleanup",
+            "scanGeneration.purge",
             "digestCache.lookup",
             "digestCache.record",
             "digestCache.prune",

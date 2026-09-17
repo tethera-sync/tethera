@@ -5,6 +5,7 @@ import type { OverallStatus, SyncMode } from "../shared/contracts"
 import type { FileManifest } from "./folder-manifest"
 import { createDestinationOccupancyCheck, createManifestPathIgnoreCheck } from "./folder-manifest"
 import { isTetheraStagingPath } from "./path-safety"
+import { SCAN_GENERATION_CAPABILITY } from "./scan-generation"
 
 const CHANGE_DEBOUNCE_MS = 750
 const FALLBACK_SCAN_MS = 5 * 60_000
@@ -111,10 +112,26 @@ export interface ReconcileFilesRequest {
 
 export interface ReconcileFilesResult extends FileSyncState {
   verifiedCount: number
+  /** One-sided files a folder, link or special entry already occupies; only generation reconciliation reports these. */
+  occupiedPaths?: string[]
 }
 
 /** Advertised by peers that can answer a continuous scan with "unchanged" instead of a full manifest. */
 export const CONTINUOUS_FINGERPRINT_CAPABILITY = "continuous-fingerprint-v1"
+
+/**
+ * Whether a changed cycle may reconcile through staged generations. Both
+ * peers must stage and page scans, the observe response must be able to span
+ * several frames, and replayable durable work must stay on the manifest path,
+ * which owns replay and conflict-choice mirroring.
+ */
+export function shouldUseGenerations(
+  capabilities: ReadonlySet<string>,
+  chunkedFrames: boolean,
+  durableOperations: number,
+): boolean {
+  return capabilities.has(SCAN_GENERATION_CAPABILITY) && chunkedFrames && durableOperations === 0
+}
 
 /** However quiet a folder looks, it is fully reconciled at least this often. */
 export const FULL_RECONCILE_INTERVAL_MS = 60 * 60_000

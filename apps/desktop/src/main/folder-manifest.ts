@@ -131,6 +131,11 @@ export interface ScanFolderOptions {
   includeDirectories?: boolean
   onDirectory?: (entry: DirectoryObservation) => void
   excludePath?: (path: string, directory: boolean) => boolean
+  /**
+   * Rewrites a physical path to the logical path it synchronizes as. Must be
+   * injective for one scan: two physical paths that map to the same logical
+   * path stage a duplicate and fail the scan instead of being synchronized.
+   */
   mapPath?: (path: string, directory?: boolean) => string
   /** Hash every file for a transfer decision; preview scans retain the bounded fast path. */
   hashAllFiles?: boolean
@@ -389,7 +394,7 @@ async function scanFolderEntries(
   rootPath: string,
   ignorePatterns: string[],
   options: ScanFolderOptions,
-  onEntry: (entry: FileManifestEntry) => void,
+  onEntry: (entry: FileManifestEntry) => void | Promise<void>,
 ): Promise<ScanSummary> {
   const root = path.resolve(rootPath)
   const rootStat = await stat(root)
@@ -520,7 +525,9 @@ async function scanFolderEntries(
         continue
       }
       const { entry, settledIdentity, reused, hashed } = settlement.inspection
-      onEntry(options.mapPath ? { ...entry, path: options.mapPath(entry.path) } : entry)
+      // A sink that stages a batch resolves here, which holds the walk at the
+      // batch boundary instead of buffering the whole folder in memory.
+      await onEntry(options.mapPath ? { ...entry, path: options.mapPath(entry.path) } : entry)
       committedFiles += 1
       if (reused) reusedFiles += 1
       else if (hashed) hashedFiles += 1
@@ -572,7 +579,9 @@ export async function scanFolder(
       if (directories.length < 100_000) directories.push(entry)
       else directoriesTruncated = true
     } : options.onDirectory,
-  }, (entry) => files.push(entry))
+  }, (entry) => {
+    files.push(entry)
+  })
   return {
     rootPath: summary.rootPath,
     files,
@@ -583,6 +592,73 @@ export async function scanFolder(
     ...(options.includeDirectories ? { directories } : {}),
     ...(summary.occupiedPaths.length > 0 ? { occupiedPaths: summary.occupiedPaths } : {}),
   }
+}
+
+/**
+ * One staged observation: a hashed file, or an occupied path (a folder
+ * without synchronized files, or a symbolic link or other special entry)
+ * that a transfer must never be planned onto.
+ */
+export type StagedEntry =
+  | { path: string; size: number; digest: string; kind: "file" }
+  | { path: string; size: number; digest?: undefined; kind: "directory" | "special" }
+
+/** Entries per staged append batch; the engine rejects larger batches. */
+const SCAN_STAGE_BATCH_ENTRIES = 1_000
+
+/**
+ * The scan mapped two physical paths onto one logical path, which no staged
+ * observation can represent. Reported instead of the engine's duplicate-path
+ * error so the user knows what to change. `path` is a relative path, never an
+ * absolute one.
+ */
+export function describeMappedPathCollision(path?: string): string {
+  const shown = path ? ` (${path})` : ""
+  return `The folder scan mapped two different paths to the same sync path${shown}, so this scan is incomplete. Rename one of them or add an ignore rule, then retry.`
+}
+
+/**
+ * Runs a full-integrity scan whose entries are flushed to an async sink in
+ * bounded batches, awaiting each flush before the walk continues. Occupied
+ * paths are staged after the files, so memory follows the frontier and the
+ * batch size rather than the folder size.
+ */
+export async function stageFolderEntries(
+  rootPath: string,
+  ignorePatterns: string[],
+  options: Omit<ScanFolderOptions, "onDirectory">,
+  onBatch: (entries: StagedEntry[]) => Promise<void>,
+): Promise<ScanSummary> {
+  let batch: StagedEntry[] = []
+  // Bounded by the batch size, so this never scales with the folder.
+  let batchPaths = new Set<string>()
+  const flush = async (): Promise<void> => {
+    if (batch.length === 0) return
+    const entries = batch
+    batch = []
+    batchPaths = new Set()
+    await onBatch(entries)
+  }
+  const summary = await scanFolderEntries(rootPath, ignorePatterns, options, (entry) => {
+    if (!entry.digest) throw new Error("A staged scan requires a verified digest for every file.")
+    if (batchPaths.has(entry.path)) {
+      throw new Error(describeMappedPathCollision(entry.path))
+    }
+    batchPaths.add(entry.path)
+    batch.push({ path: entry.path, size: entry.size, digest: entry.digest, kind: "file" })
+    // Only a full batch holds the walk; smaller remainders are flushed at the end.
+    if (batch.length >= SCAN_STAGE_BATCH_ENTRIES) return flush()
+    return undefined
+  })
+  await flush()
+  for (let index = 0; index < summary.occupiedPaths.length; index += SCAN_STAGE_BATCH_ENTRIES) {
+    await onBatch(summary.occupiedPaths.slice(index, index + SCAN_STAGE_BATCH_ENTRIES).map((occupied) => ({
+      path: occupied.path,
+      size: 0,
+      kind: occupied.kind,
+    })))
+  }
+  return summary
 }
 
 /** A full-integrity scan reduced to its observation fingerprint. */

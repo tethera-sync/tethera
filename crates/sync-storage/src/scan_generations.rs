@@ -38,12 +38,22 @@ pub struct AppendBatchRequest {
     pub entries: Vec<GenerationEntry>,
 }
 
+/// One staged observation. A `file` carries its size and digest; a
+/// `directory` (a folder without synchronized files) or `special` (symbolic
+/// link, junction or other non-file entry) records only that the path is
+/// occupied and must never be written over.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GenerationEntry {
     pub path: String,
     pub size: i64,
     pub digest: Option<String>,
+    #[serde(default = "default_entry_kind")]
+    pub kind: String,
+}
+
+fn default_entry_kind() -> String {
+    "file".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +103,22 @@ fn validate_hash_mode(value: &str) -> Result<(), MappingStoreError> {
 pub(crate) fn validate_generation_entry(entry: &GenerationEntry) -> Result<(), MappingStoreError> {
     crate::file_sync::validate_path(&entry.path)?;
     crate::file_sync::validate_size(entry.size)?;
+    match entry.kind.as_str() {
+        "file" => {}
+        "directory" | "special" => {
+            if entry.size != 0 || entry.digest.is_some() {
+                return Err(MappingStoreError::Invalid(
+                    "an occupied path must not carry a size or digest".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        _ => {
+            return Err(MappingStoreError::Invalid(
+                "entry kind must be file, directory, or special".to_owned(),
+            ));
+        }
+    }
     if let Some(digest) = entry.digest.as_deref() {
         crate::file_sync::validate_digest(digest)?;
     }
@@ -318,8 +344,8 @@ impl MappingStore {
         let mut inserted: i64 = 0;
         {
             let mut insert = transaction.prepare_cached(
-                "INSERT INTO scan_entries (generation_id, relative_path, digest, size)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO scan_entries (generation_id, relative_path, digest, size, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(generation_id, relative_path) DO NOTHING",
             )?;
             for entry in &request.entries {
@@ -327,7 +353,8 @@ impl MappingStore {
                     request.generation_id,
                     entry.path,
                     entry.digest,
-                    entry.size
+                    entry.size,
+                    entry.kind
                 ])? == 1
                 {
                     inserted += 1;
@@ -468,6 +495,48 @@ impl MappingStore {
         self.generation_status(generation_id)
     }
 
+    /// Releases a generation in any state, deleting it and its staged entries.
+    /// The owning device calls this once the generation's exchange is
+    /// finished, so sealed generations are not retained until their TTL.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, missing-generation, or database error.
+    pub fn release_scan_generation(&self, generation_id: &str) -> Result<(), MappingStoreError> {
+        self.ensure_import_completed()?;
+        validate_generation_id(generation_id)?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let removed = transaction.execute(
+            "DELETE FROM scan_generations WHERE generation_id = ?1",
+            params![generation_id],
+        )?;
+        if removed == 0 {
+            return Err(MappingStoreError::NotFound(format!(
+                "scan generation {generation_id}"
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Deletes every staged generation with its entries, whatever its state.
+    /// The engine's owner calls this once at startup, when nothing can be in
+    /// flight and an unfinished row left by a crash would otherwise hold the
+    /// open-generation quota for a day.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error.
+    pub fn purge_scan_generations(&self) -> Result<i64, MappingStoreError> {
+        self.ensure_import_completed()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let removed = transaction.execute("DELETE FROM scan_generations", [])?;
+        transaction.commit()?;
+        Ok(i64::try_from(removed).unwrap_or(i64::MAX))
+    }
+
     /// Reads the durable status of one generation.
     ///
     /// # Errors
@@ -548,7 +617,7 @@ impl MappingStore {
             ));
         }
         let mut statement = self.connection.prepare(
-            "SELECT relative_path, size, digest FROM scan_entries
+            "SELECT relative_path, size, digest, kind FROM scan_entries
              WHERE generation_id = ?1 AND (?2 IS NULL OR relative_path > ?2)
              ORDER BY relative_path LIMIT ?3",
         )?;
@@ -557,6 +626,7 @@ impl MappingStore {
                 path: row.get(0)?,
                 size: row.get(1)?,
                 digest: row.get(2)?,
+                kind: row.get(3)?,
             })
         })?;
         let mut entries = Vec::new();
@@ -595,19 +665,22 @@ impl MappingStore {
     }
 }
 
+/// Staged rows for one bounded batch of paths: size, digest, and kind.
+type StoredGenerationEntries = std::collections::HashMap<String, (i64, Option<String>, String)>;
+
 /// Loads the stored rows for one bounded batch of unique paths in a single
 /// query, so classifying a delivered entry never costs a query per entry.
 fn stored_entries(
     transaction: &Transaction<'_>,
     generation_id: &str,
     entries: &[GenerationEntry],
-) -> Result<std::collections::HashMap<String, (i64, Option<String>)>, MappingStoreError> {
+) -> Result<StoredGenerationEntries, MappingStoreError> {
     if entries.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(StoredGenerationEntries::new());
     }
     let placeholders = vec!["?"; entries.len()].join(", ");
     let mut statement = transaction.prepare_cached(&format!(
-        "SELECT relative_path, size, digest FROM scan_entries
+        "SELECT relative_path, size, digest, kind FROM scan_entries
          WHERE generation_id = ?1 AND relative_path IN ({placeholders})"
     ))?;
     let mut rows = statement.query(params_from_iter(
@@ -618,13 +691,21 @@ fn stored_entries(
         let path: String = row.get(0)?;
         let size: i64 = row.get(1)?;
         let digest: Option<String> = row.get(2)?;
-        stored.insert(path, (size, digest));
+        let kind: String = row.get(3)?;
+        stored.insert(path, (size, digest, kind));
     }
     Ok(stored)
 }
 
-fn stored_matches_entry(stored: Option<&(i64, Option<String>)>, entry: &GenerationEntry) -> bool {
-    matches!(stored, Some((size, digest)) if *size == entry.size && *digest == entry.digest)
+fn stored_matches_entry(
+    stored: Option<&(i64, Option<String>, String)>,
+    entry: &GenerationEntry,
+) -> bool {
+    matches!(
+        stored,
+        Some((size, digest, kind))
+            if *size == entry.size && *digest == entry.digest && *kind == entry.kind
+    )
 }
 
 fn require_mapping_participants(
@@ -755,6 +836,7 @@ mod tests {
             path: path.to_owned(),
             size: 4,
             digest: Some(byte.to_string().repeat(64)),
+            kind: "file".to_owned(),
         }
     }
 
@@ -926,6 +1008,114 @@ mod tests {
     }
 
     #[test]
+    fn entry_kinds_round_trip_through_pages() {
+        let store = active_store();
+        begin(&store, "gen-1");
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-1".to_owned(),
+                sequence: 0,
+                entries: vec![
+                    entry("a.txt", 'a'),
+                    GenerationEntry {
+                        path: "empty".to_owned(),
+                        size: 0,
+                        digest: None,
+                        kind: "directory".to_owned(),
+                    },
+                    GenerationEntry {
+                        path: "link".to_owned(),
+                        size: 0,
+                        digest: None,
+                        kind: "special".to_owned(),
+                    },
+                ],
+            })
+            .expect("append");
+        store
+            .seal_scan_generation(&SealGenerationRequest {
+                generation_id: "gen-1".to_owned(),
+                expected_count: 3,
+            })
+            .expect("seal");
+        let page = store
+            .read_generation_page("mapping-1", "gen-1", None, 10)
+            .expect("page");
+        assert_eq!(page.entries.len(), 3);
+        assert_eq!(page.entries[0].kind, "file");
+        assert_eq!(page.entries[1].kind, "directory");
+        assert_eq!(page.entries[2].kind, "special");
+    }
+
+    #[test]
+    fn a_replayed_batch_with_a_changed_kind_is_rejected() {
+        let store = active_store();
+        begin(&store, "gen-1");
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-1".to_owned(),
+                sequence: 0,
+                entries: vec![GenerationEntry {
+                    path: "a".to_owned(),
+                    size: 0,
+                    digest: None,
+                    kind: "directory".to_owned(),
+                }],
+            })
+            .expect("append");
+        let changed = store.append_scan_batch(&AppendBatchRequest {
+            generation_id: "gen-1".to_owned(),
+            sequence: 0,
+            entries: vec![GenerationEntry {
+                path: "a".to_owned(),
+                size: 4,
+                digest: Some("a".repeat(64)),
+                kind: "file".to_owned(),
+            }],
+        });
+        assert!(changed.is_err());
+    }
+
+    #[test]
+    fn occupied_entries_reject_sizes_digests_and_unknown_kinds() {
+        let store = active_store();
+        begin(&store, "gen-1");
+        let sized = store.append_scan_batch(&AppendBatchRequest {
+            generation_id: "gen-1".to_owned(),
+            sequence: 0,
+            entries: vec![GenerationEntry {
+                path: "empty".to_owned(),
+                size: 4,
+                digest: None,
+                kind: "directory".to_owned(),
+            }],
+        });
+        assert!(sized.is_err());
+        let digested = store.append_scan_batch(&AppendBatchRequest {
+            generation_id: "gen-1".to_owned(),
+            sequence: 0,
+            entries: vec![GenerationEntry {
+                path: "link".to_owned(),
+                size: 0,
+                digest: Some("a".repeat(64)),
+                kind: "special".to_owned(),
+            }],
+        });
+        assert!(digested.is_err());
+        let unknown = store.append_scan_batch(&AppendBatchRequest {
+            generation_id: "gen-1".to_owned(),
+            sequence: 0,
+            entries: vec![GenerationEntry {
+                path: "a.txt".to_owned(),
+                size: 4,
+                digest: Some("a".repeat(64)),
+                kind: "other".to_owned(),
+            }],
+        });
+        assert!(unknown.is_err());
+    }
+
+    #[test]
     fn generations_reconcile_to_the_same_outcome_as_full_arrays() {
         let store = active_store();
         for (generation_id, byte) in [("gen-local", 'a'), ("gen-remote", 'a')] {
@@ -962,6 +1152,7 @@ mod tests {
                 mode: "two-way".to_owned(),
                 observed_at: NOW.to_owned(),
                 queue_operations: true,
+                ignore_patterns: Vec::new(),
             })
             .expect("reconcile generations");
         assert_eq!(result.baseline_count, 1);
@@ -989,6 +1180,46 @@ mod tests {
             .expect("seal");
     }
 
+    fn sealed_entries(store: &MappingStore, generation_id: &str, entries: Vec<GenerationEntry>) {
+        begin(store, generation_id);
+        let expected_count = i64::try_from(entries.len()).expect("count fits");
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: generation_id.to_owned(),
+                sequence: 0,
+                entries,
+            })
+            .expect("append");
+        store
+            .seal_scan_generation(&SealGenerationRequest {
+                generation_id: generation_id.to_owned(),
+                expected_count,
+            })
+            .expect("seal");
+    }
+
+    /// Marks the mapping observed without recording any baseline, so a later
+    /// round plans one-sided additions as work rather than unbased conflicts.
+    fn initialize_mapping(store: &MappingStore, generation_id: &str) {
+        sealed_generation(store, generation_id, &[]);
+        let remote_id = format!("{generation_id}-remote");
+        sealed_generation(store, &remote_id, &[]);
+        let result = store
+            .reconcile_generations(&generation_request(generation_id, &remote_id, Vec::new()))
+            .expect("initialize");
+        assert_eq!(result.baseline_count, 0);
+        assert!(result.operations.is_empty());
+    }
+
+    fn occupied(path: &str, kind: &str) -> GenerationEntry {
+        GenerationEntry {
+            path: path.to_owned(),
+            size: 0,
+            digest: None,
+            kind: kind.to_owned(),
+        }
+    }
+
     fn observed(files: &[(&str, char)]) -> Vec<crate::file_sync::ObservedFile> {
         files
             .iter()
@@ -998,6 +1229,232 @@ mod tests {
                 digest: byte.to_string().repeat(64),
             })
             .collect()
+    }
+
+    fn generation_request(
+        local: &str,
+        remote: &str,
+        ignore_patterns: Vec<String>,
+    ) -> crate::file_sync::ReconcileGenerationsRequest {
+        crate::file_sync::ReconcileGenerationsRequest {
+            mapping_id: "mapping-1".to_owned(),
+            local_generation_id: local.to_owned(),
+            remote_generation_id: remote.to_owned(),
+            mode: "two-way".to_owned(),
+            observed_at: NOW.to_owned(),
+            queue_operations: true,
+            ignore_patterns,
+        }
+    }
+
+    /// Initializes the mapping and records `b.txt` as a verified common
+    /// baseline so later rounds can test baseline-dependent behaviour.
+    fn initialize_with_baseline(store: &MappingStore, generation_id: &str) {
+        sealed_generation(store, generation_id, &[("b.txt", 'b')]);
+        let remote_id = format!("{generation_id}-remote");
+        sealed_generation(store, &remote_id, &[("b.txt", 'b')]);
+        let result = store
+            .reconcile_generations(&generation_request(generation_id, &remote_id, Vec::new()))
+            .expect("initialize");
+        assert_eq!(result.baseline_count, 1);
+    }
+
+    #[test]
+    fn ignored_paths_keep_their_baselines_through_generation_reconciliation() {
+        let store = active_store();
+        initialize_with_baseline(&store, "gen-init");
+
+        // The path is ignored on both computers, so neither scan stages it.
+        sealed_generation(&store, "gen-local", &[("a.txt", 'a')]);
+        sealed_generation(&store, "gen-remote", &[("a.txt", 'a')]);
+        let ignored = store
+            .reconcile_generations(&generation_request(
+                "gen-local",
+                "gen-remote",
+                vec!["b.txt".to_owned()],
+            ))
+            .expect("reconcile with a rule");
+        assert_eq!(ignored.baseline_count, 2);
+        assert!(ignored.conflicts.is_empty());
+        assert!(ignored.operations.is_empty());
+
+        // Removing the rule compares the reappearing path against its kept
+        // baseline, so it is a deletion conflict rather than new queued work.
+        sealed_generation(&store, "gen-local-2", &[("a.txt", 'a')]);
+        sealed_generation(&store, "gen-remote-2", &[("a.txt", 'a'), ("b.txt", 'b')]);
+        let reinstated = store
+            .reconcile_generations(&generation_request(
+                "gen-local-2",
+                "gen-remote-2",
+                Vec::new(),
+            ))
+            .expect("reconcile without the rule");
+        assert!(reinstated.operations.is_empty());
+        assert_eq!(reinstated.conflicts.len(), 1);
+        assert_eq!(reinstated.conflicts[0].path, "b.txt");
+        assert_eq!(
+            reinstated.conflicts[0].kind,
+            crate::file_sync::ConflictKind::DeletionNotPropagated
+        );
+    }
+
+    #[test]
+    fn occupied_destination_paths_block_one_sided_additions() {
+        let store = active_store();
+        initialize_mapping(&store, "gen-init");
+        sealed_entries(
+            &store,
+            "gen-local",
+            vec![
+                occupied("exact-dir", "directory"),
+                occupied("link", "special"),
+                occupied("folder", "directory"),
+                entry("file.txt", 'f'),
+            ],
+        );
+        sealed_entries(
+            &store,
+            "gen-remote",
+            vec![
+                entry("exact-dir", 'e'),
+                entry("link", 'd'),
+                entry("link/child.txt", 'c'),
+                entry("file.txt/child.txt", 'b'),
+                entry("folder/inside.txt", 'a'),
+            ],
+        );
+        let result = store
+            .reconcile_generations(&generation_request("gen-local", "gen-remote", Vec::new()))
+            .expect("reconcile");
+        assert_eq!(
+            result.occupied_paths,
+            vec![
+                "exact-dir".to_owned(),
+                "file.txt".to_owned(),
+                "file.txt/child.txt".to_owned(),
+                "link".to_owned(),
+                "link/child.txt".to_owned(),
+            ]
+        );
+        assert_eq!(result.operations.len(), 1);
+        assert_eq!(result.operations[0].path, "folder/inside.txt");
+        assert_eq!(
+            result.operations[0].direction,
+            crate::file_sync::SyncDirection::PullRemote
+        );
+        assert!(result.conflicts.is_empty());
+    }
+
+    #[test]
+    fn a_baselined_path_with_an_occupied_destination_still_conflicts() {
+        let store = active_store();
+        initialize_with_baseline(&store, "gen-init");
+        sealed_entries(&store, "gen-local", vec![occupied("b.txt", "special")]);
+        sealed_generation(&store, "gen-remote", &[("b.txt", 'b')]);
+        let result = store
+            .reconcile_generations(&generation_request("gen-local", "gen-remote", Vec::new()))
+            .expect("reconcile");
+        assert_eq!(result.occupied_paths, vec!["b.txt".to_owned()]);
+        assert!(result.operations.is_empty());
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].path, "b.txt");
+        assert_eq!(
+            result.conflicts[0].kind,
+            crate::file_sync::ConflictKind::DeletionNotPropagated
+        );
+        assert!(result.conflicts[0].local_digest.is_none());
+        assert!(result.conflicts[0].remote_digest.is_none());
+    }
+
+    #[test]
+    fn release_removes_generations_in_any_state() {
+        let store = active_store();
+        begin(&store, "gen-open");
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-open".to_owned(),
+                sequence: 0,
+                entries: vec![entry("a.txt", 'a')],
+            })
+            .expect("append");
+        store
+            .release_scan_generation("gen-open")
+            .expect("release open");
+        assert!(matches!(
+            store.generation_status("gen-open"),
+            Err(MappingStoreError::NotFound(_))
+        ));
+
+        sealed_generation(&store, "gen-sealed", &[("a.txt", 'a')]);
+        store
+            .release_scan_generation("gen-sealed")
+            .expect("release sealed");
+        assert!(matches!(
+            store.generation_status("gen-sealed"),
+            Err(MappingStoreError::NotFound(_))
+        ));
+        let staged: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM scan_entries WHERE generation_id = 'gen-sealed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count entries");
+        assert_eq!(staged, 0);
+
+        begin(&store, "gen-aborted");
+        store.abort_scan_generation("gen-aborted").expect("abort");
+        store
+            .release_scan_generation("gen-aborted")
+            .expect("release aborted");
+        assert!(matches!(
+            store.release_scan_generation("missing"),
+            Err(MappingStoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn purge_removes_generations_in_every_state_and_frees_the_quota() {
+        let store = active_store();
+        begin(&store, "gen-open");
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-open".to_owned(),
+                sequence: 0,
+                entries: vec![entry("a.txt", 'a')],
+            })
+            .expect("append");
+        sealed_generation(&store, "gen-sealed", &[("b.txt", 'b')]);
+        begin(&store, "gen-aborted");
+        store.abort_scan_generation("gen-aborted").expect("abort");
+
+        assert_eq!(store.purge_scan_generations().expect("purge"), 3);
+        assert!(matches!(
+            store.generation_status("gen-open"),
+            Err(MappingStoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.generation_status("gen-sealed"),
+            Err(MappingStoreError::NotFound(_))
+        ));
+        let staged: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM scan_entries", [], |row| row.get(0))
+            .expect("count entries");
+        assert_eq!(staged, 0);
+
+        // A second purge removes nothing and still succeeds.
+        assert_eq!(store.purge_scan_generations().expect("purge again"), 0);
+        // The open-generation quota is free again for new staging.
+        begin(&store, "gen-after-purge");
+        assert_eq!(
+            store
+                .generation_status("gen-after-purge")
+                .expect("status")
+                .state,
+            "open"
+        );
     }
 
     use crate::file_sync::{ConflictKind, SyncDirection};
@@ -1109,6 +1566,7 @@ mod tests {
                     mode: (*mode).to_owned(),
                     observed_at: NOW.to_owned(),
                     queue_operations: true,
+                    ignore_patterns: Vec::new(),
                 })
                 .expect("reconcile generations");
             let from_arrays = arrays
@@ -1146,6 +1604,7 @@ mod tests {
                     path: "a.txt".to_owned(),
                     size: 4,
                     digest: None,
+                    kind: "file".to_owned(),
                 }],
             })
             .expect("append");
@@ -1163,6 +1622,7 @@ mod tests {
             mode: "two-way".to_owned(),
             observed_at: NOW.to_owned(),
             queue_operations: true,
+            ignore_patterns: Vec::new(),
         });
         assert!(matches!(result, Err(MappingStoreError::Invalid(_))));
         assert_eq!(
@@ -1368,6 +1828,7 @@ mod quota_tests {
             path: "kept.txt".to_owned(),
             size: 4,
             digest: Some("a".repeat(64)),
+            kind: "file".to_owned(),
         };
         store
             .append_scan_batch(&AppendBatchRequest {
@@ -1395,6 +1856,7 @@ mod quota_tests {
                         path: "new.txt".to_owned(),
                         size: 4,
                         digest: Some("b".repeat(64)),
+                        kind: "file".to_owned(),
                     },
                 ],
             })
@@ -1407,6 +1869,7 @@ mod quota_tests {
                 path: "overflow.txt".to_owned(),
                 size: 4,
                 digest: Some("c".repeat(64)),
+                kind: "file".to_owned(),
             }],
         });
         assert!(overflow.is_err());
@@ -1483,8 +1946,19 @@ mod scale_tests {
         store
     }
 
-    fn stage(store: &MappingStore, generation_id: &str, changed: usize) -> std::time::Duration {
-        let started = Instant::now();
+    fn scale_entry(index: usize, changed: usize) -> GenerationEntry {
+        GenerationEntry {
+            path: format!("dir-{:03}/file-{index:07}.bin", index % 500),
+            size: i64::try_from(index).expect("index fits"),
+            digest: Some(format!(
+                "{:064x}",
+                if index < changed { index + 1 } else { index }
+            )),
+            kind: "file".to_owned(),
+        }
+    }
+
+    fn stage_entries(store: &MappingStore, generation_id: &str, entries: &[GenerationEntry]) {
         store
             .begin_scan_generation(&BeginGenerationRequest {
                 generation_id: generation_id.to_owned(),
@@ -1496,16 +1970,7 @@ mod scale_tests {
                 hash_mode: "full-sha256".to_owned(),
             })
             .expect("begin");
-        let entries = (0..FILES_PER_SIDE)
-            .map(|index| GenerationEntry {
-                path: format!("dir-{:03}/file-{index:07}.bin", index % 500),
-                size: i64::try_from(index).expect("index fits"),
-                digest: Some(format!(
-                    "{:064x}",
-                    if index < changed { index + 1 } else { index }
-                )),
-            })
-            .collect::<Vec<_>>();
+        let expected_count = i64::try_from(entries.len()).expect("count fits");
         for (sequence, batch) in entries.chunks(MAX_BATCH_ENTRIES).enumerate() {
             store
                 .append_scan_batch(&AppendBatchRequest {
@@ -1518,9 +1983,17 @@ mod scale_tests {
         store
             .seal_scan_generation(&SealGenerationRequest {
                 generation_id: generation_id.to_owned(),
-                expected_count: i64::try_from(FILES_PER_SIDE).expect("count fits"),
+                expected_count,
             })
             .expect("seal");
+    }
+
+    fn stage(store: &MappingStore, generation_id: &str, changed: usize) -> std::time::Duration {
+        let entries = (0..FILES_PER_SIDE)
+            .map(|index| scale_entry(index, changed))
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        stage_entries(store, generation_id, &entries);
         started.elapsed()
     }
 
@@ -1534,6 +2007,7 @@ mod scale_tests {
                 mode: "two-way".to_owned(),
                 observed_at: NOW.to_owned(),
                 queue_operations: true,
+                ignore_patterns: Vec::new(),
             })
             .expect("reconcile");
         (
@@ -1559,5 +2033,52 @@ mod scale_tests {
         let (changed, items) = reconcile(&store, "gen-local-2", "gen-remote-1");
         println!("reconcile with 1000 local changes: {changed:?} ({items} operations/conflicts)");
         assert_eq!(items, 1_000);
+        store.abort_scan_generation("gen-local-2").ok();
+
+        // One-sided additions whose destination path an occupied entry uses
+        // exercise the occupancy probe per difference on the stream.
+        let mut remote_with_occupied = (0..FILES_PER_SIDE)
+            .map(|index| scale_entry(index, 0))
+            .collect::<Vec<_>>();
+        remote_with_occupied.extend((0..1_000).map(|index| GenerationEntry {
+            path: format!("added-{index:07}.bin"),
+            size: 0,
+            digest: None,
+            kind: "directory".to_owned(),
+        }));
+        stage_entries(&store, "gen-remote-3", &remote_with_occupied);
+        let mut local_with_added = (0..FILES_PER_SIDE)
+            .map(|index| scale_entry(index, 0))
+            .collect::<Vec<_>>();
+        local_with_added.extend((0..1_000).map(|index| GenerationEntry {
+            path: format!("added-{index:07}.bin"),
+            size: 4,
+            digest: Some(format!("{:064x}", FILES_PER_SIDE + index)),
+            kind: "file".to_owned(),
+        }));
+        let addition_stage = Instant::now();
+        stage_entries(&store, "gen-local-3", &local_with_added);
+        let addition_stage = addition_stage.elapsed();
+        let started = Instant::now();
+        let blocked = store
+            .reconcile_generations(&ReconcileGenerationsRequest {
+                mapping_id: "mapping-1".to_owned(),
+                local_generation_id: "gen-local-3".to_owned(),
+                remote_generation_id: "gen-remote-3".to_owned(),
+                mode: "two-way".to_owned(),
+                observed_at: NOW.to_owned(),
+                queue_operations: true,
+                ignore_patterns: Vec::new(),
+            })
+            .expect("reconcile");
+        println!("stage with 1000 occupied additions: {addition_stage:?}");
+        println!(
+            "reconcile with 1000 occupied additions: {:?} ({} occupied)",
+            started.elapsed(),
+            blocked.occupied_paths.len()
+        );
+        assert!(blocked.operations.is_empty());
+        assert!(blocked.conflicts.is_empty());
+        assert_eq!(blocked.occupied_paths.len(), 1_000);
     }
 }

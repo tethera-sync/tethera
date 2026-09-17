@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wire continuous reconciliation through sealed scan generations</title>
+  <meta name="strategist-type" content="plan">
+  <meta name="strategist-slug" content="generation-wiring">
+  <meta name="strategist-created" content="2026-09-17">
+  <meta name="strategist-status" content="ready">
+  <meta name="strategist-target" content="crates/sync-storage, crates/sync-engine, apps/desktop/src/main">
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; }
+    main { max-width: 60rem; margin: 0 auto; padding: 2rem 1.25rem 5rem; }
+    h1 { font-size: 1.7rem; line-height: 1.25; }
+    h2 { font-size: 1.25rem; margin-top: 2.4rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; }
+    h3 { font-size: 1.05rem; margin-top: 1.8rem; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; }
+    code { background: #8881; padding: .1em .35em; border-radius: 4px; }
+    pre { background: #8881; padding: .9rem 1rem; border-radius: 8px; overflow-x: auto; line-height: 1.45; }
+    pre code { background: none; padding: 0; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .95em; }
+    th, td { border: 1px solid #8886; padding: .45rem .6rem; text-align: left; vertical-align: top; }
+    th { background: #8882; }
+    .tldr { border-left: 4px solid #6b8; background: #6b81; padding: .75rem 1rem; border-radius: 0 8px 8px 0; }
+    .note { border-left: 4px solid #c96; background: #c961; padding: .75rem 1rem; border-radius: 0 8px 8px 0; }
+    .deferred { border-left: 4px solid #777; background: #7771; padding: .75rem 1rem; border-radius: 0 8px 8px 0; }
+    ol.steps > li { margin-bottom: .9rem; }
+    ul.tight li { margin-bottom: .25rem; }
+    .meta { color: #888; font-size: .85rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Wire continuous reconciliation through sealed scan generations</h1>
+  <p class="meta">created 2026-09-17 · status ready · target: <code>crates/sync-storage</code>, <code>crates/sync-engine</code>, <code>apps/desktop/src/main</code></p>
+
+  <section aria-labelledby="tldr">
+    <h2 id="tldr">TL;DR</h2>
+    <p class="tldr">
+      The engine already stages scans into SQLite (<code>scan_generations</code>/<code>scan_entries</code>) and reconciles two sealed
+      generations set-based, but no production code stages or fetches a generation: the live continuous cycle still builds two full
+      <code>FileManifest</code> objects in memory and exchanges them as one chunked message. Phase 1 wires the <em>continuous</em>
+      reconciliation path onto generations between peers that both advertise <code>scan-generations-v1</code>, and closes three
+      correctness gaps first (ignore rules, occupied-path skips, generation release). The initial merge and paged
+      operation/conflict consumers are deliberately deferred to separate PRs. Deletion and rename propagation stay disabled.
+    </p>
+  </section>
+
+  <section aria-labelledby="goal">
+    <h2 id="goal">1. Goal</h2>
+    <p>
+      Make steady-state continuous synchronization scale with the number of <em>differences</em> rather than the folder size, so a
+      250,000-file folder no longer materialises two full file lists per changed cycle, while preserving every current correctness
+      guarantee: no user file is replaced without the existing verified staging/archive pipeline, newly ignored paths stay
+      out of planning with their baselines, one-sided additions are never planned onto an occupied destination path, and older
+      peers keep working unchanged.
+    </p>
+  </section>
+
+  <section aria-labelledby="codebase-understanding">
+    <h2 id="codebase-understanding">2. Codebase Understanding</h2>
+
+    <h3>2.1 The live continuous cycle today (full manifests)</h3>
+    <p>Everything below is in <code>apps/desktop/src/main</code>.</p>
+    <ul class="tight">
+      <li><code>flushContinuousSync</code> (<code>index.ts:2584-2837</code>) is the whole cycle; the deterministic coordinator is the lower device id (<code>index.ts:1932-1938</code>).</li>
+      <li>Cheap first pass: when both peers advertise <code>continuous-fingerprint-v1</code> and the last quiet reconcile still matches, local <code>runCachedFolderFingerprint</code> (<code>index.ts:622</code>) plus a peer <code>continuous-sync-scan</code> with <code>knownFingerprint</code> can end the cycle with no lists at all (<code>index.ts:2636-2650</code>). This stays.</li>
+      <li>Otherwise the full pass builds both manifests: <code>runCachedFolderScan</code> (<code>index.ts:611</code>) and <code>requestPeerManifest</code> (<code>index.ts:632</code>) over <code>runPairedScans</code> (<code>paired-scan.ts:10</code>); the peer's <code>continuous-sync-scan</code> responder scans and returns a manifest (<code>index.ts:4125-4160</code>).</li>
+      <li><code>syncableObservations</code> (<code>continuous-sync.ts:191-209</code>) filters one-sided files whose destination path is occupied by a folder, symlink or special entry, then both observation arrays go to the local engine <code>fileSync.reconcile</code> (<code>index.ts:2732-2740</code>) and to the peer as <code>continuous-sync-observe</code> (<code>index.ts:2748</code>, handler <code>index.ts:4260-4293</code>).</li>
+      <li><code>executeContinuousOperations</code> (<code>index.ts:2457-2564</code>) drives both sides: pulls via <code>pullPlannedFile</code> (<code>index.ts:2918</code>) and pushes via <code>continuous-sync-apply</code> (<code>index.ts:4294</code>), authorizing every receive against the exact mirrored durable operation.</li>
+      <li>Memory: both <code>FileManifest.files</code> arrays are held for the whole cycle (<code>index.ts:2655-2662</code>, <code>2464</code>); <code>docs/15-IMPLEMENTATION-STATUS.md:113</code> records this as the known limit.</li>
+    </ul>
+
+    <h3>2.2 What already exists for generations</h3>
+    <ul class="tight">
+      <li>Storage: <code>crates/sync-storage/src/scan_generations.rs</code> — <code>begin</code> (110), <code>append</code> (232), <code>seal</code> (370), <code>abort</code> (426), <code>read_page</code> (516), <code>cleanup</code> (585); bound to mapping, authenticated participant, revision, root, ignore rules and hash mode; quotas 4 open generations / 1,000,000 entries / 1,000-entry batches; 24 h expiry.</li>
+      <li>Reconciliation: <code>MappingStore::reconcile_generations</code> (<code>file_sync.rs:314</code>) with the set-based planner <code>plan_generations_reconciliation</code> (<code>file_sync.rs:1356</code>): identical paths baseline inside SQLite, only differences stream out.</li>
+      <li>RPC: <code>scanGeneration.begin/append/seal/abort/readPage/cleanup</code> and <code>fileSync.reconcileGenerations</code> (<code>crates/sync-engine/src/main.rs:326-337</code>, method list <code>1718-1770</code>).</li>
+      <li>Peer serving: <code>scan-generation-read-page</code> responder (<code>index.ts:4164-4181</code>) reads bounded pages through the engine; <code>scan-generations-v1</code> is advertised (<code>index.ts:4162</code>).</li>
+      <li>Client half already written but unreferenced outside tests: <code>fetchPeerGenerationPages</code> (<code>scan-generation.ts:172</code>), <code>streamRelativeFilePaths</code> (212), entry/batch parsers (75-135), byte-bounded <code>toEntryPages</code> (138).</li>
+      <li>Scanner kernel that can drive staging without a manifest: <code>scanFolderEntries</code> (<code>folder-manifest.ts:388</code>) already supports digest-cache reuse, cancellation, activity counters, unreadable reporting and <code>occupiedPaths</code>; <code>fingerprintFolder</code> (<code>folder-manifest.ts:602</code>) is the existing no-list consumer.</li>
+      <li>Scale evidence: <code>generation_scale</code> (<code>scan_generations.rs:1547</code>) stages 250,000 entries in 5-9 s and reconciles in ~0.8 s (one Linux machine, file-backed WAL).</li>
+    </ul>
+
+    <h3>2.3 Blocking gaps found during this investigation</h3>
+    <table>
+      <thead><tr><th>#</th><th>Gap</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>G1</td>
+          <td>Generation planning ignores the mapping's ignore rules. A baselined path that becomes ignored is missing from both staged scans, so it falls into the baseline-only branch and becomes a <code>DeletionNotPropagated</code> conflict. <code>plan_reconciliation</code> already handles this (<code>file_sync.rs:861-865</code>); the generation planner does not.</td>
+          <td><code>docs/03-SYNC-SEMANTICS.md:100</code> ("Staged scan-generation reconciliation does not take rules yet"), <code>file_sync.rs:1356-1462</code></td>
+        </tr>
+        <tr>
+          <td>G2</td>
+          <td>Staged observations carry no occupancy. <code>syncableObservations</code> currently keeps one-sided files off a destination path used by a folder, symlink, special entry, or an ancestor that is a synced file. Without that filter the generation planner would queue transfers that can only fail (atomic no-replace link / <code>ensureContainedDestinationDirectory</code>) and would retry them every cycle.</td>
+          <td><code>continuous-sync.ts:191-209</code>, <code>folder-manifest.ts:1005-1036</code>, commit <code>0122b0d</code></td>
+        </tr>
+        <tr>
+          <td>G3</td>
+          <td>Nothing removes a sealed generation. <code>abort</code> refuses a sealed generation (<code>scan_generations.rs:453-457</code>); <code>cleanup</code> deletes only aborted or expired rows. Wiring the cycle without a release step would accumulate ~tens of MB per cycle for 24 h.</td>
+          <td><code>scan_generations.rs:370-424</code>, <code>585-600</code></td>
+        </tr>
+        <tr>
+          <td>G4</td>
+          <td>The read-page gate requires the <em>caller</em> to be the elected coordinator (<code>requireSharedActiveFolder</code>, <code>index.ts:3997-4007</code>). A symmetric exchange (each side fetches the other's sealed generation) needs the non-coordinator to read a sealed generation of its own shared mapping.</td>
+          <td><code>index.ts:4169</code>, <code>docs/17-SECURE-PEER-SESSION-AND-MAPPING.md:97</code></td>
+        </tr>
+        <tr>
+          <td>G5</td>
+          <td>No production code calls <code>scanGeneration.begin/append/seal</code> or <code>fetchPeerGenerationPages</code>; the peer responder is reachable over the wire but nothing initiates it.</td>
+          <td><code>apps/desktop/tests/scan-generation.test.ts</code> is the only caller.</td>
+        </tr>
+        <tr>
+          <td>G6</td>
+          <td>Staged entries cannot say "directory/special entry occupies this path", so the planner cannot reproduce the occupancy skip even in principle.</td>
+          <td><code>scan_generations.rs:43-47</code> (<code>path, size, digest</code> only)</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="recommendation">
+    <h2 id="recommendation">3. Recommendation</h2>
+    <p>
+      <strong>Do the continuous path now, as two sequenced PRs, and do not touch the initial merge or the operation/conflict paging in
+      this pass.</strong>
+    </p>
+    <ol class="steps">
+      <li><strong>Phase 1A (Rust, first PR):</strong> close G1, G2, G6 and G3 in <code>sync-storage</code>/<code>sync-engine</code> with tests. Nothing in the desktop calls the new fields yet, so behaviour is unchanged; this matches the repository's existing pattern of landing generation contracts before wiring (<code>docs/15-IMPLEMENTATION-STATUS.md:113</code>).</li>
+      <li><strong>Phase 1B (desktop, second PR):</strong> stage, exchange, reconcile, release — capability-gated so peers without <code>scan-generations-v1</code> keep today's manifest path byte for byte.</li>
+      <li><strong>Phase 2 (later PR):</strong> the initial merge. It cannot use <code>reconcile_generations</code>: that requires an <code>active</code> mapping (<code>file_sync.rs:322</code>) and writes baselines, while the merge runs at <code>ready-for-initial-sync</code> with additive, no-baseline semantics driven by <code>computeSyncPlan</code> (<code>initial-sync.ts:229</code>) and a paged to-pull plan the engine does not expose yet. Bundling it would put a new engine contract on the most safety-critical flow into the same review as the steady-state change.</li>
+      <li><strong>Phase 3 (later PR):</strong> paged operation/conflict consumers and UI aggregation. Both arrays are proportional to differences — exactly what the generation design already makes memory follow — so this is a real but secondary concern that needs renderer-contract changes.</li>
+    </ol>
+    <p>
+      Reasons to keep this scoped: the continuous cycle is the recurring cost and the one with the clearest existing contracts; the
+      quiet-fingerprint path already handles the common idle case; and Phase 1A is independently testable without any desktop change.
+    </p>
+    <div class="note">
+      <strong>Do not enable</strong> deletion propagation, rename propagation, or conflict winner selection. Nothing in this plan
+      changes replacement, archive, retention, or recovery behaviour.
+    </div>
+  </section>
+
+  <section aria-labelledby="scope">
+    <h2 id="scope">4. Scope</h2>
+    <h3>In scope</h3>
+    <ul class="tight">
+      <li>Schema v11: staged occupancy kind on <code>scan_entries</code>, with migration and validation.</li>
+      <li>Generation planner: ignore rules (G1), occupancy skips with faithful baselined/conflict behaviour (G2/G6).</li>
+      <li><code>scanGeneration.release</code> plus desktop release/cleanup wiring (G3).</li>
+      <li>Desktop staging (local and incoming), capability-gated cycle, two new peer requests, participant-scoped page reading (G4), progress and occupied-path reporting.</li>
+      <li>Tests, docs updates, and the compatibility fallback.</li>
+    </ul>
+    <h3>Out of scope</h3>
+    <ul class="tight">
+      <li>Initial merge / comparison preview changes (Phase 2).</li>
+      <li>Engine RPC response reshaping, <code>fileSync.operationsPage</code>/<code>conflictsPage</code> consumers, renderer conflict aggregation (Phase 3).</li>
+      <li>Any change to transfer, staging-write, archive, retention, recovery or conflict-resolution semantics.</li>
+      <li>Deletion/rename propagation; NAT traversal; accounts.</li>
+      <li>Retiring the legacy manifest path — it stays for older peers permanently until a later cleanup.</li>
+      <li>New dependencies, new lockfiles, unrelated refactors.</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="files">
+    <h2 id="files">5. Files and Areas to Inspect</h2>
+    <table>
+      <thead><tr><th>Area</th><th>Files</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Schema &amp; generations</td><td><code>crates/sync-storage/src/mapping.rs</code> (SCHEMA_VERSION 10 at line 20, <code>migrate_v9_to_v10</code> at 863), <code>crates/sync-storage/src/scan_generations.rs</code></td><td>v11 migration, kind column, release, entry validation, paging</td></tr>
+        <tr><td>Planner</td><td><code>crates/sync-storage/src/file_sync.rs</code> (<code>ReconcileGenerationsRequest</code> 141, <code>reconcile_generations</code> 314, <code>IgnoredPaths</code> 1260, <code>plan_generations_reconciliation</code> 1356, <code>plan_one_sided</code> 918, <code>plan_reconciliation</code> 833)</td><td>rules + occupancy parity, result reporting</td></tr>
+        <tr><td>Engine RPC</td><td><code>crates/sync-engine/src/main.rs</code> (dispatch 326-337, handlers 737-943, token list 1718-1770)</td><td>new request fields and the release method</td></tr>
+        <tr><td>Desktop cycle</td><td><code>apps/desktop/src/main/index.ts</code> (<code>flushContinuousSync</code> 2584, <code>runAdmittedScan</code> 473, <code>runLocalScan</code> 500, <code>withFolderDigestCache</code> 545, <code>runCachedFolderScan</code> 611, <code>requireSharedActiveFolder</code> 3997, handlers 4053-4647, <code>executeContinuousOperations</code> 2457, <code>pullPlannedFile</code> 2918, <code>recordOccupiedPaths</code> 2280)</td><td>the wiring itself</td></tr>
+        <tr><td>Scanner kernel</td><td><code>apps/desktop/src/main/folder-manifest.ts</code> (<code>scanFolderEntries</code> 388, <code>onEntry</code> call 523, <code>scanFolder</code> 561, <code>fingerprintFolder</code> 602, <code>createDestinationOccupancyCheck</code> 1005)</td><td>streaming sink and occupied entries</td></tr>
+        <tr><td>Generation contract</td><td><code>apps/desktop/src/main/scan-generation.ts</code></td><td>kind parsing, staging/exchange client</td></tr>
+        <tr><td>Validation</td><td><code>apps/desktop/src/main/ipc-validation.ts</code> (<code>validateTransferDescriptor</code> 377, <code>parsePeerFileOperations</code> 479)</td><td>peer payload parsing</td></tr>
+        <tr><td>Cancellation/admission</td><td><code>apps/desktop/src/main/scan-coordinator.ts</code>, <code>paired-scan.ts</code>, <code>peer-session-service.ts</code> (limits 32-45, 196-315)</td><td>reuse, nested requests, timeouts</td></tr>
+        <tr><td>Docs</td><td><code>docs/03</code>, <code>docs/06</code>, <code>docs/09</code>, <code>docs/11</code>, <code>docs/15</code>, <code>docs/17</code>, <code>docs/10</code></td><td>contract and status updates</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="implementation-plan">
+    <h2 id="implementation-plan">6. Implementation Plan</h2>
+
+    <h3>Phase 1A — Rust contracts (PR 1)</h3>
+    <ol class="steps">
+      <li>
+        <strong>Schema v11: staged occupancy kind.</strong>
+        In <code>crates/sync-storage/src/mapping.rs</code>: bump <code>SCHEMA_VERSION</code> to 11 and add
+        <code>migrate_v10_to_v11</code> following the existing step pattern. Add
+        <code>kind TEXT NOT NULL DEFAULT 'file' CHECK (kind IN ('file','directory','special'))</code> to <code>scan_entries</code>
+        (an <code>ALTER TABLE</code> is sufficient here; rebuilding as in v10 is acceptable but not required). Existing staged rows
+        become <code>file</code>. Update the v10 rebuild's <code>CREATE TABLE</code> in <code>migrate_v9_to_v10</code> only if the
+        executor wants a single canonical table definition; the migration chain is additive, so either way each step must be
+        self-contained.
+      </li>
+      <li>
+        <strong>Entry kind through staging, paging and validation.</strong>
+        In <code>scan_generations.rs</code>:
+        <ul class="tight">
+          <li><code>GenerationEntry</code> gains <code>#[serde(default = "default_kind")] pub kind: String</code> with <code>"file"</code> as the default, mirroring the existing stringly-typed <code>hash_mode</code> style.</li>
+          <li><code>validate_generation_entry</code>: accept only <code>file|directory|special</code>; a <code>file</code> entry keeps the current size/digest rules; a <code>directory</code>/<code>special</code> entry must have <code>size == 0</code> and <code>digest.is_none()</code> (fail closed rather than ignore).</li>
+          <li><code>append_scan_batch</code>: insert <code>kind</code>; include kind in <code>stored_entries</code>/<code>stored_matches_entry</code> so a replayed batch with a changed kind is rejected exactly like a changed digest.</li>
+          <li><code>read_generation_page</code>: select and return <code>kind</code>; keyset ordering by <code>relative_path</code> is unchanged.</li>
+          <li><code>seal</code>/<code>status</code>/quota counting: unchanged (all rows count).</li>
+        </ul>
+      </li>
+      <li>
+        <strong>Ignore rules in generation reconciliation (G1).</strong>
+        Add <code>#[serde(default)] pub ignore_patterns: Vec&lt;String&gt;</code> to <code>ReconcileGenerationsRequest</code>
+        (<code>file_sync.rs:141</code>), validated by the same rules the full-array request uses (reuse <code>validate_reconcile_request</code>'s
+        pattern checks; do not duplicate the matcher). In <code>plan_generations_reconciliation</code>, build <code>IgnoredPaths</code>
+        (<code>file_sync.rs:1260</code>) and skip any streamed row whose path it contains — mirroring <code>plan_reconciliation</code>
+        <code>file_sync.rs:861-865</code>. Identical pairs still advance baselines via
+        <code>advance_identical_generation_baselines</code> (<code>file_sync.rs:1491</code>), so an ignored-but-identical path is harmless.
+        Update <code>docs/03-SYNC-SEMANTICS.md:100</code>.
+      </li>
+      <li>
+        <strong>Occupancy-aware planning and reporting (G2/G6).</strong>
+        File rows and occupied rows share <code>scan_entries</code>. In <code>plan_generations_reconciliation</code>:
+        <ul class="tight">
+          <li>Restrict the identical-pair baselining SQL to <code>local.kind = 'file' AND remote.kind = 'file'</code> so an occupied row can never advance a baseline.</li>
+          <li>Build the differences stream from <code>kind = 'file'</code> rows only for files; occupied rows participate as blockers, not as observations.</li>
+          <li>When a row is a <em>one-sided file addition</em>, probe the <em>destination</em> generation for the path itself and each ancestor with a prepared point lookup
+            (<code>SELECT kind FROM scan_entries WHERE generation_id = ?1 AND relative_path = ?2</code>). Any hit blocks the addition: a <code>directory</code>/<code>special</code> ancestor is
+            occupancy, and a <code>file</code> ancestor is the structural file-versus-folder conflict that <code>createDestinationOccupancyCheck</code> also treats as blocking
+            (<code>folder-manifest.ts:1005-1036</code>).</li>
+          <li>Blocked outcome must mirror today exactly: with no baseline for that path, report it as an occupied skip (no operation, no conflict — safe to re-plan if the
+            user renames something); with a baseline, plan <code>DeletionNotPropagated</code> as today's filtered-observation path does (the destination no longer lists the path
+            and neither does the source view reach the planner).</li>
+          <li>Divergent pairs (both sides present, different digests) are unaffected: occupancy never applies to a path present on both sides.</li>
+          <li>Add <code>occupied_paths: Vec&lt;String&gt;</code> to the generation reconcile result (serialised only when non-empty) so the desktop can keep calling
+            <code>recordOccupiedPaths</code>. Keep it proportional to blocked additions, consistent with today's list.</li>
+        </ul>
+      </li>
+      <li>
+        <strong>Release (G3).</strong>
+        Add <code>release_scan_generation(&amp;self, generation_id: &amp;str)</code> to <code>scan_generations.rs</code>: one transaction that
+        deletes the generation row in any state (<code>open</code>, <code>sealed</code>, <code>aborted</code>) with its entries cascading, and
+        returns <code>NotFound</code> for an unknown id. Expose <code>scanGeneration.release</code> through <code>crates/sync-engine/src/main.rs</code>
+        (handler near the other generation handlers, add to the token-required method list at <code>1718-1770</code>). Leave <code>cleanup</code> and
+        <code>abort</code> semantics as they are; update <code>docs/06-DATA-MODEL.md</code>, <code>docs/09-LOCAL-RPC.md</code>.
+      </li>
+      <li>
+        <strong>Rust tests.</strong> Extend the existing suites rather than adding new harnesses:
+        <ul class="tight">
+          <li><code>scan_generations.rs</code>: kind round-trip through append/read-page; kind mismatch on replay rejected; occupied validation (non-zero size or digest rejected); release deletes sealed + open + entries, missing id is <code>NotFound</code>; v10→v11 migration preserves staged rows as <code>file</code> (follow the existing migration test style at <code>mapping.rs:2973</code>).</li>
+          <li><code>file_sync.rs</code>: generation planning equivalence with full-array planning under (a) newly ignored paths — no conflict, baseline retained, and removal of the rule re-compares against the baseline; (b) occupied directory/special at the exact path and as an ancestor; (c) a file ancestor; (d) baselined path whose destination became occupied still conflicts; (e) divergent pairs unaffected. Follow <code>generations_reconcile_to_the_same_outcome_as_full_arrays</code> (<code>scan_generations.rs:929</code>) and <code>set_based_generation_planning_matches_full_array_planning</code> (1048).</li>
+          <li>Extend <code>generation_scale</code> (<code>scan_generations.rs:1547</code>) to include occupied rows so the ancestor-probe cost is measured, and record the numbers in <code>docs/15</code>.</li>
+        </ul>
+      </li>
+    </ol>
+
+    <h3>Phase 1B — Desktop wiring (PR 2)</h3>
+    <ol class="steps" start="7">
+      <li>
+        <strong>Streaming scan sink.</strong> In <code>folder-manifest.ts</code>:
+        <ul class="tight">
+          <li>Allow <code>onEntry</code> to return <code>void | Promise&lt;void&gt;</code> and <code>await</code> it at the call site (<code>folder-manifest.ts:523</code>). Existing callers pass sync functions and are unchanged.</li>
+          <li>Add <code>onOccupied?: (occupied: OccupiedPath) =&gt; void</code> to the scan options so the staging consumer sees occupied records as they are discovered (the kernel already yields them at <code>folder-manifest.ts:325</code> and <code>:330</code>). <code>scanFolder</code>/<code>fingerprintFolder</code> keep collecting into the summary.</li>
+          <li>Add an exported batching helper (e.g. <code>stageFolderEntries</code>) that mirrors <code>scanFolder</code> but flushes at most <code>SCAN_STAGE_BATCH_ENTRIES = 1_000</code> entries to an async sink, awaiting each flush before continuing (backpressure), and returns the existing <code>ScanSummary</code>. Do not change <code>scanFolder</code> behaviour.</li>
+        </ul>
+      </li>
+      <li>
+        <strong>Generation staging module.</strong> New <code>apps/desktop/src/main/generation-staging.ts</code> (keep <code>scan-generation.ts</code> as the pure contract/validator module it documents itself to be at <code>scan-generation.ts:7-11</code>):
+        <ul class="tight">
+          <li><code>stageLocalGeneration(folder, mappingRevision, signal, onActivity)</code>: <code>scanGeneration.begin</code> with <code>{ generationId: randomUUID(), mappingId, participantDeviceId: localId, mappingRevision, root: folder.localPath, ignorePatterns, hashMode: "full-sha256" }</code>, then the streaming sink appends batches with strictly increasing <code>sequence</code> (files and occupied entries share the batch and the 1,000 cap), then <code>seal</code> with the exact expected count. Run it through <code>withFolderDigestCache</code> and <code>runAdmittedScan</code> so digest reuse, the scan ledger, admission limits and cancellation behave exactly like <code>runCachedFolderScan</code> (<code>index.ts:545-625</code>). On any failure call <code>scanGeneration.abort</code> (best effort) and rethrow.</li>
+          <li><code>stageIncomingGeneration(folder, peerDeviceId, peerRoot, generationId, signal)</code>: <code>begin</code> with the peer as participant, then iterate <code>fetchPeerGenerationPages</code> (<code>scan-generation.ts:172</code>) and append batches, then <code>seal</code>; abort on failure. Implement the missing <code>PeerPageClient</code>: <code>request</code> over <code>requirePeerSessions().request</code> with <code>NO_PEER_RESPONSE_DEADLINE</code>, <code>supportsGenerations</code> over <code>cachedPeerCapabilities</code>.</li>
+          <li><code>releaseGeneration(generationId)</code> wrapping <code>scanGeneration.release</code> (best effort, log-only failures).</li>
+          <li>Both stagers return <code>{ generationId, entries, occupied, ignored, unreadable, unreadableEntries, rootPath }</code>; nothing holds a file list.</li>
+        </ul>
+      </li>
+      <li>
+        <strong>Capability-gated cycle.</strong> In <code>flushContinuousSync</code> (<code>index.ts:2584</code>), keep the durable preflight, quiet-fingerprint pass, execution, projection and error handling shared, and branch only the scan/reconcile exchange:
+        <pre><code>const generations = capabilities.has(SCAN_GENERATION_CAPABILITY)
+if (generations) await runGenerationCycle(folder, peer, observedAt, chunked, signal?)
+else await runManifestCycle(folder, peer, observedAt, chunked, knownPeerManifest)</code></pre>
+        Generation cycle steps:
+        <ol class="tight">
+          <li><code>runPairedScans</code> of <code>stageLocalGeneration</code> and a new <code>requestPeerGenerationScan</code> (<code>continuous-sync-generation-scan</code>, below). Report local staging counters through <code>reportScanCounts(folderId, "changes", { local })</code> exactly as today, and peer counters as <code>{ remote }</code> when the reply carries them.</li>
+          <li><code>stageIncomingGeneration</code> for the peer's sealed generation.</li>
+          <li><code>fileSync.reconcileGenerations</code> with <code>{ mappingId, localGenerationId, remoteGenerationId, mode: folder.mode, observedAt, queueOperations: true, ignorePatterns: folder.ignorePatterns }</code>.</li>
+          <li><code>recordOccupiedPaths(folder, result.occupiedPaths ?? [])</code> then the existing conflict/state projection (<code>retireInitialConflictProjection</code>, <code>applyFileSyncStateToFolder</code>, <code>recordContinuousConflicts</code>, broadcast) — unchanged.</li>
+          <li>Peer reconcile: new <code>continuous-sync-observe-generations</code> request carrying <code>{ folderId, localGenerationId, remoteGenerationId (the peer's own, echoed), mode: invertMode(folder.mode), observedAt }</code>. The reply is the peer's reconcile state; validate operations with <code>parsePeerFileOperations</code> (<code>ipc-validation.ts:479</code>) and conflicts/recovery with strict parsers.</li>
+          <li><code>executeContinuousOperations</code> (<code>index.ts:2457</code>) unchanged in behaviour. Its <code>remoteManifest</code> parameter must become a source resolver: for the manifest path keep today's <code>remoteFilesByPath</code> map; for the generation path resolve <code>{ size: operation.sourceSize, digest: operation.sourceDigest }</code> from the durable operation, because <code>validateTransferDescriptor</code> compares only size and digest (<code>ipc-validation.ts:377-389</code>) and <code>pull-file-descriptor</code> re-verifies the live peer file. The mirrored-operation check (<code>continuous-sync.ts:250-262</code>) and every completion/failure path stay exactly as they are.</li>
+          <li>Release the two generations after reconcile succeeds; release in <code>finally</code> on failure. If the peer never receives the observe request, its own generations stay until <code>cleanup</code> expiry.</li>
+        </ol>
+      </li>
+      <li>
+        <strong>New peer requests and gates.</strong> In <code>handlePeerRequest</code> (<code>index.ts:4053-4647</code>):
+        <ul class="tight">
+          <li><code>continuous-sync-generation-scan</code>: <code>requireSharedActiveFolder</code> + <code>withPeerFileOperation</code>; stage the responder's own generation with the digest cache and <code>reportScanCounts(folderId, "peer-changes", …)</code>; reply <code>{ generationId, entries, occupied, ignored, unreadable }</code>. Keep <code>continuous-sync-scan</code> (<code>index.ts:4125</code>) byte-for-byte for older callers.</li>
+          <li><code>continuous-sync-observe-generations</code>: <code>requireMappingMutations</code> + <code>requireSharedActiveFolder</code>; require <code>request.mode === folder.mode</code> and use <code>folder.ignorePatterns</code> (never peer-supplied rules) exactly as the existing observe handler does (<code>index.ts:4260-4275</code>); stage the incoming generation from the coordinator, reconcile, project state, and reply it. Release the incoming generation and the echoed <code>remoteGenerationId</code> in <code>finally</code>.</li>
+          <li><code>scan-generation-read-page</code> (<code>index.ts:4164</code>): replace <code>requireSharedActiveFolder</code> with a new participant-scoped gate — active mapping, not blocked, not paused, <code>folder.remoteDeviceId === context.peerId</code> — and keep every other bound. Update <code>docs/17-SECURE-PEER-SESSION-AND-MAPPING.md</code> to say both authenticated participants may read a sealed generation of their shared mapping, bounded by pages and expiry; scans are still coordinator-initiated only.</li>
+        </ul>
+      </li>
+      <li>
+        <strong>Validation and parsers.</strong> <code>scan-generation.ts</code>: <code>parseGenerationEntry</code> accepts <code>kind</code> (<code>file</code> default; unknown rejected). Add strict parsers for the generation scan reply and the observe-generations reply using the existing validation conventions; bound counters and lists; reject unknown shapes before they affect local state.
+      </li>
+      <li>
+        <strong>Cleanup wiring.</strong> Call <code>scanGeneration.cleanup</code> with the current timestamp once when the engine becomes ready and after generation-cycle failures, so crash leftovers expire. Do not call it mid-cycle.
+      </li>
+      <li>
+        <strong>Fallback and compatibility.</strong> The generation path is used only when this build supports it and the peer advertises <code>scan-generations-v1</code>. Otherwise the manifest path runs unchanged, including <code>assertManifestFitsExchange</code> and the legacy byte budgets. No engine response shape changes (the generation result only gains an optional field), so older desktops remain compatible.
+      </li>
+      <li>
+        <strong>Docs.</strong> Update <code>docs/15-IMPLEMENTATION-STATUS.md</code> (implemented behaviour, remaining limit, new recommended next PR = Phase 2), <code>docs/03</code> (rules), <code>docs/06</code> (schema v11, release), <code>docs/09</code> (release RPC), <code>docs/11</code> (new tests), <code>docs/17</code> (generation exchange and page authorization), <code>docs/10</code> (roadmap wording).
+      </li>
+    </ol>
+
+    <h3 class="deferred">Phase 2 — initial merge (later PR, outline only)</h3>
+    <p class="deferred">
+      Add a read-only additive planning RPC over two sealed generations (no baselines, allowed before activation), returning a
+      <em>paged</em> to-pull plan plus conflict/occupied reporting, so both merge passes and convergence verification stop holding
+      manifests; keep <code>computeSyncPlan</code> semantics, the 10,000-entry outcome cap, the lease/coordination flow, and
+      <code>mergeInitialSyncFile</code>'s transfer-time rechecks. Do not start until Phase 1 has been exercised in Electron.
+    </p>
+
+    <h3 class="deferred">Phase 3 — paged consumers and UI summaries (later PR, outline only)</h3>
+    <p class="deferred">
+      Consume operations/conflicts through <code>fileSync.operationsPage</code>/<code>conflictsPage</code> (already implemented) once
+      <code>applyFileSyncStateToFolder</code> and the renderer can render counts plus a bounded conflict page. Requires renderer-contract
+      work; only worth doing when a real folder hits conflicts proportional to its size.
+    </p>
+  </section>
+
+  <section aria-labelledby="code-quality">
+    <h2 id="code-quality">7. Code Quality Rules</h2>
+    <ul class="tight">
+      <li>Follow existing patterns; keep the diff focused; no unrelated rewrites or reformatting.</li>
+      <li>Reuse <code>IgnoredPaths</code>, <code>scanFolderEntries</code>, <code>withFolderDigestCache</code>, <code>runAdmittedScan</code>, <code>runPairedScans</code>, <code>fetchPeerGenerationPages</code>, <code>parsePeerFileOperations</code> and the existing validation helpers before writing anything new.</li>
+      <li>No <code>any</code>, no assertions to silence the compiler, no non-null assertions without a local invariant.</li>
+      <li>Rust: no <code>unwrap</code>/<code>expect</code>/<code>panic!</code> on data, file, database, peer or RPC paths; <code>Result</code>-based errors; keep <code>cargo fmt</code>/Clippy clean; transactional migrations and writes.</li>
+      <li>Peer payloads stay untrusted: validate size, shape, identity, participant, revision and path before local state is touched. The peer never supplies ignore rules or limits that shape local planning.</li>
+      <li>Keep <code>scan-generation.ts</code> a contract/validator module; staging lives in <code>generation-staging.ts</code>.</li>
+      <li>No new dependencies; no lockfile edits.</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="validation">
+    <h2 id="validation">8. Testing and Validation</h2>
+    <p>Run the repository's own checks (from <code>AGENTS.md</code>):</p>
+    <pre><code>bun run desktop:typecheck
+bun run desktop:test
+bun run desktop:build
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+git diff --check
+# full pull-request gate:
+bun run verify</code></pre>
+    <p>Phase-specific suites to add or extend:</p>
+    <ul class="tight">
+      <li><strong>Rust planner:</strong> equivalence with full-array planning for rules and occupancy (see step 6); <code>generation_scale</code> with occupied rows; release and v11 migration tests.</li>
+      <li><strong>TS staging:</strong> batch size/sequence bounds; abort on append failure; incoming staging over a fake page client with backpressure and cancellation; release calls on success and failure.</li>
+      <li><strong>TS cycle:</strong> capability fallback selects the manifest path when the peer lacks the flag; generation replies are parsed strictly; occupied paths reach <code>recordOccupiedPaths</code>.</li>
+      <li><strong>Peer handlers:</strong> mode/rules cross-checks; page gate accepts the participant and still rejects a foreign peer; unknown fields ignored as before.</li>
+      <li><strong>Manual:</strong> run the desktop in Electron against a second instance if the environment provides two profiles; otherwise state plainly that only unit/integration coverage on one Linux machine was exercised. A real Linux↔Windows run is <em>not</em> covered locally.</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="acceptance">
+    <h2 id="acceptance">9. Acceptance Criteria</h2>
+    <ol class="tight">
+      <li>Between two updated peers, a full continuous cycle stages, exchanges, reconciles and releases generations; no <code>FileManifest</code> with a full file list is built on that path (assert in tests; check with the <code>TETHERA_SCAN_STRESS</code> harness if convenient).</li>
+      <li>A peer without <code>scan-generations-v1</code>, or a build without local support, runs the existing manifest path unchanged and passes the existing suite.</li>
+      <li>Newly ignored baselined paths produce no conflicts and keep baselines; removing the rule re-compares against the baseline (Rust test).</li>
+      <li>One-sided additions onto an occupied path (exact, directory/special ancestor, or file ancestor) are skipped and reported; a baselined path whose destination became occupied still conflicts — both matching today's manifest behaviour.</li>
+      <li>Generations in every state can be released; a normal cycle leaves none behind; crash leftovers are removed by <code>cleanup</code> after expiry.</li>
+      <li>Schema v11 migrates an existing v10 store with staged rows preserved, and refuses a newer schema without modification.</li>
+      <li>No deletion or rename propagation, no change to replacement/archive/retention/recovery, and no secrets or full paths exposed to the renderer or peer logs.</li>
+      <li>All commands in section 8 pass, and <code>docs/15-IMPLEMENTATION-STATUS.md</code> accurately separates implemented from planned.</li>
+    </ol>
+  </section>
+
+  <section aria-labelledby="risks">
+    <h2 id="risks">10. Risks and Notes</h2>
+    <ul class="tight">
+      <li><strong>Ancestor-probe cost:</strong> the occupancy check costs one point lookup per ancestor per one-sided addition; pathological all-new trees are measured by the extended <code>generation_scale</code>. If it proves material, cache per batch or hoist a depth-bounded join — do not drop the check.</li>
+      <li><strong>Authorization change (G4):</strong> letting a non-coordinator read a sealed generation of its own mapping is a deliberate, bounded widening of <code>scan-generation-read-page</code>; it must be reviewed and covered by a test that a non-participant peer is still rejected. If reviewers reject it, the fallback design is coordinator-pushed batch staging of its own entries, which keeps the gate untouched at the cost of a new batch request type.</li>
+      <li><strong>Nested peer requests:</strong> the peer's observe handler makes page requests back to the coordinator while the coordinator awaits the observe response. Each request opens its own connection (<code>peer-session-service.ts:212</code>), and <code>withPeerFileOperation</code> is a per-(peer, folder) guard that throws on overlap, not a queue — the plan must ensure no side holds that lock while awaiting the other (the coordinator's outbound observe is not wrapped). Test the handler path with a stalled page fetch.</li>
+      <li><strong>Generation churn:</strong> each full cycle stages two generations per side plus two incoming copies; release-on-success keeps disk bounded, but verify with the quota (4 open per mapping) that failure paths cannot exhaust it.</li>
+      <li><strong>Incoming-generation abort:</strong> a dropped connection must abort the incoming generation, not leave it open until expiry; the handler's <code>finally</code> owns this.</li>
+      <li><strong>Peak memory is reduced but not flat:</strong> operations, conflicts and recovery issues still arrive as arrays; that is Phase 3, and the plan should say so rather than implying the limit is gone.</li>
+      <li><strong>Compatibility:</strong> old peers keep manifests, so both code paths must stay healthy and tested until the platform matrix justifies retiring the legacy path.</li>
+    </ul>
+  </section>
+
+  <p class="meta">Executor prompt for this plan: <code>.ai/plans/2026-09-17-generation-wiring/executor-prompt.md</code> (Mission A = Phase 1A, Mission B = Phase 1B).</p>
+</main>
+</body>
+</html>
