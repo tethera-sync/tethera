@@ -7,7 +7,7 @@ import { createDestinationOccupancyCheck, createScanIssueBlocklist, findCaseColl
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
 import { describeTransferFile, FileChangedError, isSha256HexDigest } from "./file-transfer"
 import { formatBytes } from "../shared/byte-format"
-import { invertMode } from "./mapping-index"
+import { invertMode } from "../shared/folder-sharing-consent"
 import {
   archiveDisplacedFile,
   displacedFilePath,

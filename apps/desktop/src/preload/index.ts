@@ -15,6 +15,7 @@ import type {
   RequestFolderMappingInput,
   RefreshIncomingMappingPreviewInput,
   ResolveFileConflictInput,
+  UpdateFolderMappingInput,
 } from "../shared/contracts"
 
 const api: TetheraApi = {
@@ -44,6 +45,7 @@ const api: TetheraApi = {
     ipcRenderer.invoke("folders:start-initial-sync", folderId, acknowledgeUnreadable === true),
   dismissInitialSyncIssues: (folderId: string) => ipcRenderer.invoke("folders:dismiss-initial-sync-issues", folderId),
   setFolderPaused: (folderId: string, paused: boolean) => ipcRenderer.invoke("folders:set-paused", folderId, paused),
+  updateFolderMapping: (input: UpdateFolderMappingInput) => ipcRenderer.invoke("folders:update", input),
   removeFolder: (folderId: string) => ipcRenderer.invoke("folders:remove", folderId),
   revealPath: (path: string) => ipcRenderer.invoke("shell:reveal-path", path),
   updateSetting: <K extends AppSettingKey>(key: K, value: AppSettings[K]) => ipcRenderer.invoke("settings:update", key, value),

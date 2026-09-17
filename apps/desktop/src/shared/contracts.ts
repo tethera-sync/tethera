@@ -537,6 +537,20 @@ export interface ApproveFolderMappingInput {
   destinationPath: string
 }
 
+/**
+ * Editable rules of an existing folder mapping. Paths, participants and
+ * history caps outside these bounds are not editable: changing where a
+ * mapping points is a new mapping, not an update.
+ */
+export interface UpdateFolderMappingInput {
+  folderId: string
+  name: string
+  mode: SyncMode
+  ignorePatterns: string[]
+  historyDays: number
+  historyMaxBytes: number
+}
+
 export interface RefreshIncomingMappingPreviewInput {
   requestId: string
   destinationPath: string
@@ -603,6 +617,7 @@ export interface TetheraApi {
   startInitialSync(folderId: string, acknowledgeUnreadable?: boolean): Promise<AppSnapshot>
   dismissInitialSyncIssues(folderId: string): Promise<AppSnapshot>
   setFolderPaused(folderId: string, paused: boolean): Promise<AppSnapshot>
+  updateFolderMapping(input: UpdateFolderMappingInput): Promise<AppSnapshot>
   removeFolder(folderId: string): Promise<AppSnapshot>
   revealPath(path: string): Promise<void>
   updateSetting<K extends AppSettingKey>(key: K, value: AppSettings[K]): Promise<AppSnapshot>

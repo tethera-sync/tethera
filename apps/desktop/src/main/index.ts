@@ -68,6 +68,7 @@ import { previewsEqual, previewScanKey, PreviewScanSessions } from "./preview-sc
 import { ScanLedger, scanStageForKey } from "./scan-ledger"
 import { ScanReuseStore } from "./scan-reuse-store"
 import { formatScanIssuePath, scanIssueReportCovers, scanIssueTotal } from "../shared/folder-scan-issues"
+import { invertMode, sharingWidening } from "../shared/folder-sharing-consent"
 import { SCAN_GENERATION_CAPABILITY, SCAN_PAGE_MAX_ENTRIES } from "./scan-generation"
 import {
   assessInitialMergeConvergence,
@@ -96,8 +97,8 @@ import {
 } from "./file-transfer"
 import {
   folderFromMappingRecord,
-  invertMode,
   mappingConfigurationFromProposal,
+  participantSharingRules,
   type MappingAcknowledgement,
   type MappingApplyOutcome,
   type MappingConfiguration,
@@ -142,6 +143,7 @@ import {
   parseFreeSpaceResponse,
   parsePeerConflictCopy,
   parsePeerFileOperations,
+  parseFolderUpdateInput,
   parsePeerScanManifest,
   parseResolveFileConflictInput,
   parseRevealPath,
@@ -1438,6 +1440,28 @@ async function removeAuthoritativeMapping(record: MappingRecord): Promise<void> 
   await refreshContinuousSyncMonitors()
 }
 
+function sameIgnorePatterns(left: readonly unknown[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((pattern, index) => pattern === right[index])
+}
+
+/**
+ * Validates a paired computer's update to an existing mapping before it is
+ * applied: it may not move either folder, and it may not widen what this
+ * computer shares beyond what was approved here. Stale and duplicate events
+ * are left to the engine, which never applies them.
+ */
+function requireConsentedRemoteUpdate(previous: MappingRecord, incoming: MappingRecord): void {
+  if (incoming.revision < previous.revision || incoming.eventId === previous.eventId) return
+  const next = incoming.mapping
+  if (next.initiatorPath !== previous.mapping.initiatorPath || next.responderPath !== previous.mapping.responderPath) {
+    throw new Error("A paired computer cannot move a mapped folder. Remove the mapping and add it again.")
+  }
+  const localDeviceId = getLocalIdentityId()
+  if (sharingWidening(participantSharingRules(previous.mapping, localDeviceId), participantSharingRules(next, localDeviceId))) {
+    throw new Error("A paired computer cannot make this computer share more than it approved. Remove the mapping and add it again.")
+  }
+}
+
 function otherParticipant(mapping: MappingConfiguration, localDeviceId: string): string {
   if (mapping.initiatorDeviceId === localDeviceId) return mapping.responderDeviceId
   if (mapping.responderDeviceId === localDeviceId) return mapping.initiatorDeviceId
@@ -2701,6 +2725,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       local: remoteObservation,
       remote: localObservation,
       mode: invertMode(folder.mode),
+      ignorePatterns: folder.ignorePatterns,
       observedAt,
     }
     assertObservationExchangeSendable(observeRequest, peer.name, chunked)
@@ -2709,6 +2734,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       local: localObservation,
       remote: remoteObservation,
       mode: folder.mode,
+      ignorePatterns: folder.ignorePatterns,
       observedAt,
       queueOperations: true,
     }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
@@ -4242,12 +4268,18 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     if (request.mode !== folder.mode) {
       throw new Error("The synchronization direction no longer matches this folder's approved configuration.")
     }
+    // Older coordinators omit their rules; newer ones must agree exactly, so a
+    // settings change still being delivered cannot mix two rule sets.
+    if (request.ignorePatterns !== undefined && !(Array.isArray(request.ignorePatterns) && sameIgnorePatterns(request.ignorePatterns, folder.ignorePatterns))) {
+      throw new Error("The ignore rules no longer match this folder's approved configuration.")
+    }
     return withPeerFileOperation(context, folderId, async () => {
       const state = await engine.request<ReconcileFilesResult>("fileSync.reconcile", {
         mappingId: folderId,
         local: request.local,
         remote: request.remote,
         mode: folder.mode,
+        ignorePatterns: folder.ignorePatterns,
         observedAt: request.observedAt,
         queueOperations: true,
       }, 5 * 60_000)
@@ -4412,6 +4444,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       throw new Error("Wait for the initial merge to finish before changing or removing this mapping.")
     }
     const previous = mappingRecords.get(mappingId)
+    if (event.kind === "active" && previous) requireConsentedRemoteUpdate(previous, event.record)
     const outcome = await engine.request<MappingApplyOutcome>("mapping.applyRemote", {
       event,
       authenticatedPeerDeviceId: context.peerId,
@@ -4786,6 +4819,58 @@ function registerIpc(): void {
         scanReuseSeeds.forget(record.mapping.initiatorPath, record.mapping.ignorePatterns)
         scanReuseSeeds.forget(record.mapping.responderPath, record.mapping.ignorePatterns)
       }
+      await persistState()
+      broadcastSnapshot()
+      void flushPendingConfigurationDeliveries()
+      return snapshot
+    } finally {
+      release()
+    }
+  })
+
+  ipcMain.handle("folders:update", async (event: Electron.IpcMainInvokeEvent, input: unknown) => {
+    requireTrustedMainRenderer(event)
+    requireMappingMutations()
+    const update = parseFolderUpdateInput(input)
+    // Refuse before blocking: blocking aborts the running check this refusal is meant to leave alone.
+    if (continuousSyncInFlight.has(update.folderId)) {
+      throw new Error("Tethera is checking this folder with the other computer right now. Save the settings again once the check finishes.")
+    }
+    const release = blockContinuousSync(update.folderId)
+    try {
+      if (initialSyncInFlight.has(update.folderId) || initialSyncForwarded.has(update.folderId) || archiveRestoreInFlight.has(update.folderId) || hasConflictResolutionInFlight(update.folderId) || hasInitialSyncPeerLease(update.folderId)) {
+        throw new Error("Wait for the active file transfer to finish before changing this folder's settings.")
+      }
+      const record = mappingRecords.get(update.folderId)
+      if (!record) throw new Error("The mapping no longer exists in the authoritative database.")
+      const targetDeviceId = otherParticipant(record.mapping, getLocalIdentityId())
+      // The renderer edits in local perspective; the durable configuration is
+      // stored from the initiator's perspective.
+      const localIsInitiator = record.mapping.initiatorDeviceId === getLocalIdentityId()
+      const nextName = update.name.trim() || record.mapping.name
+      const nextMapping: MappingConfiguration = {
+        ...record.mapping,
+        name: nextName,
+        mode: localIsInitiator ? update.mode : invertMode(update.mode),
+        ignorePatterns: update.ignorePatterns,
+        historyDays: update.historyDays,
+        historyMaxBytes: update.historyMaxBytes,
+        updatedAt: new Date().toISOString(),
+      }
+      // The other computer applies the same check and would refuse the update forever.
+      if (sharingWidening(participantSharingRules(record.mapping, targetDeviceId), participantSharingRules(nextMapping, targetDeviceId))) {
+        throw new Error(`${nextMapping.name}: this change would make the other computer share more than it approved. Remove the folder and add it again to ask for approval.`)
+      }
+      const rulesChanged = nextMapping.mode !== record.mapping.mode || !sameIgnorePatterns(nextMapping.ignorePatterns, record.mapping.ignorePatterns)
+      await upsertAuthoritativeMapping(nextMapping, targetDeviceId, record.revision)
+      if (rulesChanged) {
+        // A held initial-merge scan was taken under the old rules.
+        preparedInitialSyncScans.delete(update.folderId)
+        updateFolder(update.folderId, { scanIssues: undefined })
+        scanReuseSeeds.forget(record.mapping.initiatorPath, record.mapping.ignorePatterns)
+        scanReuseSeeds.forget(record.mapping.responderPath, record.mapping.ignorePatterns)
+      }
+      pushActivity("Folder settings updated", `${nextName} has new sync settings.`, "success", update.folderId)
       await persistState()
       broadcastSnapshot()
       void flushPendingConfigurationDeliveries()

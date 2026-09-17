@@ -47,4 +47,11 @@ describe("folders view", () => {
     expect(html).toContain("Sync interrupted")
     expect(html).toContain("Live updates are limited")
   })
+
+  test("offers folder settings after setup and after the initial merge", () => {
+    for (const setupStatus of ["ready-for-initial-sync", "active"] as const) {
+      const html = render(appSnapshot({ devices: [peer], folders: [{ ...folder, setupStatus }] }))
+      expect(html).toContain("Edit settings")
+    }
+  })
 })

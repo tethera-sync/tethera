@@ -2205,6 +2205,45 @@ mod tests {
     }
 
     #[test]
+    fn file_sync_reconcile_accepts_ignore_rules_and_rejects_invalid_ones() {
+        let store = ready_store();
+        let mut upsert: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("mapping json");
+        upsert["mapping"]["setupStatus"] = serde_json::json!("active");
+        let response = handle_line(
+            &request("mapping.upsert", &upsert.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["ok"], true);
+
+        let reconcile = |patterns: serde_json::Value| {
+            let params = serde_json::json!({
+                "mappingId": "mapping-1",
+                "local": [],
+                "remote": [{"path": "cache/a.tmp", "size": 1, "digest": "a".repeat(64)}],
+                "mode": "two-way",
+                "observedAt": "2026-08-01T00:01:00Z",
+                "queueOperations": true,
+                "ignorePatterns": patterns,
+            });
+            handle_line(
+                &request("fileSync.reconcile", &params.to_string()),
+                "correct",
+                &store,
+            )
+        };
+        let response = reconcile(serde_json::json!(["cache/"]));
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["conflicts"], serde_json::json!([]));
+        assert_eq!(response["result"]["operations"], serde_json::json!([]));
+
+        let response = reconcile(serde_json::json!(["x".repeat(10_000)]));
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["errorCode"], "INVALID_PARAMS");
+    }
+
+    #[test]
     fn scan_generation_pages_are_readable_only_through_their_owning_mapping() {
         let store = ready_store();
         let mut upsert: serde_json::Value =

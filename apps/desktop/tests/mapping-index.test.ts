@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test"
 import type { FolderMappingPreview, FolderMappingProposal, FolderSummary } from "../src/shared/contracts"
 import {
   folderFromMappingRecord,
-  invertMode,
   mappingConfigurationFromLegacyFolder,
   mappingConfigurationFromProposal,
   type MappingRecord,
@@ -80,12 +79,6 @@ function record(overrides: Partial<MappingRecord> = {}): MappingRecord {
 }
 
 describe("mapping configuration projections", () => {
-  test("inverts one-way modes without changing two-way", () => {
-    expect(invertMode("send-only")).toBe("receive-only")
-    expect(invertMode("receive-only")).toBe("send-only")
-    expect(invertMode("two-way")).toBe("two-way")
-  })
-
   test("preserves the approved paths, rules, preview, and timestamps", () => {
     const configuration = mappingConfigurationFromProposal(proposal(), {
       responderDeviceName: "Windows 11",

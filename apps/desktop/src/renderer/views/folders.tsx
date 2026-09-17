@@ -17,6 +17,7 @@ import type { AppSnapshot, FolderSummary } from "@shared/contracts"
 import type { View } from "@/lib/navigation"
 import { AddFolderDialog } from "@/components/add-folder-dialog"
 import { CompactEmptyState } from "@/components/compact-empty-state"
+import { EditFolderDialog } from "@/components/edit-folder-dialog"
 import { FolderWorkPanel } from "@/components/folder-work-panel"
 import { InitialSyncIssuesDialog } from "@/components/initial-sync-issues-dialog"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -405,6 +406,12 @@ function FolderCard({
           {paused ? <PlayIcon data-icon="inline-start" /> : <PauseIcon data-icon="inline-start" />}
           {pendingAction === "resume" ? "Resuming…" : pendingAction === "pause" ? "Pausing…" : paused ? "Resume" : "Pause"}
         </Button>
+        <EditFolderDialog
+          folder={folder}
+          remoteName={remoteName}
+          disabled={!mutationsEnabled || pending}
+          disabledReason={!mutationsEnabled ? disabledReason : undefined}
+        />
         {folder.setupStatus === "ready-for-initial-sync" && initialSyncBlockedReason ? (
           <span className="min-w-0 flex-1 px-1 text-[10.5px] text-[var(--muted-foreground)]" role="status">
             {initialSyncBlockedReason}

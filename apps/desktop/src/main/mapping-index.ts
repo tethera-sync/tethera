@@ -5,6 +5,7 @@ import type {
   FolderSummary,
   SyncMode,
 } from "../shared/contracts"
+import { invertMode, type SharingRules } from "../shared/folder-sharing-consent"
 
 /**
  * Typed mirror of the bounded Rust mapping RPC contract.
@@ -102,12 +103,6 @@ export interface LegacyImportOutcome {
   alreadyCompleted: boolean
 }
 
-export function invertMode(mode: SyncMode): SyncMode {
-  if (mode === "send-only") return "receive-only"
-  if (mode === "receive-only") return "send-only"
-  return "two-way"
-}
-
 export interface MappingConfigurationFromProposalOptions {
   responderDeviceName: string
   responderPath: string
@@ -189,6 +184,13 @@ export function mappingConfigurationFromLegacyFolder(
     responderPath: folder.localPath,
     mode: invertMode(folder.mode),
   }
+}
+
+/** The direction and rules one participant shares under, from its own point of view. */
+export function participantSharingRules(mapping: MappingConfiguration, deviceId: string): SharingRules {
+  if (mapping.initiatorDeviceId === deviceId) return { mode: mapping.mode, ignorePatterns: mapping.ignorePatterns }
+  if (mapping.responderDeviceId === deviceId) return { mode: invertMode(mapping.mode), ignorePatterns: mapping.ignorePatterns }
+  throw new Error("The device is not a participant in the mapping.")
 }
 
 /** Projects one active authoritative record into the renderer model. */

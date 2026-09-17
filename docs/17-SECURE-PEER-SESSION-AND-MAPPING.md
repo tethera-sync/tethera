@@ -104,6 +104,8 @@ Active mapping records and tombstones use the authenticated peer identity establ
 
 Ordering uses monotonic revisions with deterministic event IDs; timestamps are diagnostic metadata, not the sole ordering input. A newer event defeats an older active event, and a tombstoned mapping ID is terminal. Re-adding the same folder pair creates a new mapping ID instead of reviving deletion evidence.
 
+Either user may edit an existing mapping's name, sync direction, ignore rules and version-history limits. The edit is a new revision delivered like a pause. Approval is each computer's consent to what leaves its folder, so an edit may narrow what the other computer shares but never widen it: it cannot make the other computer start sending, remove or rewrite an ignore rule while the other computer sends, or move either folder. The editing computer refuses such a change, and the receiving computer independently rejects it before applying the event; widening requires removing the mapping and requesting approval again. Stale and duplicate events are left to the engine's ordering. During a continuous cycle the coordinator sends its ignore rules with `continuous-sync-observe`, and the peer fails the cycle closed while the two rule sets differ; older coordinators omit the field.
+
 Removing a mapping commits its durable tombstone and pending peer delivery in one SQLite transaction. The peer must acknowledge the exact deletion event before the outbox entry is cleared. Disconnects and stale acknowledgements leave it pending. Tombstones survive restart and are not automatically pruned.
 
 ## Data-safety boundary

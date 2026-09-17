@@ -1438,6 +1438,7 @@ mod tests {
                 mode: "two-way".to_owned(),
                 observed_at: NOW.to_owned(),
                 queue_operations: true,
+                ignore_patterns: Vec::new(),
             })
             .expect("reconcile")
     }

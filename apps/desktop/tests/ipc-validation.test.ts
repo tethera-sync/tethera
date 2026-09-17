@@ -10,6 +10,7 @@ import {
   parseConflictCopyExpectation,
   parseCreateDirectoryInput,
   parseExactConflictChoice,
+  parseFolderUpdateInput,
   parseFreeSpaceResponse,
   parsePeerConflictCopy,
   parsePeerFileOperations,
@@ -180,6 +181,41 @@ describe("mapping-input validation", () => {
     ).toThrow("An ignore pattern is invalid or too long.")
     expect(() => validateMappingInput({ ...draft, mode: "one-way" as AddFolderInput["mode"] })).toThrow(
       "The sync direction is invalid.",
+    )
+  })
+})
+
+describe("folder-update validation", () => {
+  const update = {
+    folderId: "mapping-1",
+    name: "Projects",
+    mode: "two-way",
+    ignorePatterns: ["node_modules/"],
+    historyDays: 30,
+    historyMaxBytes: 5_000_000_000,
+  }
+
+  test("accepts a well-formed settings update", () => {
+    expect(parseFolderUpdateInput(update)).toEqual(update)
+  })
+
+  test("rejects malformed payloads and out-of-envelope values", () => {
+    expect(() => parseFolderUpdateInput(null)).toThrow("The folder settings are invalid.")
+    expect(() => parseFolderUpdateInput({ ...update, folderId: "" })).toThrow("The folder settings are invalid.")
+    expect(() => parseFolderUpdateInput({ ...update, mode: "one-way" })).toThrow("The folder settings are invalid.")
+    expect(() => parseFolderUpdateInput({ ...update, historyDays: 0 })).toThrow("Version history must be between 1 and 3,650 days.")
+    expect(() => parseFolderUpdateInput({ ...update, historyDays: 3_651 })).toThrow("Version history must be between 1 and 3,650 days.")
+    expect(() => parseFolderUpdateInput({ ...update, historyMaxBytes: 1024 })).toThrow(
+      "The history storage cap must be between 1 GB and 4 TB.",
+    )
+    expect(() => parseFolderUpdateInput({ ...update, ignorePatterns: new Array(MAX_IGNORE_PATTERNS + 1).fill("*.log") })).toThrow(
+      "Use no more than 256 ignore patterns.",
+    )
+    expect(() => parseFolderUpdateInput({ ...update, ignorePatterns: ["bad\0pattern"] })).toThrow(
+      "An ignore pattern is invalid or too long.",
+    )
+    expect(() => parseFolderUpdateInput({ ...update, name: "a".repeat(121) })).toThrow(
+      "The folder name must be 120 characters or fewer.",
     )
   })
 })

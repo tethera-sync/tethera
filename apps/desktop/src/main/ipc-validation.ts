@@ -9,6 +9,7 @@ import type {
   CreateDirectoryInput,
   ResolveFileConflictInput,
   SyncMode,
+  UpdateFolderMappingInput,
 } from "../shared/contracts"
 import type { ExactConflictChoice, FileSyncDirection, PeerFileOperationIdentity } from "./continuous-sync"
 import { FileChangedError, isSha256HexDigest, type TransferFileDescriptor } from "./file-transfer"
@@ -170,6 +171,38 @@ export function restorePersistedSettings(value: unknown, defaults: AppSettings):
 export function validateMappingInput(input: AddFolderInput): void {
   if (!input.localPath?.trim() || !input.remotePath?.trim()) throw new Error("Choose both folders before continuing.")
   if (!input.remoteDeviceId?.trim()) throw new Error("Choose a paired computer.")
+  validateMappingRules(input)
+}
+
+/**
+ * Shape check only; `validateMappingRules` then applies the shared domain
+ * bounds so create and edit report the same errors.
+ */
+const folderUpdateInputSchema = z.object({
+  folderId: deviceIdString,
+  name: z.string(),
+  mode: z.enum(["two-way", "send-only", "receive-only"]),
+  ignorePatterns: z.array(z.string()),
+  historyDays: z.number(),
+  historyMaxBytes: z.number(),
+})
+
+/** Validates the settings of an existing mapping arriving over `folders:update`. */
+export function parseFolderUpdateInput(value: unknown): UpdateFolderMappingInput {
+  const parsed = folderUpdateInputSchema.safeParse(value)
+  if (!parsed.success) throw new Error("The folder settings are invalid.")
+  validateMappingRules(parsed.data)
+  return parsed.data
+}
+
+/** The rule envelope every mapping configuration shares, whether created or edited. */
+function validateMappingRules(input: {
+  name: string
+  mode: SyncMode
+  ignorePatterns: string[]
+  historyDays: number
+  historyMaxBytes: number
+}): void {
   if (!(["two-way", "send-only", "receive-only"] as const).includes(input.mode)) throw new Error("The sync direction is invalid.")
   if (!Number.isInteger(input.historyDays) || input.historyDays < 1 || input.historyDays > 3_650) {
     throw new Error("Version history must be between 1 and 3,650 days.")

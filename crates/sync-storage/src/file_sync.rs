@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use sync_core::manifest::{IgnoreMatcher, normalize_relative};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -18,6 +19,8 @@ use crate::version_archive::{
 const MAX_FILES: usize = 1_000_000;
 const MAX_PATH_LENGTH: usize = 4_096;
 const MAX_ERROR_LENGTH: usize = 2_000;
+/// Same envelope the desktop enforces on a mapping's ignore rules.
+const MAX_IGNORE_PATTERNS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -124,6 +127,13 @@ pub struct ReconcileRequest {
     pub mode: String,
     pub observed_at: String,
     pub queue_operations: bool,
+    /// The mapping's current ignore rules. A path they exclude is left out of
+    /// planning, so adding a rule never turns still-present files into
+    /// deletion conflicts. Its baseline is kept: if the rule is removed later,
+    /// the path is compared against it again instead of being treated as new.
+    /// Older callers omit the field, which means no rules.
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -266,10 +276,12 @@ impl MappingStore {
         let baselines = read_baselines(&transaction, &request.mapping_id)?;
         let local = observation_map(&request.local)?;
         let remote = observation_map(&request.remote)?;
+        let ignored = IgnoredPaths::new(&request.ignore_patterns)?;
         let plan = plan_reconciliation(
             &transaction,
             request,
             initialized,
+            &ignored,
             &baselines,
             &local,
             &remote,
@@ -823,6 +835,7 @@ fn plan_reconciliation(
     transaction: &Transaction<'_>,
     request: &ReconcileRequest,
     initialized: bool,
+    ignored: &IgnoredPaths,
     baselines: &HashMap<String, (String, i64)>,
     local: &HashMap<String, ObservedFile>,
     remote: &HashMap<String, ObservedFile>,
@@ -842,6 +855,15 @@ fn plan_reconciliation(
         let local_file = local.get(path);
         let remote_file = remote.get(path);
         let baseline = baselines.get(path);
+        let identical = matches!(
+            (local_file, remote_file),
+            (Some(local_file), Some(remote_file)) if local_file.digest == remote_file.digest
+        );
+        // Identical pairs (almost every path) skip the rule check: both scans
+        // already applied the rules, and recording a baseline is harmless.
+        if !identical && ignored.contains(path) {
+            continue;
+        }
         match (local_file, remote_file) {
             (Some(local_file), Some(remote_file)) if local_file.digest == remote_file.digest => {
                 upsert_baseline(
@@ -1226,7 +1248,42 @@ fn validate_reconcile_request(request: &ReconcileRequest) -> Result<(), MappingS
         validate_size(file.size)?;
         validate_digest(&file.digest)?;
     }
+    if request.ignore_patterns.len() > MAX_IGNORE_PATTERNS {
+        return Err(MappingStoreError::Invalid(format!(
+            "at most {MAX_IGNORE_PATTERNS} ignore patterns are accepted"
+        )));
+    }
     Ok(())
+}
+
+/// A mapping's ignore rules applied the way a folder scan applies them: a
+/// file is excluded when it matches, or when any folder above it does.
+struct IgnoredPaths {
+    matcher: Option<IgnoreMatcher>,
+}
+
+impl IgnoredPaths {
+    fn new(patterns: &[String]) -> Result<Self, MappingStoreError> {
+        if patterns.is_empty() {
+            return Ok(Self { matcher: None });
+        }
+        let matcher = IgnoreMatcher::try_new(patterns)
+            .map_err(|error| MappingStoreError::Invalid(error.to_string()))?;
+        Ok(Self {
+            matcher: Some(matcher),
+        })
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        let Some(matcher) = &self.matcher else {
+            return false;
+        };
+        let normalized = normalize_relative(path);
+        matcher.is_ignored(&normalized, false)
+            || normalized
+                .match_indices('/')
+                .any(|(end, _)| matcher.is_ignored(&normalized[..end], true))
+    }
 }
 
 struct SealedGenerationMeta {
@@ -1508,6 +1565,7 @@ fn persist_generations_reconciliation(
         mode: request.mode.clone(),
         observed_at: request.observed_at.clone(),
         queue_operations: request.queue_operations,
+        ignore_patterns: Vec::new(),
     };
     persist_reconciliation(transaction, &proxy, operations, conflicts)
 }
@@ -1802,6 +1860,7 @@ mod tests {
                 mode: "two-way".to_owned(),
                 observed_at: NOW.to_owned(),
                 queue_operations: true,
+                ignore_patterns: Vec::new(),
             })
             .expect("reconcile")
     }
@@ -1965,6 +2024,7 @@ mod tests {
                     mode: mode.to_owned(),
                     observed_at: NOW.to_owned(),
                     queue_operations: true,
+                    ignore_patterns: Vec::new(),
                 })
                 .expect("reconcile non-authoritative one-way addition");
 
@@ -2010,6 +2070,7 @@ mod tests {
                     mode: mode.to_owned(),
                     observed_at: NOW.to_owned(),
                     queue_operations: true,
+                    ignore_patterns: Vec::new(),
                 })
                 .expect("reconcile authoritative one-way addition");
 
@@ -2049,6 +2110,7 @@ mod tests {
                 mode: "two-way".to_owned(),
                 observed_at: "2026-08-08T13:00:00Z".to_owned(),
                 queue_operations: true,
+                ignore_patterns: Vec::new(),
             })
             .expect("repeat reconciliation");
 
@@ -2284,6 +2346,7 @@ mod tests {
             mode: "two-way".to_owned(),
             observed_at: NOW.to_owned(),
             queue_operations: true,
+            ignore_patterns: Vec::new(),
         });
         assert!(result.is_err());
 
@@ -2445,6 +2508,103 @@ mod tests {
         let restored = reconcile(&store, vec![file("old.txt", 'a')], Vec::new());
         assert!(restored.operations.is_empty());
         assert_eq!(restored.conflicts.len(), 1);
+    }
+
+    fn reconcile_ignoring(
+        store: &MappingStore,
+        local: Vec<ObservedFile>,
+        remote: Vec<ObservedFile>,
+        ignore_patterns: &[&str],
+    ) -> ReconcileResult {
+        store
+            .reconcile_files(&ReconcileRequest {
+                mapping_id: "mapping-1".to_owned(),
+                local,
+                remote,
+                mode: "two-way".to_owned(),
+                observed_at: NOW.to_owned(),
+                queue_operations: true,
+                ignore_patterns: ignore_patterns.iter().map(|&p| p.to_owned()).collect(),
+            })
+            .expect("reconcile")
+    }
+
+    #[test]
+    fn a_newly_ignored_path_is_not_reported_as_deleted() {
+        let store = active_store();
+        reconcile(
+            &store,
+            vec![
+                file("node_modules/pkg/index.js", 'a'),
+                file("notes.tmp", 'a'),
+            ],
+            vec![
+                file("node_modules/pkg/index.js", 'a'),
+                file("notes.tmp", 'a'),
+            ],
+        );
+        // Both scans now leave the files out because of the new rules.
+        let result =
+            reconcile_ignoring(&store, Vec::new(), Vec::new(), &["node_modules/", "*.tmp"]);
+        assert!(result.conflicts.is_empty());
+        assert!(result.operations.is_empty());
+        assert_eq!(result.baseline_count, 2, "baselines are kept, not deleted");
+
+        // A peer still scanning with the old rules cannot queue work for an ignored path.
+        let stale_peer = reconcile_ignoring(
+            &store,
+            Vec::new(),
+            vec![file("notes.tmp", 'b')],
+            &["node_modules/", "*.tmp"],
+        );
+        assert!(stale_peer.conflicts.is_empty());
+        assert!(stale_peer.operations.is_empty());
+    }
+
+    #[test]
+    fn a_removed_rule_compares_the_path_against_its_kept_baseline() {
+        let store = active_store();
+        reconcile(
+            &store,
+            vec![file("build/out.bin", 'a')],
+            vec![file("build/out.bin", 'a')],
+        );
+        reconcile_ignoring(&store, Vec::new(), Vec::new(), &["build/"]);
+
+        let changed = reconcile(
+            &store,
+            vec![file("build/out.bin", 'b')],
+            vec![file("build/out.bin", 'a')],
+        );
+        assert_eq!(changed.operations.len(), 1);
+        assert_eq!(changed.operations[0].direction, SyncDirection::PushLocal);
+
+        let deleted = reconcile(&store, Vec::new(), vec![file("build/out.bin", 'a')]);
+        assert!(deleted.operations.is_empty());
+        assert_eq!(
+            deleted.conflicts[0].kind,
+            ConflictKind::DeletionNotPropagated
+        );
+    }
+
+    #[test]
+    fn invalid_ignore_patterns_fail_without_writing() {
+        let store = active_store();
+        let error = store
+            .reconcile_files(&ReconcileRequest {
+                mapping_id: "mapping-1".to_owned(),
+                local: vec![file("a.txt", 'a')],
+                remote: vec![file("a.txt", 'a')],
+                mode: "two-way".to_owned(),
+                observed_at: NOW.to_owned(),
+                queue_operations: true,
+                ignore_patterns: vec!["x".repeat(10_000)],
+            })
+            .expect_err("oversized pattern");
+        assert!(matches!(error, MappingStoreError::Invalid(_)));
+        let state = store.file_sync_state("mapping-1").expect("state");
+        assert_eq!(state.baseline_count, 0);
+        assert!(!state.initialized);
     }
 
     #[test]

@@ -97,6 +97,8 @@ Evidence order: stable file ID, watcher rename pair, matching digest/size/time p
 
 Use ordered slash-separated relative patterns, expose the matching rule, support a tester, show/remove presets and never ignore all dotfiles implicitly. Rule changes produce a previewed scoped reconciliation, not silent deletion.
 
+Editing an existing mapping's rules is implemented without a preview: `fileSync.reconcile` receives the mapping's current rules and leaves every excluded path (or path under an excluded folder) out of planning, so newly ignored files stay on disk and are neither transferred nor reported as deletions. Their verified baselines are kept, so removing the rule later compares each path against its last common digest rather than treating it as new. Newly included files are reconciled like any other path. Staged scan-generation reconciliation does not take rules yet.
+
 New desktop mappings suggest common temporary-file rules plus `node_modules/` and `.venv/`. Optional language presets append editable rules without replacing custom entries; only the reviewed patterns are sent for approval. Existing mappings are not changed by new defaults.
 
 ## Initial merge
