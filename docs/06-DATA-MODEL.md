@@ -1,6 +1,6 @@
 # Data model
 
-SQLite is local to each device. Schema version `8` is authoritative for mapping configuration, verified file baselines, retry/conflict state, replacement recovery metadata, staged scan generations, and older case-duplicate folder cleanup evidence. User-file bytes are never stored in SQLite.
+SQLite is local to each device. Schema version `10` is authoritative for mapping configuration, verified file baselines, retry/conflict state, replacement recovery metadata, staged scan generations, and older case-duplicate folder cleanup evidence. User-file bytes are never stored in SQLite.
 
 ## Implemented mapping tables
 
