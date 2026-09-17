@@ -311,13 +311,6 @@ impl MappingStore {
             transaction.commit()?;
             return self.generation_status(&request.generation_id);
         }
-        if entry_count + i64::try_from(request.entries.len()).unwrap_or(i64::MAX)
-            > MAX_ENTRIES_PER_GENERATION
-        {
-            return Err(MappingStoreError::Invalid(
-                "scan generation exceeds its entry quota".to_owned(),
-            ));
-        }
         // The stored rows for the bounded batch are loaded once, so a
         // duplicate is classified identical or conflicting without a query
         // per entry.
@@ -347,6 +340,16 @@ impl MappingStore {
                     )));
                 }
             }
+        }
+        // The quota applies to rows this batch actually staged: an identical
+        // path re-delivered from an earlier batch does not consume quota.
+        if entry_count
+            .checked_add(inserted)
+            .is_none_or(|count| count > MAX_ENTRIES_PER_GENERATION)
+        {
+            return Err(MappingStoreError::Invalid(
+                "scan generation exceeds its entry quota".to_owned(),
+            ));
         }
         transaction.execute(
             "UPDATE scan_generations
@@ -1270,7 +1273,10 @@ mod tests {
 
 #[cfg(test)]
 mod quota_tests {
-    use super::{BeginGenerationRequest, MAX_GENERATIONS_PER_MAPPING};
+    use super::{
+        AppendBatchRequest, BeginGenerationRequest, GenerationEntry, MAX_ENTRIES_PER_GENERATION,
+        MAX_GENERATIONS_PER_MAPPING,
+    };
     use crate::mapping::{LegacyImportRequest, MappingConfiguration, MappingStore};
 
     const NOW: &str = "2026-08-08T12:00:00Z";
@@ -1342,6 +1348,80 @@ mod quota_tests {
             hash_mode: "full-sha256".to_owned(),
         });
         assert!(overflow.is_err());
+    }
+
+    #[test]
+    fn quota_counts_inserted_rows_not_delivered_entries() {
+        let store = quota_store();
+        store
+            .begin_scan_generation(&BeginGenerationRequest {
+                generation_id: "gen-quota".to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                participant_device_id: "a-device".to_owned(),
+                mapping_revision: 1,
+                root: "/tmp/a".to_owned(),
+                ignore_patterns: Vec::new(),
+                hash_mode: "full-sha256".to_owned(),
+            })
+            .expect("begin");
+        let kept = GenerationEntry {
+            path: "kept.txt".to_owned(),
+            size: 4,
+            digest: Some("a".repeat(64)),
+        };
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-quota".to_owned(),
+                sequence: 0,
+                entries: vec![kept.clone()],
+            })
+            .expect("append");
+        // Seed the generation one row below its quota; staging a million rows
+        // would only slow the test down.
+        store
+            .connection
+            .execute(
+                "UPDATE scan_generations SET entry_count = ?2 WHERE generation_id = ?1",
+                rusqlite::params!["gen-quota", MAX_ENTRIES_PER_GENERATION - 1],
+            )
+            .expect("seed the boundary count");
+        let boundary = store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-quota".to_owned(),
+                sequence: 1,
+                entries: vec![
+                    kept,
+                    GenerationEntry {
+                        path: "new.txt".to_owned(),
+                        size: 4,
+                        digest: Some("b".repeat(64)),
+                    },
+                ],
+            })
+            .expect("an identical duplicate must not consume quota");
+        assert_eq!(boundary.entry_count, MAX_ENTRIES_PER_GENERATION);
+        let overflow = store.append_scan_batch(&AppendBatchRequest {
+            generation_id: "gen-quota".to_owned(),
+            sequence: 2,
+            entries: vec![GenerationEntry {
+                path: "overflow.txt".to_owned(),
+                size: 4,
+                digest: Some("c".repeat(64)),
+            }],
+        });
+        assert!(overflow.is_err());
+        let status = store.generation_status("gen-quota").expect("status");
+        assert_eq!(status.entry_count, MAX_ENTRIES_PER_GENERATION);
+        let staged: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM scan_entries
+                 WHERE generation_id = 'gen-quota' AND relative_path = 'overflow.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count the rejected row");
+        assert_eq!(staged, 0);
     }
 }
 
