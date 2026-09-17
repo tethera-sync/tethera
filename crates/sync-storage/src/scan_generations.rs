@@ -5,7 +5,7 @@
 //! generation is visible to baseline/planning reads. Incomplete, aborted, or
 //! stale generations never advance baselines or replace active state.
 
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 use crate::mapping::{MappingStore, MappingStoreError, check_identifier};
@@ -298,14 +298,15 @@ impl MappingStore {
         }
         if request.sequence < next_sequence {
             // Idempotent retry: every entry must already exist identically.
-            for entry in &request.entries {
-                if stored_entry(&transaction, &request.generation_id, &entry.path)?.as_ref()
-                    != Some(&(entry.size, entry.digest.clone()))
-                {
-                    return Err(MappingStoreError::Invalid(
-                        "replayed batch does not match the stored entries".to_owned(),
-                    ));
-                }
+            let stored = stored_entries(&transaction, &request.generation_id, &request.entries)?;
+            if request
+                .entries
+                .iter()
+                .any(|entry| !stored_matches_entry(stored.get(entry.path.as_str()), entry))
+            {
+                return Err(MappingStoreError::Invalid(
+                    "replayed batch does not match the stored entries".to_owned(),
+                ));
             }
             transaction.commit()?;
             return self.generation_status(&request.generation_id);
@@ -317,9 +318,10 @@ impl MappingStore {
                 "scan generation exceeds its entry quota".to_owned(),
             ));
         }
-        // The stored count advances by exactly the rows this batch inserted, so
-        // staging stays proportional to the batch rather than the generation.
-        // An identical path re-delivered from an earlier batch is idempotent.
+        // The stored rows for the bounded batch are loaded once, so a
+        // duplicate is classified identical or conflicting without a query
+        // per entry.
+        let stored = stored_entries(&transaction, &request.generation_id, &request.entries)?;
         let mut inserted: i64 = 0;
         {
             let mut insert = transaction.prepare_cached(
@@ -338,9 +340,7 @@ impl MappingStore {
                     inserted += 1;
                     continue;
                 }
-                if stored_entry(&transaction, &request.generation_id, &entry.path)?.as_ref()
-                    != Some(&(entry.size, entry.digest.clone()))
-                {
+                if !stored_matches_entry(stored.get(entry.path.as_str()), entry) {
                     return Err(MappingStoreError::Invalid(format!(
                         "scan generation contains a changed duplicate path {:?}",
                         entry.path
@@ -592,20 +592,36 @@ impl MappingStore {
     }
 }
 
-fn stored_entry(
+/// Loads the stored rows for one bounded batch of unique paths in a single
+/// query, so classifying a delivered entry never costs a query per entry.
+fn stored_entries(
     transaction: &Transaction<'_>,
     generation_id: &str,
-    path: &str,
-) -> Result<Option<(i64, Option<String>)>, MappingStoreError> {
-    transaction
-        .prepare_cached(
-            "SELECT size, digest FROM scan_entries WHERE generation_id = ?1 AND relative_path = ?2",
-        )?
-        .query_row(params![generation_id, path], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .optional()
-        .map_err(Into::into)
+    entries: &[GenerationEntry],
+) -> Result<std::collections::HashMap<String, (i64, Option<String>)>, MappingStoreError> {
+    if entries.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let placeholders = vec!["?"; entries.len()].join(", ");
+    let mut statement = transaction.prepare_cached(&format!(
+        "SELECT relative_path, size, digest FROM scan_entries
+         WHERE generation_id = ?1 AND relative_path IN ({placeholders})"
+    ))?;
+    let mut rows = statement.query(params_from_iter(
+        std::iter::once(generation_id).chain(entries.iter().map(|entry| entry.path.as_str())),
+    ))?;
+    let mut stored = std::collections::HashMap::with_capacity(entries.len());
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let size: i64 = row.get(1)?;
+        let digest: Option<String> = row.get(2)?;
+        stored.insert(path, (size, digest));
+    }
+    Ok(stored)
+}
+
+fn stored_matches_entry(stored: Option<&(i64, Option<String>)>, entry: &GenerationEntry) -> bool {
+    matches!(stored, Some((size, digest)) if *size == entry.size && *digest == entry.digest)
 }
 
 fn require_mapping_participants(
