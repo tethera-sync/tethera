@@ -38,7 +38,7 @@ Schema version 9 keeps the original migrations and adds:
 - `file_sync_conflicts` for simultaneous changes, one-sided deletion, direction mismatch, or unbased state.
 - `archive_objects` for verified content-addressed archive metadata; and
 - `file_replacement_journal` for restart-safe replacement and restore lifecycle state.
-- `scan_generations` and `scan_entries` (version 6) for bounded staged scan generations with participant/revision/root/rules/hash-mode binding, idempotent batches, seal verification, ordered paging, quota/expiry, and startup cleanup;
+- `scan_generations` and `scan_entries` (version 6, entries clustered in version 10) for bounded staged scan generations with participant/revision/root/rules/hash-mode binding, idempotent incremental batches, seal verification, ordered paging, quota/expiry, and startup cleanup;
 - `scan_digest_cache` (version 7) for the derived per-folder scan digest cache;
 - `directory_cleanup` (version 8) for approved case-duplicate folder cleanup evidence;
 - `archive_object_deletions` (version 9) for archive objects whose files version history retention still has to remove; and
@@ -110,7 +110,7 @@ For a durable conflict where both files are present, the coordinator can inspect
 
 ## Clearly not implemented
 
-- Automatic large-folder sync through staged generations in the live initial/continuous flows (the contracts, paging, and peer serving above are implemented, but live merge/reconciliation still exchanges full manifests, chunked between updated peers, so each side's file list and a received peer list are still held in memory in cycles that find changes). Measured at 250,000 files per side on a release engine, staging one generation takes 14-27 s and `fileSync.reconcileGenerations` 29-40 s even when nothing changed, because each batch recounts the whole generation and planning looks every path up individually; live wiring waits on those becoming incremental..
+- Automatic large-folder sync through staged generations in the live initial/continuous flows (the contracts, paging, and peer serving above are implemented, but live merge/reconciliation still exchanges full manifests, chunked between updated peers, so each side's file list and a received peer list are still held in memory in cycles that find changes). Staging and generation reconciliation are now incremental: at 250,000 files per side, a release-mode storage measurement (`cargo test -p sync-storage --release -- --ignored --nocapture generation_scale`, file-backed WAL database) stages one generation in 5-9 s (up to 30 s when the machine was under load) and reconciles in about 0.8 s, whether nothing or 1,000 paths changed; the first reconciliation that records every baseline took 0.8-3.6 s. Before this change the same measurement took 17-110 s to stage and 29-40 s to reconcile. These numbers come from one Linux development machine, not the packaged engine over RPC.
 - Engine-owned filesystem watching/network transfer, resumable/content-defined chunking, or bandwidth scheduling.
 - File deletion or rename propagation, resolving conflicts where either copy is missing, or pruning the archive history of removed folders.
 - NAT traversal, cloud services, accounts or telemetry.
@@ -119,7 +119,7 @@ For a durable conflict where both files are present, the coordinator can inspect
 
 ## Recommended next pull request
 
-Make staged scan generations incremental (no whole-generation recount per batch, no per-path planning lookups), then wire the live initial merge and continuous reconciliation through sealed generations end to end (streamed staging, peer generation exchange, generation reconciliation, paged operation/conflict consumers, and UI summaries). Deletion and rename propagation should remain disabled until cross-platform interruption tests prove the archive recovery and retention lifecycle safe.
+Wire the live initial merge and continuous reconciliation through sealed generations end to end (streamed staging, peer generation exchange, generation reconciliation, paged operation/conflict consumers, and UI summaries). Deletion and rename propagation should remain disabled until cross-platform interruption tests prove the archive recovery and retention lifecycle safe.
 
 ## LAN ports
 

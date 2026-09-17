@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Schema version this build reads and writes. Version 1 is intentionally left unchanged below.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 200;
@@ -831,6 +831,9 @@ impl MappingStore {
         if current < 9 {
             self.migrate_v8_to_v9()?;
         }
+        if current < 10 {
+            self.migrate_v9_to_v10()?;
+        }
         Ok(())
     }
 
@@ -848,6 +851,31 @@ impl MappingStore {
                 ON file_replacement_journal (archive_digest)
                 WHERE archive_digest IS NOT NULL;
             PRAGMA user_version = 9;",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Rebuilds staged scan entries as one clustered B-tree keyed by
+    /// generation and path. The previous rowid table stored every path in the
+    /// table, its primary-key index, and a duplicate ordering index, which
+    /// made staging a large generation dominated by index maintenance.
+    fn migrate_v9_to_v10(&self) -> Result<(), MappingStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE scan_entries_v10 (
+                generation_id TEXT NOT NULL REFERENCES scan_generations(generation_id) ON DELETE CASCADE,
+                relative_path TEXT NOT NULL,
+                digest TEXT,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                PRIMARY KEY (generation_id, relative_path)
+            ) WITHOUT ROWID;
+            INSERT INTO scan_entries_v10 (generation_id, relative_path, digest, size)
+                SELECT generation_id, relative_path, digest, size FROM scan_entries;
+            DROP TABLE scan_entries;
+            ALTER TABLE scan_entries_v10 RENAME TO scan_entries;
+            PRAGMA user_version = 10;",
         )?;
         transaction.commit()?;
         Ok(())
@@ -2932,6 +2960,79 @@ mod tests {
             )
             .expect("retention schema");
         assert_eq!(retention_schema, 2);
+
+        drop(reopened);
+        let reopened_again = MappingStore::open(&path).expect("reopen migrated database");
+        assert_eq!(
+            reopened_again.schema_version().expect("version"),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migrates_schema_v9_to_v10_preserving_staged_scan_entries() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("mappings.sqlite3");
+        let original = sample("existing-v9-mapping");
+        seed_v1(&path, std::slice::from_ref(&original));
+        drop(MappingStore::open(&path).expect("create representative current schema"));
+
+        let connection = rusqlite::Connection::open(&path).expect("open representative v9");
+        connection
+            .execute_batch(
+                "DROP TABLE scan_entries;
+                 CREATE TABLE scan_entries (
+                     generation_id TEXT NOT NULL REFERENCES scan_generations(generation_id) ON DELETE CASCADE,
+                     relative_path TEXT NOT NULL,
+                     digest TEXT,
+                     size INTEGER NOT NULL CHECK (size >= 0),
+                     PRIMARY KEY (generation_id, relative_path)
+                 );
+                 CREATE INDEX scan_entries_ordered ON scan_entries (generation_id, relative_path);
+                 INSERT INTO scan_generations (
+                     generation_id, mapping_id, participant_device_id, mapping_revision, root,
+                     ignore_patterns, hash_mode, state, entry_count, next_sequence,
+                     created_at, updated_at, expires_at
+                 ) VALUES (
+                     'staged-v9', 'existing-v9-mapping', 'linux-box', 1, '/tmp/a',
+                     '[]', 'full-sha256', 'open', 2, 1, 'now', 'now', 'later'
+                 );
+                 INSERT INTO scan_entries (generation_id, relative_path, digest, size)
+                     VALUES ('staged-v9', 'b.txt', NULL, 2), ('staged-v9', 'a.txt', NULL, 1);
+                 PRAGMA user_version = 9;",
+            )
+            .expect("downgrade representative schema to v9");
+        drop(connection);
+
+        let reopened = MappingStore::open(&path).expect("migrate v9 to v10");
+        assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
+        let staged: Vec<(String, i64)> = reopened
+            .connection
+            .prepare(
+                "SELECT relative_path, size FROM scan_entries
+                 WHERE generation_id = 'staged-v9' ORDER BY relative_path",
+            )
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("staged rows");
+        assert_eq!(
+            staged,
+            vec![("a.txt".to_owned(), 1), ("b.txt".to_owned(), 2)]
+        );
+        let (table_sql, index_count): (String, i64) = reopened
+            .connection
+            .query_row(
+                "SELECT
+                     (SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'scan_entries'),
+                     (SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'scan_entries')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("scan entry schema");
+        assert!(table_sql.contains("WITHOUT ROWID"));
+        assert_eq!(index_count, 0);
 
         drop(reopened);
         let reopened_again = MappingStore::open(&path).expect("reopen migrated database");

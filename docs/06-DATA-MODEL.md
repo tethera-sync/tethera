@@ -67,6 +67,7 @@ The active records, any tombstones needed to defeat stale PR #4 rows, outbox ent
 - Version 7 additively creates the per-mapping scan digest cache (`scan_digest_cache`), a derived performance cache keyed by mapping and relative path.
 - Version 8 additively creates `directory_cleanup`, the durable evidence for moving an approved older case-duplicate folder to the OS trash.
 - Version 9 additively creates `archive_object_deletions`, the durable queue of archive objects whose files version history retention still has to remove, and a partial index on `file_replacement_journal.archive_digest`.
+- Version 10 rebuilds `scan_entries` as a `WITHOUT ROWID` table clustered on `(generation_id, relative_path)`, copying any staged rows and dropping the duplicate ordering index, so each staged path is stored once.
 - Every schema step and `PRAGMA user_version` bump shares one immediate transaction.
 - Malformed version-1 data rolls the whole step back and leaves version 1 intact.
 - A database newer than this build supports is refused without writes.
@@ -106,19 +107,22 @@ Explicit conflict selection does not add another persistence model or schema ver
 participant, mapping revision, canonical owning root, ignore rules, and hash
 mode (`full-sha256` or `preview`), with `open`, `sealed`, or `aborted` state,
 a staged entry count, next batch sequence, and expiry. `scan_entries` stores
-one row per relative path per generation, ordered by `(generation_id,
-relative_path)` for keyset paging.
+one row per relative path per generation in a `WITHOUT ROWID` table clustered
+on `(generation_id, relative_path)` (version 10), which serves keyset paging
+and merge joins without a separate index.
 
 Batches are transactional and idempotent: an identical re-delivery is accepted
 without double-counting, while gaps, changed duplicates, stale revisions, and
-cross-mapping reads fail. Sealing verifies the staged count; only a sealed
-generation is visible to planning reads and `fileSync.reconcileGenerations`,
-which streams the union of both generations and the baseline in ordered pages
-and publishes the completed plan atomically. Aborted and expired generations
+cross-mapping reads fail. Each batch advances the stored entry count by the
+rows it inserted, so staging costs follow the batch size, not the generation
+size. Sealing verifies the staged count once; only a sealed generation is
+visible to planning reads and `fileSync.reconcileGenerations`. Reconciliation
+advances baselines for paths both generations observed identically in one
+statement and streams only differing or baseline-only paths, in path order, to
+the planner, then publishes the completed plan atomically. Aborted and expired generations
 are cleaned without touching baselines, operations, conflicts, or recovery
 evidence. At most four open generations per mapping and one million entries
-per generation are staged; one batch holds at most 1,000 entries and one
-planning page reads at most 1,000 paths.
+per generation are staged, and one batch holds at most 1,000 entries.
 
 ## Scan digest cache (version 7)
 
