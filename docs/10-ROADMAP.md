@@ -38,4 +38,4 @@ More devices, native NAT/relay, optional self-hosted rendezvous, other OSes, at-
 
 ## Recommended next pull request
 
-Archive retention now applies each folder's age and storage limits over the replacement journal, with restart-safe object removal. The next milestone should make staged scan generations incremental and wire them through the live initial merge and continuous reconciliation. Deletion and rename propagation should remain disabled until archive recovery, retention, and interruption behavior are proven safe end to end across platforms.
+Archive retention now applies each folder's age and storage limits over the replacement journal, with restart-safe object removal. Staged scan generations are now incremental; the next milestone should wire them through the live initial merge and continuous reconciliation. Deletion and rename propagation should remain disabled until archive recovery, retention, and interruption behavior are proven safe end to end across platforms.

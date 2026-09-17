@@ -5,7 +5,7 @@
 //! generation is visible to baseline/planning reads. Incomplete, aborted, or
 //! stale generations never advance baselines or replace active state.
 
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 use crate::mapping::{MappingStore, MappingStoreError, check_identifier};
@@ -298,67 +298,64 @@ impl MappingStore {
         }
         if request.sequence < next_sequence {
             // Idempotent retry: every entry must already exist identically.
-            for entry in &request.entries {
-                let stored: Option<(i64, Option<String>)> = transaction
-                    .query_row(
-                        "SELECT size, digest FROM scan_entries WHERE generation_id = ?1 AND relative_path = ?2",
-                        params![request.generation_id, entry.path],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                match stored {
-                    Some((size, digest)) if size == entry.size && digest == entry.digest => {}
-                    _ => {
-                        return Err(MappingStoreError::Invalid(
-                            "replayed batch does not match the stored entries".to_owned(),
-                        ));
-                    }
-                }
+            let stored = stored_entries(&transaction, &request.generation_id, &request.entries)?;
+            if request
+                .entries
+                .iter()
+                .any(|entry| !stored_matches_entry(stored.get(entry.path.as_str()), entry))
+            {
+                return Err(MappingStoreError::Invalid(
+                    "replayed batch does not match the stored entries".to_owned(),
+                ));
             }
             transaction.commit()?;
             return self.generation_status(&request.generation_id);
         }
-        if entry_count + i64::try_from(request.entries.len()).unwrap_or(i64::MAX)
-            > MAX_ENTRIES_PER_GENERATION
+        // The stored rows for the bounded batch are loaded once, so a
+        // duplicate is classified identical or conflicting without a query
+        // per entry.
+        let stored = stored_entries(&transaction, &request.generation_id, &request.entries)?;
+        let mut inserted: i64 = 0;
         {
-            return Err(MappingStoreError::Invalid(
-                "scan generation exceeds its entry quota".to_owned(),
-            ));
-        }
-        for entry in &request.entries {
-            let stored: Option<(i64, Option<String>)> = transaction
-                .query_row(
-                    "SELECT size, digest FROM scan_entries WHERE generation_id = ?1 AND relative_path = ?2",
-                    params![request.generation_id, entry.path],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((size, digest)) = stored {
-                if size != entry.size || digest != entry.digest {
+            let mut insert = transaction.prepare_cached(
+                "INSERT INTO scan_entries (generation_id, relative_path, digest, size)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(generation_id, relative_path) DO NOTHING",
+            )?;
+            for entry in &request.entries {
+                if insert.execute(params![
+                    request.generation_id,
+                    entry.path,
+                    entry.digest,
+                    entry.size
+                ])? == 1
+                {
+                    inserted += 1;
+                    continue;
+                }
+                if !stored_matches_entry(stored.get(entry.path.as_str()), entry) {
                     return Err(MappingStoreError::Invalid(format!(
                         "scan generation contains a changed duplicate path {:?}",
                         entry.path
                     )));
                 }
-                continue;
             }
-            transaction.execute(
-                "INSERT INTO scan_entries (generation_id, relative_path, digest, size)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![request.generation_id, entry.path, entry.digest, entry.size],
-            )?;
         }
-        // Count only newly stored rows (identical cross-batch re-deliveries do
-        // not inflate the count).
-        let fresh_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM scan_entries WHERE generation_id = ?1",
-            params![request.generation_id],
-            |row| row.get(0),
-        )?;
+        // The quota applies to rows this batch actually staged: an identical
+        // path re-delivered from an earlier batch does not consume quota.
+        if entry_count
+            .checked_add(inserted)
+            .is_none_or(|count| count > MAX_ENTRIES_PER_GENERATION)
+        {
+            return Err(MappingStoreError::Invalid(
+                "scan generation exceeds its entry quota".to_owned(),
+            ));
+        }
         transaction.execute(
-            "UPDATE scan_generations SET entry_count = ?2, next_sequence = next_sequence + 1, updated_at = ?3
+            "UPDATE scan_generations
+             SET entry_count = entry_count + ?2, next_sequence = next_sequence + 1, updated_at = ?3
              WHERE generation_id = ?1",
-            params![request.generation_id, fresh_count, now],
+            params![request.generation_id, inserted, now],
         )?;
         transaction.commit()?;
         self.generation_status(&request.generation_id)
@@ -596,6 +593,38 @@ impl MappingStore {
         transaction.commit()?;
         Ok(i64::try_from(removed).unwrap_or(i64::MAX))
     }
+}
+
+/// Loads the stored rows for one bounded batch of unique paths in a single
+/// query, so classifying a delivered entry never costs a query per entry.
+fn stored_entries(
+    transaction: &Transaction<'_>,
+    generation_id: &str,
+    entries: &[GenerationEntry],
+) -> Result<std::collections::HashMap<String, (i64, Option<String>)>, MappingStoreError> {
+    if entries.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let placeholders = vec!["?"; entries.len()].join(", ");
+    let mut statement = transaction.prepare_cached(&format!(
+        "SELECT relative_path, size, digest FROM scan_entries
+         WHERE generation_id = ?1 AND relative_path IN ({placeholders})"
+    ))?;
+    let mut rows = statement.query(params_from_iter(
+        std::iter::once(generation_id).chain(entries.iter().map(|entry| entry.path.as_str())),
+    ))?;
+    let mut stored = std::collections::HashMap::with_capacity(entries.len());
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let size: i64 = row.get(1)?;
+        let digest: Option<String> = row.get(2)?;
+        stored.insert(path, (size, digest));
+    }
+    Ok(stored)
+}
+
+fn stored_matches_entry(stored: Option<&(i64, Option<String>)>, entry: &GenerationEntry) -> bool {
+    matches!(stored, Some((size, digest)) if *size == entry.size && *digest == entry.digest)
 }
 
 fn require_mapping_participants(
@@ -940,6 +969,246 @@ mod tests {
         assert!(result.conflicts.is_empty());
     }
 
+    fn sealed_generation(store: &MappingStore, generation_id: &str, files: &[(&str, char)]) {
+        begin(store, generation_id);
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: generation_id.to_owned(),
+                sequence: 0,
+                entries: files
+                    .iter()
+                    .map(|(path, byte)| entry(path, *byte))
+                    .collect(),
+            })
+            .expect("append");
+        store
+            .seal_scan_generation(&SealGenerationRequest {
+                generation_id: generation_id.to_owned(),
+                expected_count: i64::try_from(files.len()).expect("count fits"),
+            })
+            .expect("seal");
+    }
+
+    fn observed(files: &[(&str, char)]) -> Vec<crate::file_sync::ObservedFile> {
+        files
+            .iter()
+            .map(|(path, byte)| crate::file_sync::ObservedFile {
+                path: (*path).to_owned(),
+                size: 4,
+                digest: byte.to_string().repeat(64),
+            })
+            .collect()
+    }
+
+    use crate::file_sync::{ConflictKind, SyncDirection};
+
+    type Files = &'static [(&'static str, char)];
+
+    type Outcome = (
+        usize,
+        i64,
+        Vec<(String, SyncDirection, String, Option<String>)>,
+        Vec<(String, ConflictKind, Option<String>, Option<String>)>,
+    );
+
+    fn outcome(result: &crate::file_sync::ReconcileResult) -> Outcome {
+        (
+            result.verified_count,
+            result.baseline_count,
+            result
+                .operations
+                .iter()
+                .map(|operation| {
+                    (
+                        operation.path.clone(),
+                        operation.direction,
+                        operation.source_digest.clone(),
+                        operation.expected_destination_digest.clone(),
+                    )
+                })
+                .collect(),
+            result
+                .conflicts
+                .iter()
+                .map(|conflict| {
+                    (
+                        conflict.path.clone(),
+                        conflict.kind,
+                        conflict.local_digest.clone(),
+                        conflict.remote_digest.clone(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The set-based generation planner must reach exactly the outcome of
+    /// the full-array planner for every planning category.
+    #[test]
+    fn set_based_generation_planning_matches_full_array_planning() {
+        let rounds: [(Files, Files, &str); 3] = [
+            (
+                // Uninitialized: identical paths are baselined, others are unbased.
+                &[
+                    ("same", 'a'),
+                    ("both", 'a'),
+                    ("local-only", 'a'),
+                    ("differs", 'a'),
+                    ("gone", 'a'),
+                    ("one-gone", 'a'),
+                ],
+                &[
+                    ("same", 'a'),
+                    ("both", 'a'),
+                    ("remote-only", 'a'),
+                    ("differs", 'b'),
+                    ("gone", 'a'),
+                    ("one-gone", 'a'),
+                ],
+                "two-way",
+            ),
+            (
+                &[
+                    ("same", 'a'),
+                    ("both", 'b'),
+                    ("local-new", 'c'),
+                    ("differs", 'a'),
+                    ("local-edit", 'd'),
+                    ("remote-edit", 'a'),
+                ],
+                &[
+                    ("same", 'a'),
+                    ("both", 'c'),
+                    ("remote-new", 'c'),
+                    ("differs", 'b'),
+                    ("local-edit", 'a'),
+                    ("remote-edit", 'e'),
+                    ("one-gone", 'a'),
+                ],
+                "two-way",
+            ),
+            (
+                &[("same", 'a'), ("local-new", 'c'), ("remote-edit", 'a')],
+                &[("same", 'a'), ("remote-new", 'c'), ("remote-edit", 'e')],
+                "send-only",
+            ),
+        ];
+        let arrays = active_store();
+        let generations = active_store();
+        // Round two edits paths that the first round baselined.
+        for (index, (local, remote, mode)) in rounds.iter().enumerate() {
+            let local_id = format!("gen-local-{index}");
+            let remote_id = format!("gen-remote-{index}");
+            sealed_generation(&generations, &local_id, local);
+            sealed_generation(&generations, &remote_id, remote);
+            let from_generations = generations
+                .reconcile_generations(&crate::file_sync::ReconcileGenerationsRequest {
+                    mapping_id: "mapping-1".to_owned(),
+                    local_generation_id: local_id,
+                    remote_generation_id: remote_id,
+                    mode: (*mode).to_owned(),
+                    observed_at: NOW.to_owned(),
+                    queue_operations: true,
+                })
+                .expect("reconcile generations");
+            let from_arrays = arrays
+                .reconcile_files(&crate::file_sync::ReconcileRequest {
+                    mapping_id: "mapping-1".to_owned(),
+                    local: observed(local),
+                    remote: observed(remote),
+                    mode: (*mode).to_owned(),
+                    observed_at: NOW.to_owned(),
+                    queue_operations: true,
+                    ignore_patterns: Vec::new(),
+                })
+                .expect("reconcile arrays");
+            assert_eq!(
+                outcome(&from_generations),
+                outcome(&from_arrays),
+                "round {index}"
+            );
+            assert!(
+                !from_arrays.operations.is_empty() || index == 0,
+                "round {index} exercises queued operations"
+            );
+        }
+    }
+
+    #[test]
+    fn a_generation_without_digests_cannot_be_planned() {
+        let store = active_store();
+        begin(&store, "gen-local");
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-local".to_owned(),
+                sequence: 0,
+                entries: vec![GenerationEntry {
+                    path: "a.txt".to_owned(),
+                    size: 4,
+                    digest: None,
+                }],
+            })
+            .expect("append");
+        store
+            .seal_scan_generation(&SealGenerationRequest {
+                generation_id: "gen-local".to_owned(),
+                expected_count: 1,
+            })
+            .expect("seal");
+        sealed_generation(&store, "gen-remote", &[("a.txt", 'a')]);
+        let result = store.reconcile_generations(&crate::file_sync::ReconcileGenerationsRequest {
+            mapping_id: "mapping-1".to_owned(),
+            local_generation_id: "gen-local".to_owned(),
+            remote_generation_id: "gen-remote".to_owned(),
+            mode: "two-way".to_owned(),
+            observed_at: NOW.to_owned(),
+            queue_operations: true,
+        });
+        assert!(matches!(result, Err(MappingStoreError::Invalid(_))));
+        assert_eq!(
+            store
+                .file_sync_state("mapping-1")
+                .expect("state")
+                .baseline_count,
+            0
+        );
+    }
+
+    #[test]
+    fn a_cross_batch_duplicate_counts_once_and_a_changed_one_is_rejected() {
+        let store = active_store();
+        begin(&store, "gen-1");
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-1".to_owned(),
+                sequence: 0,
+                entries: vec![entry("a.txt", 'a')],
+            })
+            .expect("append");
+        let repeated = store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-1".to_owned(),
+                sequence: 1,
+                entries: vec![entry("a.txt", 'a'), entry("b.txt", 'b')],
+            })
+            .expect("identical cross-batch duplicate");
+        assert_eq!((repeated.entry_count, repeated.next_sequence), (2, 2));
+        let changed = store.append_scan_batch(&AppendBatchRequest {
+            generation_id: "gen-1".to_owned(),
+            sequence: 2,
+            entries: vec![entry("c.txt", 'c'), entry("b.txt", 'x')],
+        });
+        assert!(changed.is_err());
+        let status = store.generation_status("gen-1").expect("status");
+        assert_eq!((status.entry_count, status.next_sequence), (2, 2));
+        store
+            .seal_scan_generation(&SealGenerationRequest {
+                generation_id: "gen-1".to_owned(),
+                expected_count: 2,
+            })
+            .expect("seal the rolled-back count");
+    }
+
     #[test]
     fn a_generation_cannot_be_read_through_another_mapping() {
         let store = active_store();
@@ -1004,7 +1273,10 @@ mod tests {
 
 #[cfg(test)]
 mod quota_tests {
-    use super::{BeginGenerationRequest, MAX_GENERATIONS_PER_MAPPING};
+    use super::{
+        AppendBatchRequest, BeginGenerationRequest, GenerationEntry, MAX_ENTRIES_PER_GENERATION,
+        MAX_GENERATIONS_PER_MAPPING,
+    };
     use crate::mapping::{LegacyImportRequest, MappingConfiguration, MappingStore};
 
     const NOW: &str = "2026-08-08T12:00:00Z";
@@ -1076,5 +1348,216 @@ mod quota_tests {
             hash_mode: "full-sha256".to_owned(),
         });
         assert!(overflow.is_err());
+    }
+
+    #[test]
+    fn quota_counts_inserted_rows_not_delivered_entries() {
+        let store = quota_store();
+        store
+            .begin_scan_generation(&BeginGenerationRequest {
+                generation_id: "gen-quota".to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                participant_device_id: "a-device".to_owned(),
+                mapping_revision: 1,
+                root: "/tmp/a".to_owned(),
+                ignore_patterns: Vec::new(),
+                hash_mode: "full-sha256".to_owned(),
+            })
+            .expect("begin");
+        let kept = GenerationEntry {
+            path: "kept.txt".to_owned(),
+            size: 4,
+            digest: Some("a".repeat(64)),
+        };
+        store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-quota".to_owned(),
+                sequence: 0,
+                entries: vec![kept.clone()],
+            })
+            .expect("append");
+        // Seed the generation one row below its quota; staging a million rows
+        // would only slow the test down.
+        store
+            .connection
+            .execute(
+                "UPDATE scan_generations SET entry_count = ?2 WHERE generation_id = ?1",
+                rusqlite::params!["gen-quota", MAX_ENTRIES_PER_GENERATION - 1],
+            )
+            .expect("seed the boundary count");
+        let boundary = store
+            .append_scan_batch(&AppendBatchRequest {
+                generation_id: "gen-quota".to_owned(),
+                sequence: 1,
+                entries: vec![
+                    kept,
+                    GenerationEntry {
+                        path: "new.txt".to_owned(),
+                        size: 4,
+                        digest: Some("b".repeat(64)),
+                    },
+                ],
+            })
+            .expect("an identical duplicate must not consume quota");
+        assert_eq!(boundary.entry_count, MAX_ENTRIES_PER_GENERATION);
+        let overflow = store.append_scan_batch(&AppendBatchRequest {
+            generation_id: "gen-quota".to_owned(),
+            sequence: 2,
+            entries: vec![GenerationEntry {
+                path: "overflow.txt".to_owned(),
+                size: 4,
+                digest: Some("c".repeat(64)),
+            }],
+        });
+        assert!(overflow.is_err());
+        let status = store.generation_status("gen-quota").expect("status");
+        assert_eq!(status.entry_count, MAX_ENTRIES_PER_GENERATION);
+        let staged: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM scan_entries
+                 WHERE generation_id = 'gen-quota' AND relative_path = 'overflow.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count the rejected row");
+        assert_eq!(staged, 0);
+    }
+}
+
+/// Release-mode scale measurement for staging and generation reconciliation.
+/// Run with `cargo test -p sync-storage --release -- --ignored --nocapture
+/// generation_scale`.
+#[cfg(test)]
+mod scale_tests {
+    use std::time::Instant;
+
+    use super::{
+        AppendBatchRequest, BeginGenerationRequest, GenerationEntry, MAX_BATCH_ENTRIES,
+        SealGenerationRequest,
+    };
+    use crate::file_sync::ReconcileGenerationsRequest;
+    use crate::mapping::{LegacyImportRequest, MappingConfiguration, MappingStore};
+
+    const NOW: &str = "2026-08-08T12:00:00Z";
+    const FILES_PER_SIDE: usize = 250_000;
+
+    fn file_store(path: &std::path::Path) -> MappingStore {
+        let store = MappingStore::open(path).expect("open store");
+        store
+            .import_legacy(&LegacyImportRequest {
+                source_fingerprint: "0".repeat(64),
+                importing_device_id: "a-device".to_owned(),
+                imported_at: NOW.to_owned(),
+                records: Vec::new(),
+            })
+            .expect("complete import");
+        store
+            .upsert_local(
+                &MappingConfiguration {
+                    id: "mapping-1".to_owned(),
+                    name: "Folder".to_owned(),
+                    initiator_device_id: "a-device".to_owned(),
+                    initiator_device_name: "A".to_owned(),
+                    responder_device_id: "b-device".to_owned(),
+                    responder_device_name: "B".to_owned(),
+                    initiator_path: "/tmp/a".to_owned(),
+                    responder_path: "/tmp/b".to_owned(),
+                    mode: "two-way".to_owned(),
+                    ignore_patterns: Vec::new(),
+                    history_days: 0,
+                    history_max_bytes: 0,
+                    max_file_bytes: None,
+                    setup_status: "active".to_owned(),
+                    paused: false,
+                    preview: None,
+                    created_at: NOW.to_owned(),
+                    updated_at: NOW.to_owned(),
+                },
+                "a-device",
+                None,
+                None,
+                NOW,
+            )
+            .expect("insert mapping");
+        store
+    }
+
+    fn stage(store: &MappingStore, generation_id: &str, changed: usize) -> std::time::Duration {
+        let started = Instant::now();
+        store
+            .begin_scan_generation(&BeginGenerationRequest {
+                generation_id: generation_id.to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                participant_device_id: "a-device".to_owned(),
+                mapping_revision: 1,
+                root: "/tmp/a".to_owned(),
+                ignore_patterns: Vec::new(),
+                hash_mode: "full-sha256".to_owned(),
+            })
+            .expect("begin");
+        let entries = (0..FILES_PER_SIDE)
+            .map(|index| GenerationEntry {
+                path: format!("dir-{:03}/file-{index:07}.bin", index % 500),
+                size: i64::try_from(index).expect("index fits"),
+                digest: Some(format!(
+                    "{:064x}",
+                    if index < changed { index + 1 } else { index }
+                )),
+            })
+            .collect::<Vec<_>>();
+        for (sequence, batch) in entries.chunks(MAX_BATCH_ENTRIES).enumerate() {
+            store
+                .append_scan_batch(&AppendBatchRequest {
+                    generation_id: generation_id.to_owned(),
+                    sequence: i64::try_from(sequence).expect("sequence fits"),
+                    entries: batch.to_vec(),
+                })
+                .expect("append");
+        }
+        store
+            .seal_scan_generation(&SealGenerationRequest {
+                generation_id: generation_id.to_owned(),
+                expected_count: i64::try_from(FILES_PER_SIDE).expect("count fits"),
+            })
+            .expect("seal");
+        started.elapsed()
+    }
+
+    fn reconcile(store: &MappingStore, local: &str, remote: &str) -> (std::time::Duration, usize) {
+        let started = Instant::now();
+        let result = store
+            .reconcile_generations(&ReconcileGenerationsRequest {
+                mapping_id: "mapping-1".to_owned(),
+                local_generation_id: local.to_owned(),
+                remote_generation_id: remote.to_owned(),
+                mode: "two-way".to_owned(),
+                observed_at: NOW.to_owned(),
+                queue_operations: true,
+            })
+            .expect("reconcile");
+        (
+            started.elapsed(),
+            result.operations.len() + result.conflicts.len(),
+        )
+    }
+
+    #[test]
+    #[ignore = "release-mode scale measurement"]
+    fn generation_scale() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = file_store(&directory.path().join("scale.sqlite3"));
+        let local = stage(&store, "gen-local-1", 0);
+        let remote = stage(&store, "gen-remote-1", 0);
+        println!("stage {FILES_PER_SIDE} files: local {local:?}, remote {remote:?}");
+        let (first, _) = reconcile(&store, "gen-local-1", "gen-remote-1");
+        println!("first reconcile (baselines recorded): {first:?}");
+        let (unchanged, _) = reconcile(&store, "gen-local-1", "gen-remote-1");
+        println!("unchanged reconcile: {unchanged:?}");
+        store.abort_scan_generation("gen-local-1").ok();
+        stage(&store, "gen-local-2", 1_000);
+        let (changed, items) = reconcile(&store, "gen-local-2", "gen-remote-1");
+        println!("reconcile with 1000 local changes: {changed:?} ({items} operations/conflicts)");
+        assert_eq!(items, 1_000);
     }
 }

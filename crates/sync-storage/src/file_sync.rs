@@ -147,8 +147,6 @@ pub struct ReconcileGenerationsRequest {
     pub queue_operations: bool,
 }
 
-const GENERATION_RECONCILE_PAGE: i64 = 1_000;
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolveConflictRequest {
@@ -300,11 +298,12 @@ impl MappingStore {
             })
     }
 
-    /// Reconciles two sealed scan generations with bounded indexed reads.
+    /// Reconciles two sealed scan generations with set-based indexed reads.
     ///
-    /// Observations are streamed in ordered pages and merged without ever
-    /// materialising full manifests, baselines, or path sets. The completed
-    /// plan is published atomically; a failure commits nothing. Incomplete
+    /// Identical paths are baselined inside `SQLite`; only differing paths are
+    /// streamed out for planning, so memory follows the number of differences
+    /// rather than the folder size. The completed plan is published
+    /// atomically; a failure commits nothing. Incomplete
     /// generations are invisible: only `sealed` generations with matching
     /// mapping, revision, and full SHA-256 digests are accepted.
     ///
@@ -1348,16 +1347,12 @@ fn validate_generations_request(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct GenerationObserved {
-    digest: String,
-    size: i64,
-}
-
-/// Streams two sealed generations and the baseline in path order, planning
-/// without materialising any full set. Baseline advances for identical paths
-/// are applied inline within the same transaction.
-#[allow(clippy::too_many_lines)]
+/// Plans two sealed generations against the baseline with set-based reads.
+///
+/// Identical pairs, almost every path in a steady-state folder, never leave
+/// `SQLite`: one statement advances their baselines. Only paths that differ
+/// are streamed back, in path order, so work outside the database is
+/// proportional to the number of differences rather than the folder size.
 fn plan_generations_reconciliation(
     transaction: &Transaction<'_>,
     request: &ReconcileGenerationsRequest,
@@ -1370,186 +1365,160 @@ fn plan_generations_reconciliation(
         operations: Vec::new(),
         conflicts: Vec::new(),
     };
-    let mut cursor: Option<String> = None;
-    loop {
-        let (paths, next) = read_distinct_paths_page(
-            transaction,
-            &request.mapping_id,
-            local_generation,
-            remote_generation,
-            cursor.as_deref(),
-            GENERATION_RECONCILE_PAGE,
-        )?;
-        if paths.is_empty() {
-            break;
-        }
-        for path in &paths {
-            let local_file = read_generation_entry(transaction, local_generation, path)?;
-            let remote_file = read_generation_entry(transaction, remote_generation, path)?;
-            let baseline = read_baseline_entry(transaction, &request.mapping_id, path)?;
-            match (local_file, remote_file) {
-                (Some(local_file), Some(remote_file))
-                    if local_file.digest == remote_file.digest =>
-                {
-                    upsert_baseline(
-                        transaction,
-                        &request.mapping_id,
-                        path,
-                        &local_file.digest,
-                        local_file.size,
-                        &request.observed_at,
-                    )?;
-                    plan.verified_count += 1;
-                }
-                (Some(local_file), Some(remote_file)) => {
-                    let local = ObservedFile {
-                        path: path.clone(),
-                        size: local_file.size,
-                        digest: local_file.digest.clone(),
-                    };
-                    let remote = ObservedFile {
-                        path: path.clone(),
-                        size: remote_file.size,
-                        digest: remote_file.digest.clone(),
-                    };
-                    plan_divergent_pair(
-                        path,
-                        &local,
-                        &remote,
-                        baseline.as_ref(),
-                        &request.mode,
-                        &mut plan.operations,
-                        &mut plan.conflicts,
-                    );
-                }
-                (Some(file), None) => {
-                    let observed = ObservedFile {
-                        path: path.clone(),
-                        size: file.size,
-                        digest: file.digest.clone(),
-                    };
-                    plan_one_sided(
-                        path,
-                        &observed,
-                        true,
-                        baseline.is_some(),
-                        initialized,
-                        &request.mode,
-                        &mut plan,
-                    );
-                }
-                (None, Some(file)) => {
-                    let observed = ObservedFile {
-                        path: path.clone(),
-                        size: file.size,
-                        digest: file.digest.clone(),
-                    };
-                    plan_one_sided(
-                        path,
-                        &observed,
-                        false,
-                        baseline.is_some(),
-                        initialized,
-                        &request.mode,
-                        &mut plan,
-                    );
-                }
-                (None, None) => {
-                    plan.conflicts.push(PlannedConflict {
-                        path: path.clone(),
-                        kind: ConflictKind::DeletionNotPropagated,
-                        local_digest: None,
-                        remote_digest: None,
-                    });
-                }
-            }
-        }
-        match next {
-            Some(next_cursor) => cursor = Some(next_cursor),
-            None => break,
+    let mut differences = transaction.prepare(
+        "SELECT local.relative_path, local.digest, local.size,
+                remote.digest, remote.size, baseline.digest, baseline.size
+         FROM scan_entries AS local
+         LEFT JOIN scan_entries AS remote
+           ON remote.generation_id = ?2 AND remote.relative_path = local.relative_path
+         LEFT JOIN file_sync_baselines AS baseline
+           ON baseline.mapping_id = ?3 AND baseline.relative_path = local.relative_path
+         WHERE local.generation_id = ?1
+           AND (remote.digest IS NULL OR local.digest IS NULL OR remote.digest <> local.digest)
+         UNION ALL
+         SELECT remote.relative_path, NULL, NULL,
+                remote.digest, remote.size, baseline.digest, baseline.size
+         FROM scan_entries AS remote
+         LEFT JOIN file_sync_baselines AS baseline
+           ON baseline.mapping_id = ?3 AND baseline.relative_path = remote.relative_path
+         WHERE remote.generation_id = ?2
+           AND NOT EXISTS (
+               SELECT 1 FROM scan_entries AS local
+               WHERE local.generation_id = ?1 AND local.relative_path = remote.relative_path
+           )
+         UNION ALL
+         SELECT baseline.relative_path, NULL, NULL, NULL, NULL, baseline.digest, baseline.size
+         FROM file_sync_baselines AS baseline
+         WHERE baseline.mapping_id = ?3
+           AND NOT EXISTS (
+               SELECT 1 FROM scan_entries AS local
+               WHERE local.generation_id = ?1 AND local.relative_path = baseline.relative_path
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM scan_entries AS remote
+               WHERE remote.generation_id = ?2 AND remote.relative_path = baseline.relative_path
+           )
+         ORDER BY 1",
+    )?;
+    let mut rows = differences.query(params![
+        local_generation,
+        remote_generation,
+        request.mapping_id
+    ])?;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let local_file = generation_observation(&path, row.get(1)?, row.get(2)?)?;
+        let remote_file = generation_observation(&path, row.get(3)?, row.get(4)?)?;
+        let baseline: Option<(String, i64)> = match (row.get(5)?, row.get(6)?) {
+            (Some(digest), Some(size)) => Some((digest, size)),
+            _ => None,
+        };
+        match (local_file, remote_file) {
+            (Some(local), Some(remote)) => plan_divergent_pair(
+                &path,
+                &local,
+                &remote,
+                baseline.as_ref(),
+                &request.mode,
+                &mut plan.operations,
+                &mut plan.conflicts,
+            ),
+            (Some(file), None) => plan_one_sided(
+                &path,
+                &file,
+                true,
+                baseline.is_some(),
+                initialized,
+                &request.mode,
+                &mut plan,
+            ),
+            (None, Some(file)) => plan_one_sided(
+                &path,
+                &file,
+                false,
+                baseline.is_some(),
+                initialized,
+                &request.mode,
+                &mut plan,
+            ),
+            (None, None) => plan.conflicts.push(PlannedConflict {
+                path,
+                kind: ConflictKind::DeletionNotPropagated,
+                local_digest: None,
+                remote_digest: None,
+            }),
         }
     }
+    drop(rows);
+    drop(differences);
+    plan.verified_count = advance_identical_generation_baselines(
+        transaction,
+        &request.mapping_id,
+        local_generation,
+        remote_generation,
+        &request.observed_at,
+    )?;
     Ok(plan)
 }
 
-fn read_distinct_paths_page(
+/// Converts one side of a streamed difference row. Every staged digest was
+/// validated on append; a missing digest means the scan was not a full
+/// SHA-256 observation and cannot be planned.
+fn generation_observation(
+    path: &str,
+    digest: Option<String>,
+    size: Option<i64>,
+) -> Result<Option<ObservedFile>, MappingStoreError> {
+    match (digest, size) {
+        (None, None) => Ok(None),
+        (Some(digest), Some(size)) => {
+            validate_digest(&digest)?;
+            Ok(Some(ObservedFile {
+                path: path.to_owned(),
+                size,
+                digest,
+            }))
+        }
+        _ => Err(MappingStoreError::Invalid(
+            "generation reconciliation requires full SHA-256 observations".to_owned(),
+        )),
+    }
+}
+
+/// Records the verified common baseline for every path both generations
+/// observed with the same digest, and returns how many such paths exist.
+/// Rows whose stored baseline already matches are left untouched.
+fn advance_identical_generation_baselines(
     transaction: &Transaction<'_>,
     mapping_id: &str,
     local_generation: &str,
     remote_generation: &str,
-    cursor: Option<&str>,
-    limit: i64,
-) -> Result<(Vec<String>, Option<String>), MappingStoreError> {
-    let mut statement = transaction.prepare(
-        "SELECT path FROM (
-            SELECT relative_path AS path FROM scan_entries WHERE generation_id = ?1
-            UNION
-            SELECT relative_path AS path FROM scan_entries WHERE generation_id = ?2
-            UNION
-            SELECT relative_path AS path FROM file_sync_baselines WHERE mapping_id = ?3
-        ) WHERE (?4 IS NULL OR path > ?4)
-        ORDER BY path LIMIT ?5",
+    verified_at: &str,
+) -> Result<usize, MappingStoreError> {
+    transaction.execute(
+        "INSERT INTO file_sync_baselines (mapping_id, relative_path, digest, size, verified_at)
+         SELECT ?3, local.relative_path, local.digest, local.size, ?4
+         FROM scan_entries AS local
+         JOIN scan_entries AS remote
+           ON remote.generation_id = ?2 AND remote.relative_path = local.relative_path
+         WHERE local.generation_id = ?1 AND local.digest = remote.digest
+         ON CONFLICT(mapping_id, relative_path) DO UPDATE SET
+            digest = excluded.digest, size = excluded.size, verified_at = excluded.verified_at
+         WHERE file_sync_baselines.digest <> excluded.digest
+            OR file_sync_baselines.size <> excluded.size",
+        params![local_generation, remote_generation, mapping_id, verified_at],
     )?;
-    let rows = statement.query_map(
-        params![
-            local_generation,
-            remote_generation,
-            mapping_id,
-            cursor,
-            limit + 1
-        ],
-        |row| row.get::<_, String>(0),
+    let identical: i64 = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM scan_entries AS local
+         JOIN scan_entries AS remote
+           ON remote.generation_id = ?2 AND remote.relative_path = local.relative_path
+         WHERE local.generation_id = ?1 AND local.digest = remote.digest",
+        params![local_generation, remote_generation],
+        |row| row.get(0),
     )?;
-    let mut paths = Vec::new();
-    for row in rows {
-        paths.push(row?);
-    }
-    let next = if i64::try_from(paths.len()).unwrap_or(i64::MAX) > limit {
-        paths.pop();
-        paths.last().cloned()
-    } else {
-        None
-    };
-    Ok((paths, next))
-}
-
-fn read_generation_entry(
-    transaction: &Transaction<'_>,
-    generation_id: &str,
-    path: &str,
-) -> Result<Option<GenerationObserved>, MappingStoreError> {
-    let row: Option<(Option<String>, i64)> = transaction
-        .query_row(
-            "SELECT digest, size FROM scan_entries WHERE generation_id = ?1 AND relative_path = ?2",
-            params![generation_id, path],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    match row {
-        None => Ok(None),
-        Some((None, _)) => Err(MappingStoreError::Invalid(
-            "generation reconciliation requires full SHA-256 observations".to_owned(),
-        )),
-        Some((Some(digest), size)) => {
-            validate_digest(&digest)?;
-            Ok(Some(GenerationObserved { digest, size }))
-        }
-    }
-}
-
-fn read_baseline_entry(
-    transaction: &Transaction<'_>,
-    mapping_id: &str,
-    path: &str,
-) -> Result<Option<(String, i64)>, MappingStoreError> {
-    transaction
-        .query_row(
-            "SELECT digest, size FROM file_sync_baselines WHERE mapping_id = ?1 AND relative_path = ?2",
-            params![mapping_id, path],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(Into::into)
+    usize::try_from(identical)
+        .map_err(|_| MappingStoreError::Invalid("identical path count is out of range".to_owned()))
 }
 
 fn persist_generations_reconciliation(
