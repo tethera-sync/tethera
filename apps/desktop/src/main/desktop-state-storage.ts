@@ -20,6 +20,11 @@ export interface PersistedInitialSyncOutcome {
   conflicts: Array<{ path: string; reason: string }>
   /** Inaccessible items the user chose to skip; absent in state written before this was recorded. */
   unreadableSkipped?: Array<{ path: string; reason: string }>
+  /**
+   * Total same-path conflicts observed, including records beyond the bounded
+   * `conflicts` sample. Absent in state written before this was recorded.
+   */
+  conflictsTotal?: number
 }
 
 const TRANSIENT_STATE_FIELDS = [

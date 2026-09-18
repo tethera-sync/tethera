@@ -2,6 +2,8 @@
 
 All notable changes to this project, newest first.
 
+- ✨ Merge large folders between updated computers without holding a full file list on either side: the initial merge now stages both scans and copies from a paged, read-only plan. Older versions keep the full-manifest merge.
+- 🐛 Plan the initial merge before copying anything, including the free-space check on both computers, case-only folder-name aliases, unreadable items and paths already in use on the receiving computer.
 - ✨ Sync large folders through staged scans: a changed check now reconciles what differs instead of holding a full file list on each computer. Both computers need the update; older versions keep the current behaviour.
 - 🐛 Clean up staged scans left behind by a crash or forced quit the next time Tethera starts, so a folder can keep syncing.
 - ✨ Scan whole folders with no file-count limit. The Scan file limit setting is gone, and a sync check now accepts up to 1,000,000 files per computer instead of rejecting folders above 10,000.

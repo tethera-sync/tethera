@@ -5,6 +5,7 @@ import type { FolderScanIssue, SyncMode } from "../shared/contracts"
 import type { FileManifest, FileManifestEntry } from "./folder-manifest"
 import { createDestinationOccupancyCheck, createScanIssueBlocklist, findCaseCollisions, manifestEntriesMatch } from "./folder-manifest"
 import { isTetheraStagingPath, resolveWithinRoot } from "./path-safety"
+import { SCAN_GENERATION_CAPABILITY } from "./scan-generation"
 import { describeTransferFile, FileChangedError, isSha256HexDigest } from "./file-transfer"
 import { formatBytes } from "../shared/byte-format"
 import { invertMode } from "../shared/folder-sharing-consent"
@@ -20,6 +21,22 @@ const MIN_FREE_SPACE_AFTER_TRANSFER = 64 * 1024 * 1024
 /** Kept spare once a whole merge has landed, so the operating system and other apps keep working. */
 const INITIAL_MERGE_FREE_SPACE_RESERVE = 1024 ** 3
 export const INITIAL_MERGE_FREE_SPACE_CAPABILITY = "initial-merge-free-space-v1"
+/**
+ * Both participants can stage their merge scans as sealed generations and plan
+ * additively from them. Advertised separately from `scan-generations-v1`
+ * because a build that stages continuous generations does not necessarily
+ * implement the merge scan request or the additive plan.
+ */
+export const INITIAL_MERGE_GENERATIONS_CAPABILITY = "initial-merge-generations-v1"
+
+/**
+ * Whether both peers can stage and plan an initial merge from sealed
+ * generations. The merge request stages a generation, so the continuous
+ * generation capability is required alongside the merge-specific one.
+ */
+export function shouldUseMergeGenerations(capabilities: ReadonlySet<string>): boolean {
+  return capabilities.has(SCAN_GENERATION_CAPABILITY) && capabilities.has(INITIAL_MERGE_GENERATIONS_CAPABILITY)
+}
 const INITIAL_CONFLICT_REASON = "Exists on both computers with different content; both copies were preserved for review in Recovery."
 /** Merge attempts before files that keep changing stop the merge instead of being merged again. */
 const MAX_INITIAL_MERGE_ATTEMPTS = 3
@@ -27,19 +44,22 @@ const MAX_INITIAL_MERGE_ATTEMPTS = 3
 /** Final verification still found files on only one computer: they appeared or changed during the copy. */
 export class InitialMergeChangedError extends Error {
   readonly pendingPaths: readonly string[]
+  /** True changing-file count, when only a bounded sample was retained. */
+  readonly pendingTotal: number
 
-  constructor(pendingPaths: readonly string[]) {
+  constructor(pendingPaths: readonly string[], pendingTotal = pendingPaths.length) {
     super(
-      `Files kept changing while the initial merge ran (${describePathSample(pendingPaths)}). The copied files are safe. ` +
+      `Files kept changing while the initial merge ran (${describePathSample(pendingPaths, pendingTotal)}). The copied files are safe. ` +
       "Close programs that are writing to these files or add ignore rules for them, then retry.",
     )
     this.pendingPaths = pendingPaths
+    this.pendingTotal = pendingTotal
   }
 }
 
-export function describePathSample(paths: readonly string[]): string {
+export function describePathSample(paths: readonly string[], total = paths.length): string {
   const shown = paths.slice(0, 3).join(", ")
-  const remaining = paths.length - 3
+  const remaining = total - Math.min(paths.length, 3)
   return remaining > 0 ? `${shown} and ${remaining.toLocaleString("en-GB")} more` : shown
 }
 
@@ -127,6 +147,16 @@ export interface SyncSkip {
   reason: string
 }
 
+/** A same-path file difference the merge leaves untouched on both computers. */
+export function initialSyncConflictSkip(path: string): SyncSkip {
+  return { path, reason: INITIAL_CONFLICT_REASON }
+}
+
+/** The one message for case-only aliases, shared by the manifest and generation paths. */
+export function initialMergeCaseCollisionMessage(collisions: readonly string[]): string {
+  return `Folder names differ only by capitalisation: ${collisions.slice(0, 3).join(", ")}. Windows treats these as the same path. Match the names on both computers or exclude these folders in the ignore rules before merging. Both copies have been preserved.`
+}
+
 export interface SyncPlan {
   toPull: FileManifestEntry[]
   skipped: SyncSkip[]
@@ -138,9 +168,15 @@ export interface InitialSyncPassResult {
   copiedFiles: number
   copiedBytes: number
   fileCount: number
+  /** Bounded sample of same-path conflicts; the total is reported by `skippedTotal`. */
   skipped: SyncSkip[]
   /** Unreadable items the merge skipped after the user chose to continue. */
   unreadableSkipped: SyncSkip[]
+  /**
+   * Total same-path skips this pass observed, including records beyond the
+   * bounded sample. Older peers omit it, so callers fall back to the sample.
+   */
+  skippedTotal?: number
 }
 
 export interface InitialMergeConvergence {
@@ -214,7 +250,7 @@ export function assertInitialMergePathCompatibility(local: FileManifest, remote:
   if (!hasWindowsPeer) return
   const collisions = findCaseCollisions([...local.files, ...remote.files])
   if (collisions.length === 0) return
-  throw new Error(`Folder names differ only by capitalisation: ${collisions.slice(0, 3).join(", ")}. Windows treats these as the same path. Match the names on both computers or exclude these folders in the ignore rules before merging. Both copies have been preserved.`)
+  throw new Error(initialMergeCaseCollisionMessage(collisions))
 }
 
 /**
@@ -245,10 +281,7 @@ export function computeSyncPlan(local: FileManifest, remote: FileManifest, mode:
 
     if (manifestEntriesMatch(localEntry, remoteEntry)) continue
 
-    skipped.push({
-      path: remoteEntry.path,
-      reason: INITIAL_CONFLICT_REASON,
-    })
+    skipped.push(initialSyncConflictSkip(remoteEntry.path))
   }
 
   return { toPull, skipped, occupied }

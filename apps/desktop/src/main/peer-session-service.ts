@@ -145,6 +145,15 @@ export interface PeerSessionServiceOptions {
   testTiming?: PeerSessionTimingOptions
 }
 
+/**
+ * Request types whose responder may stream advisory scan-progress frames while
+ * it works. Kept in one place so the requester's option check, the response
+ * reader selection and the responder's context all agree.
+ */
+function requestSupportsScanProgress(type: string): boolean {
+  return type === "scan-manifest" || type === "initial-sync-generation-scan"
+}
+
 export class PeerSessionService extends EventEmitter {
   readonly #options: PeerSessionServiceOptions
   #server: Server | null = null
@@ -198,12 +207,12 @@ export class PeerSessionService extends EventEmitter {
     if (!peer) throw new Error("This computer is not trusted.")
     if (!peer.address) throw new Error(`${peer.name} is offline or has no known LAN address.`)
     if (options.signal?.aborted) throw new Error("The peer request was cancelled before it started.")
-    const isScanManifest = request.type === "scan-manifest"
+    const supportsProgress = requestSupportsScanProgress(request.type)
     const acceptsProgress = options.onProgress !== undefined
-    const requestsProgress = isScanManifest && request.reportProgress === true
+    const requestsProgress = supportsProgress && request.reportProgress === true
     if (acceptsProgress !== requestsProgress) {
       throw peerSessionError(
-        "Scan progress can only be requested for an opted-in scan-manifest request.",
+        "Scan progress can only be requested for an opted-in scan request.",
         "PEER_SCAN_PROGRESS_OPTIONS",
       )
     }
@@ -283,7 +292,7 @@ export class PeerSessionService extends EventEmitter {
       const requestId = randomUUID()
       if (options.chunked) await connection.writeAll(encryptChunks(key, sessionId, requestId, "request", request))
       else connection.write(encryptFrame(key, sessionId, requestId, "request", request))
-      if (isScanManifest) {
+      if (supportsProgress) {
         return await this.#readScanResponse<T>(connection, key, sessionId, requestId, timeoutMs, options)
       }
       // One exchange-wide deadline bounds every chunk read: without it a peer
@@ -449,7 +458,7 @@ export class PeerSessionService extends EventEmitter {
       const request = frame.type === "secure-chunk"
         ? await readChunkedMessage<PeerRequest>(frame, readRequestFrame, key, first.sessionId, frame.requestId, "request")
         : decryptFrame<PeerRequest>(key, first.sessionId, "request", frame)
-      const canReportProgress = request.type === "scan-manifest" && request.reportProgress === true
+      const canReportProgress = requestSupportsScanProgress(request.type) && request.reportProgress === true
       const context: PeerRequestContext = {
         peerId: peer.id,
         peerName: peer.name,

@@ -11,12 +11,24 @@ import {
   InitialMergeChangedError,
   mergeInitialSyncFile,
   runCoordinatedInitialMerge,
+  shouldUseMergeGenerations,
   writeFileAtomic,
   writeFileChunksAtomic,
 } from "../src/main/initial-sync"
 import { createScanIssueBlocklist, type FileManifest } from "../src/main/folder-manifest"
+import { SCAN_GENERATION_CAPABILITY } from "../src/main/scan-generation"
 import { archiveObjectPath } from "../src/main/version-archive"
 import { manifest, sha256Hex } from "./helpers"
+
+describe("shouldUseMergeGenerations", () => {
+  test("requires both the generation and merge-generation capabilities", () => {
+    const merge = new Set(["initial-merge-generations-v1"])
+    expect(shouldUseMergeGenerations(new Set([SCAN_GENERATION_CAPABILITY]))).toBe(false)
+    expect(shouldUseMergeGenerations(merge)).toBe(false)
+    expect(shouldUseMergeGenerations(new Set([SCAN_GENERATION_CAPABILITY, ...merge]))).toBe(true)
+    expect(shouldUseMergeGenerations(new Set())).toBe(false)
+  })
+})
 
 describe("createScanIssueBlocklist", () => {
   test("blocks a directory subtree, only the exact path for a file, and the whole tree for the root", () => {

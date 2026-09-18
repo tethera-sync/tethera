@@ -430,7 +430,10 @@ export function validateInitialSyncPassResult(value: unknown): InitialSyncPassRe
     !isBoundedSkipArray(result.skipped) ||
     // Older peers do not report skipped inaccessible items; that is an empty
     // list, never an invalid result.
-    (result.unreadableSkipped !== undefined && !isBoundedSkipArray(result.unreadableSkipped))
+    (result.unreadableSkipped !== undefined && !isBoundedSkipArray(result.unreadableSkipped)) ||
+    // Older peers omit the total; when present it must cover the retained sample.
+    (result.skippedTotal !== undefined &&
+      (typeof result.skippedTotal !== "number" || !Number.isSafeInteger(result.skippedTotal) || result.skippedTotal < result.skipped.length))
   ) {
     throw new Error("The peer returned an invalid initial-merge result.")
   }
@@ -440,6 +443,7 @@ export function validateInitialSyncPassResult(value: unknown): InitialSyncPassRe
     fileCount: result.fileCount,
     skipped: result.skipped,
     unreadableSkipped: result.unreadableSkipped ?? [],
+    ...(result.skippedTotal !== undefined ? { skippedTotal: result.skippedTotal } : {}),
   }
 }
 

@@ -477,6 +477,30 @@ describe("peer transfer parsing", () => {
     ).toThrow("The peer returned an invalid initial-merge result.")
   })
 
+  test("carries a bounded conflict sample's true total", () => {
+    expect(
+      validateInitialSyncPassResult({
+        copiedFiles: 0,
+        copiedBytes: 0,
+        fileCount: 0,
+        skipped: [{ path: "a.txt", reason: "diverged" }],
+        skippedTotal: 12_000,
+      }).skippedTotal,
+    ).toBe(12_000)
+    expect(() =>
+      validateInitialSyncPassResult({ copiedFiles: 0, copiedBytes: 0, fileCount: 0, skipped: [], skippedTotal: -1 }),
+    ).toThrow("The peer returned an invalid initial-merge result.")
+    expect(() =>
+      validateInitialSyncPassResult({
+        copiedFiles: 0,
+        copiedBytes: 0,
+        fileCount: 0,
+        skipped: [{ path: "a.txt", reason: "diverged" }],
+        skippedTotal: 0,
+      }),
+    ).toThrow("The peer returned an invalid initial-merge result.")
+  })
+
   test("accepts a well-formed continuous-sync operation", () => {
     expect(
       validateContinuousOperationRequest({ type: "op", folderId: "m", path: "a.txt", digest: DIGEST, size: 5 }),

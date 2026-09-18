@@ -60,7 +60,7 @@ import {
   type MappingStoreHealth,
 } from "./engine-supervisor"
 import {
-  compareManifests, filesystemSupportsDigestReuse, isManifestPathIgnored, isScanCancelled, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
+  compareManifests, filesystemSupportsDigestReuse, isManifestPathIgnored, isScanCancelled, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type FileManifestEntry, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
 } from "./folder-manifest"
 import { globalScanCoordinator } from "./scan-coordinator"
 import { runPairedScans } from "./paired-scan"
@@ -72,9 +72,11 @@ import { invertMode, sharingWidening } from "../shared/folder-sharing-consent"
 import {
   fetchPeerGenerationPages,
   parsePeerGenerationScanReply,
+  parsePeerMergeGenerationScanReply,
   SCAN_GENERATION_CAPABILITY,
   SCAN_PAGE_MAX_ENTRIES,
   type PeerGenerationScanReply,
+  type PeerMergeGenerationScanReply,
   type PeerPageClient,
 } from "./scan-generation"
 import {
@@ -84,6 +86,14 @@ import {
   type StagedGeneration,
 } from "./generation-staging"
 import {
+  ADDITIVE_PLAN_PAGE_ENTRIES,
+  blockedPathsFromScanIssues,
+  continueAdditivePlan,
+  requestAdditivePlanPage,
+  type AdditivePlanPage,
+  type AdditivePlanRequest,
+} from "./initial-merge-plan"
+import {
   assessInitialMergeConvergence,
   assertInitialMergeCapacity,
   assertInitialMergePathCompatibility,
@@ -91,7 +101,11 @@ import {
   computeSyncPlan,
   describePathSample,
   INITIAL_MERGE_FREE_SPACE_CAPABILITY,
+  INITIAL_MERGE_GENERATIONS_CAPABILITY,
   InitialMergeChangedError,
+  shouldUseMergeGenerations,
+  initialMergeCaseCollisionMessage,
+  initialSyncConflictSkip,
   mergeInitialSyncFile,
   plannedBytes,
   type InitialSyncPassResult,
@@ -147,6 +161,7 @@ import {
   applySettingUpdate,
   isBoundedSkipArray,
   isSourceUnavailableResponse,
+  MAX_PERSISTED_SKIP_ENTRIES,
   MAX_PERSISTED_SKIP_REASON_LENGTH,
   restorePersistedSettings,
   parseArchiveHistoryRequest,
@@ -282,6 +297,8 @@ const INITIAL_SYNC_LEASE_MS = 35 * 60_000
 const INITIAL_SYNC_HEARTBEAT_MS = 5 * 60_000
 const MAX_CONCURRENT_CONTINUOUS_CYCLES = 2
 const CONTINUOUS_SYNC_RPC_TIMEOUT_MS = 5 * 60_000
+/** A merge plan's first page classifies the whole difference set, so it gets the same long bound as a reconcile. */
+const INITIAL_MERGE_RPC_TIMEOUT_MS = 5 * 60_000
 const CONFLICT_RESOLUTION_CONFIRM_TIMEOUT_MS = 15_000
 const CONTINUOUS_SYNC_RETRY_MS = 5_000
 const CONTINUOUS_SYNC_CAPACITY_RETRY_MS = 1_000
@@ -730,6 +747,122 @@ async function requestPeerGenerationScan(
 }
 
 /**
+ * Asks the peer to stage and seal its own scan for an approved initial merge,
+ * then reports its generation id, counters and bounded inaccessible paths.
+ * Only sent to peers that advertise `initial-merge-generations-v1`. A
+ * supporting peer relays its scan counters when `onProgress` is given, exactly
+ * like the manifest merge's `reportProgress`.
+ */
+async function requestPeerMergingGenerationScan(
+  peerId: string,
+  folderId: string,
+  signal: AbortSignal,
+  onProgress?: (progress: PeerScanProgress) => void,
+): Promise<PeerMergeGenerationScanReply> {
+  const request = onProgress
+    ? { type: "initial-sync-generation-scan", folderId, reportProgress: true }
+    : { type: "initial-sync-generation-scan", folderId }
+  const raw = await requirePeerSessions().request<unknown>(
+    peerId,
+    request,
+    NO_PEER_RESPONSE_DEADLINE,
+    { signal, ...(onProgress ? { onProgress } : {}) },
+  )
+  return parsePeerMergeGenerationScanReply(raw)
+}
+
+/**
+ * Stages this computer's own merge scan as a sealed generation, through the
+ * same digest cache, admission and cancellation as every other full-integrity
+ * walk. The caller releases it; an aborted stage leaves nothing behind. The
+ * scan key names the workflow stage, so the ledger shows a verification walk
+ * as `verify`, not as another merge walk.
+ */
+function stageMergingLocalGeneration(
+  folder: FolderSummary,
+  record: MappingRecord,
+  signal: AbortSignal,
+  purpose: Extract<FolderWorkActivity, { kind: "scanning" }>["purpose"],
+  onUnreadable: (issue: FolderScanIssue) => void,
+): Promise<StagedGeneration> {
+  const folderId = folder.id
+  const stage = purpose === "verify" ? "verify" : "initial"
+  return withFolderDigestCache(folderId, (digestCache) =>
+    runAdmittedScan(`${stage}:generation:${folderId}`, folderId, signal, (effective) =>
+      stageLocalGeneration(engine, {
+        mappingId: folderId,
+        participantDeviceId: getLocalIdentityId(),
+        mappingRevision: record.revision,
+        root: folder.localPath,
+        ignorePatterns: folder.ignorePatterns,
+        signal: effective,
+        digestCache,
+        reuse: scanReuseSeeds.lookup(folder.localPath, folder.ignorePatterns),
+        onUnreadable,
+        onActivity: (activity) => reportScanCounts(folderId, purpose, { local: activity }),
+        ...directoryScanOptions(folderId),
+      })))
+}
+
+/** One staged pair of merge generations with a release that is safe to call once. */
+interface StagedMergeGenerations {
+  localStaged: StagedGeneration
+  incoming: StagedGeneration
+  peerScan: PeerMergeGenerationScanReply
+  /** Complete local block set for planning; never bounded like the exchanged report. */
+  localBlocked: FolderScanIssue[]
+  release: () => Promise<void>
+}
+
+/**
+ * Stages both computers' full-integrity scans for one merge pass or
+ * convergence check and returns them together with their release. A failure
+ * releases whatever was already staged, so a partial pass leaves nothing
+ * behind, and both workflows share one staging path so their cache, admission,
+ * progress and release behaviour cannot drift apart.
+ */
+async function stageMergeGenerations(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  record: MappingRecord,
+  purpose: "initial-merge" | "verify",
+  capabilities: ReadonlySet<string>,
+): Promise<StagedMergeGenerations> {
+  const folderId = folder.id
+  const stage = purpose === "verify" ? "verify" : "initial"
+  const localBlocked: FolderScanIssue[] = []
+  let localGenerationId: string | undefined
+  let incomingGenerationId: string | undefined
+  try {
+    const relayProgress = capabilities.has(PEER_SCAN_PROGRESS_CAPABILITY)
+      ? (progress: PeerScanProgress) => reportScanCounts(folderId, purpose, { remote: progress })
+      : undefined
+    const { local: localStaged, peer: peerScan } = await runPairedScans(
+      (signal) => stageMergingLocalGeneration(folder, record, signal, purpose, (issue) => localBlocked.push(issue)),
+      (signal) => requestPeerMergingGenerationScan(peer.id, folderId, signal, relayProgress),
+    )
+    localGenerationId = localStaged.generationId
+    const incoming = await runAdmittedScan(`${stage}:incoming:${folderId}`, folderId, null, (effective) =>
+      stagePeerGeneration(folder, peer.id, peerScan.generationId, record.revision, effective))
+    incomingGenerationId = incoming.generationId
+    return {
+      localStaged,
+      incoming,
+      peerScan,
+      localBlocked,
+      release: async () => {
+        await releaseGeneration(engine, incoming.generationId)
+        await releaseGeneration(engine, localStaged.generationId)
+      },
+    }
+  } catch (error) {
+    if (incomingGenerationId) await releaseGeneration(engine, incomingGenerationId)
+    if (localGenerationId) await releaseGeneration(engine, localGenerationId)
+    throw error
+  }
+}
+
+/**
  * Fetches one sealed generation of a shared mapping from its owning computer
  * page by page and stages it locally, so both observations can be reconciled
  * set-based. Each request is its own authenticated session, so this stays
@@ -764,13 +897,16 @@ function stagePeerGeneration(
 /**
  * Stages this computer's own scan and remembers it for the coordinator's next
  * observe exchange. The superseded generation is released, so an exchange the
- * coordinator aborts leaves at most one generation behind.
+ * coordinator aborts leaves at most one generation behind. An initial merge
+ * passes `onProgress` to relay its counters to the waiting coordinator, the
+ * same way a manifest merge's `reportProgress` does.
  */
 async function stageOwnGenerationForCoordinator(
   folder: FolderSummary,
   record: MappingRecord,
   signal: AbortSignal,
   purpose: Extract<FolderWorkActivity, { kind: "scanning" }>["purpose"],
+  onProgress?: (progress: PeerScanProgress) => void,
 ): Promise<StagedGeneration> {
   const folderId = folder.id
   const staged = await withFolderDigestCache(folderId, (digestCache) =>
@@ -783,13 +919,38 @@ async function stageOwnGenerationForCoordinator(
         ignorePatterns: folder.ignorePatterns,
         signal: effective,
         digestCache,
-        onActivity: (activity) => reportScanCounts(folderId, purpose, { local: activity }),
+        onActivity: (activity) => {
+          reportScanCounts(folderId, purpose, { local: activity })
+          // The wire progress schema is strict and older peers reject unknown
+          // fields, so only the shared counters are relayed.
+          if (onProgress) {
+            onProgress({
+              stage: activity.stage,
+              scannedFiles: activity.scannedFiles,
+              ignoredEntries: activity.ignoredEntries,
+              unreadableEntries: activity.unreadableEntries,
+              hashedBytes: activity.hashedBytes,
+            })
+          }
+        },
         ...directoryScanOptions(folderId),
       })))
   const previous = stagedCoordinatorGenerations.get(folderId)
   stagedCoordinatorGenerations.set(folderId, staged.generationId)
   if (previous) await releaseGeneration(engine, previous)
   return staged
+}
+
+/**
+ * Drops the sealed scan this computer staged for the other participant, if
+ * any. An initial merge ends without a follow-up observe exchange, so it calls
+ * this explicitly instead of waiting for the next scan to replace the row.
+ */
+async function releaseStagedCoordinatorGeneration(folderId: string): Promise<void> {
+  const staged = stagedCoordinatorGenerations.get(folderId)
+  if (!staged) return
+  stagedCoordinatorGenerations.delete(folderId)
+  await releaseGeneration(engine, staged)
 }
 
 /** Stages a peer's scan reply as a generation response, so both reply shapes never mix. */
@@ -1005,13 +1166,15 @@ function parseInitialSyncOutcomes(value: unknown): Record<string, PersistedIniti
   for (const [folderId, candidate] of Object.entries(value)) {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue
     const outcome = candidate as Partial<PersistedInitialSyncOutcome>
-    const { completedAt, copiedFiles, fileCount, conflicts, unreadableSkipped } = outcome
+    const { completedAt, copiedFiles, fileCount, conflicts, unreadableSkipped, conflictsTotal } = outcome
     if (
       typeof completedAt !== "string" ||
       typeof copiedFiles !== "number" || !Number.isSafeInteger(copiedFiles) || copiedFiles < 0 ||
       typeof fileCount !== "number" || !Number.isSafeInteger(fileCount) || fileCount < 0 ||
       !isBoundedSkipArray(conflicts) ||
-      (unreadableSkipped !== undefined && !isBoundedSkipArray(unreadableSkipped))
+      (unreadableSkipped !== undefined && !isBoundedSkipArray(unreadableSkipped)) ||
+      (conflictsTotal !== undefined &&
+        (typeof conflictsTotal !== "number" || !Number.isSafeInteger(conflictsTotal) || conflictsTotal < conflicts.length))
     ) continue
     outcomes[folderId] = {
       completedAt,
@@ -1019,6 +1182,7 @@ function parseInitialSyncOutcomes(value: unknown): Record<string, PersistedIniti
       fileCount,
       conflicts,
       ...(unreadableSkipped ? { unreadableSkipped } : {}),
+      ...(conflictsTotal !== undefined ? { conflictsTotal } : {}),
     }
   }
   return outcomes
@@ -3149,11 +3313,7 @@ function blockContinuousSync(folderId: string): () => void {
   clearWatchDegraded(folderId)
   // A staged scan this computer still holds for the coordinator can never be
   // observed once the folder is paused or reconfigured; drop it eagerly.
-  const staged = stagedCoordinatorGenerations.get(folderId)
-  if (staged) {
-    stagedCoordinatorGenerations.delete(folderId)
-    void releaseGeneration(engine, staged)
-  }
+  void releaseStagedCoordinatorGeneration(folderId)
   return () => {
     continuousSyncBlocked.delete(folderId)
     void refreshContinuousSyncMonitors()
@@ -3663,6 +3823,300 @@ interface InitialSyncRunOptions {
   acknowledgedIssuesSignature?: string
   /** Where this pass sits in the merge, for the progress view. */
   initialMerge: InitialMergeStep
+  /**
+   * The non-empty inaccessible-path report this pass accepted, or undefined
+   * when it had none. A generation merge has no retained manifests, so its
+   * coordinator binds the peer's inverse allowance to this exact report.
+   */
+  onIssuesAccepted?: (issues: FolderScanIssueReport | undefined) => void
+}
+
+/**
+ * The reviewed state of one full-integrity initial-merge walk. A manifest walk
+ * can retain its manifests for a "Continue anyway" rerun; a generation walk
+ * retains only the signature, because its staged rows are released when the
+ * pass ends and the next rerun reads identities from the digest cache.
+ */
+interface InitialSyncScanDecision {
+  issues: FolderScanIssueReport
+  /** Complete local block set for planning; never bounded like the exchanged report. */
+  localBlocked: FolderScanIssue[]
+  localFileCount: number
+  remoteFileCount: number
+  retained?: { localManifest: FileManifest; remoteManifest: FileManifest }
+}
+
+/** Pauses for the user's inaccessible-path review, or clears it once acknowledged. */
+function enforceInitialSyncIssueDecision(
+  folder: FolderSummary,
+  options: InitialSyncRunOptions,
+  state: InitialSyncScanDecision,
+): void {
+  const issueTotal = scanIssueTotal(state.issues)
+  const issuesSignature = scanIssueSignature(state.issues)
+  const alreadyAcknowledged = options.allowUnreadable || options.acknowledgedIssuesSignature === issuesSignature
+  if (issueTotal > 0 && !alreadyAcknowledged && !reportCoversApproved(state.issues, approvedInitialSyncIssues(folder.id))) {
+    // Hold the scan so "Continue anyway" reuses it instead of walking both
+    // folders again, then surface the exact paths for the user's decision.
+    // Oversized scans are stored signature-only: the report signature still
+    // lets a matching fresh scan proceed after the user continues.
+    const totalFiles = state.localFileCount + state.remoteFileCount
+    preparedInitialSyncScans.set(folder.id, {
+      capturedAt: Date.now(),
+      signature: initialSyncScanSignature(folder),
+      issuesSignature,
+      ...(state.retained && totalFiles <= MAX_PREPARED_SCAN_FILES
+        ? { ...state.retained, localUnreadableEntries: state.localBlocked }
+        : {}),
+    })
+    updateFolder(folder.id, {
+      status: "needs-attention",
+      work: undefined,
+      scanIssues: state.issues,
+      currentAction: `${issueTotal === 1 ? "1 item" : `${issueTotal.toLocaleString("en-GB")} items`} could not be read. Review the list, then choose Continue anyway to skip them or cancel to fix access.`,
+    })
+    broadcastSnapshot()
+    throw new InitialSyncUnreadableError()
+  }
+  // A non-empty report reaching this point was accepted by the blanket
+  // allowance, the reviewed signature, or the approved comparison.
+  options.onIssuesAccepted?.(issueTotal > 0 ? state.issues : undefined)
+  preparedInitialSyncScans.delete(folder.id)
+  updateFolder(folder.id, { scanIssues: undefined })
+}
+
+/** One batch of pull candidates plus the differences the pass leaves untouched. */
+interface InitialSyncCopyBatch {
+  additions: readonly FileManifestEntry[]
+  conflicts: SyncSkip[]
+  occupied: string[]
+}
+
+/**
+ * Runs one initial-merge pass over a streamed plan: the same verified,
+ * no-replace transfer, pause check, progress and digest recording for the
+ * manifest path (one batch) and the generation path (bounded pages).
+ */
+async function executeInitialSyncCopyPlan(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  plan: {
+    batches: AsyncIterable<InitialSyncCopyBatch>
+    totalFiles: number
+    totalBytes: number
+    initialSkipped: readonly SyncSkip[]
+    initialOccupied: readonly string[]
+    localFileCount: number
+    issues: FolderScanIssueReport
+  },
+): Promise<InitialSyncPassResult> {
+  const { totalFiles, totalBytes } = plan
+  // The exchanged and persisted conflict list is bounded; records beyond the
+  // bound are counted so the completion message and outcome keep the true
+  // total without breaking the peer's skip-array validation.
+  const skipped: SyncSkip[] = []
+  let skippedTotal = 0
+  const retainSkip = (skip: SyncSkip): void => {
+    skippedTotal += 1
+    if (skipped.length < MAX_PERSISTED_SKIP_ENTRIES) skipped.push(skip)
+  }
+  for (const skip of plan.initialSkipped) retainSkip(skip)
+  const occupied: string[] = [...plan.initialOccupied]
+  let copiedFiles = 0
+  let copiedBytes = 0
+  let checkedFiles = 0
+  let checkedBytes = 0
+  // Files this pass leaves present even though the pre-merge scan did not list
+  // them (a transfer finished, or a copy appeared mid-merge). An occupied path
+  // holds no file, so it is never counted.
+  let addedFiles = 0
+  const startedAt = Date.now()
+  let lastBroadcastAt = 0
+
+  const reportProgress = (entryPath: string, fileBytes: number, force = false) => {
+    const now = Date.now()
+    if (!force && now - lastBroadcastAt < 100) return
+    lastBroadcastAt = now
+    const transferred = checkedBytes + fileBytes
+    const elapsedSeconds = Math.max((now - startedAt) / 1_000, 0.001)
+    updateFolder(folder.id, {
+      status: "syncing",
+      currentAction: `Checking and copying ${entryPath} (${Math.min(checkedFiles + 1, totalFiles)}/${totalFiles})`,
+    })
+    // Identical destinations and preserved conflicts count toward progress but
+    // not throughput, because no bytes were transferred for them.
+    setFolderActivity(folder.id, {
+      kind: "copying",
+      destination: "this-computer",
+      path: entryPath,
+      completedFiles: checkedFiles,
+      totalFiles,
+      transferredBytes: transferred,
+      totalBytes,
+      bytesPerSecond: Math.round((copiedBytes + fileBytes) / elapsedSeconds),
+    })
+    broadcastSnapshot()
+  }
+
+  // Copied files are verified with their full digest during transfer; record
+  // that identity so the post-merge verification can reuse it instead of
+  // reading every copied file again. Filesystems without strong identity
+  // evidence (FAT/exFAT) never record, so verification rehashes there.
+  const transferDigests = await filesystemSupportsDigestReuse(folder.localPath)
+    ? new EngineScanDigestCache(engine, folder.id, { deep: false })
+    : undefined
+  try {
+    for await (const batch of plan.batches) {
+      for (const conflict of batch.conflicts) retainSkip(conflict)
+      occupied.push(...batch.occupied)
+      for (const entry of batch.additions) {
+        const current = snapshot.folders.find((item) => item.id === folder.id)
+        if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
+        reportProgress(entry.path, 0, true)
+        const result = await mergeInitialSyncFile(folder.localPath, { ...entry, path: localFilePath(folder.id, entry.path) }, () =>
+          pullPlannedFile(folder, peer, entry, (fileBytes) => reportProgress(entry.path, fileBytes)),
+        )
+        checkedFiles += 1
+        checkedBytes += entry.size
+        if (result.status === "copied") {
+          copiedFiles += 1
+          copiedBytes += result.bytes
+          addedFiles += 1
+        } else if (result.status === "conflict") {
+          retainSkip({ ...result.skip, path: entry.path })
+          addedFiles += 1
+        } else if (result.status === "occupied") {
+          occupied.push(entry.path)
+        } else {
+          // The pre-merge scan missed a file that now matches the source exactly.
+          addedFiles += 1
+        }
+        if ((result.status === "copied" || result.status === "identical") && transferDigests && entry.digest) {
+          try {
+            const identity = await statFileIdentity(resolveWithinRoot(folder.localPath, localFilePath(folder.id, entry.path)))
+            if (identity) transferDigests.record(localFilePath(folder.id, entry.path), { ...identity, digest: entry.digest })
+          } catch {
+            // Losing a cache record only costs one extra read during verification.
+          }
+        }
+        reportProgress(entry.path, 0, true)
+      }
+    }
+  } finally {
+    await transferDigests?.finish({ complete: false })
+  }
+  recordOccupiedPaths(folder, occupied)
+  return {
+    copiedFiles,
+    copiedBytes,
+    fileCount: plan.localFileCount + addedFiles,
+    skipped,
+    unreadableSkipped: scanIssueSkips(plan.issues, "This computer", peer.name),
+    skippedTotal,
+  }
+}
+
+/** The manifest path's whole plan arrives at once; the executor streams it in one batch. */
+async function* singleInitialSyncBatch(entries: readonly FileManifestEntry[]): AsyncGenerator<InitialSyncCopyBatch, void, void> {
+  if (entries.length > 0) yield { additions: entries, conflicts: [], occupied: [] }
+}
+
+/**
+ * Streams the plan's first page and then one bounded page at a time, so the
+ * merge copies as it pages and never holds the whole plan.
+ */
+async function* additivePlanBatches(
+  request: AdditivePlanRequest,
+  firstPage: AdditivePlanPage,
+): AsyncGenerator<InitialSyncCopyBatch, void, void> {
+  const toBatch = (page: AdditivePlanPage): InitialSyncCopyBatch => ({
+    additions: page.additions.map((addition) => ({
+      path: addition.path,
+      size: addition.size,
+      modifiedMs: 0,
+      digest: addition.digest,
+    })),
+    conflicts: page.conflicts.map(initialSyncConflictSkip),
+    occupied: page.occupied,
+  })
+  yield toBatch(firstPage)
+  for await (const page of continueAdditivePlan(engine, request, firstPage, {
+    limit: ADDITIVE_PLAN_PAGE_ENTRIES,
+    timeoutMs: INITIAL_MERGE_RPC_TIMEOUT_MS,
+  })) {
+    yield toBatch(page)
+  }
+}
+
+/**
+ * Stages both computers' scans as sealed generations and drives the additive
+ * plan page by page. Neither side builds or exchanges a full file list; the
+ * plan is read-only and the merged files themselves are the durable result.
+ */
+async function runGenerationInitialSyncPass(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  options: InitialSyncRunOptions,
+  capabilities: ReadonlySet<string>,
+): Promise<InitialSyncPassResult> {
+  const record = mappingRecords.get(folder.id)
+  if (!record) throw new Error("This folder is no longer configured.")
+  const staged = await stageMergeGenerations(folder, peer, record, "initial-merge", capabilities)
+  try {
+    const { localStaged, incoming, peerScan, localBlocked } = staged
+
+    const issues: FolderScanIssueReport = {
+      local: localStaged.unreadableEntries,
+      remote: peerScan.unreadableEntries,
+      localCount: localStaged.unreadable,
+      remoteCount: peerScan.unreadable,
+    }
+    enforceInitialSyncIssueDecision(folder, options, {
+      issues,
+      localBlocked,
+      localFileCount: localStaged.files,
+      remoteFileCount: peerScan.entries,
+    })
+
+    const hasWindowsPeer = platform() === "windows" || peer.platform === "windows"
+    const request: AdditivePlanRequest = {
+      mappingId: folder.id,
+      localGenerationId: localStaged.generationId,
+      remoteGenerationId: incoming.generationId,
+      mode: folder.mode,
+      ignorePatterns: folder.ignorePatterns,
+      blockedPaths: blockedPathsFromScanIssues("This computer", localBlocked),
+      checkCaseCollisions: hasWindowsPeer,
+    }
+    const firstPage = await requestAdditivePlanPage(engine, request, {
+      limit: ADDITIVE_PLAN_PAGE_ENTRIES,
+      timeoutMs: INITIAL_MERGE_RPC_TIMEOUT_MS,
+    })
+    const totals = firstPage.totals
+    if (!totals) throw new Error("The engine returned an additive merge plan without its totals.")
+    if (totals.caseCollisions.length > 0) throw new Error(initialMergeCaseCollisionMessage(totals.caseCollisions))
+    assertInitialMergeCapacity("This computer", totals.additionBytes, await availableDiskBytes(folder.localPath))
+    // The coordinator's first pass is the last point before either computer
+    // copies anything, so it also confirms the other computer can hold the
+    // inverse pass. That pass repeats its own check against a fresh plan.
+    if (options.initialMerge.step === 1) {
+      await assertPeerCapacityForInverseMergeGenerations(folder, peer, request, incoming.generationId, peerScan)
+    }
+
+    return await executeInitialSyncCopyPlan(folder, peer, {
+      batches: additivePlanBatches(request, firstPage),
+      totalFiles: totals.additions,
+      totalBytes: totals.additionBytes,
+      // Every page carries its own conflicts and occupied paths; the first
+      // page is included in the batch stream, so nothing is counted twice.
+      initialSkipped: [],
+      initialOccupied: [],
+      localFileCount: localStaged.files,
+      issues,
+    })
+  } finally {
+    await staged.release()
+  }
 }
 
 async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, options: InitialSyncRunOptions): Promise<InitialSyncPassResult> {
@@ -3681,6 +4135,15 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   })
   setFolderActivity(folder.id, { kind: "scanning", purpose: "initial-merge" }, options.initialMerge)
   broadcastSnapshot()
+
+  // Both computers must implement the merge scan request and the additive
+  // plan; the capability was named separately from `scan-generations-v1` so a
+  // peer that stages continuous generations but not merge generations keeps
+  // the manifest path unchanged.
+  const mergeCapabilities = await cachedPeerCapabilities(peer.id)
+  if (shouldUseMergeGenerations(mergeCapabilities)) {
+    return runGenerationInitialSyncPass(folder, peer, options, mergeCapabilities)
+  }
 
   let localManifest: FileManifest
   let remoteManifest: FileManifest
@@ -3726,32 +4189,13 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   }
 
   const issues = scanIssueReportOf(localManifest, remoteManifest)
-  const issueTotal = scanIssueTotal(issues)
-  const issuesSignature = scanIssueSignature(issues)
-  const alreadyAcknowledged = options.allowUnreadable || options.acknowledgedIssuesSignature === issuesSignature
-  if (issueTotal > 0 && !alreadyAcknowledged && !reportCoversApproved(issues, approvedInitialSyncIssues(folder.id))) {
-    // Hold the scan so "Continue anyway" reuses it instead of walking both
-    // folders again, then surface the exact paths for the user's decision.
-    // Oversized scans are stored signature-only: the report signature still
-    // lets a matching fresh scan proceed after the user continues.
-    const totalFiles = localManifest.files.length + remoteManifest.files.length
-    preparedInitialSyncScans.set(folder.id, {
-      capturedAt: Date.now(),
-      signature: initialSyncScanSignature(folder),
-      issuesSignature,
-      ...(totalFiles <= MAX_PREPARED_SCAN_FILES ? { localManifest, remoteManifest, localUnreadableEntries: localBlocked } : {}),
-    })
-    updateFolder(folder.id, {
-      status: "needs-attention",
-      work: undefined,
-      scanIssues: issues,
-      currentAction: `${issueTotal === 1 ? "1 item" : `${issueTotal.toLocaleString("en-GB")} items`} could not be read. Review the list, then choose Continue anyway to skip them or cancel to fix access.`,
-    })
-    broadcastSnapshot()
-    throw new InitialSyncUnreadableError()
-  }
-  preparedInitialSyncScans.delete(folder.id)
-  updateFolder(folder.id, { scanIssues: undefined })
+  enforceInitialSyncIssueDecision(folder, options, {
+    issues,
+    localBlocked,
+    localFileCount: localManifest.files.length,
+    remoteFileCount: remoteManifest.files.length,
+    retained: { localManifest, remoteManifest },
+  })
   // The decision above already accounted for unreadable items; blocked paths
   // are excluded from the plan and reported in the outcome rather than
   // failing the whole merge.
@@ -3766,95 +4210,16 @@ async function runInitialSyncPass(folder: FolderSummary, peer: DeviceSummary, op
   // copies anything, so it also confirms the other computer can hold the
   // inverse pass. That pass repeats its own check against a fresh plan.
   if (options.initialMerge.step === 1) await assertPeerCapacityForInverseMerge(folder, peer, localManifest, remoteManifest)
-  const totalFiles = plan.toPull.length
-  let copiedFiles = 0
-  let copiedBytes = 0
-  let checkedFiles = 0
-  let checkedBytes = 0
-  // Files this pass leaves present even though the pre-merge scan did not list
-  // them (a transfer finished, or a copy appeared mid-merge). An occupied path
-  // holds no file, so it is never counted.
-  let addedFiles = 0
-  const startedAt = Date.now()
-  let lastBroadcastAt = 0
 
-  const reportProgress = (entryPath: string, fileBytes: number, force = false) => {
-    const now = Date.now()
-    if (!force && now - lastBroadcastAt < 100) return
-    lastBroadcastAt = now
-    const transferred = checkedBytes + fileBytes
-    const elapsedSeconds = Math.max((now - startedAt) / 1_000, 0.001)
-    updateFolder(folder.id, {
-      status: "syncing",
-      currentAction: `Checking and copying ${entryPath} (${Math.min(checkedFiles + 1, totalFiles)}/${totalFiles})`,
-    })
-    // Identical destinations and preserved conflicts count toward progress but
-    // not throughput, because no bytes were transferred for them.
-    setFolderActivity(folder.id, {
-      kind: "copying",
-      destination: "this-computer",
-      path: entryPath,
-      completedFiles: checkedFiles,
-      totalFiles,
-      transferredBytes: transferred,
-      totalBytes,
-      bytesPerSecond: Math.round((copiedBytes + fileBytes) / elapsedSeconds),
-    })
-    broadcastSnapshot()
-  }
-
-  // Copied files are verified with their full digest during transfer; record
-  // that identity so the post-merge verification can reuse it instead of
-  // reading every copied file again. Filesystems without strong identity
-  // evidence (FAT/exFAT) never record, so verification rehashes there.
-  const transferDigests = await filesystemSupportsDigestReuse(folder.localPath)
-    ? new EngineScanDigestCache(engine, folder.id, { deep: false })
-    : undefined
-  try {
-    for (const entry of plan.toPull) {
-      const current = snapshot.folders.find((item) => item.id === folder.id)
-      if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
-      reportProgress(entry.path, 0, true)
-      const result = await mergeInitialSyncFile(folder.localPath, { ...entry, path: localFilePath(folder.id, entry.path) }, () =>
-        pullPlannedFile(folder, peer, entry, (fileBytes) => reportProgress(entry.path, fileBytes)),
-      )
-      checkedFiles += 1
-      checkedBytes += entry.size
-      if (result.status === "copied") {
-        copiedFiles += 1
-        copiedBytes += result.bytes
-        addedFiles += 1
-      } else if (result.status === "conflict") {
-        plan.skipped.push({ ...result.skip, path: entry.path })
-        addedFiles += 1
-      } else if (result.status === "occupied") {
-        plan.occupied.push(entry.path)
-      } else {
-        // The pre-merge scan missed a file that now matches the source exactly.
-        addedFiles += 1
-      }
-      if ((result.status === "copied" || result.status === "identical") && transferDigests && entry.digest) {
-        try {
-          const identity = await statFileIdentity(resolveWithinRoot(folder.localPath, localFilePath(folder.id, entry.path)))
-          if (identity) transferDigests.record(localFilePath(folder.id, entry.path), { ...identity, digest: entry.digest })
-        } catch {
-          // Losing a cache record only costs one extra read during verification.
-        }
-      }
-      reportProgress(entry.path, 0, true)
-    }
-  } finally {
-    await transferDigests?.finish({ complete: false })
-  }
-  recordOccupiedPaths(folder, plan.occupied)
-
-  return {
-    copiedFiles,
-    copiedBytes,
-    fileCount: localManifest.files.length + addedFiles,
-    skipped: plan.skipped,
-    unreadableSkipped: scanIssueSkips(issues, "This computer", peer.name),
-  }
+  return executeInitialSyncCopyPlan(folder, peer, {
+    batches: singleInitialSyncBatch(plan.toPull),
+    totalFiles: plan.toPull.length,
+    totalBytes,
+    initialSkipped: plan.skipped,
+    initialOccupied: plan.occupied,
+    localFileCount: localManifest.files.length,
+    issues,
+  })
 }
 
 async function assertPeerCapacityForInverseMerge(
@@ -3875,15 +4240,54 @@ async function assertPeerCapacityForInverseMerge(
   assertInitialMergeCapacity(peer.name, plannedBytes(inverse.toPull), availableBytes)
 }
 
+/**
+ * The generation equivalent: the inverse plan is the same sealed generations
+ * with the roles swapped, so the coordinator can check the peer's free space
+ * before either side copies anything. The peer's bounded inaccessible-path
+ * report is the destination block set, exactly like the manifest path.
+ */
+async function assertPeerCapacityForInverseMergeGenerations(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  forwardRequest: AdditivePlanRequest,
+  peerGenerationId: string,
+  peerScan: PeerMergeGenerationScanReply,
+): Promise<void> {
+  // An older peer falls back to its per-file free-space check while copying.
+  if (!(await cachedPeerCapabilities(peer.id)).has(INITIAL_MERGE_FREE_SPACE_CAPABILITY)) return
+  const inverseRequest: AdditivePlanRequest = {
+    mappingId: folder.id,
+    localGenerationId: peerGenerationId,
+    remoteGenerationId: forwardRequest.localGenerationId,
+    mode: invertMode(folder.mode),
+    ignorePatterns: folder.ignorePatterns,
+    blockedPaths: blockedPathsFromScanIssues(peer.name, peerScan.unreadableEntries),
+    checkCaseCollisions: false,
+  }
+  const inverse = await requestAdditivePlanPage(engine, inverseRequest, {
+    limit: ADDITIVE_PLAN_PAGE_ENTRIES,
+    timeoutMs: INITIAL_MERGE_RPC_TIMEOUT_MS,
+  })
+  const totals = inverse.totals
+  if (!totals || totals.additions === 0) return
+  const availableBytes = parseFreeSpaceResponse(
+    await requirePeerSessions().request<unknown>(peer.id, { type: "initial-sync-free-space", folderId: folder.id }),
+  )
+  assertInitialMergeCapacity(peer.name, totals.additionBytes, availableBytes)
+}
+
 async function verifyInitialMergeQuiescent(
   folder: FolderSummary,
   peer: DeviceSummary,
-): Promise<{ skipped: SyncSkip[]; unreadableSkipped: SyncSkip[] }> {
+): Promise<{ skipped: SyncSkip[]; unreadableSkipped: SyncSkip[]; skippedTotal: number }> {
   updateFolder(folder.id, { currentAction: "Verifying that neither folder changed during the merge…" })
   // Only the coordinator verifies, and the coordinator always runs the first pass.
   setFolderActivity(folder.id, { kind: "scanning", purpose: "verify" }, { step: 3, firstPassUpdates: "this-computer" })
   broadcastSnapshot()
   const capabilities = await cachedPeerCapabilities(peer.id)
+  if (shouldUseMergeGenerations(capabilities)) {
+    return verifyInitialMergeQuiescentGenerations(folder, peer, capabilities)
+  }
   const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
   // Keep the complete local block set for convergence. The peer's list stays
   // bounded by the exchanged report, so a peer with more than the reported
@@ -3921,6 +4325,106 @@ async function verifyInitialMergeQuiescent(
   return {
     skipped: convergence.skipped,
     unreadableSkipped: scanIssueSkips(scanIssueReportOf(localManifest, remoteManifest), "This computer", peer.name),
+    skippedTotal: convergence.skipped.length,
+  }
+}
+
+/**
+ * The generation equivalent of the quiescence check: fresh sealed scans on
+ * both computers, then both additive directions plan page by page. A
+ * transferable file in either direction still fails convergence; the merge's
+ * preserved conflicts are returned so they survive in the outcome.
+ */
+async function verifyInitialMergeQuiescentGenerations(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  capabilities: ReadonlySet<string>,
+): Promise<{ skipped: SyncSkip[]; unreadableSkipped: SyncSkip[]; skippedTotal: number }> {
+  const record = mappingRecords.get(folder.id)
+  if (!record) throw new Error("This folder is no longer configured.")
+  const staged = await stageMergeGenerations(folder, peer, record, "verify", capabilities)
+  try {
+    const { localStaged, incoming, peerScan, localBlocked } = staged
+
+    const hasWindowsPeer = platform() === "windows" || peer.platform === "windows"
+    const localRequest: AdditivePlanRequest = {
+      mappingId: folder.id,
+      localGenerationId: localStaged.generationId,
+      remoteGenerationId: incoming.generationId,
+      mode: folder.mode,
+      ignorePatterns: folder.ignorePatterns,
+      blockedPaths: blockedPathsFromScanIssues("This computer", localBlocked),
+      checkCaseCollisions: hasWindowsPeer,
+    }
+    const peerRequest: AdditivePlanRequest = {
+      mappingId: folder.id,
+      localGenerationId: incoming.generationId,
+      remoteGenerationId: localStaged.generationId,
+      mode: invertMode(folder.mode),
+      ignorePatterns: folder.ignorePatterns,
+      blockedPaths: blockedPathsFromScanIssues(peer.name, peerScan.unreadableEntries),
+      checkCaseCollisions: hasWindowsPeer,
+    }
+    const planOptions = { limit: ADDITIVE_PLAN_PAGE_ENTRIES, timeoutMs: INITIAL_MERGE_RPC_TIMEOUT_MS }
+    const [localFirst, peerFirst] = await Promise.all([
+      requestAdditivePlanPage(engine, localRequest, planOptions),
+      requestAdditivePlanPage(engine, peerRequest, planOptions),
+    ])
+    // Both directions observe the same two generations, so the collision
+    // samples are identical; deduplicate before the user-facing message.
+    const caseCollisions = [...new Set([
+      ...(localFirst.totals?.caseCollisions ?? []),
+      ...(peerFirst.totals?.caseCollisions ?? []),
+    ])]
+    if (caseCollisions.length > 0) throw new Error(initialMergeCaseCollisionMessage(caseCollisions))
+
+    // Retain a bounded conflict sample; the observed total keeps the outcome
+    // message truthful without exceeding the exchanged skip bound.
+    const skippedByKey = new Map<string, SyncSkip>()
+    let skippedTotal = 0
+    const retainSkip = (skip: SyncSkip): void => {
+      const key = `${skip.path}\0${skip.reason}`
+      if (skippedByKey.has(key)) return
+      skippedTotal += 1
+      if (skippedByKey.size < MAX_PERSISTED_SKIP_ENTRIES) skippedByKey.set(key, skip)
+    }
+    const pendingPaths: string[] = []
+    const pendingSeen = new Set<string>()
+    let pendingTotal = 0
+    const collect = (page: AdditivePlanPage): void => {
+      for (const path of page.conflicts) {
+        retainSkip(initialSyncConflictSkip(path))
+      }
+      for (const addition of page.additions) {
+        if (pendingSeen.size >= MAX_PERSISTED_SKIP_ENTRIES) {
+          // Past the retained bound the exact union is no longer tracked; the
+          // count stays a close upper bound for the failure message.
+          pendingTotal += 1
+          continue
+        }
+        if (pendingSeen.has(addition.path)) continue
+        pendingSeen.add(addition.path)
+        pendingPaths.push(addition.path)
+        pendingTotal += 1
+      }
+    }
+    for (const [request, firstPage] of [[localRequest, localFirst], [peerRequest, peerFirst]] as const) {
+      collect(firstPage)
+      for await (const page of continueAdditivePlan(engine, request, firstPage, planOptions)) collect(page)
+    }
+    if (pendingTotal > 0) throw new InitialMergeChangedError(pendingPaths, pendingTotal)
+    return {
+      skipped: [...skippedByKey.values()],
+      unreadableSkipped: scanIssueSkips({
+        local: localStaged.unreadableEntries,
+        remote: peerScan.unreadableEntries,
+        localCount: localStaged.unreadable,
+        remoteCount: peerScan.unreadable,
+      }, "This computer", peer.name),
+      skippedTotal,
+    }
+  } finally {
+    await staged.release()
   }
 }
 
@@ -3930,9 +4434,20 @@ function uniqueSkips(...groups: SyncSkip[][]): SyncSkip[] {
   return [...byPath.values()]
 }
 
-function recordInitialSyncOutcome(folder: FolderSummary, copiedFiles: number, skipped: SyncSkip[], unreadableSkipped: SyncSkip[]): void {
-  const conflictNote = skipped.length > 0
-    ? `; ${skipped.length} same-path conflict${skipped.length === 1 ? " was" : "s were"} left untouched`
+/** Keeps an exchanged or persisted skip list inside the bound every consumer validates. */
+function boundedSkips(skips: SyncSkip[]): SyncSkip[] {
+  return skips.length > MAX_PERSISTED_SKIP_ENTRIES ? skips.slice(0, MAX_PERSISTED_SKIP_ENTRIES) : skips
+}
+
+function recordInitialSyncOutcome(
+  folder: FolderSummary,
+  copiedFiles: number,
+  skipped: SyncSkip[],
+  unreadableSkipped: SyncSkip[],
+  skippedTotal = skipped.length,
+): void {
+  const conflictNote = skippedTotal > 0
+    ? `; ${skippedTotal} same-path conflict${skippedTotal === 1 ? " was" : "s were"} left untouched`
     : ""
   const inaccessibleNote = unreadableSkipped.length > 0
     ? `; ${unreadableSkipped.length} inaccessible item${unreadableSkipped.length === 1 ? " was" : "s were"} skipped`
@@ -3940,7 +4455,7 @@ function recordInitialSyncOutcome(folder: FolderSummary, copiedFiles: number, sk
   pushActivity(
     "Initial merge completed",
     `${folder.name}: safely copied ${copiedFiles} file${copiedFiles === 1 ? "" : "s"} across both computers${conflictNote}${inaccessibleNote}.`,
-    skipped.length > 0 || unreadableSkipped.length > 0 ? "warning" : "success",
+    skippedTotal > 0 || unreadableSkipped.length > 0 ? "warning" : "success",
     folder.id,
   )
   for (const skip of skipped.slice(0, 20)) pushActivity(`Conflict left untouched: ${skip.path}`, skip.reason, "warning", folder.id)
@@ -3954,10 +4469,11 @@ function persistInitialSyncOutcome(
   fileCount: number,
   conflicts: SyncSkip[],
   unreadableSkipped: SyncSkip[] = [],
+  conflictsTotal = conflicts.length,
 ): void {
   initialSyncOutcomes = {
     ...initialSyncOutcomes,
-    [folderId]: { completedAt, copiedFiles, fileCount, conflicts, unreadableSkipped },
+    [folderId]: { completedAt, copiedFiles, fileCount, conflicts, unreadableSkipped, conflictsTotal },
   }
 }
 
@@ -3979,7 +4495,7 @@ function applyInitialSyncOutcomeStatus(folderId: string): void {
     paused,
     peerOnline: peer?.status === "online",
     // The first two-sided scan retires these, so any that remain are unchecked.
-    conflicts: outcome.conflicts.length,
+    conflicts: outcome.conflictsTotal ?? outcome.conflicts.length,
     unreadableSkipped: outcome.unreadableSkipped?.length ?? 0,
   })
   updateFolder(folderId, {
@@ -4099,6 +4615,8 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     }
     let skipped: SyncSkip[] = []
     let unreadableSkipped: SyncSkip[] = []
+    /** True same-path conflict total, including records beyond the bounded sample. */
+    let skippedTotal = 0
     let completedAt = ""
     const prepared = preparedInitialSyncScans.get(folderId)
     // A single freshness check decides both the manifests to reuse and whether
@@ -4108,15 +4626,26 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     const reusablePrepared = hasRetainedPreparedScan(prepared, folder) ? prepared : undefined
     const allowUnreadable = acknowledgeUnreadable && reusablePrepared !== undefined
     const acknowledgedIssuesSignature = acknowledgeUnreadable ? prepared?.issuesSignature : undefined
+    // A generation merge keeps no retained manifests, so the peer's inverse
+    // allowance is bound to the exact report the coordinator's user accepted:
+    // the peer proceeds only when its own fresh scan matches that report's
+    // signature, and newly inaccessible items still stop for review.
+    const peerCapabilities = await cachedPeerCapabilities(peer.id)
+    const generationMerge = shouldUseMergeGenerations(peerCapabilities)
+    let localAcceptedIssues: FolderScanIssueReport | undefined
     const { local: localResult, peer: remoteResult } = await runCoordinatedInitialMerge(
       // A repeat attempt must walk both folders again, so only the first may
       // reuse the prepared scan and its blanket unreadable allowance.
-      (attempt) => runInitialSyncPass(folder, peer, {
-        allowUnreadable: attempt === 1 && allowUnreadable,
-        prepared: attempt === 1 ? reusablePrepared : undefined,
-        acknowledgedIssuesSignature,
-        initialMerge: { step: 1, firstPassUpdates: "this-computer" },
-      }),
+      (attempt) => {
+        localAcceptedIssues = undefined
+        return runInitialSyncPass(folder, peer, {
+          allowUnreadable: attempt === 1 && allowUnreadable,
+          prepared: attempt === 1 ? reusablePrepared : undefined,
+          acknowledgedIssuesSignature,
+          initialMerge: { step: 1, firstPassUpdates: "this-computer" },
+          onIssuesAccepted: (issues) => { localAcceptedIssues = issues },
+        })
+      },
       async (attempt) => {
         updateFolder(folderId, { currentAction: `Asking ${peer.name} to merge files in the other direction…` })
         setFolderActivity(folderId, { kind: "waiting-for-peer" }, { step: 2, firstPassUpdates: "this-computer" })
@@ -4126,11 +4655,22 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
         // unreadable paths discovered after the coordinator's scan without
         // the coordinator (or the peer's user) seeing them. A repeat attempt
         // rescans later than the reviewed report, so it gets no allowance either.
+        // A generation merge instead passes the accepted report's signature in
+        // the peer's own orientation, so only a matching fresh scan proceeds.
+        const peerAcceptedSignature = generationMerge && localAcceptedIssues
+          ? scanIssueSignature({
+              local: localAcceptedIssues.remote,
+              remote: localAcceptedIssues.local,
+              localCount: localAcceptedIssues.remoteCount,
+              remoteCount: localAcceptedIssues.localCount,
+            })
+          : undefined
         return validateInitialSyncPassResult(
           await requirePeerSessions().request<InitialSyncPassResult>(peer.id, {
             type: "initial-sync-run",
             folderId,
             allowUnreadable: attempt === 1 && allowUnreadable,
+            ...(peerAcceptedSignature ? { acknowledgedIssuesSignature: peerAcceptedSignature } : {}),
           }, NO_PEER_RESPONSE_DEADLINE),
         )
       },
@@ -4139,8 +4679,16 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
         updateFolder(folderId, { currentAction: "Recording the finished merge on both computers…" })
         setFolderActivity(folderId, { kind: "finishing" })
         broadcastSnapshot()
-        skipped = uniqueSkips(local.skipped, remote.skipped, verification.skipped)
-        unreadableSkipped = uniqueSkips(local.unreadableSkipped, remote.unreadableSkipped, verification.unreadableSkipped)
+        skipped = boundedSkips(uniqueSkips(local.skipped, remote.skipped, verification.skipped))
+        unreadableSkipped = boundedSkips(uniqueSkips(local.unreadableSkipped, remote.unreadableSkipped, verification.unreadableSkipped))
+        // Each pass sees the same merge state, so the largest observed total is
+        // the best available count once a sample is all that is retained.
+        skippedTotal = Math.max(
+          skipped.length,
+          local.skippedTotal ?? local.skipped.length,
+          remote.skippedTotal ?? remote.skipped.length,
+          verification.skippedTotal,
+        )
         const currentRecord = mappingRecords.get(folderId)
         if (!currentRecord) throw new Error("The mapping was removed before its completion could be committed.")
         completedAt = new Date().toISOString()
@@ -4151,6 +4699,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
           copiedFiles: remote.copiedFiles,
           fileCount: remote.fileCount,
           conflicts: skipped,
+          conflictsTotal: skippedTotal,
           unreadableSkipped,
         })
         if (outcomeAcknowledgement.recorded !== true) {
@@ -4163,6 +4712,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
           local.fileCount,
           skipped,
           unreadableSkipped,
+          skippedTotal,
         )
         // Commit the structured outcome before activating SQLite so a crash can never
         // leave an active mapping whose preserved conflicts are invisible after restart.
@@ -4190,7 +4740,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     )
     // The completion commit recorded this same outcome durably before activation.
     applyInitialSyncOutcomeStatus(folderId)
-    recordInitialSyncOutcome(folder, localResult.copiedFiles + remoteResult.copiedFiles, skipped, unreadableSkipped)
+    recordInitialSyncOutcome(folder, localResult.copiedFiles + remoteResult.copiedFiles, skipped, unreadableSkipped, skippedTotal)
     // The durable digest cache now holds everything the merge verified; the
     // pre-mapping seed has done its job.
     scanReuseSeeds.forget(folder.localPath, folder.ignorePatterns)
@@ -4212,6 +4762,11 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     initialSyncInFlight.delete(folderId)
     initialSyncCompletions.get(folderId)?.resolve()
     initialSyncCompletions.delete(folderId)
+    // The merge may have staged this computer's scan for the peer's inverse
+    // pass; nothing else releases it because no observe exchange follows.
+    await releaseStagedCoordinatorGeneration(folderId)
+    // Aborted generation stages from this merge are cleared now, not at their TTL.
+    void cleanupStagedGenerations()
     const peer = getPairedDevice(knownFolder.remoteDeviceId)
     if (peer?.status === "online") {
       await requirePeerSessions().request(peer.id, { type: "initial-sync-release", folderId }).catch((error) => {
@@ -4224,7 +4779,12 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
   return snapshot
 }
 
-async function runPeerInitialSync(context: PeerRequestContext, folderId: string, allowUnreadable: boolean): Promise<InitialSyncPassResult> {
+async function runPeerInitialSync(
+  context: PeerRequestContext,
+  folderId: string,
+  allowUnreadable: boolean,
+  acknowledgedIssuesSignature?: string,
+): Promise<InitialSyncPassResult> {
   requireMappingMutations()
   if (initialSyncInFlight.has(folderId)) throw new Error("An initial merge is already running for this folder.")
   const record = mappingRecords.get(folderId)
@@ -4236,6 +4796,7 @@ async function runPeerInitialSync(context: PeerRequestContext, folderId: string,
   try {
     const result = await runInitialSyncPass(folder, peer, {
       allowUnreadable,
+      acknowledgedIssuesSignature,
       initialMerge: { step: 2, firstPassUpdates: "other-computer" },
     })
     scanReuseSeeds.forget(folder.localPath, folder.ignorePatterns)
@@ -4251,7 +4812,7 @@ async function runPeerInitialSync(context: PeerRequestContext, folderId: string,
       status: "syncing",
       work: undefined,
       fileCount: result.fileCount,
-      currentAction: initialSyncAttentionSummary(result.skipped.length, result.unreadableSkipped.length)
+      currentAction: initialSyncAttentionSummary(result.skippedTotal ?? result.skipped.length, result.unreadableSkipped.length)
         ?? `Initial files merged; waiting for ${peer.name} to commit completion.`,
     })
     return result
@@ -4266,6 +4827,9 @@ async function runPeerInitialSync(context: PeerRequestContext, folderId: string,
     throw error
   } finally {
     initialSyncInFlight.delete(folderId)
+    // The scan this computer staged for the coordinator's fetch is finished
+    // with once the inverse pass returns.
+    await releaseStagedCoordinatorGeneration(folderId)
     await persistState()
     broadcastSnapshot()
   }
@@ -4567,7 +5131,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     })
   }
   if (request.type === "scan-capabilities") {
-    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY, CONTINUOUS_FINGERPRINT_CAPABILITY, DIRECTORY_MAPPING_CAPABILITY, INITIAL_MERGE_FREE_SPACE_CAPABILITY] }
+    return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY, CONTINUOUS_FINGERPRINT_CAPABILITY, DIRECTORY_MAPPING_CAPABILITY, INITIAL_MERGE_FREE_SPACE_CAPABILITY, INITIAL_MERGE_GENERATIONS_CAPABILITY] }
   }
   if (request.type === "scan-generation-read-page") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -4576,8 +5140,12 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const limit = typeof request.limit === "number" ? request.limit : 200
     // Both authenticated participants may read a sealed generation of their
     // shared mapping: one side fetches the other's observation during the
-    // exchange. Starting a scan stays coordinator-only.
-    requireActiveSharedFolder(context, folderId)
+    // exchange. Starting a scan stays coordinator-only. A mapping whose
+    // initial merge is still running is covered too, because the merge fetches
+    // the same way; either gate requires the matching in-flight work or lease.
+    const pageFolder = requireSharedFolder(context, folderId)
+    if (pageFolder.setupStatus === "active") requireActiveSharedFolder(context, folderId)
+    else requireSharedInitialSyncFolder(context, folderId)
     if (!generationId || cursor === "") throw new Error("The scan generation page request is invalid.")
     return withPeerFileOperation(context, folderId, async () => {
       if (context.signal.aborted) throw new ScanCancelledError()
@@ -4899,7 +5467,43 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
   }
   if (request.type === "initial-sync-run") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
-    return runPeerInitialSync(context, folderId, request.allowUnreadable === true)
+    // The coordinator's accepted inaccessible-path report, used only when the
+    // peer's own fresh scan matches it exactly.
+    const acknowledgedIssuesSignature = typeof request.acknowledgedIssuesSignature === "string" && /^[a-f0-9]{64}$/.test(request.acknowledgedIssuesSignature)
+      ? request.acknowledgedIssuesSignature
+      : undefined
+    return runPeerInitialSync(context, folderId, request.allowUnreadable === true, acknowledgedIssuesSignature)
+  }
+  if (request.type === "initial-sync-generation-scan") {
+    requireMappingMutations()
+    const folderId = typeof request.folderId === "string" ? request.folderId : ""
+    const folder = requireSharedInitialSyncFolder(context, folderId)
+    const record = mappingRecords.get(folderId)
+    if (!record) throw new Error("This folder is no longer configured.")
+    return withPeerFileOperation(context, folderId, async () => {
+      // The coordinator runs the merge, so without this the folder here would
+      // show nothing while a long first scan reads every file.
+      const coordinatorName = getPairedDevice(context.peerId)?.name ?? "The paired computer"
+      updateFolder(folderId, {
+        status: "syncing",
+        work: newFolderWork({ kind: "scanning", purpose: "initial-merge" }),
+        currentAction: `${coordinatorName} is checking this folder for the merge…`,
+      })
+      broadcastSnapshot()
+      try {
+        const staged = await stageOwnGenerationForCoordinator(
+          folder,
+          record,
+          context.signal,
+          "initial-merge",
+          context.reportProgress,
+        )
+        return { ...generationScanReply(staged), unreadableEntries: staged.unreadableEntries }
+      } finally {
+        updateFolder(folderId, { work: undefined })
+        broadcastSnapshot()
+      }
+    })
   }
   if (request.type === "initial-sync-prepare") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -4934,6 +5538,9 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const folder = requireSharedFolder(context, folderId)
     if (hasInitialSyncPeerLease(folderId, context.peerId)) initialSyncPeerLeases.delete(folderId)
+    // The merge has no later observe exchange, so the scan staged for the
+    // coordinator is dropped here instead of waiting for a replacement.
+    await releaseStagedCoordinatorGeneration(folderId)
     if (folder.setupStatus === "ready-for-initial-sync" && !initialSyncInFlight.has(folderId)) {
       updateFolder(folderId, {
         status: "needs-attention",
@@ -4982,7 +5589,11 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       skipped: request.conflicts,
       unreadableSkipped: request.unreadableSkipped,
     })
-    persistInitialSyncOutcome(folderId, request.completedAt, result.copiedFiles, result.fileCount, result.skipped, result.unreadableSkipped)
+    // An older coordinator omits the total; a malformed one never inflates the count.
+    const conflictsTotal = typeof request.conflictsTotal === "number" && Number.isSafeInteger(request.conflictsTotal) && request.conflictsTotal >= result.skipped.length
+      ? request.conflictsTotal
+      : result.skipped.length
+    persistInitialSyncOutcome(folderId, request.completedAt, result.copiedFiles, result.fileCount, result.skipped, result.unreadableSkipped, conflictsTotal)
     await persistStateDurably()
     return { recorded: true }
   }

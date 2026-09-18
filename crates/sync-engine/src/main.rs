@@ -289,6 +289,13 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
         .expect("serialising an RPC error should not fail");
     }
 
+    dispatch(request, mapping_store)
+}
+
+/// Routes one authenticated request to its handler. Kept apart from
+/// `handle_line` so the session-token check stays visibly in front of every
+/// method, including the ones added later.
+fn dispatch(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
     match request.method.as_str() {
         "health" => serde_json::to_value(RpcResponse::success(
             request.id,
@@ -325,6 +332,9 @@ fn handle_line(line: &str, expected_token: &str, mapping_store: &MappingStoreSlo
         "fileSync.reconcile" => handle_file_sync_reconcile(request, mapping_store),
         "fileSync.reconcileGenerations" => {
             handle_file_sync_reconcile_generations(request, mapping_store)
+        }
+        "fileSync.planAdditiveGenerations" => {
+            handle_file_sync_plan_additive_generations(request, mapping_store)
         }
         "fileSync.operationsPage" => handle_file_sync_operations_page(request, mapping_store),
         "fileSync.conflictsPage" => handle_file_sync_conflicts_page(request, mapping_store),
@@ -754,6 +764,25 @@ fn handle_file_sync_reconcile_generations(
         Err(error) => {
             store_error_response(request.id, "Failed to reconcile scan generations", &error)
         }
+    }
+}
+
+fn handle_file_sync_plan_additive_generations(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: sync_storage::file_sync::PlanAdditiveGenerationsRequest =
+        match parse_params(request.params, "fileSync.planAdditiveGenerations") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.plan_additive_generations(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(request.id, "Failed to plan the additive merge", &error),
     }
 }
 
@@ -1770,6 +1799,7 @@ mod tests {
             "mapping.recordMigrationFailure",
             "fileSync.reconcile",
             "fileSync.reconcileGenerations",
+            "fileSync.planAdditiveGenerations",
             "fileSync.operationsPage",
             "fileSync.conflictsPage",
             "fileSync.resolveConflict",
@@ -2351,6 +2381,72 @@ mod tests {
         assert_eq!(foreign["errorCode"], "MAPPING_NOT_FOUND");
         assert_eq!(missing["errorCode"], "MAPPING_NOT_FOUND");
         assert_eq!(foreign["result"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn additive_merge_plans_before_activation_through_the_rpc() {
+        let store = ready_store();
+        let mut upsert: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("mapping json");
+        // The initial merge runs before the mapping is activated.
+        upsert["mapping"]["setupStatus"] = serde_json::json!("ready-for-initial-sync");
+        let response = handle_line(
+            &request("mapping.upsert", &upsert.to_string()),
+            "correct",
+            &store,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        for (method, params) in [
+            (
+                "scanGeneration.begin",
+                r#"{"generationId":"gen-local","mappingId":"mapping-1","participantDeviceId":"linux-box","mappingRevision":1,"root":"/tmp/a","ignorePatterns":[],"hashMode":"full-sha256"}"#,
+            ),
+            (
+                "scanGeneration.append",
+                r#"{"generationId":"gen-local","sequence":0,"entries":[{"path":"local.txt","size":4,"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+            ),
+            (
+                "scanGeneration.seal",
+                r#"{"generationId":"gen-local","expectedCount":1}"#,
+            ),
+            (
+                "scanGeneration.begin",
+                r#"{"generationId":"gen-remote","mappingId":"mapping-1","participantDeviceId":"linux-box","mappingRevision":1,"root":"/tmp/a","ignorePatterns":[],"hashMode":"full-sha256"}"#,
+            ),
+            (
+                "scanGeneration.append",
+                r#"{"generationId":"gen-remote","sequence":0,"entries":[{"path":"remote.txt","size":4,"digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}"#,
+            ),
+            (
+                "scanGeneration.seal",
+                r#"{"generationId":"gen-remote","expectedCount":1}"#,
+            ),
+        ] {
+            let response = handle_line(&request(method, params), "correct", &store);
+            assert_eq!(response["ok"], true, "{method} failed: {response}");
+        }
+
+        let planned = handle_line(
+            &request(
+                "fileSync.planAdditiveGenerations",
+                r#"{"mappingId":"mapping-1","localGenerationId":"gen-local","remoteGenerationId":"gen-remote","mode":"two-way","ignorePatterns":[],"blockedPaths":[],"checkCaseCollisions":false,"cursor":null,"limit":100}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(planned["ok"], true, "{planned}");
+        assert_eq!(planned["result"]["totals"]["additions"], 1);
+        assert_eq!(planned["result"]["additions"][0]["path"], "remote.txt");
+
+        let bounded = handle_line(
+            &request(
+                "fileSync.planAdditiveGenerations",
+                r#"{"mappingId":"mapping-1","localGenerationId":"gen-local","remoteGenerationId":"gen-remote","mode":"two-way","cursor":null,"limit":0}"#,
+            ),
+            "correct",
+            &store,
+        );
+        assert_eq!(bounded["errorCode"], "INVALID_PARAMS");
     }
 
     #[test]
