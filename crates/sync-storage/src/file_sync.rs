@@ -145,6 +145,13 @@ pub struct ReconcileGenerationsRequest {
     pub mode: String,
     pub observed_at: String,
     pub queue_operations: bool,
+    /// The mapping's current ignore rules, applied like the full-array
+    /// reconcile. A path they exclude is left out of planning while its
+    /// baseline is kept, so adding a rule never turns a still-present file
+    /// into a deletion conflict. Older callers omit the field, which means no
+    /// rules.
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -200,6 +207,12 @@ pub struct ReconcileResult {
     pub operations: Vec<SyncOperation>,
     pub conflicts: Vec<SyncConflict>,
     pub recovery_issues: Vec<ReplacementRecoveryIssue>,
+    /// One-sided files left out because a folder, link or special entry
+    /// already occupies their destination path. Generation reconciliation
+    /// reports these here; the full-array path filters them before the engine
+    /// sees them, so its result stays empty and serialises unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub occupied_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -240,6 +253,9 @@ struct ReconciliationPlan {
     verified_count: usize,
     operations: Vec<PlannedOperation>,
     conflicts: Vec<PlannedConflict>,
+    /// Destination paths that blocked a one-sided addition (see
+    /// `destination_path_occupied`). Reported to the caller for the user.
+    occupied: Vec<String>,
 }
 
 impl MappingStore {
@@ -295,6 +311,7 @@ impl MappingStore {
                 operations: state.operations,
                 conflicts: state.conflicts,
                 recovery_issues: state.recovery_issues,
+                occupied_paths: Vec::new(),
             })
     }
 
@@ -382,6 +399,7 @@ impl MappingStore {
                 operations: state.operations,
                 conflicts: state.conflicts,
                 recovery_issues: state.recovery_issues,
+                occupied_paths: plan.occupied,
             })
     }
 
@@ -849,6 +867,7 @@ fn plan_reconciliation(
         verified_count: 0,
         operations: Vec::new(),
         conflicts: Vec::new(),
+        occupied: Vec::new(),
     };
     for path in &paths {
         let local_file = local.get(path);
@@ -958,6 +977,70 @@ fn plan_one_sided(
         source_size: file.size,
         expected_destination_digest: None,
     });
+}
+
+/// Records a one-sided addition that a folder, link or other special entry
+/// already occupies at its destination. Without a baseline nothing else
+/// refers to the path. With one, the missing destination copy is the same
+/// deletion conflict the full-array planner reports when the filtered
+/// observations both lack it.
+fn record_occupied_addition(path: &str, has_baseline: bool, plan: &mut ReconciliationPlan) {
+    plan.occupied.push(path.to_owned());
+    if has_baseline {
+        plan.conflicts.push(PlannedConflict {
+            path: path.to_owned(),
+            kind: ConflictKind::DeletionNotPropagated,
+            local_digest: None,
+            remote_digest: None,
+        });
+    }
+}
+
+/// Whether a one-sided addition at `path` collides with an entry already in
+/// the destination generation: anything at the exact path (a synchronized
+/// file, a folder without synchronized files, or a link or other special
+/// entry), anything beneath it (which makes the path a folder), or a
+/// synchronized file or special entry above it. A real folder above the path
+/// is not occupancy, matching the manifest occupancy check.
+fn destination_path_occupied(
+    transaction: &Transaction<'_>,
+    generation_id: &str,
+    path: &str,
+) -> Result<bool, MappingStoreError> {
+    let mut lookup = transaction.prepare_cached(
+        "SELECT kind FROM scan_entries WHERE generation_id = ?1 AND relative_path = ?2",
+    )?;
+    let exact: Option<String> = lookup
+        .query_row(params![generation_id, path], |row| row.get(0))
+        .optional()?;
+    if exact.is_some() {
+        return Ok(true);
+    }
+    // The clustered (generation_id, path) index makes this exactly the paths
+    // under `path`: any string above "path/" is prefixed by it until "path0".
+    let has_descendant: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM scan_entries
+             WHERE generation_id = ?1 AND relative_path > ?2 AND relative_path < ?3
+             LIMIT 1",
+            params![generation_id, format!("{path}/"), format!("{path}0")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if has_descendant.is_some() {
+        return Ok(true);
+    }
+    let mut candidate = path.rfind('/').map(|index| &path[..index]);
+    while let Some(ancestor) = candidate {
+        let kind: Option<String> = lookup
+            .query_row(params![generation_id, ancestor], |row| row.get(0))
+            .optional()?;
+        if kind.is_some_and(|kind| kind != "directory") {
+            return Ok(true);
+        }
+        candidate = ancestor.rfind('/').map(|index| &ancestor[..index]);
+    }
+    Ok(false)
 }
 
 fn persist_reconciliation(
@@ -1339,6 +1422,11 @@ fn validate_generations_request(
             "mode must be two-way, send-only, or receive-only".to_owned(),
         ));
     }
+    if request.ignore_patterns.len() > MAX_IGNORE_PATTERNS {
+        return Err(MappingStoreError::Invalid(format!(
+            "at most {MAX_IGNORE_PATTERNS} ignore patterns are accepted"
+        )));
+    }
     if request.local_generation_id == request.remote_generation_id {
         return Err(MappingStoreError::Invalid(
             "local and remote generations must differ".to_owned(),
@@ -1347,12 +1435,58 @@ fn validate_generations_request(
     Ok(())
 }
 
+/// Every path that differs between two sealed generations, in path order:
+/// local file observations (joined with the remote file and the baseline),
+/// remote-only files, and baselined paths both file observations lack.
+/// Occupied rows never join as files; they only block additions later.
+const GENERATION_DIFFERENCES_SQL: &str = "SELECT local.relative_path, local.digest, local.size,
+            remote.digest, remote.size, baseline.digest, baseline.size
+     FROM scan_entries AS local
+     LEFT JOIN scan_entries AS remote
+       ON remote.generation_id = ?2 AND remote.relative_path = local.relative_path
+          AND remote.kind = 'file'
+     LEFT JOIN file_sync_baselines AS baseline
+       ON baseline.mapping_id = ?3 AND baseline.relative_path = local.relative_path
+     WHERE local.generation_id = ?1 AND local.kind = 'file'
+       AND (remote.digest IS NULL OR local.digest IS NULL OR remote.digest <> local.digest)
+     UNION ALL
+     SELECT remote.relative_path, NULL, NULL,
+            remote.digest, remote.size, baseline.digest, baseline.size
+     FROM scan_entries AS remote
+     LEFT JOIN file_sync_baselines AS baseline
+       ON baseline.mapping_id = ?3 AND baseline.relative_path = remote.relative_path
+     WHERE remote.generation_id = ?2 AND remote.kind = 'file'
+       AND NOT EXISTS (
+           SELECT 1 FROM scan_entries AS local
+           WHERE local.generation_id = ?1 AND local.relative_path = remote.relative_path
+             AND local.kind = 'file'
+       )
+     UNION ALL
+     SELECT baseline.relative_path, NULL, NULL, NULL, NULL, baseline.digest, baseline.size
+     FROM file_sync_baselines AS baseline
+     WHERE baseline.mapping_id = ?3
+       AND NOT EXISTS (
+           SELECT 1 FROM scan_entries AS local
+           WHERE local.generation_id = ?1 AND local.relative_path = baseline.relative_path
+             AND local.kind = 'file'
+       )
+       AND NOT EXISTS (
+           SELECT 1 FROM scan_entries AS remote
+           WHERE remote.generation_id = ?2 AND remote.relative_path = baseline.relative_path
+             AND remote.kind = 'file'
+       )
+     ORDER BY 1";
+
 /// Plans two sealed generations against the baseline with set-based reads.
 ///
 /// Identical pairs, almost every path in a steady-state folder, never leave
 /// `SQLite`: one statement advances their baselines. Only paths that differ
 /// are streamed back, in path order, so work outside the database is
 /// proportional to the number of differences rather than the folder size.
+///
+/// Occupied entries (`directory` and `special` kinds) never act as file
+/// observations. They block a one-sided addition whose destination path they
+/// use, so nothing is planned that could only fail at write time.
 fn plan_generations_reconciliation(
     transaction: &Transaction<'_>,
     request: &ReconcileGenerationsRequest,
@@ -1360,46 +1494,14 @@ fn plan_generations_reconciliation(
     local_generation: &str,
     remote_generation: &str,
 ) -> Result<ReconciliationPlan, MappingStoreError> {
+    let ignored = IgnoredPaths::new(&request.ignore_patterns)?;
     let mut plan = ReconciliationPlan {
         verified_count: 0,
         operations: Vec::new(),
         conflicts: Vec::new(),
+        occupied: Vec::new(),
     };
-    let mut differences = transaction.prepare(
-        "SELECT local.relative_path, local.digest, local.size,
-                remote.digest, remote.size, baseline.digest, baseline.size
-         FROM scan_entries AS local
-         LEFT JOIN scan_entries AS remote
-           ON remote.generation_id = ?2 AND remote.relative_path = local.relative_path
-         LEFT JOIN file_sync_baselines AS baseline
-           ON baseline.mapping_id = ?3 AND baseline.relative_path = local.relative_path
-         WHERE local.generation_id = ?1
-           AND (remote.digest IS NULL OR local.digest IS NULL OR remote.digest <> local.digest)
-         UNION ALL
-         SELECT remote.relative_path, NULL, NULL,
-                remote.digest, remote.size, baseline.digest, baseline.size
-         FROM scan_entries AS remote
-         LEFT JOIN file_sync_baselines AS baseline
-           ON baseline.mapping_id = ?3 AND baseline.relative_path = remote.relative_path
-         WHERE remote.generation_id = ?2
-           AND NOT EXISTS (
-               SELECT 1 FROM scan_entries AS local
-               WHERE local.generation_id = ?1 AND local.relative_path = remote.relative_path
-           )
-         UNION ALL
-         SELECT baseline.relative_path, NULL, NULL, NULL, NULL, baseline.digest, baseline.size
-         FROM file_sync_baselines AS baseline
-         WHERE baseline.mapping_id = ?3
-           AND NOT EXISTS (
-               SELECT 1 FROM scan_entries AS local
-               WHERE local.generation_id = ?1 AND local.relative_path = baseline.relative_path
-           )
-           AND NOT EXISTS (
-               SELECT 1 FROM scan_entries AS remote
-               WHERE remote.generation_id = ?2 AND remote.relative_path = baseline.relative_path
-           )
-         ORDER BY 1",
-    )?;
+    let mut differences = transaction.prepare(GENERATION_DIFFERENCES_SQL)?;
     let mut rows = differences.query(params![
         local_generation,
         remote_generation,
@@ -1413,34 +1515,52 @@ fn plan_generations_reconciliation(
             (Some(digest), Some(size)) => Some((digest, size)),
             _ => None,
         };
-        match (local_file, remote_file) {
+        // A newly ignored path is left out of planning entirely, exactly like
+        // the full-array planner. Its baseline was already advanced for
+        // identical pairs, so removing the rule later compares against it.
+        if ignored.contains(&path) {
+            continue;
+        }
+        match (&local_file, &remote_file) {
             (Some(local), Some(remote)) => plan_divergent_pair(
                 &path,
-                &local,
-                &remote,
+                local,
+                remote,
                 baseline.as_ref(),
                 &request.mode,
                 &mut plan.operations,
                 &mut plan.conflicts,
             ),
-            (Some(file), None) => plan_one_sided(
-                &path,
-                &file,
-                true,
-                baseline.is_some(),
-                initialized,
-                &request.mode,
-                &mut plan,
-            ),
-            (None, Some(file)) => plan_one_sided(
-                &path,
-                &file,
-                false,
-                baseline.is_some(),
-                initialized,
-                &request.mode,
-                &mut plan,
-            ),
+            (Some(file), None) => {
+                if destination_path_occupied(transaction, remote_generation, &path)? {
+                    record_occupied_addition(&path, baseline.is_some(), &mut plan);
+                } else {
+                    plan_one_sided(
+                        &path,
+                        file,
+                        true,
+                        baseline.is_some(),
+                        initialized,
+                        &request.mode,
+                        &mut plan,
+                    );
+                }
+            }
+            (None, Some(file)) => {
+                if destination_path_occupied(transaction, local_generation, &path)? {
+                    record_occupied_addition(&path, baseline.is_some(), &mut plan);
+                } else {
+                    plan_one_sided(
+                        &path,
+                        file,
+                        false,
+                        baseline.is_some(),
+                        initialized,
+                        &request.mode,
+                        &mut plan,
+                    );
+                }
+            }
             (None, None) => plan.conflicts.push(PlannedConflict {
                 path,
                 kind: ConflictKind::DeletionNotPropagated,
@@ -1501,7 +1621,8 @@ fn advance_identical_generation_baselines(
          FROM scan_entries AS local
          JOIN scan_entries AS remote
            ON remote.generation_id = ?2 AND remote.relative_path = local.relative_path
-         WHERE local.generation_id = ?1 AND local.digest = remote.digest
+              AND remote.kind = 'file'
+         WHERE local.generation_id = ?1 AND local.kind = 'file' AND local.digest = remote.digest
          ON CONFLICT(mapping_id, relative_path) DO UPDATE SET
             digest = excluded.digest, size = excluded.size, verified_at = excluded.verified_at
          WHERE file_sync_baselines.digest <> excluded.digest
@@ -1513,7 +1634,8 @@ fn advance_identical_generation_baselines(
          FROM scan_entries AS local
          JOIN scan_entries AS remote
            ON remote.generation_id = ?2 AND remote.relative_path = local.relative_path
-         WHERE local.generation_id = ?1 AND local.digest = remote.digest",
+              AND remote.kind = 'file'
+         WHERE local.generation_id = ?1 AND local.kind = 'file' AND local.digest = remote.digest",
         params![local_generation, remote_generation],
         |row| row.get(0),
     )?;

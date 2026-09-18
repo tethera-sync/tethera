@@ -1,6 +1,6 @@
 # Data model
 
-SQLite is local to each device. Schema version `10` is authoritative for mapping configuration, verified file baselines, retry/conflict state, replacement recovery metadata, staged scan generations, and older case-duplicate folder cleanup evidence. User-file bytes are never stored in SQLite.
+SQLite is local to each device. Schema version `11` is authoritative for mapping configuration, verified file baselines, retry/conflict state, replacement recovery metadata, staged scan generations, and older case-duplicate folder cleanup evidence. User-file bytes are never stored in SQLite.
 
 ## Implemented mapping tables
 
@@ -68,6 +68,7 @@ The active records, any tombstones needed to defeat stale PR #4 rows, outbox ent
 - Version 8 additively creates `directory_cleanup`, the durable evidence for moving an approved older case-duplicate folder to the OS trash.
 - Version 9 additively creates `archive_object_deletions`, the durable queue of archive objects whose files version history retention still has to remove, and a partial index on `file_replacement_journal.archive_digest`.
 - Version 10 rebuilds `scan_entries` as a `WITHOUT ROWID` table clustered on `(generation_id, relative_path)`, copying any staged rows and dropping the duplicate ordering index, so each staged path is stored once.
+- Version 11 adds `scan_entries.kind` (`file`, `directory`, or `special`, defaulting to `file`), so a staged observation records occupied destination paths as well as files; existing staged rows become `file`.
 - Every schema step and `PRAGMA user_version` bump shares one immediate transaction.
 - Malformed version-1 data rolls the whole step back and leaves version 1 intact.
 - A database newer than this build supports is refused without writes.
@@ -109,7 +110,10 @@ mode (`full-sha256` or `preview`), with `open`, `sealed`, or `aborted` state,
 a staged entry count, next batch sequence, and expiry. `scan_entries` stores
 one row per relative path per generation in a `WITHOUT ROWID` table clustered
 on `(generation_id, relative_path)` (version 10), which serves keyset paging
-and merge joins without a separate index.
+and merge joins without a separate index. Since version 11 each row carries a
+`kind`: `file` rows store the size and digest, while `directory` and `special`
+rows record an occupied path (a folder without synchronized files, or a
+symbolic link or other special entry) with no size or digest.
 
 Batches are transactional and idempotent: an identical re-delivery is accepted
 without double-counting, while gaps, changed duplicates, stale revisions, and
@@ -117,12 +121,19 @@ cross-mapping reads fail. Each batch advances the stored entry count by the
 rows it inserted, so staging costs follow the batch size, not the generation
 size. Sealing verifies the staged count once; only a sealed generation is
 visible to planning reads and `fileSync.reconcileGenerations`. Reconciliation
-advances baselines for paths both generations observed identically in one
-statement and streams only differing or baseline-only paths, in path order, to
-the planner, then publishes the completed plan atomically. Aborted and expired generations
-are cleaned without touching baselines, operations, conflicts, or recovery
-evidence. At most four open generations per mapping and one million entries
-per generation are staged, and one batch holds at most 1,000 entries.
+applies the mapping's current ignore rules, advances baselines for paths both
+generations observed identically in one statement, and streams only differing
+or baseline-only paths, in path order, to the planner. A one-sided addition
+whose destination path or ancestor is occupied, or lies beneath a synchronized
+file, is reported as an occupied skip instead of queued work. The completed
+plan is published atomically. Aborted and expired generations are cleaned
+without touching baselines, operations, conflicts, or recovery evidence, and
+an owner may release a generation in any state once its exchange has
+finished. Every staged generation is purged once at engine start, when
+nothing can be in flight, so an unfinished row left by a crash cannot hold
+the open-generation quota. At most four open generations per mapping and one
+million entries per generation are staged, and one batch holds at most 1,000
+entries.
 
 ## Scan digest cache (version 7)
 

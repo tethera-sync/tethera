@@ -20,13 +20,26 @@ import {
   mirrorConflictChoice,
   observedFiles,
   replayableOperations,
+  shouldUseGenerations,
   syncableObservations,
   type FileSyncConflict,
   type WatchHealthReport,
 } from "../src/main/continuous-sync"
+import { SCAN_GENERATION_CAPABILITY } from "../src/main/scan-generation"
 import { manifest } from "./helpers"
 
 describe("continuous sync helpers", () => {
+  test("only generation-capable chunked peers with no pending work take the generation path", () => {
+    const capable = new Set([SCAN_GENERATION_CAPABILITY])
+    expect(shouldUseGenerations(capable, true, 0)).toBe(true)
+    // A peer without the capability keeps the full-manifest path.
+    expect(shouldUseGenerations(new Set(), true, 0)).toBe(false)
+    // The observe response must be able to span several frames.
+    expect(shouldUseGenerations(capable, false, 0)).toBe(false)
+    // Replayable work stays on the manifest path, which owns conflict-choice mirroring.
+    expect(shouldUseGenerations(capable, true, 1)).toBe(false)
+  })
+
   test("replays only durable operations whose source and destination are still exact", () => {
     const operation = {
       id: 1,

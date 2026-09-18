@@ -2,6 +2,8 @@
 
 All notable changes to this project, newest first.
 
+- ✨ Sync large folders through staged scans: a changed check now reconciles what differs instead of holding a full file list on each computer. Both computers need the update; older versions keep the current behaviour.
+- 🐛 Clean up staged scans left behind by a crash or forced quit the next time Tethera starts, so a folder can keep syncing.
 - ✨ Scan whole folders with no file-count limit. The Scan file limit setting is gone, and a sync check now accepts up to 1,000,000 files per computer instead of rejecting folders above 10,000.
 - ✨ Watch every folder for live changes: one native watcher on Windows and macOS, and no 10,000-folder cap on Linux.
 - ⚡ Stream large sync messages to the engine and the other computer instead of building them in memory, holding about 170 MB less during a 250,000-file sync check.

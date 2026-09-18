@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Schema version this build reads and writes. Version 1 is intentionally left unchanged below.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 200;
@@ -834,6 +834,26 @@ impl MappingStore {
         if current < 10 {
             self.migrate_v9_to_v10()?;
         }
+        if current < 11 {
+            self.migrate_v10_to_v11()?;
+        }
+        Ok(())
+    }
+
+    /// Adds the staged entry kind so a scan can record an occupied path (a
+    /// folder without synchronized files, or a symbolic link or other special
+    /// entry) alongside the files it observed. Staged files keep the previous
+    /// shape and every existing row becomes a file.
+    fn migrate_v10_to_v11(&self) -> Result<(), MappingStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "ALTER TABLE scan_entries
+                ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'
+                CHECK (kind IN ('file', 'directory', 'special'));
+            PRAGMA user_version = 11;",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -3033,6 +3053,69 @@ mod tests {
             .expect("scan entry schema");
         assert!(table_sql.contains("WITHOUT ROWID"));
         assert_eq!(index_count, 0);
+
+        drop(reopened);
+        let reopened_again = MappingStore::open(&path).expect("reopen migrated database");
+        assert_eq!(
+            reopened_again.schema_version().expect("version"),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migrates_schema_v10_to_v11_keeping_staged_entries_as_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("mappings.sqlite3");
+        let original = sample("existing-v10-mapping");
+        seed_v1(&path, std::slice::from_ref(&original));
+        drop(MappingStore::open(&path).expect("create representative current schema"));
+
+        let connection = rusqlite::Connection::open(&path).expect("open representative v10");
+        connection
+            .execute_batch(
+                "DROP TABLE scan_entries;
+                 CREATE TABLE scan_entries (
+                     generation_id TEXT NOT NULL REFERENCES scan_generations(generation_id) ON DELETE CASCADE,
+                     relative_path TEXT NOT NULL,
+                     digest TEXT,
+                     size INTEGER NOT NULL CHECK (size >= 0),
+                     PRIMARY KEY (generation_id, relative_path)
+                 ) WITHOUT ROWID;
+                 INSERT INTO scan_generations (
+                     generation_id, mapping_id, participant_device_id, mapping_revision, root,
+                     ignore_patterns, hash_mode, state, entry_count, next_sequence,
+                     created_at, updated_at, expires_at
+                 ) VALUES (
+                     'staged-v10', 'existing-v10-mapping', 'linux-box', 1, '/tmp/a',
+                     '[]', 'full-sha256', 'open', 2, 1, 'now', 'now', 'later'
+                 );
+                 INSERT INTO scan_entries (generation_id, relative_path, digest, size)
+                     VALUES ('staged-v10', 'b.txt', NULL, 2), ('staged-v10', 'a.txt', NULL, 1);
+                 PRAGMA user_version = 10;",
+            )
+            .expect("downgrade representative schema to v10");
+        drop(connection);
+
+        let reopened = MappingStore::open(&path).expect("migrate v10 to v11");
+        assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
+        let staged: Vec<(String, i64, String)> = reopened
+            .connection
+            .prepare(
+                "SELECT relative_path, size, kind FROM scan_entries
+                 WHERE generation_id = 'staged-v10' ORDER BY relative_path",
+            )
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("staged rows");
+        assert_eq!(
+            staged,
+            vec![
+                ("a.txt".to_owned(), 1, "file".to_owned()),
+                ("b.txt".to_owned(), 2, "file".to_owned()),
+            ]
+        );
 
         drop(reopened);
         let reopened_again = MappingStore::open(&path).expect("reopen migrated database");

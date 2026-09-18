@@ -69,7 +69,20 @@ import { ScanLedger, scanStageForKey } from "./scan-ledger"
 import { ScanReuseStore } from "./scan-reuse-store"
 import { formatScanIssuePath, scanIssueReportCovers, scanIssueTotal } from "../shared/folder-scan-issues"
 import { invertMode, sharingWidening } from "../shared/folder-sharing-consent"
-import { SCAN_GENERATION_CAPABILITY, SCAN_PAGE_MAX_ENTRIES } from "./scan-generation"
+import {
+  fetchPeerGenerationPages,
+  parsePeerGenerationScanReply,
+  SCAN_GENERATION_CAPABILITY,
+  SCAN_PAGE_MAX_ENTRIES,
+  type PeerGenerationScanReply,
+  type PeerPageClient,
+} from "./scan-generation"
+import {
+  releaseGeneration,
+  stageIncomingGeneration,
+  stageLocalGeneration,
+  type StagedGeneration,
+} from "./generation-staging"
 import {
   assessInitialMergeConvergence,
   assertInitialMergeCapacity,
@@ -174,6 +187,7 @@ import {
   mirrorConflictChoice,
   observedFiles,
   replayableOperations,
+  shouldUseGenerations,
   syncableObservations,
   type FileSyncConflict,
   type FileSyncDirection,
@@ -659,9 +673,22 @@ async function cachedPeerCapabilities(peerId: string): Promise<ReadonlySet<strin
 const quietReconciles = new Map<string, QuietReconcile>()
 
 /**
+ * Per folder, the sealed scan this computer staged for the coordinator's next
+ * observe exchange. Replaced (and released) by the following scan, so an
+ * aborted exchange leaves at most one generation behind.
+ */
+const stagedCoordinatorGenerations = new Map<string, string>()
+
+type PeerContinuousScanReply =
+  | { kind: "unchanged" }
+  | { kind: "generation"; reply: PeerGenerationScanReply }
+  | { kind: "manifest"; manifest: FileManifest }
+
+/**
  * Asks the peer for its continuous-sync observation, offering the fingerprint
  * it had at the last quiet reconcile so a supporting peer can answer that
- * nothing changed instead of sending it.
+ * nothing changed instead of sending it. A generation-aware request lets a
+ * supporting peer stage its scan instead of returning a manifest.
  */
 async function requestPeerContinuousScan(
   peerId: string,
@@ -669,9 +696,135 @@ async function requestPeerContinuousScan(
   knownFingerprint: string,
   signal: AbortSignal,
   chunked: boolean,
-): Promise<FileManifest | { unchanged: true }> {
-  const raw = await requirePeerSessions().request<unknown>(peerId, { type: "continuous-sync-scan", folderId, knownFingerprint }, NO_PEER_RESPONSE_DEADLINE, { signal, chunked })
-  return isUnchangedScanReply(raw) ? raw : parsePeerManifest(raw)
+  preferGeneration: boolean,
+): Promise<PeerContinuousScanReply> {
+  const request = preferGeneration
+    ? { type: "continuous-sync-scan", folderId, knownFingerprint, preferGeneration: true }
+    : { type: "continuous-sync-scan", folderId, knownFingerprint }
+  const raw = await requirePeerSessions().request<unknown>(peerId, request, NO_PEER_RESPONSE_DEADLINE, { signal, chunked })
+  if (isUnchangedScanReply(raw)) return { kind: "unchanged" }
+  // Only a generation-aware request can answer with a generation id; anything
+  // else a legacy peer sends is its manifest.
+  return preferGeneration
+    ? { kind: "generation", reply: parsePeerGenerationScanReply(raw) }
+    : { kind: "manifest", manifest: parsePeerManifest(raw) }
+}
+
+/**
+ * Asks the peer to stage and seal its own scan instead of returning a full
+ * manifest, then reports its generation id and counters. Only sent to peers
+ * that advertise `scan-generations-v1`.
+ */
+async function requestPeerGenerationScan(
+  peerId: string,
+  folderId: string,
+  signal: AbortSignal,
+): Promise<PeerGenerationScanReply> {
+  const raw = await requirePeerSessions().request<unknown>(
+    peerId,
+    { type: "continuous-sync-scan", folderId, preferGeneration: true },
+    NO_PEER_RESPONSE_DEADLINE,
+    { signal },
+  )
+  return parsePeerGenerationScanReply(raw)
+}
+
+/**
+ * Fetches one sealed generation of a shared mapping from its owning computer
+ * page by page and stages it locally, so both observations can be reconciled
+ * set-based. Each request is its own authenticated session, so this stays
+ * safe to run while the coordinator answers the exchange.
+ */
+function stagePeerGeneration(
+  folder: FolderSummary,
+  peerId: string,
+  generationId: string,
+  mappingRevision: number,
+  signal: AbortSignal,
+): Promise<StagedGeneration> {
+  const client: PeerPageClient = {
+    request: (payload, timeoutMs, pageSignal) => requirePeerSessions().request(peerId, payload, timeoutMs, { signal: pageSignal }),
+    // Reaching this path already required the capability on both computers.
+    supportsGenerations: () => Promise.resolve(true),
+  }
+  const pages = fetchPeerGenerationPages(client, folder.id, generationId, {
+    limit: SCAN_PAGE_MAX_ENTRIES,
+    timeoutMs: CONTINUOUS_SYNC_RPC_TIMEOUT_MS,
+    signal,
+  })
+  return stageIncomingGeneration(engine, pages, {
+    mappingId: folder.id,
+    participantDeviceId: peerId,
+    mappingRevision,
+    root: folder.remotePath,
+    ignorePatterns: folder.ignorePatterns,
+  })
+}
+
+/**
+ * Stages this computer's own scan and remembers it for the coordinator's next
+ * observe exchange. The superseded generation is released, so an exchange the
+ * coordinator aborts leaves at most one generation behind.
+ */
+async function stageOwnGenerationForCoordinator(
+  folder: FolderSummary,
+  record: MappingRecord,
+  signal: AbortSignal,
+  purpose: Extract<FolderWorkActivity, { kind: "scanning" }>["purpose"],
+): Promise<StagedGeneration> {
+  const folderId = folder.id
+  const staged = await withFolderDigestCache(folderId, (digestCache) =>
+    runAdmittedScan(`inbound:generation:${folderId}`, folderId, signal, (effective) =>
+      stageLocalGeneration(engine, {
+        mappingId: folderId,
+        participantDeviceId: getLocalIdentityId(),
+        mappingRevision: record.revision,
+        root: folder.localPath,
+        ignorePatterns: folder.ignorePatterns,
+        signal: effective,
+        digestCache,
+        onActivity: (activity) => reportScanCounts(folderId, purpose, { local: activity }),
+        ...directoryScanOptions(folderId),
+      })))
+  const previous = stagedCoordinatorGenerations.get(folderId)
+  stagedCoordinatorGenerations.set(folderId, staged.generationId)
+  if (previous) await releaseGeneration(engine, previous)
+  return staged
+}
+
+/** Stages a peer's scan reply as a generation response, so both reply shapes never mix. */
+function generationScanReply(staged: StagedGeneration): PeerGenerationScanReply {
+  return {
+    generationId: staged.generationId,
+    entries: staged.files,
+    occupied: staged.occupied,
+    ignored: staged.ignored,
+    unreadable: staged.unreadable,
+  }
+}
+
+/** Removes aborted and expired staged scans. Runs after a failed cycle, while other folders may still be staging. Best effort. */
+async function cleanupStagedGenerations(): Promise<void> {
+  if (engine.state.status !== "ready") return
+  try {
+    await engine.request("scanGeneration.cleanup", { now: new Date().toISOString() })
+  } catch (error) {
+    console.warn("[continuous-sync] unable to clean staged scans", error)
+  }
+}
+
+/**
+ * Removes every staged scan at engine start, when nothing can be in flight.
+ * An unfinished generation left by a crash would otherwise hold the
+ * open-generation quota for a day and block staging. Best effort.
+ */
+async function purgeStagedGenerations(): Promise<void> {
+  if (engine.state.status !== "ready") return
+  try {
+    await engine.request("scanGeneration.purge")
+  } catch (error) {
+    console.warn("[continuous-sync] unable to purge staged scans", error)
+  }
 }
 
 /**
@@ -1341,6 +1494,12 @@ async function initializeAuthoritativeMappings(health: MappingStoreHealth): Prom
         },
       })
       if (engine.generation !== generation) return
+      // Unfinished staged scans from a previous run would hold the
+      // open-generation quota. Purge them now: the legacy import has
+      // completed, the store is not yet marked ready, and no monitor or cycle
+      // is running, so neither local nor inbound generation staging can race
+      // the purge (both fail closed until the store is ready).
+      await purgeStagedGenerations()
       if (result.stateDocument) {
         legacyStateSource = {
           kind: "readable",
@@ -2457,11 +2616,14 @@ async function retireInitialConflictProjection(folderId: string, state: FileSync
 async function executeContinuousOperations(
   folder: FolderSummary,
   peer: DeviceSummary,
-  remoteManifest: FileManifest,
+  remoteManifest: FileManifest | undefined,
   operations: FileSyncOperation[],
   peerOperations: PeerFileOperationIdentity[],
 ): Promise<number> {
-  const remoteFilesByPath = new Map(remoteManifest.files.map((entry) => [entry.path, entry]))
+  // A generation cycle already staged the peer's observation and re-verifies
+  // every pulled file through its descriptor, so it resolves the source from
+  // the durable operation instead of a manifest.
+  const remoteFilesByPath = remoteManifest ? new Map(remoteManifest.files.map((entry) => [entry.path, entry])) : undefined
   const totalBytes = operations.reduce((total, operation) => total + operation.sourceSize, 0)
   let copiedBytes = 0
   let copiedFiles = 0
@@ -2499,7 +2661,9 @@ async function executeContinuousOperations(
         if (!peerOperation) {
           throw new Error(`${operation.path} has no exact durable operation on the paired computer.`)
         }
-        const entry = remoteFilesByPath.get(operation.path)
+        const entry = remoteFilesByPath
+          ? remoteFilesByPath.get(operation.path)
+          : { path: operation.path, size: operation.sourceSize, digest: operation.sourceDigest, modifiedMs: 0 }
         if (!entry || entry.digest !== operation.sourceDigest || entry.size !== operation.sourceSize) {
           throw new Error(`${operation.path} changed after reconciliation; it will be retried.`)
         }
@@ -2581,6 +2745,131 @@ async function recordPeerConflictChoice(
   return parsePeerFileOperations(response)
 }
 
+/**
+ * One continuous cycle between computers that both stage scans as sealed
+ * generations: this computer stages its own scan, fetches the peer's pages,
+ * and reconciles both set-based, so neither side holds a full file list.
+ *
+ * Only a cycle with no durable operation pending takes this path: the
+ * manifest path owns replay and conflict-choice mirroring, and a queued
+ * operation must not be replaced by a fresh plan before it runs.
+ */
+async function runGenerationCycle(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  record: MappingRecord,
+  observedAt: string,
+  chunked: boolean,
+  knownPeerScan?: PeerGenerationScanReply,
+): Promise<ReconcileFilesResult> {
+  const folderId = folder.id
+  let localGenerationId: string | undefined
+  let incomingGenerationId: string | undefined
+  try {
+    const { local: localGeneration, peer: peerScan } = await runPairedScans(
+      (signal) => withFolderDigestCache(folderId, (digestCache) =>
+        runAdmittedScan(`continuous:generation:${folderId}`, folderId, signal, (effective) =>
+          stageLocalGeneration(engine, {
+            mappingId: folderId,
+            participantDeviceId: getLocalIdentityId(),
+            mappingRevision: record.revision,
+            root: folder.localPath,
+            ignorePatterns: folder.ignorePatterns,
+            signal: effective,
+            digestCache,
+            onActivity: (activity) => reportScanCounts(folderId, "changes", { local: activity }),
+            ...directoryScanOptions(folderId),
+          }))),
+      (signal) => knownPeerScan
+        ? Promise.resolve(knownPeerScan)
+        : requestPeerGenerationScan(peer.id, folderId, signal),
+    )
+    localGenerationId = localGeneration.generationId
+    assertStagedGenerationComplete(localGeneration, "This computer")
+    assertPeerStagedScanComplete(peerScan, peer.name)
+
+    // Fetching the peer's pages and reconciling can take as long as the local
+    // scan, so the folder shows what it is waiting on instead of stale counters.
+    setFolderActivity(folderId, { kind: "waiting-for-peer" })
+    broadcastSnapshot()
+    const incoming = await runAdmittedScan(`continuous:incoming:${folderId}`, folderId, null, (effective) =>
+      stagePeerGeneration(folder, peer.id, peerScan.generationId, record.revision, effective))
+    incomingGenerationId = incoming.generationId
+
+    const result = await engine.request<ReconcileFilesResult>("fileSync.reconcileGenerations", {
+      mappingId: folderId,
+      localGenerationId: localGeneration.generationId,
+      remoteGenerationId: incoming.generationId,
+      mode: folder.mode,
+      ignorePatterns: folder.ignorePatterns,
+      observedAt,
+      queueOperations: true,
+    }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
+    recordOccupiedPaths(folder, result.occupiedPaths ?? [])
+    await retireInitialConflictProjection(folderId, result)
+    if (result.conflicts.length > 0) {
+      applyFileSyncStateToFolder(folderId, result)
+      recordContinuousConflicts(folder, result.conflicts)
+      broadcastSnapshot()
+    }
+
+    const peerResult = await requirePeerSessions().request<unknown>(peer.id, {
+      type: "continuous-sync-observe-generations",
+      folderId,
+      localGenerationId: localGeneration.generationId,
+      mode: invertMode(folder.mode),
+      ignorePatterns: folder.ignorePatterns,
+      observedAt,
+    }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, { chunked })
+
+    // The peer fetched and reconciled this computer's generation as part of
+    // that exchange, so both staged scans are finished with now.
+    await releaseGeneration(engine, incoming.generationId)
+    incomingGenerationId = undefined
+    await releaseGeneration(engine, localGeneration.generationId)
+    localGenerationId = undefined
+
+    const peerOperations = parsePeerFileOperations(peerResult)
+    const copiedFiles = await executeContinuousOperations(
+      folder,
+      peer,
+      undefined,
+      result.operations,
+      peerOperations,
+    )
+
+    const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+    const completedAt = new Date().toISOString()
+    if (result.operations.length === 0 && peerOperations.length === 0 && state.operations.length === 0) {
+      quietReconciles.set(folderId, {
+        revision: record.revision,
+        localFingerprint: localGeneration.fingerprint,
+        remoteFingerprint: incoming.fingerprint,
+        baselineCount: state.baselineCount,
+        conflictKey: conflictKey(state.conflicts),
+        reconciledAt: Date.now(),
+      })
+    }
+    applyFileSyncStateToFolder(folderId, state, completedAt)
+    continuousLastErrors.delete(folderId)
+    if (copiedFiles > 0) {
+      pushActivity(
+        "Folder changes synchronized",
+        `${folder.name}: copied ${copiedFiles} file${copiedFiles === 1 ? "" : "s"} safely with ${peer.name}.`,
+        "success",
+        folderId,
+      )
+    }
+    recordContinuousConflicts(folder, state.conflicts)
+    return result
+  } finally {
+    if (incomingGenerationId) await releaseGeneration(engine, incomingGenerationId)
+    if (localGenerationId) await releaseGeneration(engine, localGenerationId)
+    // Aborted stages from this cycle are cleared now instead of at their TTL.
+    void cleanupStagedGenerations()
+  }
+}
+
 async function flushContinuousSync(folderId: string): Promise<void> {
   if (!continuousSyncQueued.has(folderId) || continuousSyncInFlight.has(folderId)) return
   continuousSyncQueued.delete(folderId)
@@ -2634,24 +2923,32 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     const capabilities = await cachedPeerCapabilities(peer.id)
     const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
     const quiet = quietReconciles.get(folderId)
+    const generations = shouldUseGenerations(capabilities, chunked, durableBeforeReconcile.operations.length)
     let knownPeerManifest: FileManifest | undefined
+    let knownPeerScan: PeerGenerationScanReply | undefined
     if (capabilities.has(CONTINUOUS_FINGERPRINT_CAPABILITY) && canSkipUnchangedCycle(quiet, durableBeforeReconcile, record.revision, Date.now())) {
       // Cheap first pass: fingerprints only, with no file list held on either computer.
       const { local: localPass, peer: peerReply } = await runPairedScans(
         (signal) => runCachedFolderFingerprint(`continuous:${folderId}`, folder, signal),
-        (signal) => requestPeerContinuousScan(peer.id, folderId, quiet.remoteFingerprint, signal, chunked),
+        (signal) => requestPeerContinuousScan(peer.id, folderId, quiet.remoteFingerprint, signal, chunked, generations),
       )
       const localUnchanged = localPass.unreadable === 0 && localPass.fingerprint === quiet.localFingerprint
-      if (localUnchanged && isUnchangedScanReply(peerReply)) {
+      if (localUnchanged && peerReply.kind === "unchanged") {
         applyFileSyncStateToFolder(folderId, durableBeforeReconcile, new Date().toISOString())
         continuousLastErrors.delete(folderId)
         recordContinuousConflicts(folder, durableBeforeReconcile.conflicts)
         return
       }
-      if (!isUnchangedScanReply(peerReply)) knownPeerManifest = peerReply
+      if (peerReply.kind === "generation") knownPeerScan = peerReply.reply
+      else if (peerReply.kind === "manifest") knownPeerManifest = peerReply.manifest
+      // An `unchanged` answer the local pass could not confirm is re-scanned in full.
     }
     // Only a clean quiet reconcile below may leave a skip record behind.
     quietReconciles.delete(folderId)
+    if (generations) {
+      reconciledState = await runGenerationCycle(folder, peer, record, observedAt, chunked, knownPeerScan)
+      return
+    }
     const { local: localManifest, peer: remoteManifest } = await runPairedScans(
       (signal) => runCachedFolderScan(`continuous:${folderId}`, folder, signal, {
         onActivity: (activity) => reportScanCounts(folderId, "changes", { local: activity }),
@@ -2850,6 +3147,13 @@ function blockContinuousSync(folderId: string): () => void {
   continuousSyncMonitors.delete(folderId)
   // No monitor means no coverage claim to show while the folder is blocked.
   clearWatchDegraded(folderId)
+  // A staged scan this computer still holds for the coordinator can never be
+  // observed once the folder is paused or reconfigured; drop it eagerly.
+  const staged = stagedCoordinatorGenerations.get(folderId)
+  if (staged) {
+    stagedCoordinatorGenerations.delete(folderId)
+    void releaseGeneration(engine, staged)
+  }
   return () => {
     continuousSyncBlocked.delete(folderId)
     void refreshContinuousSyncMonitors()
@@ -2913,6 +3217,22 @@ function describeUnreadableIssues(issues: readonly FolderScanIssue[], total: num
   const shown = issues.slice(0, 3).map((issue) => `${formatScanIssuePath(issue.path)} (${issue.reason})`)
   const remaining = total - shown.length
   return remaining > 0 ? `${shown.join(", ")} and ${remaining} more` : shown.join(", ")
+}
+
+/** The staged-generation equivalent of `assertCompleteTransferManifest`: an incomplete observation is never reconciled. */
+function assertStagedGenerationComplete(staged: StagedGeneration, computer: string): void {
+  if (staged.unreadable === 0) return
+  throw new Error(
+    `${computer}'s folder has ${staged.unreadable} unreadable item${staged.unreadable === 1 ? "" : "s"}: ${describeUnreadableIssues(staged.unreadableEntries, staged.unreadable)}. Fix access and retry.`,
+  )
+}
+
+/** The peer's scan reply carries counters only; a nonzero count still fails the cycle closed. */
+function assertPeerStagedScanComplete(reply: PeerGenerationScanReply, computer: string): void {
+  if (reply.unreadable === 0) return
+  throw new Error(
+    `${computer}'s folder has ${reply.unreadable} unreadable item${reply.unreadable === 1 ? "" : "s"}. Fix access and retry.`,
+  )
 }
 
 async function pullPlannedFile(
@@ -3994,13 +4314,24 @@ function requireSharedFileSource(context: PeerRequestContext, folderId: string, 
   return folder
 }
 
-function requireSharedActiveFolder(context: PeerRequestContext, folderId: string): FolderSummary {
+/**
+ * An active shared mapping between this computer and the authenticated peer,
+ * with no configuration change in flight and nothing paused. Both mapping
+ * participants pass; callers that start work add their own participant rule.
+ */
+function requireActiveSharedFolder(context: PeerRequestContext, folderId: string): FolderSummary {
   const folder = requireSharedFolder(context, folderId)
   const record = mappingRecords.get(folderId)
   if (!record || folder.setupStatus !== "active") throw new Error("This folder has not completed its initial merge.")
   if (continuousSyncBlocked.has(folderId)) throw new Error("This folder's configuration is changing. Retry shortly.")
   if (folder.paused || snapshot.paused) throw new Error("This folder is paused.")
-  if (continuousCoordinatorId(record) !== context.peerId) {
+  return folder
+}
+
+function requireSharedActiveFolder(context: PeerRequestContext, folderId: string): FolderSummary {
+  const folder = requireActiveSharedFolder(context, folderId)
+  const record = mappingRecords.get(folderId)
+  if (!record || continuousCoordinatorId(record) !== context.peerId) {
     throw new Error("Only the elected synchronization coordinator can request this operation.")
   }
   return folder
@@ -4125,8 +4456,12 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
   if (request.type === "continuous-sync-scan") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     const folder = requireSharedActiveFolder(context, folderId)
+    const record = mappingRecords.get(folderId)
+    if (!record) throw new Error("This folder has not completed its shared configuration.")
     // A malformed fingerprint is treated as absent, never as a match.
     const knownFingerprint = isObservationFingerprint(request.knownFingerprint) ? request.knownFingerprint : undefined
+    // Only a coordinator that negotiated `scan-generations-v1` asks for this.
+    const preferGeneration = request.preferGeneration === true
     return withPeerFileOperation(context, folderId, async () => {
       // The coordinator runs the comparison, so without this the folder here
       // would show nothing while a long first scan reads every file.
@@ -4145,6 +4480,13 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
             if (state.operations.length === 0 && state.recoveryIssues.length === 0) return { unchanged: true }
           }
         }
+        if (preferGeneration) {
+          // Staging writes generations, so it waits for the same store
+          // readiness the reconcile exchange requires; this also keeps an
+          // inbound scan from racing the startup purge.
+          requireMappingMutations()
+          return generationScanReply(await stageOwnGenerationForCoordinator(folder, record, context.signal, "peer-changes"))
+        }
         const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, context.signal, {
           onActivity: (activity) => reportScanCounts(folderId, "peer-changes", { local: activity }),
         })
@@ -4158,6 +4500,72 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       }
     })
   }
+  if (request.type === "continuous-sync-observe-generations") {
+    requireMappingMutations()
+    const folderId = typeof request.folderId === "string" ? request.folderId : ""
+    const coordinatorGenerationId = typeof request.localGenerationId === "string" ? request.localGenerationId : ""
+    // The direction is this computer's approved policy, exactly as for the
+    // manifest observe exchange; a disagreement fails the cycle closed.
+    const folder = requireSharedActiveFolder(context, folderId)
+    if (request.mode !== folder.mode) {
+      throw new Error("The synchronization direction no longer matches this folder's approved configuration.")
+    }
+    // The peer's rules never decide local planning; they must agree exactly
+    // with this computer's approved rules, so a settings change still being
+    // delivered cannot mix two rule sets.
+    if (request.ignorePatterns !== undefined && !(Array.isArray(request.ignorePatterns) && sameIgnorePatterns(request.ignorePatterns, folder.ignorePatterns))) {
+      throw new Error("The ignore rules no longer match this folder's approved configuration.")
+    }
+    if (!coordinatorGenerationId) throw new Error("The staged scan exchange is invalid.")
+    const ownGenerationId = stagedCoordinatorGenerations.get(folderId)
+    if (!ownGenerationId) throw new Error("No staged scan is waiting for this exchange.")
+    const observedAt = typeof request.observedAt === "string" ? request.observedAt : ""
+    const record = mappingRecords.get(folderId)
+    if (!record) throw new Error("This folder has not completed its shared configuration.")
+    return withPeerFileOperation(context, folderId, async () => {
+      // The coordinator is waiting on this computer, which is fetching and
+      // reconciling the staged scan; show that instead of nothing.
+      setFolderActivity(folderId, { kind: "waiting-for-peer" })
+      broadcastSnapshot()
+      try {
+        const incoming = await runAdmittedScan(`inbound:generation-incoming:${folderId}`, folderId, context.signal, (effective) =>
+          stagePeerGeneration(folder, context.peerId, coordinatorGenerationId, record.revision, effective))
+        try {
+          const state = await engine.request<ReconcileFilesResult>("fileSync.reconcileGenerations", {
+            mappingId: folderId,
+            localGenerationId: ownGenerationId,
+            remoteGenerationId: incoming.generationId,
+            mode: folder.mode,
+            ignorePatterns: folder.ignorePatterns,
+            observedAt,
+            queueOperations: true,
+          }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS)
+          await retireInitialConflictProjection(folderId, state)
+          applyFileSyncStateToFolder(folderId, state, new Date().toISOString())
+          const current = snapshot.folders.find((item) => item.id === folderId)
+          if (current) {
+            recordOccupiedPaths(current, state.occupiedPaths ?? [])
+            recordContinuousConflicts(current, state.conflicts)
+          }
+          broadcastSnapshot()
+          return state
+        } finally {
+          await releaseGeneration(engine, incoming.generationId)
+          if (stagedCoordinatorGenerations.get(folderId) === ownGenerationId) {
+            stagedCoordinatorGenerations.delete(folderId)
+          }
+          await releaseGeneration(engine, ownGenerationId)
+        }
+      } finally {
+        // Success cleared the phase with the durable state; a failure has not.
+        const current = snapshot.folders.find((item) => item.id === folderId)
+        if (current?.work?.activity.kind === "waiting-for-peer") {
+          updateFolder(folderId, { work: undefined })
+          broadcastSnapshot()
+        }
+      }
+    })
+  }
   if (request.type === "scan-capabilities") {
     return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY, CONTINUOUS_FINGERPRINT_CAPABILITY, DIRECTORY_MAPPING_CAPABILITY, INITIAL_MERGE_FREE_SPACE_CAPABILITY] }
   }
@@ -4166,11 +4574,14 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     const generationId = typeof request.generationId === "string" ? request.generationId : ""
     const cursor = request.cursor === undefined || request.cursor === null ? undefined : typeof request.cursor === "string" ? request.cursor : ""
     const limit = typeof request.limit === "number" ? request.limit : 200
-    requireSharedActiveFolder(context, folderId)
+    // Both authenticated participants may read a sealed generation of their
+    // shared mapping: one side fetches the other's observation during the
+    // exchange. Starting a scan stays coordinator-only.
+    requireActiveSharedFolder(context, folderId)
     if (!generationId || cursor === "") throw new Error("The scan generation page request is invalid.")
     return withPeerFileOperation(context, folderId, async () => {
       if (context.signal.aborted) throw new ScanCancelledError()
-      const page = await engine.request<{ entries: Array<{ path: string; size: number; digest?: string }>; nextCursor?: string }>(
+      const page = await engine.request<{ entries: Array<{ path: string; size: number; digest?: string; kind?: string }>; nextCursor?: string }>(
         "scanGeneration.readPage",
         { mappingId: folderId, generationId, cursor, limit },
       )

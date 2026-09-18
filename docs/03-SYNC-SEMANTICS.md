@@ -52,6 +52,8 @@ Full-integrity scans of an active folder may reuse a digest recorded by an earli
 
 A continuous cycle may stop after scanning when nothing changed. Each computer first computes an order-independent fingerprint of its full-integrity observation (every file's path, size and digest) without holding the file list in memory. If both fingerprints match the ones seen by the last reconcile that queued nothing, the mapping revision is the same, and neither computer has pending operations, recovery issues, changed conflicts or a changed baseline count, reconciling again would decide exactly the same, so the cycle ends without exchanging manifests or writing state. The first cycle after launch, and at least one cycle per hour, always reconciles in full.
 
+A changed cycle between computers that both advertise `scan-generations-v1` reconciles through staged generations instead of exchanging full manifests. Each computer stages its own full-integrity scan into SQLite as a sealed generation, fetches the other's sealed generation page by page, and reconciles the two set-based, so neither computer builds a full file list. A cycle with a durable operation pending stays on the manifest path, which owns replay and conflict-choice mirroring, and a peer without the capability always uses full manifests. Whichever path runs, the same baselines, directional durable operations, conflict rules and commit guarantees apply.
+
 ## Transfer strategy
 
 - Small files: whole-file.
@@ -97,7 +99,9 @@ Evidence order: stable file ID, watcher rename pair, matching digest/size/time p
 
 Use ordered slash-separated relative patterns, expose the matching rule, support a tester, show/remove presets and never ignore all dotfiles implicitly. Rule changes produce a previewed scoped reconciliation, not silent deletion.
 
-Editing an existing mapping's rules is implemented without a preview: `fileSync.reconcile` receives the mapping's current rules and leaves every excluded path (or path under an excluded folder) out of planning, so newly ignored files stay on disk and are neither transferred nor reported as deletions. Their verified baselines are kept, so removing the rule later compares each path against its last common digest rather than treating it as new. Newly included files are reconciled like any other path. Staged scan-generation reconciliation does not take rules yet.
+Editing an existing mapping's rules is implemented without a preview: `fileSync.reconcile` and `fileSync.reconcileGenerations` receive the mapping's current rules and leave every excluded path (or path under an excluded folder) out of planning, so newly ignored files stay on disk and are neither transferred nor reported as deletions. Their verified baselines are kept, so removing the rule later compares each path against its last common digest rather than treating it as new. Newly included files are reconciled like any other path.
+
+A one-sided file whose destination path is already used by a folder, symbolic link or other special entry is left out of planning and reported as an occupied path; a synchronized file above the path blocks it the same way. Generation reconciliation applies the same rule from its staged occupied entries and from the destination generation's paths, so a transfer that could only fail is never planned.
 
 New desktop mappings suggest common temporary-file rules plus `node_modules/` and `.venv/`. Optional language presets append editable rules without replacing custom entries; only the reviewed patterns are sent for approval. Existing mappings are not changed by new defaults.
 

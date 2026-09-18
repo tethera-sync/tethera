@@ -14,7 +14,7 @@ Delivered local-index foundation:
 - SQLite schema v4 stores per-file verified baselines, retryable operations, conflicts, archive objects, and replacement recovery state.
 - Native recursive watchers plus a periodic safety scan drive continuous reconciliation.
 
-Still outstanding in M1: scan generations/paging, incremental hashing at scale, and moving the live desktop scanner onto a single Rust implementation.
+Staged scan generations now back live continuous cycles between updated peers, with incremental staging, paged exchange and set-based reconciliation; incremental hashing at scale is the durable digest cache. Still outstanding in M1: wiring the initial merge through staged generations with a paged additive plan, and moving the live desktop scanner onto a single Rust implementation (deferred).
 
 ## M2 LAN technical MVP
 Identity/pairing, LAN discovery, encrypted mutual session, folder mapping, previewed initial merge, whole-file transfer, atomic journalled commit, two-way sync, history/archive.
@@ -38,4 +38,4 @@ More devices, native NAT/relay, optional self-hosted rendezvous, other OSes, at-
 
 ## Recommended next pull request
 
-Archive retention now applies each folder's age and storage limits over the replacement journal, with restart-safe object removal. Staged scan generations are now incremental; the next milestone should wire them through the live initial merge and continuous reconciliation. Deletion and rename propagation should remain disabled until archive recovery, retention, and interruption behavior are proven safe end to end across platforms.
+Archive retention now applies each folder's age and storage limits over the replacement journal, with restart-safe object removal. Continuous reconciliation now runs through staged scan generations between updated peers; the next milestone should wire the initial merge through them with a paged additive plan. Deletion and rename propagation should remain disabled until archive recovery, retention, and interruption behavior are proven safe end to end across platforms.
