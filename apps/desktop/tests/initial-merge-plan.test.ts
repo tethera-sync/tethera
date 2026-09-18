@@ -87,6 +87,17 @@ describe("additive merge plan contract", () => {
     expect(() => parseAdditivePlanPage({ additions, conflicts: [], occupied: [] })).toThrow("invalid additive merge plan")
   })
 
+  test("accepts a case-collision description covering two full paths", () => {
+    const description = `${"a".repeat(4_096)} ↔ ${"b".repeat(4_096)}`
+    const page = parseAdditivePlanPage({
+      additions: [],
+      conflicts: [],
+      occupied: [],
+      totals: { ...EMPTY_TOTALS, caseCollisions: [description] },
+    })
+    expect(page.totals?.caseCollisions).toEqual([description])
+  })
+
   test("sends the exact engine request and requires totals on the first page", async () => {
     const rpc = fakeRpc([{ additions: [], conflicts: [], occupied: [], totals: EMPTY_TOTALS }])
     await requestAdditivePlanPage(rpc, request({ blockedPaths: [{ path: "dir", directory: true }], checkCaseCollisions: true }))

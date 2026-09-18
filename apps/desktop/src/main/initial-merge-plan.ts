@@ -103,6 +103,13 @@ const planPathSchema = z
   .max(4_096)
   .refine((value) => !value.includes("\0"), "plan path must be NUL-free")
 
+/**
+ * One collision description holds two full prefixed paths plus the ` ↔ `
+ * separator. A staged path is at most 4096 bytes and never more UTF-16 code
+ * units, so this covers the engine's largest sample.
+ */
+const MAX_CASE_COLLISION_DESCRIPTION_CHARS = 4_096 * 2 + 16
+
 const additionSchema = z
   .object({
     path: planPathSchema,
@@ -117,7 +124,7 @@ const totalsSchema = z
     additionBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     conflicts: z.number().int().nonnegative().max(1_000_000),
     occupied: z.number().int().nonnegative().max(1_000_000),
-    caseCollisions: z.array(z.string().max(4_300)).max(10).optional(),
+    caseCollisions: z.array(z.string().max(MAX_CASE_COLLISION_DESCRIPTION_CHARS)).max(10).optional(),
   })
   .strict()
 
