@@ -21,6 +21,15 @@ const MAX_PATH_LENGTH: usize = 4_096;
 const MAX_ERROR_LENGTH: usize = 2_000;
 /// Same envelope the desktop enforces on a mapping's ignore rules.
 const MAX_IGNORE_PATTERNS: usize = 256;
+/// Largest destination-blocked path list accepted by an additive merge plan.
+/// The desktop refuses a merge with more blocked paths rather than sending an
+/// unbounded request; the cap matches its persisted merge-outcome bound.
+const MAX_BLOCKED_PATHS: usize = 10_000;
+/// One-page bound for an additive merge plan, matching the other paged reads.
+const MAX_ADDITIVE_PLAN_PAGE: i64 = 1_000;
+/// Case-only alias descriptions returned by an additive merge plan. The merge
+/// only ever shows the first few, so a bounded sample is enough.
+const MAX_CASE_COLLISIONS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -152,6 +161,84 @@ pub struct ReconcileGenerationsRequest {
     /// rules.
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
+}
+
+/// One destination path an additive merge must not write to because the
+/// receiving computer could not read it. A directory blocks its whole subtree,
+/// exactly like the desktop's scan-issue blocklist.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BlockedMergePath {
+    /// Empty only for a directory entry: the whole folder root could not be read.
+    pub path: String,
+    pub directory: bool,
+}
+
+/// A read-only, paged plan for one direction of an initial merge. It reads no
+/// baseline, queues no durable operation and records no conflict, because the
+/// merge copies files itself and only activation makes the folder durable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanAdditiveGenerationsRequest {
+    pub mapping_id: String,
+    /// The receiving computer's sealed generation.
+    pub local_generation_id: String,
+    /// The sending computer's sealed generation.
+    pub remote_generation_id: String,
+    pub mode: String,
+    /// The mapping's current ignore rules, applied like the continuous planner.
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
+    /// Destination paths left out of the plan because they could not be read.
+    #[serde(default)]
+    pub blocked_paths: Vec<BlockedMergePath>,
+    /// Whether to report case-only path aliases. Requested only when one of the
+    /// two computers is Windows, matching the merge's compatibility check.
+    #[serde(default)]
+    pub check_case_collisions: bool,
+    /// Last difference path of the previous page; absent starts at the beginning.
+    pub cursor: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// One file to copy from the remote generation to the local one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdditiveMergeAddition {
+    pub path: String,
+    pub size: i64,
+    pub digest: String,
+}
+
+/// Exact whole-plan totals, returned only with the first page so the caller
+/// can check free space before copying anything. The page loop itself never
+/// holds more than one page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdditiveMergeTotals {
+    pub additions: usize,
+    pub addition_bytes: i64,
+    pub conflicts: usize,
+    pub occupied: usize,
+    /// Bounded case-only alias samples; only present when requested.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub case_collisions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdditiveMergePlanPage {
+    pub additions: Vec<AdditiveMergeAddition>,
+    /// Same-path files with different content: preserved on both computers.
+    pub conflicts: Vec<String>,
+    /// Additions left out because a folder, link or special entry already uses
+    /// the destination path.
+    pub occupied: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Present only when the request had no cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totals: Option<AdditiveMergeTotals>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -401,6 +488,83 @@ impl MappingStore {
                 recovery_issues: state.recovery_issues,
                 occupied_paths: plan.occupied,
             })
+    }
+
+    /// Plans one additive direction of an initial merge from two sealed scan
+    /// generations.
+    ///
+    /// This is deliberately read-only: it writes no baseline, queues no durable
+    /// operation and records no conflict, because an initial merge only becomes
+    /// durable when the mapping is activated. It is allowed before activation,
+    /// and it pages by path so neither computer ever holds a full plan.
+    ///
+    /// The first page (no cursor) also returns exact whole-plan totals so the
+    /// caller can check free space before copying anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, mapping-state, stale-generation or database error.
+    pub fn plan_additive_generations(
+        &self,
+        request: &PlanAdditiveGenerationsRequest,
+    ) -> Result<AdditiveMergePlanPage, MappingStoreError> {
+        self.ensure_import_completed()?;
+        validate_additive_plan_request(request)?;
+        // A deferred transaction takes a consistent read snapshot without a
+        // write lock: planning must never block or mutate a running sync.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        require_mergeable_mapping(&transaction, &request.mapping_id)?;
+        let current_revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM mapping_revisions WHERE mapping_id = ?1",
+                params![request.mapping_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| MappingStoreError::NotFound(request.mapping_id.clone()))?;
+        let local_meta = sealed_generation_meta(
+            &transaction,
+            &request.local_generation_id,
+            &request.mapping_id,
+        )?;
+        let remote_meta = sealed_generation_meta(
+            &transaction,
+            &request.remote_generation_id,
+            &request.mapping_id,
+        )?;
+        if local_meta.revision != current_revision || remote_meta.revision != current_revision {
+            return Err(MappingStoreError::Invalid(
+                "scan generation mapping revision is stale".to_owned(),
+            ));
+        }
+        if local_meta.hash_mode != "full-sha256" || remote_meta.hash_mode != "full-sha256" {
+            return Err(MappingStoreError::Invalid(
+                "an additive merge plan requires full SHA-256 observations".to_owned(),
+            ));
+        }
+        let ignored = IgnoredPaths::new(&request.ignore_patterns)?;
+        let blocked = BlockedMergePaths::new(&request.blocked_paths)?;
+        let totals = if request.cursor.is_none() {
+            Some(compute_additive_plan_totals(
+                &transaction,
+                request,
+                &ignored,
+                &blocked,
+            )?)
+        } else {
+            None
+        };
+        let limit = request.limit.unwrap_or(200);
+        let (additions, conflicts, occupied, next_cursor) =
+            read_additive_plan_page(&transaction, request, &ignored, &blocked, limit)?;
+        Ok(AdditiveMergePlanPage {
+            additions,
+            conflicts,
+            occupied,
+            next_cursor,
+            totals,
+        })
     }
 
     /// Bounded page over durable operations, ordered by id.
@@ -1661,6 +1825,411 @@ fn persist_generations_reconciliation(
     persist_reconciliation(transaction, &proxy, operations, conflicts)
 }
 
+fn validate_additive_plan_request(
+    request: &PlanAdditiveGenerationsRequest,
+) -> Result<(), MappingStoreError> {
+    check_identifier("mappingId", &request.mapping_id)?;
+    crate::scan_generations::validate_generation_id(&request.local_generation_id)?;
+    crate::scan_generations::validate_generation_id(&request.remote_generation_id)?;
+    if request.local_generation_id == request.remote_generation_id {
+        return Err(MappingStoreError::Invalid(
+            "local and remote generations must differ".to_owned(),
+        ));
+    }
+    if !["two-way", "send-only", "receive-only"].contains(&request.mode.as_str()) {
+        return Err(MappingStoreError::Invalid(
+            "mode must be two-way, send-only, or receive-only".to_owned(),
+        ));
+    }
+    if request.ignore_patterns.len() > MAX_IGNORE_PATTERNS {
+        return Err(MappingStoreError::Invalid(format!(
+            "at most {MAX_IGNORE_PATTERNS} ignore patterns are accepted"
+        )));
+    }
+    if request.blocked_paths.len() > MAX_BLOCKED_PATHS {
+        return Err(MappingStoreError::Invalid(format!(
+            "at most {MAX_BLOCKED_PATHS} blocked paths are accepted"
+        )));
+    }
+    if let Some(cursor) = request.cursor.as_deref() {
+        validate_path(cursor)?;
+    }
+    if let Some(limit) = request.limit {
+        if limit <= 0 || limit > MAX_ADDITIVE_PLAN_PAGE {
+            return Err(MappingStoreError::Invalid(
+                "additive plan page limit is outside the supported bound".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An initial merge may plan before the mapping is activated, but never for a
+/// mapping that has not been approved yet.
+fn require_mergeable_mapping(
+    transaction: &Transaction<'_>,
+    mapping_id: &str,
+) -> Result<(), MappingStoreError> {
+    let setup_status: Option<String> = transaction
+        .query_row(
+            "SELECT setup_status FROM folder_mappings WHERE id = ?1",
+            params![mapping_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match setup_status.as_deref() {
+        Some("ready-for-initial-sync" | "active") => Ok(()),
+        Some(_) => Err(MappingStoreError::Invalid(
+            "an additive merge plan requires an approved mapping".to_owned(),
+        )),
+        None => Err(MappingStoreError::NotFound(mapping_id.to_owned())),
+    }
+}
+
+/// Destination paths the merge must not write to. Matches the desktop's
+/// `createScanIssueBlocklist`: a file blocks exactly its path, a directory
+/// blocks itself and everything beneath it, and the root blocks the tree.
+struct BlockedMergePaths {
+    files: std::collections::HashSet<String>,
+    directories: std::collections::HashSet<String>,
+    blocked_root: bool,
+}
+
+impl BlockedMergePaths {
+    fn new(entries: &[BlockedMergePath]) -> Result<Self, MappingStoreError> {
+        let mut files = std::collections::HashSet::new();
+        let mut directories = std::collections::HashSet::new();
+        let mut blocked_root = false;
+        for entry in entries {
+            if entry.path.is_empty() {
+                if entry.directory {
+                    blocked_root = true;
+                    continue;
+                }
+                return Err(MappingStoreError::Invalid(
+                    "a blocked file path must not be empty".to_owned(),
+                ));
+            }
+            validate_path(&entry.path)?;
+            if entry.directory {
+                directories.insert(entry.path.clone());
+            } else {
+                files.insert(entry.path.clone());
+            }
+        }
+        Ok(Self {
+            files,
+            directories,
+            blocked_root,
+        })
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        if self.blocked_root || self.files.contains(path) {
+            return true;
+        }
+        let mut candidate = Some(path);
+        while let Some(current) = candidate {
+            if self.directories.contains(current) {
+                return true;
+            }
+            candidate = current.rfind('/').map(|index| &current[..index]);
+        }
+        false
+    }
+}
+
+/// What one streamed difference row means for the additive plan.
+enum AdditiveRowOutcome {
+    /// Left out entirely: an ignore rule, a blocked destination, a local-only
+    /// file (the inverse pass owns it), or a one-way send.
+    Skipped,
+    Addition {
+        size: i64,
+        digest: String,
+    },
+    /// Same-path files with different content; both copies are preserved.
+    Conflict,
+    /// The destination path is already a folder, link or special entry.
+    Occupied,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_additive_row(
+    transaction: &Transaction<'_>,
+    local_generation: &str,
+    mode: &str,
+    ignored: &IgnoredPaths,
+    blocked: &BlockedMergePaths,
+    path: &str,
+    local_file: Option<ObservedFile>,
+    remote_file: Option<ObservedFile>,
+) -> Result<AdditiveRowOutcome, MappingStoreError> {
+    if ignored.contains(path) {
+        return Ok(AdditiveRowOutcome::Skipped);
+    }
+    match (local_file, remote_file) {
+        (Some(_), Some(_)) => Ok(AdditiveRowOutcome::Conflict),
+        // A local-only file is the inverse pass's work, and a row with no file
+        // on either side cannot be created without a baseline.
+        (Some(_) | None, None) => Ok(AdditiveRowOutcome::Skipped),
+        (None, Some(file)) => {
+            if mode == "send-only" || blocked.contains(path) {
+                return Ok(AdditiveRowOutcome::Skipped);
+            }
+            if destination_path_occupied(transaction, local_generation, path)? {
+                return Ok(AdditiveRowOutcome::Occupied);
+            }
+            Ok(AdditiveRowOutcome::Addition {
+                size: file.size,
+                digest: file.digest,
+            })
+        }
+    }
+}
+
+/// Every path that differs between two sealed generations, in path order: a
+/// local file joined with the remote file when the remote generation observes
+/// one at the same path, and a remote-only file the local generation does not.
+/// Occupied rows never join as files; they only block additions through the
+/// destination probe. The cursor is the last path the caller saw, and it pages
+/// over raw difference rows so a page that classifies many rows as skipped
+/// still advances.
+///
+/// The cursor is bound as an empty string for the first page, never as SQL
+/// `NULL`: an `IS NULL OR` guard would stop `SQLite` using the clustered path
+/// index and make every page a full scan of the whole difference set. Relative
+/// paths are never empty, so `> ''` includes every row.
+const ADDITIVE_DIFFERENCES_SQL: &str = "SELECT local.relative_path, local.digest, local.size,
+            remote.digest, remote.size
+     FROM scan_entries AS local
+     LEFT JOIN scan_entries AS remote
+       ON remote.generation_id = ?2 AND remote.relative_path = local.relative_path
+          AND remote.kind = 'file'
+     WHERE local.generation_id = ?1 AND local.kind = 'file'
+       AND (remote.digest IS NULL OR remote.digest <> local.digest)
+       AND local.relative_path > ?3
+     UNION ALL
+     SELECT remote.relative_path, NULL, NULL, remote.digest, remote.size
+     FROM scan_entries AS remote
+     WHERE remote.generation_id = ?2 AND remote.kind = 'file'
+       AND NOT EXISTS (
+           SELECT 1 FROM scan_entries AS local
+           WHERE local.generation_id = ?1 AND local.relative_path = remote.relative_path
+             AND local.kind = 'file'
+       )
+       AND remote.relative_path > ?3
+     ORDER BY 1 LIMIT ?4";
+
+#[allow(clippy::type_complexity)]
+fn read_additive_plan_page(
+    transaction: &Transaction<'_>,
+    request: &PlanAdditiveGenerationsRequest,
+    ignored: &IgnoredPaths,
+    blocked: &BlockedMergePaths,
+    limit: i64,
+) -> Result<
+    (
+        Vec<AdditiveMergeAddition>,
+        Vec<String>,
+        Vec<String>,
+        Option<String>,
+    ),
+    MappingStoreError,
+> {
+    let mut additions = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut occupied = Vec::new();
+    let mut next_cursor = None;
+    let mut statement = transaction.prepare_cached(ADDITIVE_DIFFERENCES_SQL)?;
+    let mut rows = statement.query(params![
+        request.local_generation_id,
+        request.remote_generation_id,
+        request.cursor.as_deref().unwrap_or(""),
+        limit + 1,
+    ])?;
+    let mut examined: i64 = 0;
+    let mut last_path: Option<String> = None;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        // The extra row only proves another page exists; it is not consumed.
+        if examined >= limit {
+            next_cursor = last_path;
+            break;
+        }
+        let local_file = generation_observation(&path, row.get(1)?, row.get(2)?)?;
+        let remote_file = generation_observation(&path, row.get(3)?, row.get(4)?)?;
+        match plan_additive_row(
+            transaction,
+            &request.local_generation_id,
+            &request.mode,
+            ignored,
+            blocked,
+            &path,
+            local_file,
+            remote_file,
+        )? {
+            AdditiveRowOutcome::Skipped => {}
+            AdditiveRowOutcome::Addition { size, digest } => {
+                additions.push(AdditiveMergeAddition {
+                    path: path.clone(),
+                    size,
+                    digest,
+                });
+            }
+            AdditiveRowOutcome::Conflict => conflicts.push(path.clone()),
+            AdditiveRowOutcome::Occupied => occupied.push(path.clone()),
+        }
+        last_path = Some(path);
+        examined += 1;
+    }
+    Ok((additions, conflicts, occupied, next_cursor))
+}
+
+/// Counts the whole plan without holding it, so the first page can report exact
+/// totals for the free-space check. Every row is classified exactly like a
+/// page row, so totals and pages can never disagree.
+fn compute_additive_plan_totals(
+    transaction: &Transaction<'_>,
+    request: &PlanAdditiveGenerationsRequest,
+    ignored: &IgnoredPaths,
+    blocked: &BlockedMergePaths,
+) -> Result<AdditiveMergeTotals, MappingStoreError> {
+    let mut additions = 0usize;
+    let mut addition_bytes: i64 = 0;
+    let mut conflicts = 0usize;
+    let mut occupied = 0usize;
+    let mut statement = transaction.prepare(ADDITIVE_DIFFERENCES_SQL)?;
+    let mut rows = statement.query(params![
+        request.local_generation_id,
+        request.remote_generation_id,
+        "",
+        -1i64,
+    ])?;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let local_file = generation_observation(&path, row.get(1)?, row.get(2)?)?;
+        let remote_file = generation_observation(&path, row.get(3)?, row.get(4)?)?;
+        match plan_additive_row(
+            transaction,
+            &request.local_generation_id,
+            &request.mode,
+            ignored,
+            blocked,
+            &path,
+            local_file,
+            remote_file,
+        )? {
+            AdditiveRowOutcome::Skipped => {}
+            AdditiveRowOutcome::Addition { size, .. } => {
+                additions += 1;
+                addition_bytes = addition_bytes.saturating_add(size);
+            }
+            AdditiveRowOutcome::Conflict => conflicts += 1,
+            AdditiveRowOutcome::Occupied => occupied += 1,
+        }
+    }
+    drop(rows);
+    drop(statement);
+    let case_collisions = if request.check_case_collisions {
+        find_generation_case_collisions(
+            transaction,
+            &request.local_generation_id,
+            &request.remote_generation_id,
+        )?
+    } else {
+        Vec::new()
+    };
+    Ok(AdditiveMergeTotals {
+        additions,
+        addition_bytes,
+        conflicts,
+        occupied,
+        case_collisions,
+    })
+}
+
+/// One directory frame of the streaming case-collision walk.
+struct CaseDir {
+    name: String,
+    children: HashMap<String, String>,
+}
+
+/// Case-only path aliases between two sealed generations, in the same shape
+/// the desktop's `findCaseCollisions` reports: two paths whose earlier
+/// components match exactly and whose next components differ only by case.
+///
+/// Paths stream in order, so only the directories on the active branch are
+/// retained and a subtree's siblings are dropped as soon as the walk leaves
+/// it. Memory therefore follows the widest branch rather than the folder size.
+fn find_generation_case_collisions(
+    transaction: &Transaction<'_>,
+    local_generation: &str,
+    remote_generation: &str,
+) -> Result<Vec<String>, MappingStoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT relative_path FROM (
+             SELECT relative_path FROM scan_entries WHERE generation_id = ?1 AND kind = 'file'
+             UNION
+             SELECT relative_path FROM scan_entries WHERE generation_id = ?2 AND kind = 'file'
+         ) ORDER BY 1",
+    )?;
+    let mut rows = statement.query(params![local_generation, remote_generation])?;
+    let mut stack: Vec<CaseDir> = vec![CaseDir {
+        name: String::new(),
+        children: HashMap::new(),
+    }];
+    let mut collisions: Vec<String> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let segments: Vec<&str> = path.split('/').collect();
+        // Frames hold one directory each; stack[0] is the root, and
+        // stack[depth + 1] is the directory named by segments[depth].
+        let mut common = 0;
+        while common < segments.len()
+            && common + 1 < stack.len()
+            && stack[common + 1].name == segments[common]
+        {
+            common += 1;
+        }
+        stack.truncate(common + 1);
+        let mut collided = false;
+        for (index, segment) in segments.iter().enumerate().skip(common) {
+            let folded = segment.to_lowercase();
+            let Some(parent) = stack.last_mut() else {
+                return Err(MappingStoreError::Invalid(
+                    "case-collision walk lost its root".to_owned(),
+                ));
+            };
+            if let Some(existing) = parent.children.get(&folded) {
+                if existing.as_str() != *segment {
+                    let prefix = if index == 0 {
+                        String::new()
+                    } else {
+                        format!("{}/", segments[..index].join("/"))
+                    };
+                    let description = format!("{prefix}{existing} ↔ {prefix}{segment}");
+                    if !collisions.contains(&description) {
+                        collisions.push(description);
+                    }
+                    collided = true;
+                    break;
+                }
+            } else {
+                parent.children.insert(folded, (*segment).to_owned());
+            }
+            stack.push(CaseDir {
+                name: (*segment).to_owned(),
+                children: HashMap::new(),
+            });
+        }
+        if collided && collisions.len() >= MAX_CASE_COLLISIONS {
+            break;
+        }
+    }
+    Ok(collisions)
+}
+
 pub(crate) fn validate_path(path: &str) -> Result<(), MappingStoreError> {
     if path.is_empty() || path.len() > MAX_PATH_LENGTH || path.contains('\0') {
         return Err(MappingStoreError::Invalid(
@@ -2738,5 +3307,696 @@ mod tests {
         assert_eq!(state.baseline_count, 0);
         assert!(state.operations.is_empty());
         assert!(state.conflicts.is_empty());
+    }
+
+    fn merge_configuration(setup_status: &str, updated_at: &str) -> MappingConfiguration {
+        MappingConfiguration {
+            id: "mapping-1".to_owned(),
+            name: "Folder".to_owned(),
+            initiator_device_id: "a-device".to_owned(),
+            initiator_device_name: "A".to_owned(),
+            responder_device_id: "b-device".to_owned(),
+            responder_device_name: "B".to_owned(),
+            initiator_path: "/tmp/a".to_owned(),
+            responder_path: "/tmp/b".to_owned(),
+            mode: "two-way".to_owned(),
+            ignore_patterns: Vec::new(),
+            history_days: 0,
+            history_max_bytes: 0,
+            max_file_bytes: None,
+            setup_status: setup_status.to_owned(),
+            paused: false,
+            preview: None,
+            created_at: NOW.to_owned(),
+            updated_at: updated_at.to_owned(),
+        }
+    }
+
+    fn merge_store_with_status(setup_status: &str) -> MappingStore {
+        let store = MappingStore::open_in_memory().expect("open store");
+        store
+            .import_legacy(&LegacyImportRequest {
+                source_fingerprint: "0".repeat(64),
+                importing_device_id: "a-device".to_owned(),
+                imported_at: NOW.to_owned(),
+                records: Vec::new(),
+            })
+            .expect("complete import");
+        store
+            .upsert_local(
+                &merge_configuration(setup_status, NOW),
+                "a-device",
+                None,
+                None,
+                NOW,
+            )
+            .expect("insert mapping");
+        store
+    }
+
+    fn merge_store() -> MappingStore {
+        merge_store_with_status("ready-for-initial-sync")
+    }
+
+    fn generation_entry(path: &str, byte: char) -> crate::scan_generations::GenerationEntry {
+        crate::scan_generations::GenerationEntry {
+            path: path.to_owned(),
+            size: 4,
+            digest: Some(byte.to_string().repeat(64)),
+            kind: "file".to_owned(),
+        }
+    }
+
+    fn occupied_entry(path: &str, kind: &str) -> crate::scan_generations::GenerationEntry {
+        crate::scan_generations::GenerationEntry {
+            path: path.to_owned(),
+            size: 0,
+            digest: None,
+            kind: kind.to_owned(),
+        }
+    }
+
+    fn stage_generation(
+        store: &MappingStore,
+        generation_id: &str,
+        entries: Vec<crate::scan_generations::GenerationEntry>,
+    ) {
+        store
+            .begin_scan_generation(&crate::scan_generations::BeginGenerationRequest {
+                generation_id: generation_id.to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                participant_device_id: "a-device".to_owned(),
+                mapping_revision: 1,
+                root: "/tmp/a".to_owned(),
+                ignore_patterns: Vec::new(),
+                hash_mode: "full-sha256".to_owned(),
+            })
+            .expect("begin");
+        let expected_count = i64::try_from(entries.len()).expect("count fits");
+        let mut remaining = entries.into_iter().peekable();
+        let mut sequence = 0i64;
+        while remaining.peek().is_some() {
+            let batch: Vec<_> = remaining.by_ref().take(1_000).collect();
+            store
+                .append_scan_batch(&crate::scan_generations::AppendBatchRequest {
+                    generation_id: generation_id.to_owned(),
+                    sequence,
+                    entries: batch,
+                })
+                .expect("append");
+            sequence += 1;
+        }
+        store
+            .seal_scan_generation(&crate::scan_generations::SealGenerationRequest {
+                generation_id: generation_id.to_owned(),
+                expected_count,
+            })
+            .expect("seal");
+    }
+
+    fn plan_request(local: &str, remote: &str) -> PlanAdditiveGenerationsRequest {
+        PlanAdditiveGenerationsRequest {
+            mapping_id: "mapping-1".to_owned(),
+            local_generation_id: local.to_owned(),
+            remote_generation_id: remote.to_owned(),
+            mode: "two-way".to_owned(),
+            ignore_patterns: Vec::new(),
+            blocked_paths: Vec::new(),
+            check_case_collisions: false,
+            cursor: None,
+            limit: None,
+        }
+    }
+
+    /// Walks every page and returns the plan in the same shape a caller sees,
+    /// plus how many pages came back.
+    fn walk_plan(
+        store: &MappingStore,
+        request: &PlanAdditiveGenerationsRequest,
+    ) -> (
+        Vec<AdditiveMergeAddition>,
+        Vec<String>,
+        Vec<String>,
+        AdditiveMergeTotals,
+        usize,
+    ) {
+        let first = store
+            .plan_additive_generations(request)
+            .expect("first plan page");
+        let totals = first.totals.clone().expect("first page totals");
+        let mut additions = first.additions;
+        let mut conflicts = first.conflicts;
+        let mut occupied = first.occupied;
+        let mut cursor = first.next_cursor;
+        let mut pages = 1usize;
+        while let Some(next) = cursor {
+            let page = store
+                .plan_additive_generations(&PlanAdditiveGenerationsRequest {
+                    cursor: Some(next),
+                    ..request.clone()
+                })
+                .expect("next plan page");
+            assert!(
+                page.totals.is_none(),
+                "totals must only accompany the first page"
+            );
+            additions.extend(page.additions);
+            conflicts.extend(page.conflicts);
+            occupied.extend(page.occupied);
+            cursor = page.next_cursor;
+            pages += 1;
+        }
+        (additions, conflicts, occupied, totals, pages)
+    }
+
+    #[test]
+    fn additive_plan_pages_additions_with_totals_on_the_first_page() {
+        let store = merge_store();
+        stage_generation(
+            &store,
+            "gen-local",
+            vec![
+                generation_entry("conflict.txt", 'a'),
+                generation_entry("local-only.txt", 'a'),
+                generation_entry("same.txt", 'a'),
+            ],
+        );
+        stage_generation(
+            &store,
+            "gen-remote",
+            vec![
+                generation_entry("conflict.txt", 'b'),
+                generation_entry("remote-1.txt", 'c'),
+                generation_entry("remote-2.txt", 'd'),
+                generation_entry("same.txt", 'a'),
+            ],
+        );
+        // One raw difference row per page, so the walk crosses several pages.
+        let (additions, conflicts, occupied, totals, pages) = walk_plan(
+            &store,
+            &PlanAdditiveGenerationsRequest {
+                limit: Some(1),
+                ..plan_request("gen-local", "gen-remote")
+            },
+        );
+        assert!(pages > 1, "the walk must cross a page boundary");
+        assert_eq!(
+            additions
+                .iter()
+                .map(|addition| addition.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["remote-1.txt", "remote-2.txt"]
+        );
+        assert_eq!(conflicts, vec!["conflict.txt"]);
+        assert!(occupied.is_empty());
+        assert_eq!(totals.additions, 2);
+        assert_eq!(totals.addition_bytes, 8);
+        assert_eq!(totals.conflicts, 1);
+        assert_eq!(totals.occupied, 0);
+    }
+
+    #[test]
+    fn additive_plan_is_read_only() {
+        let store = merge_store();
+        stage_generation(
+            &store,
+            "gen-local",
+            vec![generation_entry("local.txt", 'a')],
+        );
+        stage_generation(
+            &store,
+            "gen-remote",
+            vec![generation_entry("remote.txt", 'b')],
+        );
+        let (additions, _, _, _, _) = walk_plan(&store, &plan_request("gen-local", "gen-remote"));
+        assert_eq!(additions.len(), 1);
+        let state = store.file_sync_state("mapping-1").expect("state");
+        assert!(
+            !state.initialized,
+            "planning must not initialize the mapping"
+        );
+        assert_eq!(state.baseline_count, 0, "planning must not write baselines");
+        assert!(state.operations.is_empty());
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn additive_plan_reports_occupied_paths_and_skips_blocked_ones() {
+        let store = merge_store();
+        stage_generation(
+            &store,
+            "gen-local",
+            vec![
+                occupied_entry("empty-dir", "directory"),
+                occupied_entry("link", "special"),
+                occupied_entry("nested", "directory"),
+            ],
+        );
+        stage_generation(
+            &store,
+            "gen-remote",
+            vec![
+                generation_entry("blocked.txt", 'a'),
+                generation_entry("empty-dir", 'b'),
+                generation_entry("free.txt", 'c'),
+                generation_entry("link", 'd'),
+                generation_entry("nested/inner.txt", 'e'),
+            ],
+        );
+        // An exact directory, a special entry, and a file whose ancestor is a
+        // synchronized file are occupancy; a file inside an existing directory
+        // is a valid addition.
+        let (additions, conflicts, occupied, totals, _) = walk_plan(
+            &store,
+            &PlanAdditiveGenerationsRequest {
+                blocked_paths: vec![
+                    BlockedMergePath {
+                        path: "blocked.txt".to_owned(),
+                        directory: false,
+                    },
+                    // A blocked path is left out even when it also collides
+                    // with an occupied destination.
+                    BlockedMergePath {
+                        path: "link".to_owned(),
+                        directory: false,
+                    },
+                ],
+                ..plan_request("gen-local", "gen-remote")
+            },
+        );
+        assert_eq!(
+            additions
+                .iter()
+                .map(|addition| addition.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["free.txt", "nested/inner.txt"]
+        );
+        assert!(conflicts.is_empty());
+        assert_eq!(occupied, vec!["empty-dir"]);
+        assert_eq!(totals.additions, 2);
+        assert_eq!(totals.occupied, 1);
+
+        // A blocked directory covers its whole subtree, so the nested addition
+        // is left out silently instead.
+        let (additions, _, occupied, totals, _) = walk_plan(
+            &store,
+            &PlanAdditiveGenerationsRequest {
+                blocked_paths: vec![BlockedMergePath {
+                    path: "nested".to_owned(),
+                    directory: true,
+                }],
+                ..plan_request("gen-local", "gen-remote")
+            },
+        );
+        assert_eq!(
+            additions
+                .iter()
+                .map(|addition| addition.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["blocked.txt", "free.txt"]
+        );
+        assert_eq!(occupied, vec!["empty-dir", "link"]);
+        assert_eq!(totals.occupied, 2);
+
+        // A blocked root leaves the whole plan empty.
+        let (additions, _, occupied, totals, _) = walk_plan(
+            &store,
+            &PlanAdditiveGenerationsRequest {
+                blocked_paths: vec![BlockedMergePath {
+                    path: String::new(),
+                    directory: true,
+                }],
+                ..plan_request("gen-local", "gen-remote")
+            },
+        );
+        assert!(additions.is_empty());
+        assert!(occupied.is_empty());
+        assert_eq!(totals.additions, 0);
+    }
+
+    #[test]
+    fn additive_plan_skips_ignore_rules_and_one_way_sends() {
+        let store = merge_store();
+        stage_generation(
+            &store,
+            "gen-local",
+            vec![generation_entry("local.txt", 'a')],
+        );
+        stage_generation(
+            &store,
+            "gen-remote",
+            vec![
+                generation_entry("ignored/out.bin", 'b'),
+                generation_entry("kept.txt", 'c'),
+            ],
+        );
+        let request = PlanAdditiveGenerationsRequest {
+            ignore_patterns: vec!["ignored/**".to_owned()],
+            ..plan_request("gen-local", "gen-remote")
+        };
+        let (additions, _, _, totals, _) = walk_plan(&store, &request);
+        assert_eq!(
+            additions
+                .iter()
+                .map(|addition| addition.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept.txt"]
+        );
+        assert_eq!(totals.additions, 1);
+
+        let send_only = PlanAdditiveGenerationsRequest {
+            mode: "send-only".to_owned(),
+            ..plan_request("gen-local", "gen-remote")
+        };
+        let (additions, _, _, totals, _) = walk_plan(&store, &send_only);
+        assert!(additions.is_empty());
+        assert_eq!(totals.additions, 0);
+    }
+
+    #[test]
+    fn additive_plan_marks_a_file_ancestor_as_occupied() {
+        let store = merge_store();
+        stage_generation(&store, "gen-local", vec![generation_entry("a/b", 'a')]);
+        stage_generation(&store, "gen-remote", vec![generation_entry("a/b/c", 'b')]);
+        let (additions, _, occupied, totals, _) =
+            walk_plan(&store, &plan_request("gen-local", "gen-remote"));
+        assert!(additions.is_empty());
+        assert_eq!(occupied, vec!["a/b/c"]);
+        assert_eq!(totals.occupied, 1);
+    }
+
+    #[test]
+    fn additive_plan_reports_case_only_aliases_when_asked() {
+        let store = merge_store();
+        stage_generation(
+            &store,
+            "gen-local",
+            vec![generation_entry("docs/readme.md", 'a')],
+        );
+        stage_generation(
+            &store,
+            "gen-remote",
+            vec![generation_entry("docs/README.md", 'b')],
+        );
+        let quiet = store
+            .plan_additive_generations(&plan_request("gen-local", "gen-remote"))
+            .expect("plan");
+        assert!(quiet.totals.expect("totals").case_collisions.is_empty());
+
+        let checked = store
+            .plan_additive_generations(&PlanAdditiveGenerationsRequest {
+                check_case_collisions: true,
+                ..plan_request("gen-local", "gen-remote")
+            })
+            .expect("plan");
+        let collisions = checked.totals.expect("totals").case_collisions;
+        assert_eq!(collisions.len(), 1);
+        assert!(collisions[0].contains("readme.md"));
+        assert!(collisions[0].contains("README.md"));
+
+        // A collision at a directory component is reported at that component,
+        // exactly like the desktop's trie walk.
+        stage_generation(
+            &store,
+            "gen-dir-local",
+            vec![generation_entry("a/B/x.txt", 'a')],
+        );
+        stage_generation(
+            &store,
+            "gen-dir-remote",
+            vec![generation_entry("a/b/y.txt", 'b')],
+        );
+        let directory = store
+            .plan_additive_generations(&PlanAdditiveGenerationsRequest {
+                check_case_collisions: true,
+                ..plan_request("gen-dir-local", "gen-dir-remote")
+            })
+            .expect("plan");
+        let collisions = directory.totals.expect("totals").case_collisions;
+        assert_eq!(collisions, vec!["a/B ↔ a/b"]);
+    }
+
+    #[test]
+    #[ignore = "opt-in timing: cargo test -p sync-storage --release -- --ignored --nocapture additive_plan_scale_timing"]
+    fn additive_plan_scale_timing() {
+        let count = std::env::var("TETHERA_PLAN_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(250_000);
+        let store = merge_store();
+        let local: Vec<_> = (0..count)
+            .map(|index| generation_entry(&format!("local/{index}/file.txt"), 'a'))
+            .collect();
+        // Every remote path is one-sided, so the plan probes one destination
+        // ancestor chain per addition: the worst case for the summary pass.
+        let remote: Vec<_> = (0..count)
+            .map(|index| generation_entry(&format!("remote/{index}/file.txt"), 'b'))
+            .collect();
+        stage_generation(&store, "gen-local", local);
+        stage_generation(&store, "gen-remote", remote);
+        let request = plan_request("gen-local", "gen-remote");
+        let page_limit = std::env::var("TETHERA_PLAN_PAGE")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1_000);
+        let started = std::time::Instant::now();
+        let first = store
+            .plan_additive_generations(&PlanAdditiveGenerationsRequest {
+                limit: Some(page_limit),
+                ..request.clone()
+            })
+            .expect("first page");
+        let summary = started.elapsed();
+        let totals = first.totals.expect("totals");
+        let mut pages = 1usize;
+        let mut cursor = first.next_cursor;
+        let started = std::time::Instant::now();
+        while let Some(next) = cursor {
+            let page = store
+                .plan_additive_generations(&PlanAdditiveGenerationsRequest {
+                    cursor: Some(next),
+                    ..request.clone()
+                })
+                .expect("page");
+            pages += 1;
+            cursor = page.next_cursor;
+        }
+        eprintln!(
+            "[additive-plan-scale] files={count} additions={} summary={summary:?} pages={pages} remaining={:?}",
+            totals.additions,
+            started.elapsed()
+        );
+        assert_eq!(totals.additions, count);
+    }
+
+    #[test]
+    fn additive_plan_keeps_a_stable_query_plan_when_paging() {
+        let store = merge_store();
+        stage_generation(
+            &store,
+            "gen-local",
+            vec![generation_entry("local.txt", 'a')],
+        );
+        stage_generation(
+            &store,
+            "gen-remote",
+            vec![generation_entry("remote.txt", 'b')],
+        );
+        let transaction =
+            Transaction::new_unchecked(&store.connection, TransactionBehavior::Deferred)
+                .expect("read transaction");
+        let mut statement = transaction
+            .prepare(&format!("EXPLAIN QUERY PLAN {ADDITIVE_DIFFERENCES_SQL}"))
+            .expect("prepare plan");
+        let details: Vec<String> = statement
+            .query_map(params!["gen-local", "gen-remote", "", 501i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("query plan")
+            .collect::<Result<_, _>>()
+            .expect("plan rows");
+        // A cursor page must be served by ordered index walks and a merge; a
+        // temporary sort would make every page scan the whole difference set.
+        assert!(
+            details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "paged plan needs a temporary sort: {details:?}"
+        );
+    }
+
+    #[test]
+    fn additive_plan_rejects_unapproved_or_incomplete_generations() {
+        let store = merge_store();
+        stage_generation(&store, "gen-local", vec![generation_entry("a.txt", 'a')]);
+        stage_generation(&store, "gen-remote", vec![generation_entry("b.txt", 'b')]);
+
+        // The same id can never be both sides of a plan.
+        let same = store.plan_additive_generations(&plan_request("gen-local", "gen-local"));
+        assert!(matches!(same, Err(MappingStoreError::Invalid(_))));
+
+        // An unknown generation fails closed.
+        let unknown = store.plan_additive_generations(&plan_request("gen-local", "gen-missing"));
+        assert!(matches!(unknown, Err(MappingStoreError::NotFound(_))));
+
+        // An open generation is not a complete observation.
+        store
+            .begin_scan_generation(&crate::scan_generations::BeginGenerationRequest {
+                generation_id: "gen-open".to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                participant_device_id: "a-device".to_owned(),
+                mapping_revision: 1,
+                root: "/tmp/a".to_owned(),
+                ignore_patterns: Vec::new(),
+                hash_mode: "full-sha256".to_owned(),
+            })
+            .expect("begin");
+        let open = store.plan_additive_generations(&plan_request("gen-local", "gen-open"));
+        assert!(matches!(open, Err(MappingStoreError::Invalid(_))));
+
+        // A page bound outside the supported range fails closed.
+        let bound = store.plan_additive_generations(&PlanAdditiveGenerationsRequest {
+            limit: Some(0),
+            ..plan_request("gen-local", "gen-remote")
+        });
+        assert!(matches!(bound, Err(MappingStoreError::Invalid(_))));
+        let bound = store.plan_additive_generations(&PlanAdditiveGenerationsRequest {
+            limit: Some(MAX_ADDITIVE_PLAN_PAGE + 1),
+            ..plan_request("gen-local", "gen-remote")
+        });
+        assert!(matches!(bound, Err(MappingStoreError::Invalid(_))));
+    }
+
+    #[test]
+    fn additive_plan_requires_an_approved_mapping() {
+        let store = merge_store_with_status("pending-approval");
+        stage_generation(&store, "gen-local", vec![generation_entry("a.txt", 'a')]);
+        stage_generation(&store, "gen-remote", vec![generation_entry("b.txt", 'b')]);
+        let result = store.plan_additive_generations(&plan_request("gen-local", "gen-remote"));
+        assert!(matches!(result, Err(MappingStoreError::Invalid(_))));
+    }
+
+    #[test]
+    fn additive_plan_rejects_foreign_and_aborted_generations() {
+        let store = merge_store();
+        stage_generation(&store, "gen-local", vec![generation_entry("a.txt", 'a')]);
+        stage_generation(&store, "gen-remote", vec![generation_entry("b.txt", 'b')]);
+
+        // A generation that belongs to another mapping is never readable.
+        let other = MappingConfiguration {
+            id: "mapping-2".to_owned(),
+            ..merge_configuration("ready-for-initial-sync", NOW)
+        };
+        store
+            .upsert_local(&other, "a-device", None, None, NOW)
+            .expect("second mapping");
+        store
+            .begin_scan_generation(&crate::scan_generations::BeginGenerationRequest {
+                generation_id: "gen-foreign".to_owned(),
+                mapping_id: "mapping-2".to_owned(),
+                participant_device_id: "a-device".to_owned(),
+                mapping_revision: 1,
+                root: "/tmp/c".to_owned(),
+                ignore_patterns: Vec::new(),
+                hash_mode: "full-sha256".to_owned(),
+            })
+            .expect("begin foreign");
+        store
+            .append_scan_batch(&crate::scan_generations::AppendBatchRequest {
+                generation_id: "gen-foreign".to_owned(),
+                sequence: 0,
+                entries: vec![generation_entry("c.txt", 'c')],
+            })
+            .expect("append foreign");
+        store
+            .seal_scan_generation(&crate::scan_generations::SealGenerationRequest {
+                generation_id: "gen-foreign".to_owned(),
+                expected_count: 1,
+            })
+            .expect("seal foreign");
+        let foreign = store.plan_additive_generations(&plan_request("gen-local", "gen-foreign"));
+        assert!(matches!(foreign, Err(MappingStoreError::Invalid(_))));
+
+        // An aborted generation is not a complete observation.
+        store
+            .begin_scan_generation(&crate::scan_generations::BeginGenerationRequest {
+                generation_id: "gen-aborted".to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                participant_device_id: "a-device".to_owned(),
+                mapping_revision: 1,
+                root: "/tmp/a".to_owned(),
+                ignore_patterns: Vec::new(),
+                hash_mode: "full-sha256".to_owned(),
+            })
+            .expect("begin aborted");
+        store
+            .abort_scan_generation("gen-aborted")
+            .expect("abort generation");
+        let aborted = store.plan_additive_generations(&plan_request("gen-local", "gen-aborted"));
+        assert!(matches!(aborted, Err(MappingStoreError::Invalid(_))));
+    }
+
+    #[test]
+    fn additive_plan_rejects_preview_mode_invalid_blocks_and_stale_revisions() {
+        let store = merge_store();
+        stage_generation(&store, "gen-local", vec![generation_entry("a.txt", 'a')]);
+        stage_generation(&store, "gen-remote", vec![generation_entry("b.txt", 'b')]);
+
+        // A blocked file path without a path is rejected rather than blocking
+        // nothing silently.
+        let empty_block = store.plan_additive_generations(&PlanAdditiveGenerationsRequest {
+            blocked_paths: vec![BlockedMergePath {
+                path: String::new(),
+                directory: false,
+            }],
+            ..plan_request("gen-local", "gen-remote")
+        });
+        assert!(matches!(empty_block, Err(MappingStoreError::Invalid(_))));
+
+        // A preview-mode generation can lack digests, so planning refuses it
+        // instead of treating a partial observation as a full one.
+        store
+            .begin_scan_generation(&crate::scan_generations::BeginGenerationRequest {
+                generation_id: "gen-preview".to_owned(),
+                mapping_id: "mapping-1".to_owned(),
+                participant_device_id: "a-device".to_owned(),
+                mapping_revision: 1,
+                root: "/tmp/a".to_owned(),
+                ignore_patterns: Vec::new(),
+                hash_mode: "preview".to_owned(),
+            })
+            .expect("begin preview");
+        store
+            .append_scan_batch(&crate::scan_generations::AppendBatchRequest {
+                generation_id: "gen-preview".to_owned(),
+                sequence: 0,
+                entries: vec![crate::scan_generations::GenerationEntry {
+                    path: "preview.txt".to_owned(),
+                    size: 4,
+                    digest: None,
+                    kind: "file".to_owned(),
+                }],
+            })
+            .expect("append preview");
+        store
+            .seal_scan_generation(&crate::scan_generations::SealGenerationRequest {
+                generation_id: "gen-preview".to_owned(),
+                expected_count: 1,
+            })
+            .expect("seal preview");
+        let preview = store.plan_additive_generations(&plan_request("gen-preview", "gen-remote"));
+        assert!(matches!(preview, Err(MappingStoreError::Invalid(_))));
+
+        // Bumping the mapping revision after staging makes both observations
+        // stale, exactly as it does for generation reconciliation.
+        store
+            .upsert_local(
+                &merge_configuration("ready-for-initial-sync", "2026-08-08T13:00:00Z"),
+                "a-device",
+                None,
+                Some(1),
+                "2026-08-08T13:00:00Z",
+            )
+            .expect("bump revision");
+        let stale = store.plan_additive_generations(&plan_request("gen-local", "gen-remote"));
+        assert!(matches!(stale, Err(MappingStoreError::Invalid(_))));
     }
 }

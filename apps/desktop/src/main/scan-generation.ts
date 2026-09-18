@@ -1,4 +1,5 @@
-import { ScanCancelledError } from "./folder-manifest"
+import { MAX_UNREADABLE_REPORTED, ScanCancelledError, isFolderScanIssue } from "./folder-manifest"
+import type { FolderScanIssue } from "../shared/contracts"
 
 /**
  * TypeScript mirror of the Rust `scan_generations` contract. Every value the
@@ -90,6 +91,32 @@ export function parsePeerGenerationScanReply(value: unknown): PeerGenerationScan
     ignored: count(value.ignored),
     unreadable: count(value.unreadable),
   }
+}
+
+/**
+ * The initial merge's generation scan reply. Unlike a continuous cycle, a
+ * merge may continue past unreadable items after the user reviews them, so the
+ * responder also returns its bounded detail list; the count stays the true
+ * total and is what planning and the review decision compare.
+ */
+export interface PeerMergeGenerationScanReply extends PeerGenerationScanReply {
+  unreadableEntries: FolderScanIssue[]
+}
+
+export function parsePeerMergeGenerationScanReply(value: unknown): PeerMergeGenerationScanReply {
+  const base = parsePeerGenerationScanReply(value)
+  const entries = (value as { unreadableEntries?: unknown }).unreadableEntries
+  if (entries === undefined) return { ...base, unreadableEntries: [] }
+  if (!Array.isArray(entries) || entries.length > MAX_UNREADABLE_REPORTED) {
+    throw new Error("The paired computer returned an invalid staged scan.")
+  }
+  const unreadableEntries = entries.map((entry) => {
+    if (!isFolderScanIssue(entry)) {
+      throw new Error("The paired computer returned an invalid staged scan.")
+    }
+    return { path: entry.path, reason: entry.reason, kind: entry.kind }
+  })
+  return { ...base, unreadableEntries }
 }
 
 export interface PeerPageClient {

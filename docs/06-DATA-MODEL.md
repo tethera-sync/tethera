@@ -126,10 +126,15 @@ generations observed identically in one statement, and streams only differing
 or baseline-only paths, in path order, to the planner. A one-sided addition
 whose destination path or ancestor is occupied, or lies beneath a synchronized
 file, is reported as an occupied skip instead of queued work. The completed
-plan is published atomically. Aborted and expired generations are cleaned
-without touching baselines, operations, conflicts, or recovery evidence, and
-an owner may release a generation in any state once its exchange has
-finished. Every staged generation is purged once at engine start, when
+plan is published atomically. The initial merge's `fileSync.planAdditiveGenerations`
+reads the same sealed rows under a deferred read transaction and writes
+nothing at all: it applies the same ignore rules and destination-occupancy
+rule, pages the difference set by path, and reports pull candidates,
+same-path conflicts, and occupied and blocked destinations without touching
+baselines, operations, conflicts, or recovery evidence. Aborted and expired
+generations are cleaned without touching baselines, operations, conflicts, or
+recovery evidence, and an owner may release a generation in any state once its
+exchange has finished. Every staged generation is purged once at engine start, when
 nothing can be in flight, so an unfinished row left by a crash cannot hold
 the open-generation quota. At most four open generations per mapping and one
 million entries per generation are staged, and one batch holds at most 1,000

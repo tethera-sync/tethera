@@ -3,6 +3,7 @@ import {
   fetchPeerGenerationPages,
   parseGenerationEntry,
   parsePeerGenerationScanReply,
+  parsePeerMergeGenerationScanReply,
 } from "../src/main/scan-generation"
 import { ScanCancelledError } from "../src/main/folder-manifest"
 
@@ -76,5 +77,50 @@ describe("scan generation contracts", () => {
         // Cancelled before the first request.
       }
     })()).rejects.toBeInstanceOf(ScanCancelledError)
+  })
+
+  test("parses a merge scan reply with its bounded inaccessible report", () => {
+    const reply = parsePeerMergeGenerationScanReply({
+      generationId: "gen-1",
+      entries: 2,
+      occupied: 1,
+      ignored: 0,
+      unreadable: 1,
+      unreadableEntries: [{ path: "private", reason: "Permission denied", kind: "directory" }],
+    })
+    expect(reply.generationId).toBe("gen-1")
+    expect(reply.unreadable).toBe(1)
+    expect(reply.unreadableEntries).toEqual([{ path: "private", reason: "Permission denied", kind: "directory" }])
+  })
+
+  test("treats a missing merge report as empty but rejects a malformed one", () => {
+    const reply = parsePeerMergeGenerationScanReply({
+      generationId: "gen-1",
+      entries: 0,
+      occupied: 0,
+      ignored: 0,
+      unreadable: 0,
+    })
+    expect(reply.unreadableEntries).toEqual([])
+    expect(() =>
+      parsePeerMergeGenerationScanReply({
+        generationId: "gen-1",
+        entries: 0,
+        occupied: 0,
+        ignored: 0,
+        unreadable: 1,
+        unreadableEntries: [{ path: "private", reason: "", kind: "file" }],
+      }),
+    ).toThrow("invalid staged scan")
+    expect(() =>
+      parsePeerMergeGenerationScanReply({
+        generationId: "gen-1",
+        entries: 0,
+        occupied: 0,
+        ignored: 0,
+        unreadable: 1,
+        unreadableEntries: Array.from({ length: 101 }, (_value, index) => ({ path: `p-${index}`, reason: "denied", kind: "file" })),
+      }),
+    ).toThrow("invalid staged scan")
   })
 })
