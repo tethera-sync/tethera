@@ -3775,6 +3775,7 @@ mod tests {
             let page = store
                 .plan_additive_generations(&PlanAdditiveGenerationsRequest {
                     cursor: Some(next),
+                    limit: Some(page_limit),
                     ..request.clone()
                 })
                 .expect("page");
