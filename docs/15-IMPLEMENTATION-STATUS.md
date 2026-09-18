@@ -27,7 +27,7 @@ This document separates implemented behaviour from planned behaviour so the prod
 
 SQLite is the sole authoritative store for approved folder-mapping configuration. The desktop starts its stable device identity, opens the authenticated Rust RPC session, completes or verifies the legacy import, and then obtains active mappings through `mapping.list`. It never silently falls back to `state.json`.
 
-Schema version 10 keeps the original migrations and adds:
+Schema version 11 keeps the original migrations and adds:
 
 - `mapping_revisions` for the current active event metadata;
 - `mapping_tombstones` for durable deletion evidence;

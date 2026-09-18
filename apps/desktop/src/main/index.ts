@@ -1494,6 +1494,12 @@ async function initializeAuthoritativeMappings(health: MappingStoreHealth): Prom
         },
       })
       if (engine.generation !== generation) return
+      // Unfinished staged scans from a previous run would hold the
+      // open-generation quota. Purge them now: the legacy import has
+      // completed, the store is not yet marked ready, and no monitor or cycle
+      // is running, so neither local nor inbound generation staging can race
+      // the purge (both fail closed until the store is ready).
+      await purgeStagedGenerations()
       if (result.stateDocument) {
         legacyStateSource = {
           kind: "readable",
@@ -1521,9 +1527,6 @@ async function initializeAuthoritativeMappings(health: MappingStoreHealth): Prom
       }
       await Promise.all(snapshot.folders.map((folder) => refreshContinuousSyncState(folder.id)))
       await refreshContinuousSyncMonitors()
-      // Unfinished staged scans from a previous run would hold the
-      // open-generation quota; purge them before any cycle is scheduled.
-      await purgeStagedGenerations()
       for (const folder of snapshot.folders) scheduleContinuousSync(folder.id)
       await persistState()
       broadcastSnapshot()
@@ -4478,6 +4481,10 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
           }
         }
         if (preferGeneration) {
+          // Staging writes generations, so it waits for the same store
+          // readiness the reconcile exchange requires; this also keeps an
+          // inbound scan from racing the startup purge.
+          requireMappingMutations()
           return generationScanReply(await stageOwnGenerationForCoordinator(folder, record, context.signal, "peer-changes"))
         }
         const manifest = await runCachedFolderScan(`inbound:${folderId}`, folder, context.signal, {
