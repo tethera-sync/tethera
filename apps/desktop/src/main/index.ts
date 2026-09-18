@@ -3824,11 +3824,11 @@ interface InitialSyncRunOptions {
   /** Where this pass sits in the merge, for the progress view. */
   initialMerge: InitialMergeStep
   /**
-   * Whether this pass accepted a non-empty inaccessible-path report. A
-   * generation merge has no retained manifests to forward to the peer's
-   * inverse pass, so its coordinator uses this verdict instead.
+   * The non-empty inaccessible-path report this pass accepted, or undefined
+   * when it had none. A generation merge has no retained manifests, so its
+   * coordinator binds the peer's inverse allowance to this exact report.
    */
-  onIssuesAccepted?: (accepted: boolean) => void
+  onIssuesAccepted?: (issues: FolderScanIssueReport | undefined) => void
 }
 
 /**
@@ -3880,7 +3880,7 @@ function enforceInitialSyncIssueDecision(
   }
   // A non-empty report reaching this point was accepted by the blanket
   // allowance, the reviewed signature, or the approved comparison.
-  options.onIssuesAccepted?.(issueTotal > 0)
+  options.onIssuesAccepted?.(issueTotal > 0 ? state.issues : undefined)
   preparedInitialSyncScans.delete(folder.id)
   updateFolder(folder.id, { scanIssues: undefined })
 }
@@ -4626,23 +4626,24 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     const reusablePrepared = hasRetainedPreparedScan(prepared, folder) ? prepared : undefined
     const allowUnreadable = acknowledgeUnreadable && reusablePrepared !== undefined
     const acknowledgedIssuesSignature = acknowledgeUnreadable ? prepared?.issuesSignature : undefined
-    // A generation merge keeps no retained manifests, so the local pass's
-    // acceptance verdict is what authorises the peer's inverse pass to skip the
-    // same reviewed items. It is only consulted for generation-capable peers.
+    // A generation merge keeps no retained manifests, so the peer's inverse
+    // allowance is bound to the exact report the coordinator's user accepted:
+    // the peer proceeds only when its own fresh scan matches that report's
+    // signature, and newly inaccessible items still stop for review.
     const peerCapabilities = await cachedPeerCapabilities(peer.id)
     const generationMerge = shouldUseMergeGenerations(peerCapabilities)
-    let localIssuesAccepted = false
+    let localAcceptedIssues: FolderScanIssueReport | undefined
     const { local: localResult, peer: remoteResult } = await runCoordinatedInitialMerge(
       // A repeat attempt must walk both folders again, so only the first may
       // reuse the prepared scan and its blanket unreadable allowance.
       (attempt) => {
-        localIssuesAccepted = false
+        localAcceptedIssues = undefined
         return runInitialSyncPass(folder, peer, {
           allowUnreadable: attempt === 1 && allowUnreadable,
           prepared: attempt === 1 ? reusablePrepared : undefined,
           acknowledgedIssuesSignature,
           initialMerge: { step: 1, firstPassUpdates: "this-computer" },
-          onIssuesAccepted: (accepted) => { localIssuesAccepted = accepted },
+          onIssuesAccepted: (issues) => { localAcceptedIssues = issues },
         })
       },
       async (attempt) => {
@@ -4654,12 +4655,22 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
         // unreadable paths discovered after the coordinator's scan without
         // the coordinator (or the peer's user) seeing them. A repeat attempt
         // rescans later than the reviewed report, so it gets no allowance either.
-        const peerAllowUnreadable = attempt === 1 && (allowUnreadable || (generationMerge && localIssuesAccepted))
+        // A generation merge instead passes the accepted report's signature in
+        // the peer's own orientation, so only a matching fresh scan proceeds.
+        const peerAcceptedSignature = generationMerge && localAcceptedIssues
+          ? scanIssueSignature({
+              local: localAcceptedIssues.remote,
+              remote: localAcceptedIssues.local,
+              localCount: localAcceptedIssues.remoteCount,
+              remoteCount: localAcceptedIssues.localCount,
+            })
+          : undefined
         return validateInitialSyncPassResult(
           await requirePeerSessions().request<InitialSyncPassResult>(peer.id, {
             type: "initial-sync-run",
             folderId,
-            allowUnreadable: peerAllowUnreadable,
+            allowUnreadable: attempt === 1 && allowUnreadable,
+            ...(peerAcceptedSignature ? { acknowledgedIssuesSignature: peerAcceptedSignature } : {}),
           }, NO_PEER_RESPONSE_DEADLINE),
         )
       },
@@ -4768,7 +4779,12 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
   return snapshot
 }
 
-async function runPeerInitialSync(context: PeerRequestContext, folderId: string, allowUnreadable: boolean): Promise<InitialSyncPassResult> {
+async function runPeerInitialSync(
+  context: PeerRequestContext,
+  folderId: string,
+  allowUnreadable: boolean,
+  acknowledgedIssuesSignature?: string,
+): Promise<InitialSyncPassResult> {
   requireMappingMutations()
   if (initialSyncInFlight.has(folderId)) throw new Error("An initial merge is already running for this folder.")
   const record = mappingRecords.get(folderId)
@@ -4780,6 +4796,7 @@ async function runPeerInitialSync(context: PeerRequestContext, folderId: string,
   try {
     const result = await runInitialSyncPass(folder, peer, {
       allowUnreadable,
+      acknowledgedIssuesSignature,
       initialMerge: { step: 2, firstPassUpdates: "other-computer" },
     })
     scanReuseSeeds.forget(folder.localPath, folder.ignorePatterns)
@@ -5450,7 +5467,12 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
   }
   if (request.type === "initial-sync-run") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
-    return runPeerInitialSync(context, folderId, request.allowUnreadable === true)
+    // The coordinator's accepted inaccessible-path report, used only when the
+    // peer's own fresh scan matches it exactly.
+    const acknowledgedIssuesSignature = typeof request.acknowledgedIssuesSignature === "string" && /^[a-f0-9]{64}$/.test(request.acknowledgedIssuesSignature)
+      ? request.acknowledgedIssuesSignature
+      : undefined
+    return runPeerInitialSync(context, folderId, request.allowUnreadable === true, acknowledgedIssuesSignature)
   }
   if (request.type === "initial-sync-generation-scan") {
     requireMappingMutations()
