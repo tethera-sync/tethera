@@ -1,6 +1,6 @@
 {
 	"name": "@tethera/desktop",
-	"version": "0.1.15",
+	"version": "0.1.16",
 	"private": true,
 	"description": "Tethera desktop sync client",
 	"author": "Tethera <noreply@tdanks.com>",
