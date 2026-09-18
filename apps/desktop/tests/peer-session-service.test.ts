@@ -169,6 +169,17 @@ describe("secure peer-session crypto", () => {
       20,
       { onProgress: () => undefined },
     )).rejects.toMatchObject({ code: "PEER_SCAN_PROGRESS_OPTIONS" })
+    await expect(requester.request(
+      responderIdentity.id,
+      { type: "initial-sync-generation-scan", reportProgress: true },
+      20,
+    )).rejects.toMatchObject({ code: "PEER_SCAN_PROGRESS_OPTIONS" })
+    await expect(requester.request(
+      responderIdentity.id,
+      { type: "initial-sync-generation-scan" },
+      20,
+      { onProgress: () => undefined },
+    )).rejects.toMatchObject({ code: "PEER_SCAN_PROGRESS_OPTIONS" })
   })
 
   test("validates progress envelopes and rejects replayed or malformed activity", () => {
@@ -261,6 +272,40 @@ describe("secure peer-session crypto", () => {
         { onProgress: (progress) => activity.push(progress.scannedFiles) },
       )).resolves.toEqual({ complete: true })
       expect(activity).toEqual([1, 2, 3])
+    } finally {
+      await requester.stop()
+      await responder.stop()
+    }
+  })
+
+  test("relays progress for an initial-merge generation scan", async () => {
+    const requesterIdentity = testIdentity("requester-generation-progress")
+    const responderIdentity = testIdentity("responder-generation-progress")
+    const responder = new PeerSessionService({
+      pairing: fakePairing(responderIdentity, requesterIdentity, 0),
+      port: 0,
+      testTiming: { scanProgressIntervalMs: 1 },
+      onRequest: async (context) => {
+        expect(context.reportProgress).toBeDefined()
+        context.reportProgress?.({ ...TEST_PROGRESS, scannedFiles: 7 })
+        return { generationId: "gen-1", entries: 7, occupied: 0, ignored: 0, unreadable: 0 }
+      },
+    })
+    await responder.start()
+    const requester = new PeerSessionService({
+      pairing: fakePairing(requesterIdentity, responderIdentity, responder.port),
+      port: 0,
+      onRequest: async () => undefined,
+    })
+    const activity: number[] = []
+    try {
+      await expect(requester.request<{ generationId: string }>(
+        responderIdentity.id,
+        { type: "initial-sync-generation-scan", reportProgress: true },
+        1_000,
+        { onProgress: (progress) => activity.push(progress.scannedFiles) },
+      )).resolves.toEqual({ generationId: "gen-1", entries: 7, occupied: 0, ignored: 0, unreadable: 0 })
+      expect(activity).toEqual([7])
     } finally {
       await requester.stop()
       await responder.stop()
