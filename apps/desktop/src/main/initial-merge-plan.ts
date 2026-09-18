@@ -63,8 +63,13 @@ export interface AdditivePlanRpc {
 /**
  * Converts one computer's complete scan-issue report into destination block
  * paths for the plan: a file blocks exactly its path, a directory blocks
- * itself and everything beneath it, and a root directory issue blocks the
- * tree. An empty file path can never match a relative path and is dropped.
+ * itself and everything beneath it, and a root directory issue fails the plan
+ * instead of blocking the tree.
+ *
+ * An unreadable folder root means nothing could be enumerated, so every
+ * addition would be blocked and both plan directions would look converged
+ * without copying anything. That silent no-op is never a merge, so it fails
+ * closed. An empty file path can never match a relative path and is dropped.
  *
  * An over-long path is dropped too: every staged plan path is within the
  * engine's 4096-byte bound, so such a path can neither equal a plan path nor
@@ -82,7 +87,10 @@ export function blockedPathsFromScanIssues(
   }
   const blocked: AdditivePlanBlockedPath[] = []
   for (const issue of issues) {
-    if (issue.path === "" && issue.kind === "file") continue
+    if (issue.path === "") {
+      if (issue.kind === "file") continue
+      throw new Error(`${computer}'s folder root could not be read, so the merge cannot be planned safely. Fix access to the folder, then retry.`)
+    }
     if (Buffer.byteLength(issue.path, "utf8") > 4_096) continue
     blocked.push({ path: issue.path, directory: issue.kind === "directory" })
   }

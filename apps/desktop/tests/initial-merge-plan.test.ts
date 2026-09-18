@@ -123,14 +123,18 @@ describe("blocked merge paths from scan issues", () => {
       { path: "a.txt", reason: "denied", kind: "file" },
       { path: "private", reason: "denied", kind: "directory" },
       { path: "", reason: "root unreadable", kind: "file" },
-      { path: "", reason: "root unreadable", kind: "directory" },
       { path: "x".repeat(4_097), reason: "too long", kind: "directory" },
     ])
     expect(blocked).toEqual([
       { path: "a.txt", directory: false },
       { path: "private", directory: true },
-      { path: "", directory: true },
     ])
+  })
+
+  test("fails closed on an unreadable folder root instead of blocking every addition", () => {
+    expect(() =>
+      blockedPathsFromScanIssues("This computer", [{ path: "", reason: "root unreadable", kind: "directory" }]),
+    ).toThrow("folder root could not be read")
   })
 
   test("fails closed above the engine's bound", () => {
