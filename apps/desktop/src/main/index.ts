@@ -1166,13 +1166,15 @@ function parseInitialSyncOutcomes(value: unknown): Record<string, PersistedIniti
   for (const [folderId, candidate] of Object.entries(value)) {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue
     const outcome = candidate as Partial<PersistedInitialSyncOutcome>
-    const { completedAt, copiedFiles, fileCount, conflicts, unreadableSkipped } = outcome
+    const { completedAt, copiedFiles, fileCount, conflicts, unreadableSkipped, conflictsTotal } = outcome
     if (
       typeof completedAt !== "string" ||
       typeof copiedFiles !== "number" || !Number.isSafeInteger(copiedFiles) || copiedFiles < 0 ||
       typeof fileCount !== "number" || !Number.isSafeInteger(fileCount) || fileCount < 0 ||
       !isBoundedSkipArray(conflicts) ||
-      (unreadableSkipped !== undefined && !isBoundedSkipArray(unreadableSkipped))
+      (unreadableSkipped !== undefined && !isBoundedSkipArray(unreadableSkipped)) ||
+      (conflictsTotal !== undefined &&
+        (typeof conflictsTotal !== "number" || !Number.isSafeInteger(conflictsTotal) || conflictsTotal < conflicts.length))
     ) continue
     outcomes[folderId] = {
       completedAt,
@@ -1180,6 +1182,7 @@ function parseInitialSyncOutcomes(value: unknown): Record<string, PersistedIniti
       fileCount,
       conflicts,
       ...(unreadableSkipped ? { unreadableSkipped } : {}),
+      ...(conflictsTotal !== undefined ? { conflictsTotal } : {}),
     }
   }
   return outcomes
@@ -3908,7 +3911,16 @@ async function executeInitialSyncCopyPlan(
   },
 ): Promise<InitialSyncPassResult> {
   const { totalFiles, totalBytes } = plan
-  const skipped: SyncSkip[] = [...plan.initialSkipped]
+  // The exchanged and persisted conflict list is bounded; records beyond the
+  // bound are counted so the completion message and outcome keep the true
+  // total without breaking the peer's skip-array validation.
+  const skipped: SyncSkip[] = []
+  let skippedTotal = 0
+  const retainSkip = (skip: SyncSkip): void => {
+    skippedTotal += 1
+    if (skipped.length < MAX_PERSISTED_SKIP_ENTRIES) skipped.push(skip)
+  }
+  for (const skip of plan.initialSkipped) retainSkip(skip)
   const occupied: string[] = [...plan.initialOccupied]
   let copiedFiles = 0
   let copiedBytes = 0
@@ -3955,7 +3967,7 @@ async function executeInitialSyncCopyPlan(
     : undefined
   try {
     for await (const batch of plan.batches) {
-      skipped.push(...batch.conflicts)
+      for (const conflict of batch.conflicts) retainSkip(conflict)
       occupied.push(...batch.occupied)
       for (const entry of batch.additions) {
         const current = snapshot.folders.find((item) => item.id === folder.id)
@@ -3971,7 +3983,7 @@ async function executeInitialSyncCopyPlan(
           copiedBytes += result.bytes
           addedFiles += 1
         } else if (result.status === "conflict") {
-          skipped.push({ ...result.skip, path: entry.path })
+          retainSkip({ ...result.skip, path: entry.path })
           addedFiles += 1
         } else if (result.status === "occupied") {
           occupied.push(entry.path)
@@ -4000,6 +4012,7 @@ async function executeInitialSyncCopyPlan(
     fileCount: plan.localFileCount + addedFiles,
     skipped,
     unreadableSkipped: scanIssueSkips(plan.issues, "This computer", peer.name),
+    skippedTotal,
   }
 }
 
@@ -4266,7 +4279,7 @@ async function assertPeerCapacityForInverseMergeGenerations(
 async function verifyInitialMergeQuiescent(
   folder: FolderSummary,
   peer: DeviceSummary,
-): Promise<{ skipped: SyncSkip[]; unreadableSkipped: SyncSkip[] }> {
+): Promise<{ skipped: SyncSkip[]; unreadableSkipped: SyncSkip[]; skippedTotal: number }> {
   updateFolder(folder.id, { currentAction: "Verifying that neither folder changed during the merge…" })
   // Only the coordinator verifies, and the coordinator always runs the first pass.
   setFolderActivity(folder.id, { kind: "scanning", purpose: "verify" }, { step: 3, firstPassUpdates: "this-computer" })
@@ -4312,6 +4325,7 @@ async function verifyInitialMergeQuiescent(
   return {
     skipped: convergence.skipped,
     unreadableSkipped: scanIssueSkips(scanIssueReportOf(localManifest, remoteManifest), "This computer", peer.name),
+    skippedTotal: convergence.skipped.length,
   }
 }
 
@@ -4325,7 +4339,7 @@ async function verifyInitialMergeQuiescentGenerations(
   folder: FolderSummary,
   peer: DeviceSummary,
   capabilities: ReadonlySet<string>,
-): Promise<{ skipped: SyncSkip[]; unreadableSkipped: SyncSkip[] }> {
+): Promise<{ skipped: SyncSkip[]; unreadableSkipped: SyncSkip[]; skippedTotal: number }> {
   const record = mappingRecords.get(folder.id)
   if (!record) throw new Error("This folder is no longer configured.")
   const staged = await stageMergeGenerations(folder, peer, record, "verify", capabilities)
@@ -4364,14 +4378,22 @@ async function verifyInitialMergeQuiescentGenerations(
     ])]
     if (caseCollisions.length > 0) throw new Error(initialMergeCaseCollisionMessage(caseCollisions))
 
+    // Retain a bounded conflict sample; the observed total keeps the outcome
+    // message truthful without exceeding the exchanged skip bound.
     const skippedByKey = new Map<string, SyncSkip>()
+    let skippedTotal = 0
+    const retainSkip = (skip: SyncSkip): void => {
+      const key = `${skip.path}\0${skip.reason}`
+      if (skippedByKey.has(key)) return
+      skippedTotal += 1
+      if (skippedByKey.size < MAX_PERSISTED_SKIP_ENTRIES) skippedByKey.set(key, skip)
+    }
     const pendingPaths: string[] = []
     const pendingSeen = new Set<string>()
     let pendingTotal = 0
     const collect = (page: AdditivePlanPage): void => {
       for (const path of page.conflicts) {
-        const skip = initialSyncConflictSkip(path)
-        skippedByKey.set(`${skip.path}\0${skip.reason}`, skip)
+        retainSkip(initialSyncConflictSkip(path))
       }
       for (const addition of page.additions) {
         if (pendingSeen.size >= MAX_PERSISTED_SKIP_ENTRIES) {
@@ -4399,6 +4421,7 @@ async function verifyInitialMergeQuiescentGenerations(
         localCount: localStaged.unreadable,
         remoteCount: peerScan.unreadable,
       }, "This computer", peer.name),
+      skippedTotal,
     }
   } finally {
     await staged.release()
@@ -4411,9 +4434,20 @@ function uniqueSkips(...groups: SyncSkip[][]): SyncSkip[] {
   return [...byPath.values()]
 }
 
-function recordInitialSyncOutcome(folder: FolderSummary, copiedFiles: number, skipped: SyncSkip[], unreadableSkipped: SyncSkip[]): void {
-  const conflictNote = skipped.length > 0
-    ? `; ${skipped.length} same-path conflict${skipped.length === 1 ? " was" : "s were"} left untouched`
+/** Keeps an exchanged or persisted skip list inside the bound every consumer validates. */
+function boundedSkips(skips: SyncSkip[]): SyncSkip[] {
+  return skips.length > MAX_PERSISTED_SKIP_ENTRIES ? skips.slice(0, MAX_PERSISTED_SKIP_ENTRIES) : skips
+}
+
+function recordInitialSyncOutcome(
+  folder: FolderSummary,
+  copiedFiles: number,
+  skipped: SyncSkip[],
+  unreadableSkipped: SyncSkip[],
+  skippedTotal = skipped.length,
+): void {
+  const conflictNote = skippedTotal > 0
+    ? `; ${skippedTotal} same-path conflict${skippedTotal === 1 ? " was" : "s were"} left untouched`
     : ""
   const inaccessibleNote = unreadableSkipped.length > 0
     ? `; ${unreadableSkipped.length} inaccessible item${unreadableSkipped.length === 1 ? " was" : "s were"} skipped`
@@ -4421,7 +4455,7 @@ function recordInitialSyncOutcome(folder: FolderSummary, copiedFiles: number, sk
   pushActivity(
     "Initial merge completed",
     `${folder.name}: safely copied ${copiedFiles} file${copiedFiles === 1 ? "" : "s"} across both computers${conflictNote}${inaccessibleNote}.`,
-    skipped.length > 0 || unreadableSkipped.length > 0 ? "warning" : "success",
+    skippedTotal > 0 || unreadableSkipped.length > 0 ? "warning" : "success",
     folder.id,
   )
   for (const skip of skipped.slice(0, 20)) pushActivity(`Conflict left untouched: ${skip.path}`, skip.reason, "warning", folder.id)
@@ -4435,10 +4469,11 @@ function persistInitialSyncOutcome(
   fileCount: number,
   conflicts: SyncSkip[],
   unreadableSkipped: SyncSkip[] = [],
+  conflictsTotal = conflicts.length,
 ): void {
   initialSyncOutcomes = {
     ...initialSyncOutcomes,
-    [folderId]: { completedAt, copiedFiles, fileCount, conflicts, unreadableSkipped },
+    [folderId]: { completedAt, copiedFiles, fileCount, conflicts, unreadableSkipped, conflictsTotal },
   }
 }
 
@@ -4460,7 +4495,7 @@ function applyInitialSyncOutcomeStatus(folderId: string): void {
     paused,
     peerOnline: peer?.status === "online",
     // The first two-sided scan retires these, so any that remain are unchecked.
-    conflicts: outcome.conflicts.length,
+    conflicts: outcome.conflictsTotal ?? outcome.conflicts.length,
     unreadableSkipped: outcome.unreadableSkipped?.length ?? 0,
   })
   updateFolder(folderId, {
@@ -4580,6 +4615,8 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     }
     let skipped: SyncSkip[] = []
     let unreadableSkipped: SyncSkip[] = []
+    /** True same-path conflict total, including records beyond the bounded sample. */
+    let skippedTotal = 0
     let completedAt = ""
     const prepared = preparedInitialSyncScans.get(folderId)
     // A single freshness check decides both the manifests to reuse and whether
@@ -4631,8 +4668,16 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
         updateFolder(folderId, { currentAction: "Recording the finished merge on both computers…" })
         setFolderActivity(folderId, { kind: "finishing" })
         broadcastSnapshot()
-        skipped = uniqueSkips(local.skipped, remote.skipped, verification.skipped)
-        unreadableSkipped = uniqueSkips(local.unreadableSkipped, remote.unreadableSkipped, verification.unreadableSkipped)
+        skipped = boundedSkips(uniqueSkips(local.skipped, remote.skipped, verification.skipped))
+        unreadableSkipped = boundedSkips(uniqueSkips(local.unreadableSkipped, remote.unreadableSkipped, verification.unreadableSkipped))
+        // Each pass sees the same merge state, so the largest observed total is
+        // the best available count once a sample is all that is retained.
+        skippedTotal = Math.max(
+          skipped.length,
+          local.skippedTotal ?? local.skipped.length,
+          remote.skippedTotal ?? remote.skipped.length,
+          verification.skippedTotal,
+        )
         const currentRecord = mappingRecords.get(folderId)
         if (!currentRecord) throw new Error("The mapping was removed before its completion could be committed.")
         completedAt = new Date().toISOString()
@@ -4643,6 +4688,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
           copiedFiles: remote.copiedFiles,
           fileCount: remote.fileCount,
           conflicts: skipped,
+          conflictsTotal: skippedTotal,
           unreadableSkipped,
         })
         if (outcomeAcknowledgement.recorded !== true) {
@@ -4655,6 +4701,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
           local.fileCount,
           skipped,
           unreadableSkipped,
+          skippedTotal,
         )
         // Commit the structured outcome before activating SQLite so a crash can never
         // leave an active mapping whose preserved conflicts are invisible after restart.
@@ -4682,7 +4729,7 @@ async function startInitialSync(folderId: string, acknowledgeUnreadable = false)
     )
     // The completion commit recorded this same outcome durably before activation.
     applyInitialSyncOutcomeStatus(folderId)
-    recordInitialSyncOutcome(folder, localResult.copiedFiles + remoteResult.copiedFiles, skipped, unreadableSkipped)
+    recordInitialSyncOutcome(folder, localResult.copiedFiles + remoteResult.copiedFiles, skipped, unreadableSkipped, skippedTotal)
     // The durable digest cache now holds everything the merge verified; the
     // pre-mapping seed has done its job.
     scanReuseSeeds.forget(folder.localPath, folder.ignorePatterns)
@@ -4748,7 +4795,7 @@ async function runPeerInitialSync(context: PeerRequestContext, folderId: string,
       status: "syncing",
       work: undefined,
       fileCount: result.fileCount,
-      currentAction: initialSyncAttentionSummary(result.skipped.length, result.unreadableSkipped.length)
+      currentAction: initialSyncAttentionSummary(result.skippedTotal ?? result.skipped.length, result.unreadableSkipped.length)
         ?? `Initial files merged; waiting for ${peer.name} to commit completion.`,
     })
     return result
@@ -5520,7 +5567,11 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       skipped: request.conflicts,
       unreadableSkipped: request.unreadableSkipped,
     })
-    persistInitialSyncOutcome(folderId, request.completedAt, result.copiedFiles, result.fileCount, result.skipped, result.unreadableSkipped)
+    // An older coordinator omits the total; a malformed one never inflates the count.
+    const conflictsTotal = typeof request.conflictsTotal === "number" && Number.isSafeInteger(request.conflictsTotal) && request.conflictsTotal >= result.skipped.length
+      ? request.conflictsTotal
+      : result.skipped.length
+    persistInitialSyncOutcome(folderId, request.completedAt, result.copiedFiles, result.fileCount, result.skipped, result.unreadableSkipped, conflictsTotal)
     await persistStateDurably()
     return { recorded: true }
   }

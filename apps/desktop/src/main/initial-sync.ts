@@ -168,9 +168,15 @@ export interface InitialSyncPassResult {
   copiedFiles: number
   copiedBytes: number
   fileCount: number
+  /** Bounded sample of same-path conflicts; the total is reported by `skippedTotal`. */
   skipped: SyncSkip[]
   /** Unreadable items the merge skipped after the user chose to continue. */
   unreadableSkipped: SyncSkip[]
+  /**
+   * Total same-path skips this pass observed, including records beyond the
+   * bounded sample. Older peers omit it, so callers fall back to the sample.
+   */
+  skippedTotal?: number
 }
 
 export interface InitialMergeConvergence {
