@@ -2,6 +2,8 @@
 
 All notable changes to this project, newest first.
 
+- ✨ Resolve many two-copy conflicts in one action by verifying both files and queuing the newest modified copy; ties, changed or unavailable files, and direction-blocked choices remain untouched.
+- ⚡ Keep the Recovery screen responsive with large conflict sets by rendering conflicts in 100-row pages.
 - ✨ Merge large folders between updated computers without holding a full file list on either side: the initial merge now stages both scans and copies from a paged, read-only plan. Older versions keep the full-manifest merge.
 - 🐛 Plan the initial merge before copying anything, including the free-space check on both computers, case-only folder-name aliases, unreadable items and paths already in use on the receiving computer.
 - ✨ Sync large folders through staged scans: a changed check now reconciles what differs instead of holding a full file list on each computer. Both computers need the update; older versions keep the current behaviour.

@@ -15,6 +15,7 @@ use sync_platform::scan::scan_folder;
 use sync_protocol::{HealthResponse, MappingStoreHealth, ProtocolVersion, RpcRequest, RpcResponse};
 use sync_storage::file_sync::{
     AuthorizeFileApplicationRequest, ReconcileRequest, ResolveConflictRequest,
+    ResolveConflictsRequest,
 };
 use sync_storage::mapping::{
     LegacyImportRequest, LegacyMigrationState, MappingConfiguration, MappingEvent, MappingStore,
@@ -339,6 +340,7 @@ fn dispatch(request: RpcRequest, mapping_store: &MappingStoreSlot) -> Value {
         "fileSync.operationsPage" => handle_file_sync_operations_page(request, mapping_store),
         "fileSync.conflictsPage" => handle_file_sync_conflicts_page(request, mapping_store),
         "fileSync.resolveConflict" => handle_file_sync_resolve_conflict(request, mapping_store),
+        "fileSync.resolveConflicts" => handle_file_sync_resolve_conflicts(request, mapping_store),
         "scanGeneration.begin" => handle_scan_generation_begin(request, mapping_store),
         "scanGeneration.append" => handle_scan_generation_append(request, mapping_store),
         "scanGeneration.seal" => handle_scan_generation_seal(request, mapping_store),
@@ -1080,6 +1082,25 @@ fn handle_file_sync_resolve_conflict(
     }
 }
 
+fn handle_file_sync_resolve_conflicts(
+    request: RpcRequest,
+    mapping_store: &MappingStoreSlot,
+) -> Value {
+    let params: ResolveConflictsRequest =
+        match parse_params(request.params, "fileSync.resolveConflicts") {
+            Ok(params) => params,
+            Err(message) => return error_response_with_code(request.id, "INVALID_PARAMS", message),
+        };
+    let store = match mapping_store.store() {
+        Ok(store) => store,
+        Err(failure) => return rpc_failure_response(request.id, failure),
+    };
+    match store.resolve_file_conflicts(&params) {
+        Ok(result) => success_response(request.id, result),
+        Err(error) => store_error_response(request.id, "Failed to resolve file conflicts", &error),
+    }
+}
+
 fn handle_file_sync_authorize_apply(
     request: RpcRequest,
     mapping_store: &MappingStoreSlot,
@@ -1803,6 +1824,7 @@ mod tests {
             "fileSync.operationsPage",
             "fileSync.conflictsPage",
             "fileSync.resolveConflict",
+            "fileSync.resolveConflicts",
             "scanGeneration.begin",
             "scanGeneration.append",
             "scanGeneration.seal",

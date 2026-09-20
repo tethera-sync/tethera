@@ -42,6 +42,8 @@ A revision wins sequentially when it descends from another. Revisions are concur
 - A choice is valid only while both current digests and sizes still match the recorded conflict. A changed or missing copy forces a fresh scan instead of applying stale intent.
 - One-way folder direction still applies to manual resolution. Deletion conflicts remain read-only until deletion propagation has complete recovery semantics.
 
+Bulk newest-copy resolution applies the same rules to a bounded queue batch. Each candidate is freshly hashed on both computers, and only a strictly later valid modification time selects a winner. Equal or unavailable times, changed or missing copies, and direction-blocked choices remain conflicts. Every engine batch records all exact choices in one SQLite transaction or records none; selected replacements still run through the ordinary archive-backed operation path.
+
 The coordinator records a valid choice as ordinary durable `push-local` or `pull-remote` work. Before transfer, the authenticated peer records the exact mirrored operation in its own local orientation so the receiving journal can bind replacement to durable work. Restart recovery replays it only when both observed source and destination still match that exact operation. Replacement then uses the normal staging, digest verification, archive, journal and atomic no-replace commit path; conflict-specific code does not bypass those guarantees.
 
 ## Change observation

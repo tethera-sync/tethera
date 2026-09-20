@@ -254,6 +254,15 @@ pub struct ResolveConflictRequest {
     pub requested_at: String,
 }
 
+pub const MAX_BULK_CONFLICT_CHOICES: usize = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveConflictsRequest {
+    pub mapping_id: String,
+    pub choices: Vec<ResolveConflictRequest>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthorizeFileApplicationRequest {
@@ -721,63 +730,50 @@ impl MappingStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         require_active_mapping(&transaction, &request.mapping_id)?;
-        let conflict = read_conflicts(&transaction, &request.mapping_id)?
-            .into_iter()
-            .find(|conflict| conflict.path == request.path)
-            .ok_or_else(|| {
-                MappingStoreError::NotFound(format!(
-                    "file conflict {}:{}",
-                    request.mapping_id, request.path
-                ))
-            })?;
-        if conflict.local_digest.as_deref() != Some(request.local_digest.as_str())
-            || conflict.remote_digest.as_deref() != Some(request.remote_digest.as_str())
-        {
-            return Err(MappingStoreError::Invalid(
-                "the file conflict changed before the selected version could be recorded"
-                    .to_owned(),
-            ));
-        }
+        queue_conflict_resolution(&transaction, request)?;
+        transaction.commit()?;
+        self.file_sync_state(&request.mapping_id)
+    }
 
-        let operation = match request.direction {
-            SyncDirection::PushLocal => PlannedOperation {
-                path: request.path.clone(),
-                direction: request.direction,
-                source_digest: request.local_digest.clone(),
-                source_size: request.local_size,
-                expected_destination_digest: Some(request.remote_digest.clone()),
-            },
-            SyncDirection::PullRemote => PlannedOperation {
-                path: request.path.clone(),
-                direction: request.direction,
-                source_digest: request.remote_digest.clone(),
-                source_size: request.remote_size,
-                expected_destination_digest: Some(request.local_digest.clone()),
-            },
-        };
-        if let Some(existing) = read_operations(&transaction, &request.mapping_id)?
-            .into_iter()
-            .find(|candidate| candidate.path == request.path)
-        {
-            let same_choice = existing.direction == operation.direction
-                && existing.source_digest == operation.source_digest
-                && existing.source_size == operation.source_size
-                && existing.expected_destination_digest == operation.expected_destination_digest;
-            if !same_choice {
+    /// Records a bounded set of exact conflict choices atomically. Every
+    /// choice must still match its durable conflict; otherwise none are queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, missing-conflict, stale-conflict, active-operation, mapping-state, or
+    /// database error without committing any choice in the batch.
+    pub fn resolve_file_conflicts(
+        &self,
+        request: &ResolveConflictsRequest,
+    ) -> Result<FileSyncState, MappingStoreError> {
+        self.ensure_import_completed()?;
+        check_identifier("mappingId", &request.mapping_id)?;
+        if request.choices.is_empty() || request.choices.len() > MAX_BULK_CONFLICT_CHOICES {
+            return Err(MappingStoreError::Invalid(format!(
+                "bulk conflict choices must contain between 1 and {MAX_BULK_CONFLICT_CHOICES} entries"
+            )));
+        }
+        let mut paths = BTreeSet::new();
+        for choice in &request.choices {
+            if choice.mapping_id != request.mapping_id || !paths.insert(choice.path.as_str()) {
                 return Err(MappingStoreError::Invalid(
-                    "a different file operation is already pending for this conflict".to_owned(),
+                    "bulk conflict choices must name one mapping and unique paths".to_owned(),
                 ));
             }
-            transaction.rollback()?;
-            return self.file_sync_state(&request.mapping_id);
+            validate_path(&choice.path)?;
+            validate_digest(&choice.local_digest)?;
+            validate_size(choice.local_size)?;
+            validate_digest(&choice.remote_digest)?;
+            validate_size(choice.remote_size)?;
+            validate_timestamp("requestedAt", &choice.requested_at)?;
         }
 
-        insert_operation(
-            &transaction,
-            &request.mapping_id,
-            &request.requested_at,
-            &operation,
-        )?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        require_active_mapping(&transaction, &request.mapping_id)?;
+        for choice in &request.choices {
+            queue_conflict_resolution(&transaction, choice)?;
+        }
         transaction.commit()?;
         self.file_sync_state(&request.mapping_id)
     }
@@ -1474,6 +1470,66 @@ fn plan_divergent_pair(
             });
         }
     }
+}
+
+fn queue_conflict_resolution(
+    transaction: &Transaction<'_>,
+    request: &ResolveConflictRequest,
+) -> Result<(), MappingStoreError> {
+    let conflict = read_conflicts(transaction, &request.mapping_id)?
+        .into_iter()
+        .find(|conflict| conflict.path == request.path)
+        .ok_or_else(|| {
+            MappingStoreError::NotFound(format!(
+                "file conflict {}:{}",
+                request.mapping_id, request.path
+            ))
+        })?;
+    if conflict.local_digest.as_deref() != Some(request.local_digest.as_str())
+        || conflict.remote_digest.as_deref() != Some(request.remote_digest.as_str())
+    {
+        return Err(MappingStoreError::Invalid(
+            "the file conflict changed before the selected version could be recorded".to_owned(),
+        ));
+    }
+    let operation = match request.direction {
+        SyncDirection::PushLocal => PlannedOperation {
+            path: request.path.clone(),
+            direction: request.direction,
+            source_digest: request.local_digest.clone(),
+            source_size: request.local_size,
+            expected_destination_digest: Some(request.remote_digest.clone()),
+        },
+        SyncDirection::PullRemote => PlannedOperation {
+            path: request.path.clone(),
+            direction: request.direction,
+            source_digest: request.remote_digest.clone(),
+            source_size: request.remote_size,
+            expected_destination_digest: Some(request.local_digest.clone()),
+        },
+    };
+    if let Some(existing) = read_operations(transaction, &request.mapping_id)?
+        .into_iter()
+        .find(|candidate| candidate.path == request.path)
+    {
+        let same_choice = existing.direction == operation.direction
+            && existing.source_digest == operation.source_digest
+            && existing.source_size == operation.source_size
+            && existing.expected_destination_digest == operation.expected_destination_digest;
+        if same_choice {
+            return Ok(());
+        }
+        return Err(MappingStoreError::Invalid(
+            "a different file operation is already pending for this conflict".to_owned(),
+        ));
+    }
+    insert_operation(
+        transaction,
+        &request.mapping_id,
+        &request.requested_at,
+        &operation,
+    )?;
+    Ok(())
 }
 
 fn validate_reconcile_request(request: &ReconcileRequest) -> Result<(), MappingStoreError> {
@@ -2900,6 +2956,81 @@ mod tests {
             requested_at: "2026-08-08T12:01:00Z".to_owned(),
         });
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn bulk_conflict_resolution_records_all_exact_choices_atomically() {
+        let store = active_store();
+        reconcile(
+            &store,
+            vec![file("one.txt", 'a'), file("two.txt", 'b')],
+            vec![file("one.txt", 'c'), file("two.txt", 'd')],
+        );
+        let choice = |path: &str, local: char, remote: char| ResolveConflictRequest {
+            mapping_id: "mapping-1".to_owned(),
+            path: path.to_owned(),
+            direction: SyncDirection::PushLocal,
+            local_digest: local.to_string().repeat(64),
+            local_size: 4,
+            remote_digest: remote.to_string().repeat(64),
+            remote_size: 4,
+            requested_at: "2026-08-08T12:01:00Z".to_owned(),
+        };
+
+        let resolved = store
+            .resolve_file_conflicts(&ResolveConflictsRequest {
+                mapping_id: "mapping-1".to_owned(),
+                choices: vec![choice("one.txt", 'a', 'c'), choice("two.txt", 'b', 'd')],
+            })
+            .expect("resolve exact conflict batch");
+        assert_eq!(resolved.operations.len(), 2);
+
+        let atomic_store = active_store();
+        reconcile(
+            &atomic_store,
+            vec![file("one.txt", 'a'), file("two.txt", 'b')],
+            vec![file("one.txt", 'c'), file("two.txt", 'd')],
+        );
+        let failed = atomic_store.resolve_file_conflicts(&ResolveConflictsRequest {
+            mapping_id: "mapping-1".to_owned(),
+            choices: vec![choice("one.txt", 'a', 'c'), choice("two.txt", 'e', 'd')],
+        });
+        assert!(failed.is_err());
+        let state = atomic_store
+            .file_sync_state("mapping-1")
+            .expect("read state");
+        assert!(state.operations.is_empty());
+    }
+
+    #[test]
+    fn bulk_conflict_resolution_rejects_duplicate_paths_and_oversized_batches() {
+        let store = active_store();
+        let choice = ResolveConflictRequest {
+            mapping_id: "mapping-1".to_owned(),
+            path: "one.txt".to_owned(),
+            direction: SyncDirection::PushLocal,
+            local_digest: "a".repeat(64),
+            local_size: 4,
+            remote_digest: "b".repeat(64),
+            remote_size: 4,
+            requested_at: "2026-08-08T12:01:00Z".to_owned(),
+        };
+        assert!(
+            store
+                .resolve_file_conflicts(&ResolveConflictsRequest {
+                    mapping_id: "mapping-1".to_owned(),
+                    choices: vec![choice.clone(), choice.clone()],
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .resolve_file_conflicts(&ResolveConflictsRequest {
+                    mapping_id: "mapping-1".to_owned(),
+                    choices: vec![choice; MAX_BULK_CONFLICT_CHOICES + 1],
+                })
+                .is_err()
+        );
     }
 
     #[test]

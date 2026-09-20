@@ -26,6 +26,7 @@ const api: TetheraApi = {
   getRecoveryState: () => ipcRenderer.invoke("recovery:get-state"),
   inspectFileConflict: (input: ConflictInspectionInput) => ipcRenderer.invoke("recovery:inspect-conflict", input),
   resolveFileConflict: (input: ResolveFileConflictInput) => ipcRenderer.invoke("recovery:resolve-conflict", input),
+  resolveNewestConflicts: () => ipcRenderer.invoke("recovery:resolve-newest-conflicts"),
   revealConflictFile: (input: ConflictInspectionInput) => ipcRenderer.invoke("recovery:reveal-conflict-file", input),
   pauseAll: () => ipcRenderer.invoke("app:pause-all"),
   resumeAll: () => ipcRenderer.invoke("app:resume-all"),

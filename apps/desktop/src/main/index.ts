@@ -50,6 +50,7 @@ import type {
   RecoveryConflict,
   RecoveryState,
   ResolveFileConflictInput,
+  ResolveNewestConflictsResult,
   SyncMode,
   UpdateState,
 } from "../shared/contracts"
@@ -2580,6 +2581,110 @@ async function resolveFileConflict(value: unknown): Promise<AppSnapshot> {
   )
   await persistState()
   return broadcastSnapshot()
+}
+
+const BULK_CONFLICT_BATCH_SIZE = 100
+
+function emptyNewestConflictResult(): ResolveNewestConflictsResult {
+  return { inspected: 0, queued: 0, skippedTies: 0, skippedUnavailable: 0, skippedChanged: 0, skippedPolicy: 0 }
+}
+
+function addNewestConflictResult(target: ResolveNewestConflictsResult, value: ResolveNewestConflictsResult): void {
+  target.inspected += value.inspected
+  target.queued += value.queued
+  target.skippedTies += value.skippedTies
+  target.skippedUnavailable += value.skippedUnavailable
+  target.skippedChanged += value.skippedChanged
+  target.skippedPolicy += value.skippedPolicy
+}
+
+async function resolveNewestConflictsLocally(folderId: string): Promise<ResolveNewestConflictsResult> {
+  requireMappingMutations()
+  const { folder, peer, record } = requireRecoveryFolder(folderId)
+  if (!isLocalContinuousCoordinator(record)) throw new Error("Only the elected synchronization coordinator can queue bulk conflict choices.")
+  if (folder.paused || snapshot.paused) throw new Error("Resume this folder before resolving conflicts.")
+  if (peer.status !== "online") throw new Error(`${peer.name} must be online to inspect both copies.`)
+  if (continuousSyncInFlight.has(folder.id) || initialSyncInFlight.has(folder.id) || archiveRestoreInFlight.has(folder.id)) {
+    throw new Error("Wait for the current folder operation to finish before resolving conflicts.")
+  }
+  const bulkKey = `${folder.id}\0*`
+  if (hasConflictResolutionInFlight(folder.id)) throw new Error("A conflict resolution is already being prepared for this folder.")
+  conflictResolutionInFlight.add(bulkKey)
+  const result = emptyNewestConflictResult()
+  try {
+    const initialState = await engine.request<FileSyncState>("fileSync.getState", { id: folder.id })
+    const pending = initialState.conflicts.filter((conflict) =>
+      conflict.localDigest !== undefined && conflict.remoteDigest !== undefined &&
+      !initialState.operations.some((operation) => operation.path === conflict.path))
+    let choices: Array<Record<string, unknown>> = []
+    const flush = async (): Promise<void> => {
+      if (choices.length === 0) return
+      const state = await engine.request<FileSyncState>("fileSync.resolveConflicts", { mappingId: folder.id, choices })
+      result.queued += choices.length
+      choices = []
+      applyFileSyncStateToFolder(folder.id, state)
+    }
+    for (const conflict of pending) {
+      result.inspected += 1
+      let inspection: ConflictInspection
+      try {
+        inspection = await inspectFileConflict({ mappingId: folder.id, path: conflict.path })
+      } catch {
+        result.skippedChanged += 1
+        continue
+      }
+      const { local, remote } = inspection
+      if (!local.present || !remote.present || local.digest === undefined || remote.digest === undefined || local.size === undefined || remote.size === undefined) {
+        result.skippedUnavailable += 1
+        continue
+      }
+      const localTime = local.modifiedAt ? Date.parse(local.modifiedAt) : Number.NaN
+      const remoteTime = remote.modifiedAt ? Date.parse(remote.modifiedAt) : Number.NaN
+      if (!Number.isFinite(localTime) || !Number.isFinite(remoteTime) || localTime === remoteTime) {
+        result.skippedTies += 1
+        continue
+      }
+      const direction = localTime > remoteTime ? "push-local" : "pull-remote"
+      try {
+        requireAllowedConflictDirection(folder.mode, direction)
+      } catch {
+        result.skippedPolicy += 1
+        continue
+      }
+      choices.push({
+        mappingId: folder.id,
+        path: conflict.path,
+        direction,
+        localDigest: local.digest,
+        localSize: local.size,
+        remoteDigest: remote.digest,
+        remoteSize: remote.size,
+        requestedAt: new Date().toISOString(),
+      })
+      if (choices.length >= BULK_CONFLICT_BATCH_SIZE) await flush()
+    }
+    await flush()
+    await persistState()
+    if (result.queued > 0) scheduleContinuousSync(folder.id)
+    broadcastSnapshot()
+    return result
+  } finally {
+    conflictResolutionInFlight.delete(bulkKey)
+  }
+}
+
+async function resolveNewestConflicts(): Promise<ResolveNewestConflictsResult> {
+  const total = emptyNewestConflictResult()
+  for (const folder of snapshot.folders.filter((candidate) => candidate.setupStatus === "active" && (candidate.conflictCount ?? 0) > 0)) {
+    const record = mappingRecords.get(folder.id)
+    const peer = getPairedDevice(folder.remoteDeviceId)
+    if (!record || !peer) continue
+    const result = isLocalContinuousCoordinator(record)
+      ? await resolveNewestConflictsLocally(folder.id)
+      : await requirePeerSessions().request<ResolveNewestConflictsResult>(peer.id, { type: "continuous-sync-resolve-newest-conflicts", folderId: folder.id }, NO_PEER_RESPONSE_DEADLINE)
+    addNewestConflictResult(total, result)
+  }
+  return total
 }
 
 function recordContinuousConflicts(folder: FolderSummary, conflicts: FileSyncConflict[]): void {
@@ -5199,6 +5304,15 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     await resolveFileConflictLocally(input)
     return { accepted: true }
   }
+  if (request.type === "continuous-sync-resolve-newest-conflicts") {
+    const folderId = typeof request.folderId === "string" ? request.folderId : ""
+    requireSharedActiveFolder(context, folderId)
+    const record = mappingRecords.get(folderId)
+    if (!record || !isLocalContinuousCoordinator(record) || context.peerId === getLocalIdentityId()) {
+      throw new Error("This computer is not the elected conflict-resolution coordinator.")
+    }
+    return resolveNewestConflictsLocally(folderId)
+  }
   if (request.type === "continuous-sync-record-conflict-choice") {
     requireMappingMutations()
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
@@ -5699,6 +5813,10 @@ function registerIpc(): void {
   ipcMain.handle("recovery:resolve-conflict", async (event, input: unknown) => {
     requireTrustedMainRenderer(event)
     return resolveFileConflict(input)
+  })
+  ipcMain.handle("recovery:resolve-newest-conflicts", async (event) => {
+    requireTrustedMainRenderer(event)
+    return resolveNewestConflicts()
   })
   ipcMain.handle("recovery:reveal-conflict-file", async (event, input: ConflictInspectionInput) => {
     requireTrustedMainRenderer(event)

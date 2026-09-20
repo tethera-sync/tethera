@@ -445,6 +445,15 @@ export interface RecoveryState {
   issues: RecoveryIssue[]
 }
 
+export interface ResolveNewestConflictsResult {
+  inspected: number
+  queued: number
+  skippedTies: number
+  skippedUnavailable: number
+  skippedChanged: number
+  skippedPolicy: number
+}
+
 export interface ArchivedVersion {
   entryId: string
   path: string
@@ -603,6 +612,7 @@ export interface TetheraApi {
   getRecoveryState(): Promise<RecoveryState>
   inspectFileConflict(input: ConflictInspectionInput): Promise<ConflictInspection>
   resolveFileConflict(input: ResolveFileConflictInput): Promise<AppSnapshot>
+  resolveNewestConflicts(): Promise<ResolveNewestConflictsResult>
   revealConflictFile(input: ConflictInspectionInput): Promise<void>
   pauseAll(): Promise<AppSnapshot>
   resumeAll(): Promise<AppSnapshot>

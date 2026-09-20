@@ -7,6 +7,7 @@ import {
   FolderOpenIcon,
   RefreshCwIcon,
   ShieldCheckIcon,
+  SparklesIcon,
 } from "lucide-react"
 import type {
   AppSnapshot,
@@ -14,11 +15,22 @@ import type {
   ConflictInspection,
   RecoveryConflict,
   RecoveryState,
+  ResolveNewestConflictsResult,
   SyncMode,
 } from "@shared/contracts"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import {
   Dialog,
@@ -45,6 +57,11 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
   const [request, setRequest] = useState<RecoveryRequestState>({ status: "loading" })
   const [refreshing, setRefreshing] = useState(false)
   const [selected, setSelected] = useState<RecoveryConflict>()
+  const [bulkDialogOpen, setBulkDialogOpen] = useState(false)
+  const [bulkRunning, setBulkRunning] = useState(false)
+  const [bulkResult, setBulkResult] = useState<ResolveNewestConflictsResult>()
+  const [bulkError, setBulkError] = useState<string>()
+  const [visibleConflictCount, setVisibleConflictCount] = useState(100)
   const refreshGeneration = useRef(0)
   const recoveryToken = snapshot.folders
     .map((folder) => `${folder.id}:${folder.conflictCount ?? 0}:${folder.recoveryIssueCount ?? 0}`)
@@ -132,6 +149,20 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
         </Alert>
       ) : null}
 
+      {bulkResult ? (
+        <Alert className="rounded-lg px-4 py-3 text-xs" role="status">
+          <AlertDescription>
+            Queued {bulkResult.queued} newest {bulkResult.queued === 1 ? "copy" : "copies"}. Left {bulkResult.skippedTies} tied, {bulkResult.skippedUnavailable} unavailable, {bulkResult.skippedChanged} changed, and {bulkResult.skippedPolicy} blocked by folder direction.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {bulkError ? (
+        <Alert variant="destructive" className="rounded-lg px-4 py-3 text-xs" role="alert">
+          <AlertDescription>{bulkError}</AlertDescription>
+        </Alert>
+      ) : null}
+
       {request.status === "ready" && request.data.issues.length > 0 ? (
         <section className="overflow-hidden rounded-[var(--radius-card)] border border-[color-mix(in_oklab,var(--danger)_30%,var(--border))] bg-[var(--surface)]">
           <div className="flex items-start gap-3 border-b border-[var(--border)] bg-[color-mix(in_oklab,var(--danger)_8%,var(--surface))] px-4 py-3">
@@ -162,10 +193,16 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
               <h3 className="m-0 text-xs font-semibold">File conflicts</h3>
               <p className="mt-1 text-[10.5px] text-[var(--muted-foreground)]">No copy changes until an exact version is selected and verified.</p>
             </div>
-            <Badge variant="warning">{request.data.conflicts.length} waiting</Badge>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => setBulkDialogOpen(true)} disabled={bulkRunning}>
+                {bulkRunning ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : <SparklesIcon data-icon="inline-start" />}
+                {bulkRunning ? "Checking…" : "Newest wins"}
+              </Button>
+              <Badge variant="warning">{request.data.conflicts.length} waiting</Badge>
+            </div>
           </div>
           <div className="divide-y divide-[var(--border)]">
-            {request.data.conflicts.map((conflict) => (
+            {request.data.conflicts.slice(0, visibleConflictCount).map((conflict) => (
               <article key={`${conflict.mappingId}:${conflict.path}`} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 px-4 py-3 max-[760px]:grid-cols-1">
                 <div className="min-w-0">
                   <div className="flex min-w-0 items-center gap-2">
@@ -189,6 +226,13 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
                 </Button>
               </article>
             ))}
+            {request.data.conflicts.length > visibleConflictCount ? (
+              <div className="flex justify-center px-4 py-3">
+                <Button variant="ghost" size="sm" onClick={() => setVisibleConflictCount((count) => count + 100)}>
+                  Show 100 more ({request.data.conflicts.length - visibleConflictCount} remaining)
+                </Button>
+              </div>
+            ) : null}
           </div>
         </section>
       ) : null}
@@ -211,6 +255,40 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
           await refresh()
         }}
       />
+      <AlertDialog open={bulkDialogOpen} onOpenChange={setBulkDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Use the newest modified copy?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Tethera will verify both copies for every conflict, queue the copy with the later modified time, and archive the replaced copy during sync. Ties, unavailable files, changed files, and choices blocked by the folder direction stay unresolved. Keep both computers online; this may take a while.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={bulkRunning}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={bulkRunning}
+              onClick={async () => {
+                setBulkRunning(true)
+                setBulkError(undefined)
+                setBulkResult(undefined)
+                try {
+                  const result = await window.folderSync.resolveNewestConflicts()
+                  setBulkResult(result)
+                  setBulkDialogOpen(false)
+                  await refresh()
+                } catch (error) {
+                  setBulkError(errorMessage(error, "The newest-copy choices could not be queued."))
+                  setBulkDialogOpen(false)
+                } finally {
+                  setBulkRunning(false)
+                }
+              }}
+            >
+              Queue newest copies
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
