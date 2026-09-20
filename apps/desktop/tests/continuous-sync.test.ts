@@ -6,6 +6,7 @@ import { fingerprintFolder, parsePeerManifest, scanFolder, type FileManifest } f
 import { fingerprintObservation } from "../src/main/observation-fingerprint"
 import {
   canSkipUnchangedCycle,
+  conflictChoiceOperations,
   conflictKey,
   FULL_RECONCILE_INTERVAL_MS,
   isUnchangedScanReply,
@@ -55,30 +56,22 @@ function openConflict(path: string): FileSyncConflict {
 }
 
 describe("continuous sync helpers", () => {
-  test("only generation-capable chunked peers without a conflict choice take the generation path", () => {
+  test("generation-capable chunked peers keep the scalable path while queued work is drained separately", () => {
     const capable = new Set([SCAN_GENERATION_CAPABILITY])
-    const idle = { operations: [], conflicts: [] }
-    const queued = { operations: [pendingOperation("notes.txt")], conflicts: [] }
-    const chosen = {
-      operations: [pendingOperation("notes.txt")],
-      conflicts: [openConflict("notes.txt")],
-    }
-    expect(shouldUseGenerations(capable, true, idle)).toBe(true)
+    expect(shouldUseGenerations(capable, true)).toBe(true)
     // A peer without the capability keeps the full-manifest path.
-    expect(shouldUseGenerations(new Set(), true, idle)).toBe(false)
+    expect(shouldUseGenerations(new Set(), true)).toBe(false)
     // The observe response must be able to span several frames.
-    expect(shouldUseGenerations(capable, false, idle)).toBe(false)
-    // Ordinary queued work is re-planned from the same observations, so it
-    // stays on the scalable path instead of stranding a large folder.
-    expect(shouldUseGenerations(capable, true, queued)).toBe(true)
-    // A conflict choice is not re-derived from observations, so it keeps the
-    // manifest path that mirrors it to the paired computer.
-    expect(shouldUseGenerations(capable, true, chosen)).toBe(false)
-    // An unrelated open conflict does not hold back the queued work.
-    expect(shouldUseGenerations(capable, true, {
-      operations: [pendingOperation("notes.txt")],
-      conflicts: [openConflict("report.txt")],
-    })).toBe(true)
+    expect(shouldUseGenerations(capable, false)).toBe(false)
+  })
+
+  test("selects only queued operations that resolve still-open conflicts", () => {
+    const chosen = pendingOperation("notes.txt")
+    const ordinary = { ...pendingOperation("photo.jpg"), id: 2 }
+    expect(conflictChoiceOperations({
+      operations: [chosen, ordinary],
+      conflicts: [openConflict("notes.txt"), openConflict("unrelated.txt")],
+    })).toEqual([chosen])
   })
 
   test("replays only durable operations whose source and destination are still exact", () => {

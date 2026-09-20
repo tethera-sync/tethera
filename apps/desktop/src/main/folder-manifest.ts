@@ -19,13 +19,14 @@ const HASH_BUFFER_BYTES = 512 * 1024
 export { MAX_LEGACY_MANIFEST_ENCODED_BYTES }
 const MAX_MANIFEST_PATH_BYTES = 4096
 /**
- * Bounded fan-out for concurrent `inspectManifestFile` calls within one scan.
- * The scan coordinator admits up to 4 concurrent scans, so this keeps the
- * worst case at 4 * 16 = 64 in-flight file operations and 4 * 16 * 512KiB =
- * 32 MiB of hash scratch buffers, instead of growing unboundedly with scan
- * count or directory size.
+ * Upper bound for concurrent `inspectManifestFile` calls within one scan.
+ * Interactive setup work uses the full bound for throughput. Automatic scans
+ * use the lower background limit below, keeping their combined file I/O and
+ * hash scratch buffers modest while the desktop remains in use.
  */
 export const SCAN_FILE_CONCURRENCY = 16
+/** Keeps automatic background checks responsive without saturating storage. */
+export const BACKGROUND_SCAN_FILE_CONCURRENCY = 4
 
 export class ScanCancelledError extends Error {
   constructor(message = "The folder scan was cancelled.") {
@@ -132,6 +133,8 @@ export interface CompareManifestOptions {
 }
 
 export interface ScanFolderOptions {
+  /** Overrides file-inspection fan-out for lower-priority background work. */
+  fileConcurrency?: number
   includeDirectories?: boolean
   onDirectory?: (entry: DirectoryObservation) => void
   excludePath?: (path: string, directory: boolean) => boolean
@@ -232,8 +235,6 @@ interface ScanWalkContext {
   onListing: (relativeDirectory: string) => void
 }
 
-/** Caps queued ignored/unreadable records so a slow file cannot let the walk run arbitrarily far ahead. */
-const MAX_PENDING_SCAN_RECORDS = SCAN_FILE_CONCURRENCY * 8
 /** Files are looked up in the digest cache this many at a time, ahead of inspection. */
 const DIGEST_LOOKUP_BATCH = 256
 /** Bounds walk-ahead while gathering one lookup batch through long runs of ignored entries. */
@@ -417,6 +418,10 @@ async function scanFolderEntries(
   const occupiedPaths: OccupiedPath[] = []
   const maxFileBytes = resolveFileSizeLimit(options.maxFileBytes)
   const hashAllFiles = options.hashAllFiles === true
+  const fileConcurrency = options.fileConcurrency === undefined
+    ? SCAN_FILE_CONCURRENCY
+    : Math.max(1, Math.min(SCAN_FILE_CONCURRENCY, Math.floor(options.fileConcurrency)))
+  const maxPendingScanRecords = fileConcurrency * 8
   // A root on FAT/exFAT (or a filesystem that cannot be identified) never
   // reuses digests, whatever the driver-synthesized inode/ctime claim.
   const identityReuseAllowed = await filesystemSupportsDigestReuse(root)
@@ -426,7 +431,7 @@ async function scanFolderEntries(
   // Each in-flight inspection borrows a slot and lazily allocates that slot's
   // scratch buffer, so peak scratch memory is bounded by the concurrency and
   // scans of empty files never allocate.
-  const freeSlots: Array<{ buffer?: Buffer }> = Array.from({ length: SCAN_FILE_CONCURRENCY }, () => ({}))
+  const freeSlots: Array<{ buffer?: Buffer }> = Array.from({ length: fileConcurrency }, () => ({}))
   let hashedBytes = 0
   let lastActivityAt = -Infinity
   function reportActivity(stage: FolderScanActivity["stage"], currentPath: string, force = false): void {
@@ -485,7 +490,7 @@ async function scanFolderEntries(
   let walkDone = false
   try {
     for (;;) {
-      while (!walkDone && pendingFiles < SCAN_FILE_CONCURRENCY && pending.length < MAX_PENDING_SCAN_RECORDS) {
+      while (!walkDone && pendingFiles < fileConcurrency && pending.length < maxPendingScanRecords) {
         const next = await records.next()
         if (next.done) {
           walkDone = true

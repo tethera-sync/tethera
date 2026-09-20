@@ -125,12 +125,12 @@ export const CONTINUOUS_FINGERPRINT_CAPABILITY = "continuous-fingerprint-v1"
  * an operation or a conflict for a path, never both. Such a choice is not
  * re-derived from observations, so a fresh plan would drop it.
  */
-function hasConflictChoiceOperation(
+export function conflictChoiceOperations(
   { operations, conflicts }: Pick<FileSyncState, "operations" | "conflicts">,
-): boolean {
-  if (operations.length === 0 || conflicts.length === 0) return false
+): FileSyncOperation[] {
+  if (operations.length === 0 || conflicts.length === 0) return []
   const conflictPaths = new Set(conflicts.map((conflict) => conflict.path))
-  return operations.some((operation) => conflictPaths.has(operation.path))
+  return operations.filter((operation) => conflictPaths.has(operation.path))
 }
 
 /**
@@ -138,19 +138,16 @@ function hasConflictChoiceOperation(
  * must stage and page scans, and the observe response must be able to span
  * several frames.
  *
- * Only a conflict choice keeps a cycle on the manifest path, which owns
- * mirroring that choice to the paired computer. Ordinary queued work is
- * planned independently by both computers from the same observations, so a
- * generation cycle re-plans and runs it unchanged. Excluding that work too
- * would strand a folder too large for the whole-manifest exchange: its
- * operations could never run, so its cycles could never stop falling back.
+ * Conflict choices are drained before scan-mode selection, while ordinary
+ * queued work is planned independently by both computers from the same
+ * observations. Generation-capable folders therefore never have to fall back
+ * to materialising a whole-folder manifest merely because work is queued.
  */
 export function shouldUseGenerations(
   capabilities: ReadonlySet<string>,
   chunkedFrames: boolean,
-  durable: Pick<FileSyncState, "operations" | "conflicts">,
 ): boolean {
-  return capabilities.has(SCAN_GENERATION_CAPABILITY) && chunkedFrames && !hasConflictChoiceOperation(durable)
+  return capabilities.has(SCAN_GENERATION_CAPABILITY) && chunkedFrames
 }
 
 /** However quiet a folder looks, it is fully reconciled at least this often. */

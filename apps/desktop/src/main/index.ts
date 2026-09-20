@@ -61,7 +61,7 @@ import {
   type MappingStoreHealth,
 } from "./engine-supervisor"
 import {
-  compareManifests, filesystemSupportsDigestReuse, isManifestPathIgnored, isScanCancelled, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type FileManifestEntry, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
+  BACKGROUND_SCAN_FILE_CONCURRENCY, compareManifests, filesystemSupportsDigestReuse, isManifestPathIgnored, isScanCancelled, parsePeerManifest, ScanCancelledError, scanFolder, assertManifestWithinLegacyByteBudget, statFileIdentity, type CachedFileDigest, type FileManifest, type FileManifestEntry, type ScanDigestCache, type ScanMetrics, fingerprintFolder, type FolderFingerprint,
 } from "./folder-manifest"
 import { globalScanCoordinator } from "./scan-coordinator"
 import { runPairedScans } from "./paired-scan"
@@ -190,6 +190,7 @@ import {
 } from "./ipc-validation"
 import {
   canSkipUnchangedCycle,
+  conflictChoiceOperations,
   conflictKey,
   CONTINUOUS_FINGERPRINT_CAPABILITY,
   isUnchangedScanReply,
@@ -232,6 +233,7 @@ import {
   canInstallUpdate,
   clampProgressPercent,
   formatUpdateError,
+  formatUpdateInstallError,
   isUpdateBusy,
   normalizeReleaseNotes,
   nowIso,
@@ -534,6 +536,7 @@ function runLocalScan(
   rootPath: string,
   ignorePatterns: string[],
   options: {
+    fileConcurrency?: number
     includeDirectories?: boolean
     excludePath?: (path: string, directory: boolean) => boolean
     mapPath?: (path: string, directory?: boolean) => string
@@ -549,6 +552,7 @@ function runLocalScan(
   signal: AbortSignal | null,
 ): Promise<FileManifest> {
   return runAdmittedScan(key, options.folderId, signal, (effective) => scanFolder(rootPath, ignorePatterns, {
+    fileConcurrency: options.fileConcurrency,
     includeDirectories: options.includeDirectories,
     excludePath: options.excludePath,
     mapPath: options.mapPath,
@@ -641,6 +645,7 @@ function directoryScanOptions(folderId: string) {
 }
 
 interface CachedFolderScanOptions {
+  fileConcurrency?: number
   reuse?: ReadonlyMap<string, CachedFileDigest>
   onUnreadable?: (issue: FolderScanIssue) => void
   onActivity?: (activity: import("../shared/contracts").FolderScanActivity) => void
@@ -653,14 +658,24 @@ function runCachedFolderScan(
   signal: AbortSignal | null,
   options: CachedFolderScanOptions = {},
 ): Promise<FileManifest> {
+  const fileConcurrency = options.fileConcurrency ?? (
+    key.startsWith("continuous:") || key.startsWith("inbound:")
+      ? BACKGROUND_SCAN_FILE_CONCURRENCY
+      : undefined
+  )
   return withFolderDigestCache(folder.id, (digestCache) =>
-    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, folderId: folder.id, digestCache, ...options, ...directoryScanOptions(folder.id) }, signal))
+    runLocalScan(key, folder.localPath, folder.ignorePatterns, { hashAllFiles: true, folderId: folder.id, digestCache, ...options, fileConcurrency, ...directoryScanOptions(folder.id) }, signal))
 }
 
 /** The same pass reduced to an observation fingerprint, holding no file list in memory. */
 function runCachedFolderFingerprint(key: string, folder: ActiveFolderScanTarget, signal: AbortSignal | null): Promise<FolderFingerprint> {
   return withFolderDigestCache(folder.id, (digestCache) =>
-    runAdmittedScan(key, folder.id, signal, (effective) => fingerprintFolder(folder.localPath, folder.ignorePatterns, { signal: effective, digestCache, ...directoryScanOptions(folder.id) })))
+    runAdmittedScan(key, folder.id, signal, (effective) => fingerprintFolder(folder.localPath, folder.ignorePatterns, {
+      signal: effective,
+      digestCache,
+      fileConcurrency: key.startsWith("continuous:") || key.startsWith("inbound:") ? BACKGROUND_SCAN_FILE_CONCURRENCY : undefined,
+      ...directoryScanOptions(folder.id),
+    })))
 }
 
 /**
@@ -926,6 +941,7 @@ async function stageOwnGenerationForCoordinator(
         root: folder.localPath,
         ignorePatterns: folder.ignorePatterns,
         signal: effective,
+        fileConcurrency: BACKGROUND_SCAN_FILE_CONCURRENCY,
         digestCache,
         onActivity: (activity) => {
           reportScanCounts(folderId, purpose, { local: activity })
@@ -3056,6 +3072,7 @@ async function runGenerationCycle(
             root: folder.localPath,
             ignorePatterns: folder.ignorePatterns,
             signal: effective,
+            fileConcurrency: BACKGROUND_SCAN_FILE_CONCURRENCY,
             digestCache,
             onActivity: (activity) => reportScanCounts(folderId, "changes", { local: activity }),
             ...directoryScanOptions(folderId),
@@ -3199,11 +3216,45 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       applyFileSyncStateToFolder(folderId, durableBeforeReconcile)
       throw new Error("A replacement recovery issue must be repaired before this folder can synchronize.")
     }
+    const chosenOperations = conflictChoiceOperations(durableBeforeReconcile)
+    if (chosenOperations.length > 0) {
+      let peerOperations: PeerFileOperationIdentity[] = []
+      for (const operation of chosenOperations) {
+        const inspection = await inspectFileConflict({ mappingId: folder.id, path: operation.path })
+        if (
+          !inspection.local.present || inspection.local.digest === undefined || inspection.local.size === undefined ||
+          !inspection.remote.present || inspection.remote.digest === undefined || inspection.remote.size === undefined
+        ) {
+          throw new Error(`Both exact copies of ${operation.path} are required to resume its conflict resolution.`)
+        }
+        peerOperations = await recordPeerConflictChoice(folder, peer, operation.path, {
+          direction: operation.direction,
+          localDigest: inspection.local.digest,
+          localSize: inspection.local.size,
+          remoteDigest: inspection.remote.digest,
+          remoteSize: inspection.remote.size,
+        })
+      }
+      const copiedFiles = await executeContinuousOperations(folder, peer, undefined, chosenOperations, peerOperations)
+      const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+      await retireInitialConflictProjection(folderId, state)
+      applyFileSyncStateToFolder(folderId, state, new Date().toISOString())
+      continuousLastErrors.delete(folderId)
+      pushActivity(
+        "Conflict resolution completed",
+        `${folder.name}: applied ${copiedFiles} selected file version${copiedFiles === 1 ? "" : "s"}; each replaced copy was archived first.`,
+        "success",
+        folderId,
+      )
+      recordContinuousConflicts(folder, state.conflicts)
+      continuousSyncQueued.add(folderId)
+      return
+    }
     const observedAt = new Date().toISOString()
     const capabilities = await cachedPeerCapabilities(peer.id)
     const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
     const quiet = quietReconciles.get(folderId)
-    const generations = shouldUseGenerations(capabilities, chunked, durableBeforeReconcile)
+    const generations = shouldUseGenerations(capabilities, chunked)
     let knownPeerManifest: FileManifest | undefined
     let knownPeerScan: PeerGenerationScanReply | undefined
     if (capabilities.has(CONTINUOUS_FINGERPRINT_CAPABILITY) && canSkipUnchangedCycle(quiet, durableBeforeReconcile, record.revision, Date.now())) {
@@ -3231,6 +3282,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     }
     const { local: localManifest, peer: remoteManifest } = await runPairedScans(
       (signal) => runCachedFolderScan(`continuous:${folderId}`, folder, signal, {
+        fileConcurrency: BACKGROUND_SCAN_FILE_CONCURRENCY,
         onActivity: (activity) => reportScanCounts(folderId, "changes", { local: activity }),
       }),
       (signal) => knownPeerManifest
@@ -6291,16 +6343,32 @@ function requestUpdateInstall(): void {
   if (!canInstallUpdate(snapshot.update)) {
     throw new Error("No downloaded update is ready to install yet.")
   }
+  // An installer that refuses to run — a dismissed Linux privilege prompt is
+  // the common one — is reported through the updater's `error` event while
+  // `quitAndInstall` returns normally. Without capturing it the app would just
+  // stay open with no restart and no explanation. The install is synchronous,
+  // so an error raised during the call is this install's.
+  let failure: Error | undefined
+  const captureFailure = (error: Error): void => {
+    failure = error
+  }
+  autoUpdater.once("error", captureFailure)
   try {
     isQuitting = true
     // Silent install with no installer pages, then relaunch the updated app
     // instead of leaving the user to start Tethera again.
     autoUpdater.quitAndInstall(true, true)
   } catch (error) {
-    isQuitting = false
-    console.error("[updater] install failed", error)
-    throw new Error(formatUpdateError(error))
+    failure = error instanceof Error ? error : new Error(String(error))
+  } finally {
+    autoUpdater.off("error", captureFailure)
   }
+  if (!failure) return
+  // Nothing is quitting after all. Leaving this set would make the next window
+  // close quit Tethera instead of hiding it to the tray.
+  isQuitting = false
+  console.error("[updater] install failed", failure)
+  throw new Error(formatUpdateInstallError(failure))
 }
 
 function scheduleUpdateChecks(): void {

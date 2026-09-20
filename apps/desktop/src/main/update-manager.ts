@@ -48,6 +48,20 @@ export function formatUpdateError(error: unknown): string {
   return "The update check failed. We'll retry automatically."
 }
 
+/**
+ * Turn a failed install into a sentence that says what to do next. On Linux the
+ * package manager runs behind a privilege prompt, so a dismissed or unavailable
+ * prompt is the ordinary failure and simply trying again usually works.
+ * No paths, URLs, or stack traces.
+ */
+export function formatUpdateInstallError(error: unknown): string {
+  const message = error instanceof Error ? error.message : ""
+  if (/pkexec|polkit|gksudo|kdesudo|sudo|not authorized|permission denied|exited with code (?:1|126|127)\b/i.test(message)) {
+    return "Tethera needs permission to replace the installed version. Try again and approve the prompt when it appears."
+  }
+  return "The update couldn't be installed, so Tethera is still running the current version. Try again, or install the latest release manually."
+}
+
 /** An update already staged for install must survive later feed errors. */
 export function shouldPreserveDownloadedOnError(current: UpdateState): boolean {
   return current.status === "downloaded"

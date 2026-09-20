@@ -111,6 +111,11 @@ export function DeviceUpdateIndicator({ update }: { update: UpdateState }) {
     setWorking(null)
   }
 
+  // A failed action must be seen, not only announced. The pointer is still on
+  // the button after a click, so the tooltip is where the user is looking —
+  // without this, an install that never starts looks like nothing happened.
+  const tooltip = (title: string): string => actionError ?? title
+
   if (update.status === "checking") {
     const copy = quietCopy(update)
     return (
@@ -192,7 +197,7 @@ export function DeviceUpdateIndicator({ update }: { update: UpdateState }) {
               </Button>
             }
           />
-          <TooltipContent>{title}</TooltipContent>
+          <TooltipContent>{tooltip(title)}</TooltipContent>
         </Tooltip>
         {actionError ? (
           <span role="alert" className="sr-only">{actionError}</span>
@@ -219,7 +224,7 @@ export function DeviceUpdateIndicator({ update }: { update: UpdateState }) {
               </Button>
             }
           />
-          <TooltipContent>{title}</TooltipContent>
+          <TooltipContent>{tooltip(title)}</TooltipContent>
         </Tooltip>
         {actionError ? (
           <span role="alert" className="sr-only">{actionError}</span>
@@ -246,7 +251,7 @@ export function DeviceUpdateIndicator({ update }: { update: UpdateState }) {
             </Button>
           }
         />
-        <TooltipContent>{copy.title}</TooltipContent>
+        <TooltipContent>{tooltip(copy.title)}</TooltipContent>
       </Tooltip>
       {actionError ? (
         <span role="alert" className="sr-only">{actionError}</span>

@@ -407,6 +407,18 @@ describe("concurrent scan parity", () => {
     }
   })
 
+  test("a lower background concurrency preserves the exact manifest", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-manifest-background-test-"))
+    try {
+      await Promise.all(Array.from({ length: 12 }, (_, index) => writeFile(path.join(root, `${index}.txt`), `content ${index}`)))
+      const foreground = await scanFolder(root, [], { hashAllFiles: true })
+      const background = await scanFolder(root, [], { hashAllFiles: true, fileConcurrency: 2 })
+      expect(background).toEqual(foreground)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
 })
 
 function sha256(content: string): string {

@@ -157,6 +157,15 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
         </Alert>
       ) : null}
 
+      {bulkRunning ? (
+        <Alert className="flex items-center gap-3 rounded-lg px-4 py-3 text-xs" role="status" aria-live="polite">
+          <RefreshCwIcon className="size-4 shrink-0 animate-spin" />
+          <AlertDescription>
+            Checking {request.status === "ready" ? request.data.conflicts.length.toLocaleString() : "the"} conflict copies and queueing safe newest versions. Large folders can take a few minutes; syncing continues automatically when verification finishes.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
       {bulkError ? (
         <Alert variant="destructive" className="rounded-lg px-4 py-3 text-xs" role="alert">
           <AlertDescription>{bulkError}</AlertDescription>
@@ -271,10 +280,12 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
                 setBulkRunning(true)
                 setBulkError(undefined)
                 setBulkResult(undefined)
+                // Return to the Recovery view immediately so the persistent
+                // progress notice is visible throughout a long verification.
+                setBulkDialogOpen(false)
                 try {
                   const result = await window.folderSync.resolveNewestConflicts()
                   setBulkResult(result)
-                  setBulkDialogOpen(false)
                   await refresh()
                 } catch (error) {
                   setBulkError(errorMessage(error, "The newest-copy choices could not be queued."))
@@ -284,7 +295,8 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
                 }
               }}
             >
-              Queue newest copies
+              {bulkRunning ? <RefreshCwIcon className="animate-spin" data-icon="inline-start" /> : null}
+              {bulkRunning ? "Starting…" : "Queue newest copies"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

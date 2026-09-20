@@ -2,6 +2,10 @@
 
 All notable changes to this project, newest first.
 
+- 🐛 Run queued newest-copy conflict choices before another whole-folder scan, so large folders start resolving instead of leaving the queue untouched.
+- ⚡ Keep automatic local and peer scans responsive by limiting their background file hashing without weakening full-content verification.
+- 🎨 Close the newest-copy confirmation immediately and show persistent progress while Tethera verifies a large conflict set.
+- 🐛 Explain update-install failures in the sidebar and allow another attempt instead of leaving the app apparently stuck after Restart & update.
 - 🐛 Stop a large folder rescanning itself without end: once any file was queued to copy, every check fell back to the whole-folder exchange that a folder that size cannot finish, so the queued copies never ran and the next check started over. Only a conflict you resolved yourself now takes that path.
 - ⚡ Keep every digest a scan records instead of dropping them when the engine falls behind or the check is stopped, so the next check reads only the files that actually changed.
 - 🐛 Let "Use the newest copy" stop the check that is running instead of refusing while a large folder is being scanned, and stop reporting a check you interrupted as a sync failure.

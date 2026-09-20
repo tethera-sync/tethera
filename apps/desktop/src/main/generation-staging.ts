@@ -44,6 +44,7 @@ export interface GenerationBinding {
 
 export interface StageLocalGenerationOptions extends GenerationBinding {
   signal?: AbortSignal | null
+  fileConcurrency?: number
   digestCache?: ScanDigestCache
   reuse?: ReadonlyMap<string, CachedFileDigest>
   excludePath?: (path: string, directory: boolean) => boolean
@@ -115,6 +116,7 @@ export async function stageLocalGeneration(
         onSettledDigest: options.onSettledDigest,
         onUnreadable: options.onUnreadable,
         signal: options.signal,
+        fileConcurrency: options.fileConcurrency,
       },
       async (entries) => {
         for (const entry of entries) {
