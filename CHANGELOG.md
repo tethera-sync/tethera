@@ -2,6 +2,9 @@
 
 All notable changes to this project, newest first.
 
+- 🐛 Stop a large folder rescanning itself without end: once any file was queued to copy, every check fell back to the whole-folder exchange that a folder that size cannot finish, so the queued copies never ran and the next check started over. Only a conflict you resolved yourself now takes that path.
+- ⚡ Keep every digest a scan records instead of dropping them when the engine falls behind or the check is stopped, so the next check reads only the files that actually changed.
+- 🐛 Let "Use the newest copy" stop the check that is running instead of refusing while a large folder is being scanned, and stop reporting a check you interrupted as a sync failure.
 - ✨ Resolve many two-copy conflicts in one action by verifying both files and queuing the newest modified copy; ties, changed or unavailable files, and direction-blocked choices remain untouched.
 - ⚡ Keep the Recovery screen responsive with large conflict sets by rendering conflicts in 100-row pages.
 - ✨ Merge large folders between updated computers without holding a full file list on either side: the initial merge now stages both scans and copies from a paged, read-only plan. Older versions keep the full-manifest merge.

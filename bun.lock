@@ -7,7 +7,7 @@
     },
     "apps/desktop": {
       "name": "@tethera/desktop",
-      "version": "0.1.18",
+      "version": "0.1.19",
       "dependencies": {
         "@base-ui/react": "1.6.0",
         "@shadcn/react": "^0.3.1",

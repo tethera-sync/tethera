@@ -28,6 +28,16 @@ function paramsOf(call: { params: unknown } | undefined): Record<string, unknown
   return Object.fromEntries(Object.entries(params))
 }
 
+function recordedPaths(params: unknown): string[] {
+  const entries = paramsOf({ params }).entries
+  if (!Array.isArray(entries)) throw new Error("expected recorded entries")
+  return entries.map((entry) => {
+    const recordedPath = paramsOf({ params: entry }).path
+    if (typeof recordedPath !== "string") throw new Error("expected a recorded path")
+    return recordedPath
+  })
+}
+
 describe("engine digest cache", () => {
   test("returns requested, well-formed entries and nothing for unknown paths", async () => {
     const { rpc, calls } = fakeRpc(() => ({ entries: [{ path: "a.txt", ...identity }] }))
@@ -75,6 +85,48 @@ describe("engine digest cache", () => {
     expect(records.map((params) => (Array.isArray(params.entries) ? params.entries.length : -1))).toEqual([1_000, 1_000, 500])
     expect(new Set(records.map((params) => params.sweepId)).size).toBe(1)
     expect(calls.some((call) => call.method === "digestCache.prune")).toBe(false)
+  })
+
+  test("an engine slower than the scan holds the scan up instead of losing digests", async () => {
+    const waiting: Array<() => void> = []
+    const recorded = new Set<string>()
+    const rpc: DigestCacheRpc = {
+      async request<T>(method: string, params?: unknown): Promise<T> {
+        if (method === "digestCache.record") {
+          for (const recordedPath of recordedPaths(params)) recorded.add(recordedPath)
+          await new Promise<void>((resolve) => waiting.push(resolve))
+        }
+        return {} as T
+      },
+    }
+    const cache = new EngineScanDigestCache(rpc, "mapping-1", { deep: true })
+    const offered = 12_000
+    let heldUp = false
+    const sweep = (async () => {
+      for (let index = 0; index < offered; index += 1) {
+        const ready = cache.record(`file-${index}.txt`, identity)
+        if (ready) {
+          heldUp = true
+          await ready
+        }
+      }
+      await cache.finish({ complete: true })
+    })()
+
+    let finished = false
+    void sweep.then(() => {
+      finished = true
+    })
+    // Let the sweep run, releasing the engine one batch at a time; a dropped
+    // batch would let it finish having recorded fewer paths than it offered.
+    for (let guard = 0; !finished && guard < 1_000; guard += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      waiting.shift()?.()
+    }
+    await sweep
+
+    expect(heldUp).toBe(true)
+    expect(recorded.size).toBe(offered)
   })
 
   test("only a complete deep sweep whose records all landed prunes, keeping its own sweep", async () => {

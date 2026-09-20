@@ -92,8 +92,12 @@ export interface CachedFileDigest extends FileIdentity {
 export interface ScanDigestCache {
   /** Recorded digests for these paths; a path without a record is simply absent. */
   lookup(relativePaths: string[]): Promise<ReadonlyMap<string, CachedFileDigest>>
-  /** Offers a freshly hashed, committed file whose identity is settled enough to trust later. */
-  record(relativePath: string, entry: CachedFileDigest): void
+  /**
+   * Offers a freshly hashed, committed file whose identity is settled enough to
+   * trust later. A returned promise is the cache asking the scan to wait before
+   * offering more.
+   */
+  record(relativePath: string, entry: CachedFileDigest): void | Promise<void>
 }
 
 /**
@@ -534,7 +538,7 @@ async function scanFolderEntries(
       else unhashedFiles += 1
       if (settledIdentity && entry.digest) {
         const settledDigest = { ...settledIdentity, digest: entry.digest }
-        if (digestCache) digestCache.record(entry.path, settledDigest)
+        if (digestCache) await digestCache.record(entry.path, settledDigest)
         options.onSettledDigest?.(entry.path, settledDigest)
       }
     }

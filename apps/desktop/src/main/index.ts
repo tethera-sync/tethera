@@ -581,11 +581,18 @@ async function withFolderDigestCache<T>(
   const startedAt = Date.now()
   const deep = digestCacheVerifier.requiresDeepSweep(folderId, startedAt)
   const digestCache = new EngineScanDigestCache(engine, folderId, { deep })
-  const result = await pass(digestCache)
   // Scans are never cut short, so a pass that returns covered the whole folder.
-  await digestCache.finish({ complete: true })
-  if (deep) digestCacheVerifier.completedDeepSweep(folderId, startedAt)
-  return result
+  let complete = false
+  try {
+    const result = await pass(digestCache)
+    complete = true
+    return result
+  } finally {
+    // A cancelled pass still keeps the digests it recorded, so the files it
+    // already read are not read again; only a complete sweep may prune.
+    await digestCache.finish({ complete })
+    if (deep && complete) digestCacheVerifier.completedDeepSweep(folderId, startedAt)
+  }
 }
 
 type ActiveFolderScanTarget = Pick<FolderSummary, "id" | "localPath" | "ignorePatterns">
@@ -2604,12 +2611,16 @@ async function resolveNewestConflictsLocally(folderId: string): Promise<ResolveN
   if (!isLocalContinuousCoordinator(record)) throw new Error("Only the elected synchronization coordinator can queue bulk conflict choices.")
   if (folder.paused || snapshot.paused) throw new Error("Resume this folder before resolving conflicts.")
   if (peer.status !== "online") throw new Error(`${peer.name} must be online to inspect both copies.`)
-  if (continuousSyncInFlight.has(folder.id) || initialSyncInFlight.has(folder.id) || archiveRestoreInFlight.has(folder.id)) {
-    throw new Error("Wait for the current folder operation to finish before resolving conflicts.")
+  if (initialSyncInFlight.has(folder.id) || archiveRestoreInFlight.has(folder.id)) {
+    throw new Error("Wait for the current file transfer to finish before resolving conflicts.")
   }
   const bulkKey = `${folder.id}\0*`
   if (hasConflictResolutionInFlight(folder.id)) throw new Error("A conflict resolution is already being prepared for this folder.")
+  // Claim the folder before stopping its check: a cycle only defers to a
+  // resolution already in flight, and a large folder can be checking almost
+  // continuously, which would otherwise leave no moment to resolve anything.
   conflictResolutionInFlight.add(bulkKey)
+  if (continuousSyncInFlight.has(folder.id)) abortFolderScans(folder.id)
   const result = emptyNewestConflictResult()
   try {
     const initialState = await engine.request<FileSyncState>("fileSync.getState", { id: folder.id })
@@ -3192,7 +3203,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     const capabilities = await cachedPeerCapabilities(peer.id)
     const chunked = capabilities.has(CHUNKED_FRAMES_CAPABILITY)
     const quiet = quietReconciles.get(folderId)
-    const generations = shouldUseGenerations(capabilities, chunked, durableBeforeReconcile.operations.length)
+    const generations = shouldUseGenerations(capabilities, chunked, durableBeforeReconcile)
     let knownPeerManifest: FileManifest | undefined
     let knownPeerScan: PeerGenerationScanReply | undefined
     if (capabilities.has(CONTINUOUS_FINGERPRINT_CAPABILITY) && canSkipUnchangedCycle(quiet, durableBeforeReconcile, record.revision, Date.now())) {
@@ -3347,6 +3358,15 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     }
     recordContinuousConflicts(folder, state.conflicts)
   } catch (error) {
+    // A cancelled check was stopped deliberately — by shutdown, a settings
+    // change, a pause, or a conflict resolution claiming the folder. Nothing
+    // failed, so the durable state is simply shown again and the folder is
+    // checked once whatever stopped it releases it.
+    if (isScanCancelled(error)) {
+      await refreshContinuousSyncState(folderId)
+      scheduleContinuousSyncRetry(folderId, CONTINUOUS_SYNC_RETRY_MS, () => scheduleContinuousSync(folderId))
+      return
+    }
     const message = error instanceof Error ? error.message : "Continuous synchronization failed."
     // A pending roll-forward is retried before the failure is projected, so the
     // state read below already reflects a recovery that succeeded this cycle.

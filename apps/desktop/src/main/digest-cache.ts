@@ -9,7 +9,7 @@ export interface DigestCacheRpc {
 
 /** The engine accepts at most this many paths or entries per digest-cache call. */
 const MAX_DIGEST_CACHE_BATCH = 1_000
-/** Record batches allowed to queue behind a slow engine before further records are dropped. */
+/** Record batches allowed to queue behind a slow engine before the scan waits for them. */
 const MAX_QUEUED_RECORD_BATCHES = 8
 /** However the cache looks, every folder is fully re-hashed at least this often. */
 export const DIGEST_CACHE_DEEP_VERIFY_MS = 24 * 60 * 60 * 1_000
@@ -96,19 +96,23 @@ export class EngineScanDigestCache implements ScanDigestCache {
     console.warn(`[digest-cache] ${reason} for ${this.#mappingId}; hashing those files instead`, detail)
   }
 
-  record(relativePath: string, entry: CachedFileDigest): void {
+  /**
+   * Resolves once the engine is ready for more. Dropping a batch instead would
+   * leave the folder permanently short of cached digests, so every later sweep
+   * would read those files again; waiting only slows the scan to the rate the
+   * engine can persist.
+   */
+  record(relativePath: string, entry: CachedFileDigest): void | Promise<void> {
     this.#pending.push({ ...entry, path: relativePath })
-    if (this.#pending.length >= MAX_DIGEST_CACHE_BATCH) this.#flushPending()
+    if (this.#pending.length < MAX_DIGEST_CACHE_BATCH) return
+    this.#flushPending()
+    if (this.#queuedBatches >= MAX_QUEUED_RECORD_BATCHES) return this.#flushes
   }
 
   #flushPending(): void {
     if (this.#pending.length === 0) return
     const entries = this.#pending
     this.#pending = []
-    if (this.#queuedBatches >= MAX_QUEUED_RECORD_BATCHES) {
-      this.#recordsLost = true
-      return
-    }
     this.#queuedBatches += 1
     this.#flushes = this.#flushes.then(async () => {
       try {
@@ -123,9 +127,13 @@ export class EngineScanDigestCache implements ScanDigestCache {
   }
 
   /**
-   * Flushes outstanding records. Only a complete deep sweep whose every record
-   * landed may prune rows it did not rewrite: those describe files that are
-   * gone, now ignored, or no longer settled.
+   * Flushes outstanding records, including those of a sweep that was cancelled:
+   * a recorded identity is checked again before it stands in for a hash, so
+   * keeping it only saves the next sweep from reading that file again.
+   *
+   * Only a complete deep sweep whose every record landed may prune rows it did
+   * not rewrite: those describe files that are gone, now ignored, or no longer
+   * settled.
    */
   async finish(options: { complete: boolean }): Promise<void> {
     this.#flushPending()

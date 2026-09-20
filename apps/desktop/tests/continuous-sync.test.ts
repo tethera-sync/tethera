@@ -28,16 +28,57 @@ import {
 import { SCAN_GENERATION_CAPABILITY } from "../src/main/scan-generation"
 import { manifest } from "./helpers"
 
+function pendingOperation(path: string): FileSyncOperation {
+  return {
+    id: 1,
+    mappingId: "mapping-1",
+    path,
+    direction: "push-local",
+    sourceDigest: "b".repeat(64),
+    sourceSize: 4,
+    status: "pending",
+    attempts: 0,
+    createdAt: "2026-08-31T12:00:00Z",
+    updatedAt: "2026-08-31T12:00:00Z",
+  }
+}
+
+function openConflict(path: string): FileSyncConflict {
+  return {
+    mappingId: "mapping-1",
+    path,
+    kind: "simultaneous-modification",
+    localDigest: "b".repeat(64),
+    remoteDigest: "c".repeat(64),
+    detectedAt: "2026-08-31T12:00:00Z",
+  }
+}
+
 describe("continuous sync helpers", () => {
-  test("only generation-capable chunked peers with no pending work take the generation path", () => {
+  test("only generation-capable chunked peers without a conflict choice take the generation path", () => {
     const capable = new Set([SCAN_GENERATION_CAPABILITY])
-    expect(shouldUseGenerations(capable, true, 0)).toBe(true)
+    const idle = { operations: [], conflicts: [] }
+    const queued = { operations: [pendingOperation("notes.txt")], conflicts: [] }
+    const chosen = {
+      operations: [pendingOperation("notes.txt")],
+      conflicts: [openConflict("notes.txt")],
+    }
+    expect(shouldUseGenerations(capable, true, idle)).toBe(true)
     // A peer without the capability keeps the full-manifest path.
-    expect(shouldUseGenerations(new Set(), true, 0)).toBe(false)
+    expect(shouldUseGenerations(new Set(), true, idle)).toBe(false)
     // The observe response must be able to span several frames.
-    expect(shouldUseGenerations(capable, false, 0)).toBe(false)
-    // Replayable work stays on the manifest path, which owns conflict-choice mirroring.
-    expect(shouldUseGenerations(capable, true, 1)).toBe(false)
+    expect(shouldUseGenerations(capable, false, idle)).toBe(false)
+    // Ordinary queued work is re-planned from the same observations, so it
+    // stays on the scalable path instead of stranding a large folder.
+    expect(shouldUseGenerations(capable, true, queued)).toBe(true)
+    // A conflict choice is not re-derived from observations, so it keeps the
+    // manifest path that mirrors it to the paired computer.
+    expect(shouldUseGenerations(capable, true, chosen)).toBe(false)
+    // An unrelated open conflict does not hold back the queued work.
+    expect(shouldUseGenerations(capable, true, {
+      operations: [pendingOperation("notes.txt")],
+      conflicts: [openConflict("report.txt")],
+    })).toBe(true)
   })
 
   test("replays only durable operations whose source and destination are still exact", () => {

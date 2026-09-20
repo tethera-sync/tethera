@@ -120,17 +120,37 @@ export interface ReconcileFilesResult extends FileSyncState {
 export const CONTINUOUS_FINGERPRINT_CAPABILITY = "continuous-fingerprint-v1"
 
 /**
- * Whether a changed cycle may reconcile through staged generations. Both
- * peers must stage and page scans, the observe response must be able to span
- * several frames, and replayable durable work must stay on the manifest path,
- * which owns replay and conflict-choice mirroring.
+ * A pending operation on a path the reconciler still reports as a conflict can
+ * only come from a conflict choice the user made: reconciliation plans either
+ * an operation or a conflict for a path, never both. Such a choice is not
+ * re-derived from observations, so a fresh plan would drop it.
+ */
+function hasConflictChoiceOperation(
+  { operations, conflicts }: Pick<FileSyncState, "operations" | "conflicts">,
+): boolean {
+  if (operations.length === 0 || conflicts.length === 0) return false
+  const conflictPaths = new Set(conflicts.map((conflict) => conflict.path))
+  return operations.some((operation) => conflictPaths.has(operation.path))
+}
+
+/**
+ * Whether a changed cycle may reconcile through staged generations. Both peers
+ * must stage and page scans, and the observe response must be able to span
+ * several frames.
+ *
+ * Only a conflict choice keeps a cycle on the manifest path, which owns
+ * mirroring that choice to the paired computer. Ordinary queued work is
+ * planned independently by both computers from the same observations, so a
+ * generation cycle re-plans and runs it unchanged. Excluding that work too
+ * would strand a folder too large for the whole-manifest exchange: its
+ * operations could never run, so its cycles could never stop falling back.
  */
 export function shouldUseGenerations(
   capabilities: ReadonlySet<string>,
   chunkedFrames: boolean,
-  durableOperations: number,
+  durable: Pick<FileSyncState, "operations" | "conflicts">,
 ): boolean {
-  return capabilities.has(SCAN_GENERATION_CAPABILITY) && chunkedFrames && durableOperations === 0
+  return capabilities.has(SCAN_GENERATION_CAPABILITY) && chunkedFrames && !hasConflictChoiceOperation(durable)
 }
 
 /** However quiet a folder looks, it is fully reconciled at least this often. */
