@@ -53,13 +53,14 @@ export function parseGenerationEntry(value: unknown): GenerationEntry {
   if (kind !== "file" && kind !== "directory" && kind !== "special") {
     throw new Error("The scan generation entry kind is invalid.")
   }
-  if (kind !== "file" && (value.size !== 0 || value.digest !== undefined)) {
+  const digest = value.digest === null ? undefined : value.digest
+  if (kind !== "file" && (value.size !== 0 || digest !== undefined)) {
     throw new Error("An occupied scan generation entry must not carry a size or digest.")
   }
-  if (value.digest !== undefined && (typeof value.digest !== "string" || !/^[a-f0-9]{64}$/.test(value.digest))) {
+  if (digest !== undefined && (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest))) {
     throw new Error("The scan generation entry digest is invalid.")
   }
-  return { path: entryPath, size: value.size, digest: value.digest, kind }
+  return { path: entryPath, size: value.size, digest, kind }
 }
 
 export interface PeerGenerationScanReply {

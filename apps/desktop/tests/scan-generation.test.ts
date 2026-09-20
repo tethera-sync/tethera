@@ -11,7 +11,12 @@ describe("scan generation contracts", () => {
   test("entry kinds default to files and occupied kinds carry nothing else", () => {
     expect(parseGenerationEntry({ path: "a.txt", size: 1, digest: "a".repeat(64) }).kind).toBe("file")
     expect(parseGenerationEntry({ path: "empty", size: 0, kind: "directory" }).kind).toBe("directory")
-    expect(parseGenerationEntry({ path: "link", size: 0, kind: "special" }).kind).toBe("special")
+    expect(parseGenerationEntry({ path: "link", size: 0, digest: null, kind: "special" })).toEqual({
+      path: "link",
+      size: 0,
+      digest: undefined,
+      kind: "special",
+    })
     expect(() => parseGenerationEntry({ path: "empty", size: 4, kind: "directory" })).toThrow("occupied")
     expect(() => parseGenerationEntry({ path: "link", size: 0, digest: "a".repeat(64), kind: "special" })).toThrow("occupied")
     expect(() => parseGenerationEntry({ path: "a.txt", size: 1, kind: "other" })).toThrow("kind")
