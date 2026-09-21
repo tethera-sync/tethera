@@ -17,6 +17,7 @@ Plain local files are not protected from malware/admins/unlocked theft/applicati
 - **Path/symlink attack:** component validation, containment checks, no-follow APIs and revalidation at mutation.
 - **Resource exhaustion:** quotas, pagination, bounded channels, streaming, timeouts and concurrency limits.
 - **Supply chain/update:** lockfiles, dependency review, reproducible CI, signed artefacts, separate signing keys and rotation plan.
+- **Remote update request:** a paired computer may ask another to update, but never supplies the version, URL or installer. The receiving computer uses its own release feed and verified download with downgrades disabled, so the request can at most install the newest published release and restart Tethera. It is refused during a merge, restore or conflict resolution, and it is recorded in that computer's activity log.
 
 ## Identity
 

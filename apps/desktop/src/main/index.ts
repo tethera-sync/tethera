@@ -8,7 +8,7 @@ import {
   shell,
   Tray,
 } from "electron"
-import { autoUpdater } from "electron-updater"
+import { autoUpdater, DebUpdater, PacmanUpdater, RpmUpdater } from "electron-updater"
 import { execFile } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
@@ -44,6 +44,8 @@ import type {
   InitialMergeStep,
   MappingState,
   PairingState,
+  PeerAppReport,
+  PeerUpdateInstall,
   PreviewFolderMappingInput,
   RequestFolderMappingInput,
   RefreshIncomingMappingPreviewInput,
@@ -151,7 +153,15 @@ import {
 } from "./desktop-state-storage"
 import { PairingService } from "./pairing-service"
 import { CHUNKED_FRAMES_CAPABILITY, measurePeerRequest, NO_PEER_RESPONSE_DEADLINE, PeerSessionService, type PeerRequest, type PeerRequestContext } from "./peer-session-service"
-import { requestPeerCapabilities } from "./peer-capabilities"
+import { requestPeerCapabilities, UNSUPPORTED_PEER_REQUEST } from "./peer-capabilities"
+import {
+  APP_UPDATE_INSTALL_REQUEST,
+  APP_UPDATE_STATUS_REQUEST,
+  PEER_APP_UPDATE_POLL_MS,
+  PeerAppUpdates,
+  peerAppReport,
+  type PeerUpdateOutcome,
+} from "./peer-app-update"
 import { requestPeerPreview } from "./peer-preview"
 import { PEER_SCAN_PROGRESS_CAPABILITY, type PeerScanProgress } from "./peer-scan-progress"
 import { folderComparisonResult } from "../shared/folder-comparison-result"
@@ -372,6 +382,15 @@ const idleUpdateState: UpdateState = { status: "idle" }
 let updateCheckTimer: NodeJS.Timeout | null = null
 let lastUpdateProgressPercent: number | null = null
 let lastUpdateProgressAt: number | null = null
+/** The paired computer that asked this one to update, until that update installs or stops. */
+let peerUpdateRequester: string | undefined
+let peerAppStatusTimer: NodeJS.Timeout | null = null
+/** The Tethera version of each paired computer, and the updates this computer asked them to install. */
+const peerAppUpdates = new PeerAppUpdates({
+  client: { request: (deviceId, request, timeoutMs) => requirePeerSessions().request(deviceId, request, timeoutMs) },
+  onChange: () => refreshDeviceAppViews(),
+  onFinished: (peerName, outcome) => recordPeerUpdateOutcome(peerName, outcome),
+})
 
 function currentAppVersion(): string {
   try {
@@ -1308,7 +1327,7 @@ function syncPairingSnapshot(): AppSnapshot {
   snapshot.pairing = pairing.getState()
   snapshot.devices = [
     { ...getLocalDevice(), fingerprint: snapshot.pairing.localFingerprint },
-    ...trustedDevices,
+    ...trustedDevices.map(withPeerApp),
   ]
 
   const onlinePeer = trustedDevices.find((device) => device.status === "online")
@@ -1342,6 +1361,25 @@ function syncPairingSnapshot(): AppSnapshot {
   return broadcastSnapshot()
 }
 
+/** Adds what this computer knows about a paired computer's Tethera installation. */
+function withPeerApp(device: DeviceSummary): DeviceSummary {
+  return { ...device, ...peerAppUpdates.view(device.id) }
+}
+
+function refreshDeviceAppViews(): void {
+  snapshot.devices = snapshot.devices.map((device) => (device.status === "this-device" ? device : withPeerApp(device)))
+  broadcastSnapshot()
+}
+
+function recordPeerUpdateOutcome(peerName: string, outcome: PeerUpdateOutcome): void {
+  if (outcome.kind === "updated") {
+    pushActivity(`${peerName} updated`, `Tethera on ${peerName} is now v${outcome.version}.`, "success")
+  } else {
+    pushActivity(`Couldn't update ${peerName}`, outcome.message, "warning")
+  }
+  void persistState().catch((error) => console.error("[peer-app] unable to persist the update outcome", error))
+}
+
 async function startNetworkServices(): Promise<void> {
   pairing = new PairingService({
     dataDirectory: app.getPath("userData"),
@@ -1364,6 +1402,7 @@ async function startNetworkServices(): Promise<void> {
     void persistState().catch((error) => console.error("[pairing] unable to persist the paired device state", error))
   })
   pairing.on("revoked", (device: { id: string; name: string }) => {
+    peerAppUpdates.forget(device.id)
     snapshot.folders = snapshot.folders.map((folder) =>
       folder.remoteDeviceId === device.id ? { ...folder, status: "needs-attention" } : folder,
     )
@@ -1387,6 +1426,11 @@ async function startNetworkServices(): Promise<void> {
     void flushPendingMappingDecisions().catch((error) => console.warn("[mapping-index] unable to deliver pending mapping decisions", error))
     void flushPendingConfigurationDeliveries()
   }, 5_000)
+  peerAppStatusTimer = setInterval(() => {
+    peerAppUpdates.refreshDue(
+      getPairedDevices().map((device) => ({ id: device.id, name: device.name, online: device.status === "online" })),
+    )
+  }, PEER_APP_UPDATE_POLL_MS)
   syncPairingSnapshot()
 }
 
@@ -5545,6 +5589,8 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       }
     })
   }
+  if (request.type === APP_UPDATE_STATUS_REQUEST) return localPeerAppReport()
+  if (request.type === APP_UPDATE_INSTALL_REQUEST) return acceptPeerUpdateRequest(context.peerName)
   if (request.type === "scan-capabilities") {
     return { capabilities: [SCAN_GENERATION_CAPABILITY, PEER_SCAN_PROGRESS_CAPABILITY, CHUNKED_FRAMES_CAPABILITY, CONTINUOUS_FINGERPRINT_CAPABILITY, DIRECTORY_MAPPING_CAPABILITY, INITIAL_MERGE_FREE_SPACE_CAPABILITY, INITIAL_MERGE_GENERATIONS_CAPABILITY] }
   }
@@ -6091,7 +6137,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     broadcastSnapshot()
     return { received: true }
   }
-  throw new Error("This secure peer request is not supported.")
+  throw new Error(UNSUPPORTED_PEER_REQUEST)
 }
 
 function registerIpc(): void {
@@ -6435,6 +6481,14 @@ function registerIpc(): void {
     requireTrustedMainRenderer(event)
     requestUpdateInstall()
   })
+  ipcMain.handle("devices:update-app", async (event, deviceId: unknown) => {
+    requireTrustedMainRenderer(event)
+    const peer = getPairedDevices().find((device) => device.id === deviceId)
+    if (!peer) throw new Error("That computer is no longer paired with this one.")
+    if (peer.status !== "online") throw new Error(`${peer.name} must be online to update it.`)
+    await peerAppUpdates.start(peer)
+    return snapshot
+  })
 }
 
 function requireTrustedMainRenderer(event: Electron.IpcMainInvokeEvent): void {
@@ -6520,7 +6574,7 @@ function updateVersionHint(): string | undefined {
   return "version" in current && typeof current.version === "string" ? current.version : undefined
 }
 
-async function requestUpdateCheck(source: "ipc" | "tray" | "startup" | "schedule"): Promise<void> {
+async function requestUpdateCheck(source: "ipc" | "tray" | "startup" | "schedule" | "peer"): Promise<void> {
   if (!app.isPackaged) {
     if (source === "ipc") {
       setUpdateState({
@@ -6608,7 +6662,83 @@ function requestUpdateInstall(): void {
   // close quit Tethera instead of hiding it to the tray.
   isQuitting = false
   console.error("[updater] install failed", failure)
-  throw new Error(formatUpdateInstallError(failure))
+  const message = formatUpdateInstallError(failure)
+  // Kept in the state so the tray, the sidebar and a paired computer that asked for this install can all show why.
+  if (snapshot.update.status === "downloaded") setUpdateState({ ...snapshot.update, installError: message })
+  throw new Error(message)
+}
+
+/**
+ * How this installation applies an update a paired computer asks for. Linux
+ * packages install through a privilege prompt that blocks this process until
+ * someone at this computer answers it, so they only download.
+ */
+function peerUpdateInstall(): PeerUpdateInstall {
+  if (!app.isPackaged) return "unsupported"
+  const packageManaged = autoUpdater instanceof DebUpdater || autoUpdater instanceof RpmUpdater || autoUpdater instanceof PacmanUpdater
+  return packageManaged && process.getuid?.() !== 0 ? "needs-approval" : "automatic"
+}
+
+function localPeerAppReport(): PeerAppReport {
+  return peerAppReport(currentAppVersion(), peerUpdateInstall(), snapshot.update)
+}
+
+/**
+ * Starts the update a paired computer asked for. The update always comes from
+ * this installation's own release feed, never from the peer, and downgrades
+ * stay disabled, so a peer can at most make this computer install the newest
+ * release. A merge, restore or conflict resolution someone started here is not
+ * cut short by a restart the requesting computer cannot see.
+ */
+function acceptPeerUpdateRequest(peerName: string): PeerAppReport {
+  if (!app.isPackaged) throw new Error(`Tethera on ${os.hostname()} is a development build and can't update itself.`)
+  if (
+    initialSyncInFlight.size > 0 || initialSyncForwarded.size > 0 || hasAnyInitialSyncPeerLease() ||
+    archiveRestoreInFlight.size > 0 || hasConflictResolutionInFlight()
+  ) {
+    throw new Error(`${os.hostname()} is in the middle of a merge, restore or conflict resolution. Update it when that finishes.`)
+  }
+  peerUpdateRequester = peerName
+  pushActivity("Update requested", `${peerName} asked Tethera to install the newest release.`, "info")
+  const update = snapshot.update
+  if (update.status === "downloaded") {
+    // This attempt replaces the previous install failure.
+    const { installError: _previousFailure, ...ready } = update
+    setUpdateState(ready)
+    void installUpdateForPeer()
+  } else if (update.status === "available") {
+    void requestUpdateDownload().catch((error) => console.warn("[updater] download for a paired computer failed", error))
+  } else if (!isUpdateBusy(update)) {
+    // The check sets `checking` before this reply is built, so the requesting
+    // computer never takes the previous check's result as its answer.
+    void requestUpdateCheck("peer")
+  }
+  broadcastSnapshot()
+  return localPeerAppReport()
+}
+
+/** Installs the update a paired computer asked for, once it is downloaded. */
+async function installUpdateForPeer(): Promise<void> {
+  const requester = peerUpdateRequester
+  peerUpdateRequester = undefined
+  if (!requester || snapshot.update.status !== "downloaded") return
+  if (peerUpdateInstall() === "needs-approval") {
+    pushActivity(
+      "Update ready to install",
+      `${requester} asked Tethera to update. Restart Tethera here to install v${snapshot.update.version}; it asks for your password.`,
+      "info",
+    )
+    broadcastSnapshot()
+    return
+  }
+  // Keep the activity entry that explains why Tethera restarted.
+  await persistState().catch((error) => console.error("[updater] unable to record the update request before installing", error))
+  try {
+    requestUpdateInstall()
+  } catch (error) {
+    // The failure is in the update state, where the requesting computer reads it.
+    console.error("[updater] install for a paired computer failed", error)
+  }
 }
 
 function scheduleUpdateChecks(): void {
@@ -6647,12 +6777,19 @@ function setUpAutoUpdater(): void {
       currentVersion: currentAppVersion(),
       lastCheckedAt: nowIso(),
     })
+    if (peerUpdateRequester) {
+      void requestUpdateDownload().catch((error) => console.warn("[updater] download for a paired computer failed", error))
+    }
   })
   autoUpdater.on("update-not-available", () => {
+    peerUpdateRequester = undefined
     setUpdateState({ status: "not-available", currentVersion: currentAppVersion(), lastCheckedAt: nowIso() })
   })
   autoUpdater.on("error", (error) => {
     console.error("[updater] error", error)
+    // A failed check or download ends the update a paired computer asked for;
+    // a later scheduled check must not install it unannounced.
+    peerUpdateRequester = undefined
     if (shouldPreserveDownloadedOnError(snapshot.update)) return
     setUpdateState({
       status: "error",
@@ -6690,6 +6827,7 @@ function setUpAutoUpdater(): void {
       currentVersion: currentAppVersion(),
       lastCheckedAt: nowIso(),
     })
+    if (peerUpdateRequester) void installUpdateForPeer()
   })
 }
 
@@ -6849,6 +6987,7 @@ app.on("will-quit", () => {
   clearInterval(preparedInitialSyncSweepTimer)
   if (updateCheckTimer) clearInterval(updateCheckTimer)
   if (decisionRetryTimer) clearInterval(decisionRetryTimer)
+  if (peerAppStatusTimer) clearInterval(peerAppStatusTimer)
   if (archiveRetentionTimer) clearInterval(archiveRetentionTimer)
   for (const retry of continuousSyncRetryTimers.values()) clearTimeout(retry)
   continuousSyncRetryTimers.clear()

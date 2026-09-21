@@ -520,6 +520,14 @@ describe("peer transfer parsing", () => {
     ).toEqual({ folderId: "m", path: "a.txt", digest: DIGEST, size: 5, expectedDestinationDigest: undefined })
   })
 
+  test("reads a null destination digest from a 0.1.22 coordinator as a new file", () => {
+    const base = { type: "op", folderId: "m", path: "a.txt", digest: DIGEST, size: 5 }
+    expect(validateContinuousOperationRequest({ ...base, expectedDestinationDigest: null }).expectedDestinationDigest).toBeUndefined()
+    expect(() => validateContinuousOperationRequest({ ...base, expectedDestinationDigest: 7 })).toThrow(
+      "The continuous-sync file operation is invalid.",
+    )
+  })
+
   test("rejects staging paths, bad digests, and negative sizes", () => {
     const base = { type: "op", folderId: "m", path: "a.txt", digest: DIGEST, size: 5 }
     expect(() => validateContinuousOperationRequest({ ...base, digest: "nope" })).toThrow(
@@ -539,6 +547,20 @@ describe("peer transfer parsing", () => {
         operations: [{ id: 1, path: "a.txt", direction: "pull-remote", sourceDigest: DIGEST, sourceSize: 5 }],
       }),
     ).toEqual([{ id: 1, path: "a.txt", direction: "pull-remote", sourceDigest: DIGEST, sourceSize: 5, expectedDestinationDigest: undefined }])
+  })
+
+  test("accepts the full durable operation a 0.1.22 peer sends, with null for an absent digest", () => {
+    const operation = {
+      id: 3, mappingId: "m", path: "new.txt", direction: "push-local", sourceDigest: DIGEST, sourceSize: 5,
+      expectedDestinationDigest: null, status: "pending", attempts: 0, lastError: null,
+      createdAt: "2026-09-21T00:00:00Z", updatedAt: "2026-09-21T00:00:00Z",
+    }
+    expect(parsePeerFileOperations({ operations: [operation] })).toEqual([
+      { id: 3, path: "new.txt", direction: "push-local", sourceDigest: DIGEST, sourceSize: 5, expectedDestinationDigest: undefined },
+    ])
+    expect(() =>
+      parsePeerFileOperations({ operations: [{ ...operation, expectedDestinationDigest: "bad" }] }),
+    ).toThrow("The paired computer returned an invalid durable operation.")
   })
 
   test("accepts an operation list larger than the old 10,000 cap", () => {

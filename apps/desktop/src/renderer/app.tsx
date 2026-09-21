@@ -24,6 +24,7 @@ import { TooltipProvider } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 import { prettyPlatform, prettyRoute } from "@/lib/format"
 import { navItems, viewTitle, type View } from "@/lib/navigation"
+import { peerNeedsUpdate, peerUpdateView } from "@/lib/peer-update"
 import { createSnapshotSubscription, getLocalDevice, getPairedDevices, mappingMutationAvailability, preferredPairedDevice, type SnapshotSubscription } from "@/lib/snapshot"
 import { ActivityView } from "./views/activity"
 import { DevicesView } from "./views/devices"
@@ -183,6 +184,7 @@ export function App() {
     0,
   )
   const pendingApprovals = snapshot.pairing.incomingRequests.length + snapshot.mappings.incoming.filter((request) => request.status === "pending").length
+  const outdatedPeers = pairedDevices.filter((device) => peerNeedsUpdate(peerUpdateView(device, snapshot.update.currentVersion))).length
   const { enabled: mappingMutationsEnabled, reason: mappingMutationReason } = mappingMutationAvailability(
     snapshot.mappingStore,
   )
@@ -258,6 +260,8 @@ export function App() {
                       ) : null}
                       {item.id === "devices" && pendingApprovals > 0 ? (
                         <span className="nav-dot [width:6px] [height:6px] [border-radius:999px] [background:var(--warning)] [box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--warning)_22%,_transparent)]" role="img" aria-label={`${pendingApprovals} approvals waiting`} />
+                      ) : item.id === "devices" && outdatedPeers > 0 ? (
+                        <span className="nav-dot [width:6px] [height:6px] [border-radius:999px] [background:var(--primary)] [box-shadow:0_0_0_3px_color-mix(in_oklab,_var(--primary)_22%,_transparent)]" role="img" aria-label={outdatedPeers === 1 ? "A paired computer can be updated" : `${outdatedPeers} paired computers can be updated`} />
                       ) : null}
                     </Button>
                   )

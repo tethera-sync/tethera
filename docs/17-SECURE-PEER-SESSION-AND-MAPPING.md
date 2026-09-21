@@ -32,7 +32,16 @@ The server currently accepts only bounded typed operations:
 - coordinate the inverse pass of an explicitly started initial merge;
 - inspect and durably mirror an exact two-copy conflict choice for an active mapping; and
 - describe and serve approved mapping-relative files in bounded encrypted chunks;
-- advertise the `scan-generations-v1` capability and serve bounded pages of a sealed staged scan generation to either mapping participant.
+- advertise the `scan-generations-v1` capability and serve bounded pages of a sealed staged scan generation to either mapping participant; and
+- report the installed Tethera version and update progress (`app-update-status`), and install the newest release from this computer's own update feed when a paired computer asks (`app-update-install`).
+
+## Updating a paired computer
+
+`app-update-status` answers with the app version, how an update would install (`automatic`, `needs-approval` for Linux packages whose installer waits at a password prompt, or `unsupported` for a development build) and the computer's own update state, reduced to status, target version, download percentage and a short failure reason; release notes and byte counts are not sent. The requester validates the report like any peer message: versions must be release versions, percentages whole numbers from 0 to 100 and messages at most 500 characters. A computer that predates the request answers with the exact unsupported-request error and is shown as too old to update remotely; any other failure is an error, not a downgrade.
+
+`app-update-install` carries no parameters. The receiving computer never takes a version, URL or file from the peer: it checks its own configured release feed, downloads through electron-updater's verified download, and keeps downgrades and prereleases disabled, so a paired computer can at most make it install the newest published release. It refuses while an initial merge, archive restore or conflict resolution is running there, starts its check before replying so the requester never reads a stale result, and records the request in its activity log. An `automatic` install restarts Tethera once the download finishes; a `needs-approval` install stops at downloaded and asks someone at that computer to restart, because the password prompt would block Tethera until answered. A failed install is kept in its update state and reported back.
+
+The requesting computer reads each online paired computer's report when it comes online and every ten minutes, and every three seconds while following an update it asked for. The update is complete once the computer reports a different version. It fails when the computer reports an error or no newer release, stops before finishing, stays downloaded without restarting for ten minutes, or stays out of reach for ten minutes.
 
 Each encrypted frame remains capped at 16 MiB. Parsed inbound messages are additionally bounded to 32 queued messages and 4 MiB while a handler runs; overflow closes the connection and terminal state clears retained buffers and queues. Peer request handlers expose a socket-close/deadline abort signal that cooperative scans thread to their next checkpoint.
 

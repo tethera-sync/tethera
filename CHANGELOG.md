@@ -2,6 +2,7 @@
 
 All notable changes to this project, newest first.
 
+- ✨ Update the other computer from this one: each paired device now shows its Tethera version, and when it is out of date you can update it from its card and follow the download and restart there. Windows and AppImage installs finish on their own; Linux packages download and then ask for a password on that computer. Both computers need this version before one can update the other.
 - ✨ Settle conflicts that are only Windows-versus-Unix line endings automatically: when both computers hold the same text and one copy uses LF throughout, Tethera keeps that copy (the form git stores) and archives the other, instead of asking you about every file of a repository checked out on both systems. Both computers need the update.
 - 🎨 Announce each sync conflict once, when it first needs you, instead of re-listing the remaining conflicts every time some are resolved, and explain a conflict without a shared history in plain words.
 - 🐛 Stop one file blocking a whole queue: a queued copy or a selected conflict version that could not be applied used to abandon every other queued file with it, and the same file was retried first on every check, so nothing after it ever ran. Each path now fails on its own, the rest of the queue continues, and a selected version whose copies no longer exist on both computers is retired so the conflict is detected again.

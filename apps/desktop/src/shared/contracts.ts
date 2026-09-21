@@ -110,7 +110,49 @@ export interface DeviceSummary {
   lastSeenAt?: string
   fingerprint?: string
   pairedAt?: string
+  /** A paired computer's Tethera installation, once it has answered. Never set for this device. */
+  app?: PeerAppStatus
+  /** Present while this computer is updating the paired computer, or after that failed. */
+  appUpdate?: PeerAppUpdateRequest
 }
+
+/**
+ * How a computer applies an update a paired computer asks it to install.
+ * `needs-approval`: a Linux package, whose install waits at a password prompt
+ * on that computer, so it downloads and leaves the install to someone there.
+ * `unsupported`: a development build, which cannot update itself.
+ */
+export type PeerUpdateInstall = "automatic" | "needs-approval" | "unsupported"
+
+/** A computer's own update progress, as it reports it to a paired computer. */
+export type PeerUpdateStatus =
+  | { status: "idle" }
+  | { status: "checking" }
+  | { status: "available"; version: string }
+  | { status: "not-available" }
+  | { status: "downloading"; version: string; progressPercent: number }
+  | { status: "downloaded"; version: string; installError?: string }
+  | { status: "error"; message: string }
+
+/** What a computer reports about its Tethera installation in answer to `app-update-status`. */
+export interface PeerAppReport {
+  version: string
+  install: PeerUpdateInstall
+  update: PeerUpdateStatus
+}
+
+/** `legacy`: the paired computer's Tethera predates version reports, so it can only be updated there. */
+export type PeerAppStatus = { kind: "legacy" } | ({ kind: "reported" } & PeerAppReport)
+
+/**
+ * This computer's request that a paired computer update itself. `updating`
+ * follows the paired computer's own progress; `restarting` means it has the
+ * update and is installing it, so it is expected to drop off and reconnect.
+ */
+export type PeerAppUpdateRequest =
+  | { status: "updating" }
+  | { status: "restarting" }
+  | { status: "failed"; message: string }
 
 export interface PairingCandidate {
   id: string
@@ -213,6 +255,8 @@ export type UpdateState =
       version: string
       releaseNotes?: string
       releaseDate?: string
+      /** Why the last install attempt failed; the update stays downloaded for another attempt. */
+      installError?: string
       currentVersion?: string
       lastCheckedAt?: string
     }
@@ -638,6 +682,8 @@ export interface TetheraApi {
   approvePairing(requestId: string): Promise<AppSnapshot>
   rejectPairing(requestId: string): Promise<AppSnapshot>
   revokeDevice(deviceId: string): Promise<AppSnapshot>
+  /** Asks a paired computer to install the newest Tethera release from its own update feed. */
+  updatePairedDevice(deviceId: string): Promise<AppSnapshot>
   showWindow(): Promise<void>
   checkForUpdates(): Promise<void>
   downloadUpdate(): Promise<void>

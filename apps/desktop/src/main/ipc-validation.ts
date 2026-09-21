@@ -466,11 +466,7 @@ export function validateContinuousOperationRequest(request: PeerRequest): {
   const relativePath = typeof request.path === "string" ? request.path : ""
   const digest = typeof request.digest === "string" ? request.digest : ""
   const size = typeof request.size === "number" ? request.size : Number.NaN
-  const expectedDestinationDigest = request.expectedDestinationDigest === undefined
-    ? undefined
-    : typeof request.expectedDestinationDigest === "string"
-      ? request.expectedDestinationDigest
-      : ""
+  const expectedDestinationDigest = peerExpectedDestinationDigest(request.expectedDestinationDigest)
   if (
     !folderId ||
     !relativePath ||
@@ -483,6 +479,16 @@ export function validateContinuousOperationRequest(request: PeerRequest): {
     throw new Error("The continuous-sync file operation is invalid.")
   }
   return { folderId, path: relativePath, digest, size, expectedDestinationDigest }
+}
+
+/**
+ * An absent destination digest means no file is expected there yet. Peers up
+ * to 0.1.22 send it as `null`; any other non-string becomes "", which then
+ * fails the digest check.
+ */
+function peerExpectedDestinationDigest(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  return typeof value === "string" ? value : ""
 }
 
 /** Matches the largest file list a sync check accepts, so a big change set is never refused. */
@@ -500,7 +506,8 @@ export function parsePeerFileOperations(value: unknown): PeerFileOperationIdenti
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       throw new Error("The paired computer returned an invalid durable operation.")
     }
-    const operation = value as Partial<PeerFileOperationIdentity>
+    const operation = value as Partial<Omit<PeerFileOperationIdentity, "expectedDestinationDigest">>
+    const expectedDestinationDigest = peerExpectedDestinationDigest((value as { expectedDestinationDigest?: unknown }).expectedDestinationDigest)
     if (
       typeof operation.id !== "number" || !Number.isSafeInteger(operation.id) || operation.id <= 0 ||
       typeof operation.path !== "string" || !operation.path || operation.path.length > 4_096 ||
@@ -508,7 +515,7 @@ export function parsePeerFileOperations(value: unknown): PeerFileOperationIdenti
       (operation.direction !== "pull-remote" && operation.direction !== "push-local") ||
       !isSha256HexDigest(operation.sourceDigest) ||
       typeof operation.sourceSize !== "number" || !Number.isSafeInteger(operation.sourceSize) || operation.sourceSize < 0 ||
-      (operation.expectedDestinationDigest !== undefined && !isSha256HexDigest(operation.expectedDestinationDigest))
+      (expectedDestinationDigest !== undefined && !isSha256HexDigest(expectedDestinationDigest))
     ) {
       throw new Error("The paired computer returned an invalid durable operation.")
     }
@@ -518,7 +525,7 @@ export function parsePeerFileOperations(value: unknown): PeerFileOperationIdenti
       direction: operation.direction,
       sourceDigest: operation.sourceDigest,
       sourceSize: operation.sourceSize,
-      expectedDestinationDigest: operation.expectedDestinationDigest,
+      expectedDestinationDigest,
     }
   })
 }

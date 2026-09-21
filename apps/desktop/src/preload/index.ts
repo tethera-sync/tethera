@@ -57,6 +57,7 @@ const api: TetheraApi = {
   approvePairing: (requestId: string) => ipcRenderer.invoke("pairing:approve", requestId),
   rejectPairing: (requestId: string) => ipcRenderer.invoke("pairing:reject", requestId),
   revokeDevice: (deviceId: string) => ipcRenderer.invoke("pairing:revoke", deviceId),
+  updatePairedDevice: (deviceId: string) => ipcRenderer.invoke("devices:update-app", deviceId),
   showWindow: () => ipcRenderer.invoke("window:show"),
   checkForUpdates: () => ipcRenderer.invoke("updates:check"),
   downloadUpdate: () => ipcRenderer.invoke("updates:download"),
