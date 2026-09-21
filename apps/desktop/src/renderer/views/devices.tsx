@@ -9,12 +9,14 @@ import {
 import type { AppSnapshot } from "@shared/contracts"
 import { FolderPickerDialog } from "@/components/folder-picker-dialog"
 import { PairDeviceDialog } from "@/components/pair-device-dialog"
+import { PeerUpdatePanel } from "@/components/peer-update-panel"
 import { RevokeDeviceDialog } from "@/components/revoke-device-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { StatusPill } from "@/components/ui/status-pill"
 import { cn } from "@/lib/utils"
 import { pretty, prettyPlatform, prettyRoute } from "@/lib/format"
+import { deviceVersionLabel } from "@/lib/peer-update"
 import { getLocalDevice, getPairedDevices } from "@/lib/snapshot"
 
 export function DevicesView({
@@ -32,6 +34,7 @@ export function DevicesView({
   const [pairingOpen, setPairingOpen] = useState(false)
   const localDevice = getLocalDevice(snapshot)
   const pairedDevices = getPairedDevices(snapshot)
+  const localVersion = snapshot.update.currentVersion
 
   return (
     <div className="page-stack [display:grid] [gap:16px] [width:100%] [max-width:1180px] [margin:0_auto]">
@@ -106,11 +109,20 @@ export function DevicesView({
                 <dd>{device.address ?? "Not connected"}</dd>
               </div>
               <div>
+                <dt>Version</dt>
+                <dd>{deviceVersionLabel(device, localVersion)}</dd>
+              </div>
+              <div>
                 <dt>Identity</dt>
                 <dd className="device-fingerprint [max-width:180px] [overflow:hidden] [font-family:ui-monospace,_SFMono-Regular,_Menlo,_Monaco,_Consolas,_monospace] [font-size:9px] [text-overflow:ellipsis] [white-space:nowrap]">{device.fingerprint ?? "Loading…"}</dd>
               </div>
             </dl>
-            {device.status !== "this-device" ? <RevokeDeviceDialog device={device} /> : null}
+            {device.status !== "this-device" ? (
+              <>
+                <PeerUpdatePanel device={device} localVersion={localVersion} />
+                <RevokeDeviceDialog device={device} />
+              </>
+            ) : null}
           </article>
         ))}
 

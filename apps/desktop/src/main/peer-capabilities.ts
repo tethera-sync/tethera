@@ -7,6 +7,9 @@ export interface CapabilityPeerClient {
 
 const capabilitiesSchema = z.object({ capabilities: z.array(z.string().max(100)).max(32) })
 
+/** The exact error a peer returns for a request type it predates; the only reply that means "older version". */
+export const UNSUPPORTED_PEER_REQUEST = "This secure peer request is not supported."
+
 /**
  * Asks a peer which optional protocol features it supports. Older version-4
  * peers predate capability discovery, and only their exact unsupported-operation
@@ -24,7 +27,7 @@ export async function requestPeerCapabilities(
     if (!parsed.success) throw new Error("The other computer returned invalid scan capabilities. Update Tethera on both computers and retry.")
     return new Set(parsed.data.capabilities)
   } catch (error) {
-    if (error instanceof Error && error.message === "This secure peer request is not supported.") return new Set()
+    if (error instanceof Error && error.message === UNSUPPORTED_PEER_REQUEST) return new Set()
     throw error
   }
 }

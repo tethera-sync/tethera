@@ -207,7 +207,7 @@ export function DeviceUpdateIndicator({ update }: { update: UpdateState }) {
   }
 
   if (update.status === "downloaded") {
-    const title = `Tethera v${update.version} is ready to install. Restart to switch — folders and pairings carry over.`
+    const title = update.installError ?? `Tethera v${update.version} is ready to install. Restart to switch — folders and pairings carry over.`
     return (
       <>
         <Tooltip>

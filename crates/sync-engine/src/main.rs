@@ -2631,6 +2631,62 @@ mod tests {
     }
 
     #[test]
+    fn file_sync_rpc_omits_absent_digests_instead_of_sending_null() {
+        let store = ready_store();
+        let mut upsert: serde_json::Value =
+            serde_json::from_str(sample_mapping_json()).expect("mapping json");
+        upsert["mapping"]["setupStatus"] = serde_json::json!("active");
+        handle_line(
+            &request("mapping.upsert", &upsert.to_string()),
+            "correct",
+            &store,
+        );
+        let reconcile = |local: serde_json::Value, remote: serde_json::Value| {
+            let params = serde_json::json!({
+                "mappingId": "mapping-1",
+                "local": local,
+                "remote": remote,
+                "mode": "two-way",
+                "observedAt": "2026-08-01T00:01:00Z",
+                "queueOperations": true,
+            });
+            handle_line(
+                &request("fileSync.reconcile", &params.to_string()),
+                "correct",
+                &store,
+            )
+        };
+        let shared =
+            serde_json::json!({ "path": "shared.txt", "size": 4, "digest": "b".repeat(64) });
+        let created =
+            serde_json::json!({ "path": "created.txt", "size": 4, "digest": "c".repeat(64) });
+        assert_eq!(
+            reconcile(serde_json::json!([shared]), serde_json::json!([shared]))["ok"],
+            true
+        );
+
+        // A new file has no destination digest; 0.1.22 sent `null`, which the
+        // paired computer refused, so continuous sync never copied a new file.
+        let response = reconcile(serde_json::json!([shared, created]), serde_json::json!([]));
+        assert_eq!(response["ok"], true);
+        let operation = &response["result"]["operations"][0];
+        assert_eq!(operation["path"], "created.txt");
+        assert_eq!(operation["direction"], "push-local");
+        assert!(operation.get("expectedDestinationDigest").is_none());
+        assert!(operation.get("lastError").is_none());
+
+        let conflict = response["result"]["conflicts"]
+            .as_array()
+            .expect("conflict list")
+            .iter()
+            .find(|conflict| conflict["path"] == "shared.txt")
+            .expect("the unpropagated deletion is a conflict");
+        assert_eq!(conflict["kind"], "deletion-not-propagated");
+        assert_eq!(conflict["localDigest"], "b".repeat(64));
+        assert!(conflict.get("remoteDigest").is_none());
+    }
+
+    #[test]
     fn mapping_paths_round_trip_unchanged_for_both_platforms() {
         let store = ready_store();
         handle_line(

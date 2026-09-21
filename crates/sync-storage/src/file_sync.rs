@@ -99,6 +99,9 @@ impl ConflictKind {
     }
 }
 
+/// Absent values are omitted rather than sent as `null`: the desktop declares
+/// these fields optional and compares them with `undefined`, so a `null`
+/// would read as a present digest, on this computer and on its peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncOperation {
@@ -108,21 +111,26 @@ pub struct SyncOperation {
     pub direction: SyncDirection,
     pub source_digest: String,
     pub source_size: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_destination_digest: Option<String>,
     pub status: String,
     pub attempts: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
+/// A missing copy is an omitted digest, as for [`SyncOperation`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncConflict {
     pub mapping_id: String,
     pub path: String,
     pub kind: ConflictKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub local_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_digest: Option<String>,
     pub detected_at: String,
 }
