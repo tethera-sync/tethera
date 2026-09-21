@@ -8,6 +8,9 @@ import {
   canSkipUnchangedCycle,
   conflictChoiceOperations,
   conflictKey,
+  describeTransferFailures,
+  MAX_CONFLICT_CHOICE_ATTEMPTS,
+  partitionConflictChoices,
   FULL_RECONCILE_INTERVAL_MS,
   isUnchangedScanReply,
   type FileSyncOperation,
@@ -72,6 +75,28 @@ describe("continuous sync helpers", () => {
       operations: [chosen, ordinary],
       conflicts: [openConflict("notes.txt"), openConflict("unrelated.txt")],
     })).toEqual([chosen])
+  })
+
+  test("keeps retrying a conflict choice until its attempts are exhausted, then lets reconciliation retire it", () => {
+    const fresh = pendingOperation("notes.txt")
+    const retried = { ...pendingOperation("draft.txt"), id: 2, attempts: MAX_CONFLICT_CHOICE_ATTEMPTS - 1 }
+    // Its copies changed after the choice was made, so no cycle can ever apply
+    // it; leaving it runnable would block every choice queued behind it.
+    const stale = { ...pendingOperation("gone.txt"), id: 3, status: "failed" as const, attempts: MAX_CONFLICT_CHOICE_ATTEMPTS }
+    expect(partitionConflictChoices([fresh, retried, stale])).toEqual({
+      runnable: [fresh, retried],
+      exhausted: [stale],
+    })
+  })
+
+  test("reports queued copies that failed with one concrete cause and a count", () => {
+    expect(describeTransferFailures([])).toBe("No queued file failed.")
+    expect(describeTransferFailures([{ path: "notes.txt", detail: "The file changed." }]))
+      .toBe("notes.txt: The file changed.")
+    expect(describeTransferFailures([
+      { path: "notes.txt", detail: "The file changed." },
+      { path: "draft.txt", detail: "The peer is busy." },
+    ])).toBe("2 files stayed queued. notes.txt: The file changed.")
   })
 
   test("replays only durable operations whose source and destination are still exact", () => {

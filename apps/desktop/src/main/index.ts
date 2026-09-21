@@ -191,8 +191,11 @@ import {
 import {
   canSkipUnchangedCycle,
   conflictChoiceOperations,
+  CONFLICT_CHOICE_DRAIN_LIMIT,
   conflictKey,
   CONTINUOUS_FINGERPRINT_CAPABILITY,
+  describeTransferFailures,
+  partitionConflictChoices,
   isUnchangedScanReply,
   type QuietReconcile,
   conflictSummary,
@@ -213,6 +216,8 @@ import {
   type FileSyncState,
   type ExactConflictChoice,
   type ReconcileFilesResult,
+  type TransferBatchResult,
+  type TransferFailure,
 } from "./continuous-sync"
 import { fingerprintObservation, isObservationFingerprint } from "./observation-fingerprint"
 import { listArchivedVersions } from "./archive-history"
@@ -2909,13 +2914,24 @@ async function retireInitialConflictProjection(folderId: string, state: FileSync
   await persistState()
 }
 
+/** Surfaces the queued paths a cycle could not copy, without hiding that the rest of the batch ran. */
+function reportQueuedTransferFailures(folder: FolderSummary, failures: TransferFailure[]): void {
+  if (failures.length === 0) return
+  pushActivity(
+    "Some queued copies did not finish",
+    `${folder.name}: ${describeTransferFailures(failures)}`,
+    "warning",
+    folder.id,
+  )
+}
+
 async function executeContinuousOperations(
   folder: FolderSummary,
   peer: DeviceSummary,
   remoteManifest: FileManifest | undefined,
   operations: FileSyncOperation[],
   peerOperations: PeerFileOperationIdentity[],
-): Promise<number> {
+): Promise<TransferBatchResult> {
   // A generation cycle already staged the peer's observation and re-verifies
   // every pulled file through its descriptor, so it resolves the source from
   // the durable operation instead of a manifest.
@@ -2923,16 +2939,25 @@ async function executeContinuousOperations(
   const totalBytes = operations.reduce((total, operation) => total + operation.sourceSize, 0)
   let copiedBytes = 0
   let copiedFiles = 0
+  let attemptedFiles = 0
+  const failures: TransferFailure[] = []
   const startedAt = Date.now()
   let lastProgressBroadcastAt = 0
   for (const operation of operations) {
     const current = snapshot.folders.find((item) => item.id === folder.id)
     if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
+    // Checked per file rather than once: a peer that drops mid-batch would
+    // otherwise fail every remaining operation individually, and each of those
+    // failures counts against work that was never actually attempted.
+    if (getPairedDevice(folder.remoteDeviceId)?.status !== "online") {
+      throw new Error(`${peer.name} went offline before the queued copies finished.`)
+    }
+    attemptedFiles += 1
     const reportProgress = (fileBytes: number) => {
       const transferred = copiedBytes + fileBytes
       updateFolder(folder.id, {
         status: "syncing",
-        currentAction: `Syncing ${operation.path} (${copiedFiles + 1}/${operations.length})`,
+        currentAction: `Syncing ${operation.path} (${attemptedFiles}/${operations.length})`,
       })
       setFolderActivity(folder.id, {
         kind: "copying",
@@ -3011,16 +3036,21 @@ async function executeContinuousOperations(
       copiedFiles += 1
       copiedBytes += operation.sourceSize
     } catch (error) {
+      // A cancelled cycle stops the whole batch, but one path that cannot be
+      // copied must not: the queue is attempted in the same order every cycle,
+      // so a single stale, locked or unwritable file used to block every other
+      // queued copy behind it for as long as it stayed queued.
+      if (isScanCancelled(error)) throw error
       const detail = error instanceof Error ? error.message : "The transfer failed."
       await engine.request("fileSync.fail", {
         operationId: operation.id,
         detail,
         failedAt: new Date().toISOString(),
       }).catch((recordError) => console.warn("[continuous-sync] unable to persist transfer failure", recordError))
-      throw error
+      failures.push({ path: operation.path, detail })
     }
   }
-  return copiedFiles
+  return { copiedFiles, failures }
 }
 
 async function recordPeerConflictChoice(
@@ -3039,6 +3069,68 @@ async function recordPeerConflictChoice(
     throw new Error(`The peer did not durably record the selected version for ${path}.`)
   }
   return parsePeerFileOperations(response)
+}
+
+/**
+ * Runs the conflict choices the user already made, before any fresh plan can
+ * replace them. A choice names exact copies on both computers, so it is
+ * mirrored to the paired computer and then transferred like ordinary work.
+ *
+ * One bounded batch per cycle, and one choice whose copies no longer match is
+ * recorded as failed instead of ending the cycle: the queue is drained in the
+ * same order every time, so a single file edited since the choice was made
+ * used to stop every other choice behind it from ever running.
+ */
+async function drainConflictChoices(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  runnable: FileSyncOperation[],
+): Promise<TransferBatchResult & { remaining: number }> {
+  const batch = runnable.slice(0, CONFLICT_CHOICE_DRAIN_LIMIT)
+  const mirrored: FileSyncOperation[] = []
+  const failures: TransferFailure[] = []
+  let peerOperations: PeerFileOperationIdentity[] = []
+  for (const operation of batch) {
+    const current = snapshot.folders.find((item) => item.id === folder.id)
+    if (!current || current.paused || snapshot.paused) throw new Error("Syncing was paused before it finished.")
+    // A peer that dropped cannot confirm any remaining choice, and counting
+    // those as failures would retire decisions that are still perfectly valid.
+    if (getPairedDevice(folder.remoteDeviceId)?.status !== "online") {
+      throw new Error(`${peer.name} went offline before the selected versions were applied.`)
+    }
+    try {
+      const inspection = await inspectFileConflict({ mappingId: folder.id, path: operation.path })
+      if (
+        !inspection.local.present || inspection.local.digest === undefined || inspection.local.size === undefined ||
+        !inspection.remote.present || inspection.remote.digest === undefined || inspection.remote.size === undefined
+      ) {
+        throw new Error(`Both exact copies of ${operation.path} are required to resume its conflict resolution.`)
+      }
+      peerOperations = await recordPeerConflictChoice(folder, peer, operation.path, {
+        direction: operation.direction,
+        localDigest: inspection.local.digest,
+        localSize: inspection.local.size,
+        remoteDigest: inspection.remote.digest,
+        remoteSize: inspection.remote.size,
+      })
+      mirrored.push(operation)
+    } catch (error) {
+      if (isScanCancelled(error)) throw error
+      const detail = error instanceof Error ? error.message : "The selected version could not be prepared."
+      await engine.request("fileSync.fail", {
+        operationId: operation.id,
+        detail,
+        failedAt: new Date().toISOString(),
+      }).catch((recordError) => console.warn("[continuous-sync] unable to persist conflict-choice failure", recordError))
+      failures.push({ path: operation.path, detail })
+    }
+  }
+  const transferred = await executeContinuousOperations(folder, peer, undefined, mirrored, peerOperations)
+  return {
+    copiedFiles: transferred.copiedFiles,
+    failures: [...failures, ...transferred.failures],
+    remaining: runnable.length - batch.length,
+  }
 }
 
 /**
@@ -3127,7 +3219,7 @@ async function runGenerationCycle(
     localGenerationId = undefined
 
     const peerOperations = parsePeerFileOperations(peerResult)
-    const copiedFiles = await executeContinuousOperations(
+    const { copiedFiles, failures } = await executeContinuousOperations(
       folder,
       peer,
       undefined,
@@ -3157,6 +3249,7 @@ async function runGenerationCycle(
         folderId,
       )
     }
+    reportQueuedTransferFailures(folder, failures)
     recordContinuousConflicts(folder, state.conflicts)
     return result
   } finally {
@@ -3216,39 +3309,46 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       applyFileSyncStateToFolder(folderId, durableBeforeReconcile)
       throw new Error("A replacement recovery issue must be repaired before this folder can synchronize.")
     }
-    const chosenOperations = conflictChoiceOperations(durableBeforeReconcile)
-    if (chosenOperations.length > 0) {
-      let peerOperations: PeerFileOperationIdentity[] = []
-      for (const operation of chosenOperations) {
-        const inspection = await inspectFileConflict({ mappingId: folder.id, path: operation.path })
-        if (
-          !inspection.local.present || inspection.local.digest === undefined || inspection.local.size === undefined ||
-          !inspection.remote.present || inspection.remote.digest === undefined || inspection.remote.size === undefined
-        ) {
-          throw new Error(`Both exact copies of ${operation.path} are required to resume its conflict resolution.`)
-        }
-        peerOperations = await recordPeerConflictChoice(folder, peer, operation.path, {
-          direction: operation.direction,
-          localDigest: inspection.local.digest,
-          localSize: inspection.local.size,
-          remoteDigest: inspection.remote.digest,
-          remoteSize: inspection.remote.size,
-        })
-      }
-      const copiedFiles = await executeContinuousOperations(folder, peer, undefined, chosenOperations, peerOperations)
+    const { runnable: runnableChoices, exhausted: exhaustedChoices } = partitionConflictChoices(
+      conflictChoiceOperations(durableBeforeReconcile),
+    )
+    if (runnableChoices.length > 0) {
+      const drained = await drainConflictChoices(folder, peer, runnableChoices)
       const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
       await retireInitialConflictProjection(folderId, state)
       applyFileSyncStateToFolder(folderId, state, new Date().toISOString())
       continuousLastErrors.delete(folderId)
-      pushActivity(
-        "Conflict resolution completed",
-        `${folder.name}: applied ${copiedFiles} selected file version${copiedFiles === 1 ? "" : "s"}; each replaced copy was archived first.`,
-        "success",
-        folderId,
-      )
+      if (drained.copiedFiles > 0) {
+        pushActivity(
+          "Conflict resolution completed",
+          `${folder.name}: applied ${drained.copiedFiles} selected file version${drained.copiedFiles === 1 ? "" : "s"}; each replaced copy was archived first.${drained.remaining > 0 ? ` ${drained.remaining} more are still queued.` : ""}`,
+          "success",
+          folderId,
+        )
+      }
+      if (drained.failures.length > 0) {
+        pushActivity(
+          "Selected versions could not be applied",
+          `${folder.name}: ${describeTransferFailures(drained.failures)}`,
+          "warning",
+          folderId,
+        )
+      }
       recordContinuousConflicts(folder, state.conflicts)
       continuousSyncQueued.add(folderId)
       return
+    }
+    if (exhaustedChoices.length > 0) {
+      // Every queued choice has failed too often to keep retrying, so the copies
+      // it named are gone from at least one computer. Falling through lets the
+      // reconcile below retire them and record the conflict again, which is the
+      // only way a stale choice leaves the queue.
+      pushActivity(
+        "Conflict choices need making again",
+        `${folder.name}: ${exhaustedChoices.length} selected file version${exhaustedChoices.length === 1 ? " is" : "s are"} no longer on both computers, so the conflict is being detected again.`,
+        "warning",
+        folderId,
+      )
     }
     const observedAt = new Date().toISOString()
     const capabilities = await cachedPeerCapabilities(peer.id)
@@ -3327,7 +3427,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
           remoteSize: remote.size,
         })
       }
-      const copiedFiles = await executeContinuousOperations(folder, peer, remoteManifest, replayable, peerOperations)
+      const { copiedFiles, failures } = await executeContinuousOperations(folder, peer, remoteManifest, replayable, peerOperations)
       const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
       await retireInitialConflictProjection(folderId, state)
       applyFileSyncStateToFolder(folderId, state, new Date().toISOString())
@@ -3341,6 +3441,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
         "success",
         folderId,
       )
+      reportQueuedTransferFailures(folder, failures)
       recordContinuousConflicts(folder, state.conflicts)
       continuousSyncQueued.add(folderId)
       return
@@ -3377,7 +3478,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     const peerResult = await requirePeerSessions().request<unknown>(peer.id, observeRequest, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, { chunked })
 
     const peerOperations = parsePeerFileOperations(peerResult)
-    const copiedFiles = await executeContinuousOperations(
+    const { copiedFiles, failures } = await executeContinuousOperations(
       folder,
       peer,
       remoteManifest,
@@ -3408,6 +3509,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
         folderId,
       )
     }
+    reportQueuedTransferFailures(folder, failures)
     recordContinuousConflicts(folder, state.conflicts)
   } catch (error) {
     // A cancelled check was stopped deliberately — by shutdown, a settings

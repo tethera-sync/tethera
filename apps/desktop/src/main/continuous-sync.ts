@@ -134,6 +134,57 @@ export function conflictChoiceOperations(
 }
 
 /**
+ * Conflict choices mirrored and run in one cycle. Each one costs a paired
+ * inspection before it can be mirrored, so a folder holding thousands of them
+ * would otherwise disappear into a single cycle that copies nothing until the
+ * very end and that a restart has to begin again. A bounded batch keeps the
+ * queue visibly moving and leaves the rest for the next cycle.
+ */
+export const CONFLICT_CHOICE_DRAIN_LIMIT = 100
+
+/**
+ * How often one conflict choice may fail before a cycle stops retrying it.
+ * Reaching this means the copies the choice named are gone from at least one
+ * computer, so reconciliation retires the choice and records the conflict
+ * again rather than blocking every other queued copy behind it forever.
+ */
+export const MAX_CONFLICT_CHOICE_ATTEMPTS = 3
+
+/** Splits queued conflict choices into the ones still worth retrying and the ones that are exhausted. */
+export function partitionConflictChoices(chosen: FileSyncOperation[]): {
+  runnable: FileSyncOperation[]
+  exhausted: FileSyncOperation[]
+} {
+  const runnable: FileSyncOperation[] = []
+  const exhausted: FileSyncOperation[] = []
+  for (const operation of chosen) {
+    if (operation.attempts >= MAX_CONFLICT_CHOICE_ATTEMPTS) exhausted.push(operation)
+    else runnable.push(operation)
+  }
+  return { runnable, exhausted }
+}
+
+/** One queued path a cycle could not copy, and why. */
+export interface TransferFailure {
+  path: string
+  detail: string
+}
+
+/** What one pass over a batch of durable operations achieved. */
+export interface TransferBatchResult {
+  copiedFiles: number
+  failures: TransferFailure[]
+}
+
+/** Names one concrete failure and counts the rest, so a large batch still reports in a single line. */
+export function describeTransferFailures(failures: TransferFailure[]): string {
+  const [first] = failures
+  if (!first) return "No queued file failed."
+  if (failures.length === 1) return `${first.path}: ${first.detail}`
+  return `${failures.length} files stayed queued. ${first.path}: ${first.detail}`
+}
+
+/**
  * Whether a changed cycle may reconcile through staged generations. Both peers
  * must stage and page scans, and the observe response must be able to span
  * several frames.
