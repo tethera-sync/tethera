@@ -7,11 +7,13 @@ import { fingerprintObservation } from "../src/main/observation-fingerprint"
 import {
   canSkipUnchangedCycle,
   conflictChoiceOperations,
+  conflictCopiesKey,
   conflictKey,
   describeTransferFailures,
   MAX_CONFLICT_CHOICE_ATTEMPTS,
   partitionConflictChoices,
   FULL_RECONCILE_INTERVAL_MS,
+  isLineEndingCandidate,
   isUnchangedScanReply,
   type FileSyncOperation,
   type FileSyncState,
@@ -24,6 +26,7 @@ import {
   mirrorConflictChoice,
   observedFiles,
   replayableOperations,
+  selectConflictsToReport,
   shouldUseGenerations,
   syncableObservations,
   type FileSyncConflict,
@@ -456,5 +459,61 @@ describe("idle-cycle fingerprints across the wire", () => {
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  })
+})
+
+describe("conflict activity reports", () => {
+  const deletion: FileSyncConflict = {
+    mappingId: "mapping-1",
+    path: "gone.txt",
+    kind: "deletion-not-propagated",
+    remoteDigest: "d".repeat(64),
+    detectedAt: "2026-08-31T12:00:00Z",
+  }
+  const unbased: FileSyncConflict = { ...openConflict("package.json"), kind: "unbased-divergence" }
+  const none: ReadonlySet<string> = new Set()
+
+  test("only a conflict with both copies and no one-way block may be a line-ending difference", () => {
+    expect(isLineEndingCandidate(unbased)).toBe(true)
+    expect(isLineEndingCandidate(openConflict("both.txt"))).toBe(true)
+    expect(isLineEndingCandidate(deletion)).toBe(false)
+    expect(isLineEndingCandidate({ ...unbased, kind: "direction-blocked" })).toBe(false)
+  })
+
+  test("holds a line-ending candidate back until it is compared or seen again", () => {
+    const state = { conflicts: [unbased, deletion], operations: [] }
+    const first = selectConflictsToReport(state, none, none, none)
+    expect(first.report).toEqual([deletion])
+
+    const compared = selectConflictsToReport(state, first.reported, none, new Set([conflictCopiesKey(unbased)]))
+    expect(compared.report).toEqual([unbased])
+
+    const seenAgain = selectConflictsToReport(state, first.reported, first.seen, none)
+    expect(seenAgain.report).toEqual([unbased])
+  })
+
+  test("never announces a conflict whose resolution is already queued", () => {
+    const state = { conflicts: [unbased], operations: [pendingOperation(unbased.path)] }
+    const report = selectConflictsToReport(state, none, new Set([conflictCopiesKey(unbased)]), none)
+    expect(report.report).toEqual([])
+    expect(report.reported.size).toBe(0)
+  })
+
+  test("announces each conflict once while it stays open, and again if it returns", () => {
+    const blocked: FileSyncConflict = { ...openConflict("one-way.txt"), kind: "direction-blocked" }
+    const both = { conflicts: [deletion, blocked], operations: [] }
+    const first = selectConflictsToReport(both, none, none, none)
+    expect(first.report).toEqual([deletion, blocked])
+
+    // Resolving one conflict re-announces nothing.
+    const shrunk = selectConflictsToReport({ conflicts: [deletion], operations: [] }, first.reported, first.seen, none)
+    expect(shrunk.report).toEqual([])
+
+    // A conflict that reappears later is news again.
+    expect(selectConflictsToReport(both, shrunk.reported, shrunk.seen, none).report).toEqual([blocked])
+
+    // Changed copies make it a different conflict.
+    const changed = { ...deletion, remoteDigest: "e".repeat(64) }
+    expect(selectConflictsToReport({ conflicts: [changed], operations: [] }, first.reported, none, none).report).toEqual([changed])
   })
 })

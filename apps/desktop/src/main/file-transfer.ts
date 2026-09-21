@@ -1,6 +1,7 @@
 import { lstat, open, realpath, stat } from "./synced-fs"
 import { createHash } from "node:crypto"
 import path from "node:path"
+import { createTextDigestHasher } from "./line-endings"
 import { resolveWithinRoot } from "./path-safety"
 
 /** Keeps base64 responses comfortably below the peer session's 16 MiB line limit. */
@@ -38,25 +39,44 @@ export interface TransferFileIdentity {
   modifiedMs: number
 }
 
+export interface TextFileDescriptor extends TransferFileDescriptor {
+  /** The file's content hashed with CRLF read as LF; absent for binary content. */
+  textDigest?: string
+}
+
 /**
  * Opens an approved mapping-relative file without accepting a symlink escape, hashes it through
  * a bounded buffer, and confirms it stayed stable for the whole read.
  */
 export async function describeTransferFile(rootPath: string, relativePath: string): Promise<TransferFileDescriptor> {
+  return describeContainedFile(rootPath, relativePath, false)
+}
+
+/** {@link describeTransferFile} plus a line-ending-insensitive text digest taken from the same read. */
+export async function describeTextFile(rootPath: string, relativePath: string): Promise<TextFileDescriptor> {
+  return describeContainedFile(rootPath, relativePath, true)
+}
+
+async function describeContainedFile(rootPath: string, relativePath: string, includeText: boolean): Promise<TextFileDescriptor> {
   const { absolutePath, handle, initial } = await openContainedRegularFile(rootPath, relativePath)
   try {
     const hash = createHash("sha256")
+    const text = includeText ? createTextDigestHasher() : undefined
     const buffer = Buffer.allocUnsafe(TRANSFER_CHUNK_BYTES)
     let offset = 0
     while (offset < initial.size) {
       const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, initial.size - offset), offset)
       if (bytesRead === 0) throw new FileChangedError("The shared file changed while its transfer digest was being prepared.")
       hash.update(buffer.subarray(0, bytesRead))
+      text?.update(buffer.subarray(0, bytesRead))
       offset += bytesRead
     }
     const after = await handle.stat()
     assertStableIdentity(initial, after, absolutePath)
-    return { size: initial.size, modifiedMs: initial.mtimeMs, digest: hash.digest("hex") }
+    const descriptor: TextFileDescriptor = { size: initial.size, modifiedMs: initial.mtimeMs, digest: hash.digest("hex") }
+    const textDigest = text?.digest()
+    if (textDigest !== undefined) descriptor.textDigest = textDigest
+    return descriptor
   } finally {
     await handle.close()
   }

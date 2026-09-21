@@ -38,6 +38,7 @@ A revision wins sequentially when it descends from another. Revisions are concur
 
 - Descendant beats ancestor.
 - Concurrent files remain untouched until a user explicitly chooses one of the exact current copies; wall clock is never a winner selector.
+- Two present copies that hold the same text and differ only in CRLF versus LF line endings are not concurrent content. The coordinator settles such an unbased or simultaneous conflict without the user by recording the copy that uses LF throughout (git's stored form) as an ordinary exact choice. Text means no NUL byte; each copy is hashed with every CRLF read as LF in the same read that produces its exact digest. Copies that both contain CRLF, binary copies, direction-blocked changes, deletions, and copies on a paired computer that does not report a text digest remain conflicts.
 - Preserve the displaced copy in history and keep the durable conflict until the selected replacement is verified and indexed on both participants.
 - A choice is valid only while both current digests and sizes still match the recorded conflict. A changed or missing copy forces a fresh scan instead of applying stale intent.
 - One-way folder direction still applies to manual resolution. Deletion conflicts remain read-only until deletion propagation has complete recovery semantics.

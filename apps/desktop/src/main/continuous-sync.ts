@@ -218,12 +218,70 @@ export interface QuietReconcile {
   reconciledAt: number
 }
 
+/** Identifies one open conflict by its path, kind and the exact copies it holds. */
+export function conflictCopiesKey(conflict: FileSyncConflict): string {
+  return JSON.stringify([conflict.path, conflict.kind, conflict.localDigest ?? null, conflict.remoteDigest ?? null])
+}
+
 /** Identifies a set of open conflicts, independent of the order they were listed in. */
 export function conflictKey(conflicts: FileSyncConflict[]): string {
-  return conflicts
-    .map((conflict) => JSON.stringify([conflict.path, conflict.kind, conflict.localDigest ?? null, conflict.remoteDigest ?? null]))
-    .sort()
-    .join("\n")
+  return conflicts.map(conflictCopiesKey).sort().join("\n")
+}
+
+/**
+ * Whether a conflict may turn out to hold the same text on both computers in
+ * different line endings, which the coordinator settles without asking. A
+ * one-way folder's blocked change keeps its protection, and a deletion has
+ * only one copy to compare.
+ */
+export function isLineEndingCandidate(conflict: FileSyncConflict): boolean {
+  return (
+    (conflict.kind === "unbased-divergence" || conflict.kind === "simultaneous-modification") &&
+    conflict.localDigest !== undefined &&
+    conflict.remoteDigest !== undefined
+  )
+}
+
+export interface ConflictReport {
+  /** Conflicts to announce now. */
+  report: FileSyncConflict[]
+  /** Every announced conflict still open, by {@link conflictCopiesKey}. */
+  reported: Set<string>
+  /** Every conflict seen by this pass, by {@link conflictCopiesKey}. */
+  seen: Set<string>
+}
+
+/**
+ * Picks the conflicts worth a new activity entry, so resolving some of a large
+ * set never re-announces the rest. A conflict whose resolution is already
+ * queued is not announced. A line-ending candidate waits until the coordinator
+ * has compared its copies, or until a later pass still finds it (the paired
+ * computer cannot see that comparison), because most are settled without the
+ * user and announcing them first would only be noise.
+ */
+export function selectConflictsToReport(
+  state: Pick<FileSyncState, "conflicts" | "operations">,
+  previouslyReported: ReadonlySet<string>,
+  previouslySeen: ReadonlySet<string>,
+  lineEndingChecked: ReadonlySet<string>,
+): ConflictReport {
+  const queuedPaths = new Set(conflictChoiceOperations(state).map((operation) => operation.path))
+  const report: FileSyncConflict[] = []
+  const reported = new Set<string>()
+  const seen = new Set<string>()
+  for (const conflict of state.conflicts) {
+    const key = conflictCopiesKey(conflict)
+    seen.add(key)
+    if (previouslyReported.has(key)) {
+      reported.add(key)
+      continue
+    }
+    if (queuedPaths.has(conflict.path)) continue
+    if (isLineEndingCandidate(conflict) && !lineEndingChecked.has(key) && !previouslySeen.has(key)) continue
+    report.push(conflict)
+    reported.add(key)
+  }
+  return { report, reported, seen }
 }
 
 /**
@@ -365,7 +423,7 @@ export function conflictSummary(conflicts: FileSyncConflict[]): string {
   const details = [
     simultaneous > 0 ? `${simultaneous} edited on both computers` : "",
     deletions > 0 ? `${deletions} deleted on one computer` : "",
-    unbased > 0 ? `${unbased} without a verified baseline` : "",
+    unbased > 0 ? `${unbased} different on each computer` : "",
     directionBlocked > 0 ? `${directionBlocked} changed against the one-way direction` : "",
   ].filter(Boolean)
   return `${conflicts.length} conflict${conflicts.length === 1 ? " needs" : "s need"} attention${details.length > 0 ? ` (${details.join(", ")})` : ""}; neither copy was changed.`

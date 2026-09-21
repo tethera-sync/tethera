@@ -318,6 +318,8 @@ export interface PeerConflictCopy {
   size?: number
   modifiedMs?: number
   digest?: string
+  /** Only when the request asked for it and the copy is text; see `describeTextFile`. */
+  textDigest?: string
 }
 
 export function parsePeerConflictCopy(value: unknown): PeerConflictCopy {
@@ -332,7 +334,8 @@ export function parsePeerConflictCopy(value: unknown): PeerConflictCopy {
   if (
     !Number.isSafeInteger(candidate.size) || (candidate.size ?? -1) < 0 ||
     !Number.isFinite(candidate.modifiedMs) ||
-    !isSha256HexDigest(candidate.digest)
+    !isSha256HexDigest(candidate.digest) ||
+    (candidate.textDigest !== undefined && !isSha256HexDigest(candidate.textDigest))
   ) {
     throw new Error("The paired computer returned invalid conflict file metadata.")
   }
@@ -341,6 +344,7 @@ export function parsePeerConflictCopy(value: unknown): PeerConflictCopy {
     size: candidate.size,
     modifiedMs: candidate.modifiedMs,
     digest: candidate.digest,
+    ...(candidate.textDigest === undefined ? {} : { textDigest: candidate.textDigest }),
   }
 }
 
@@ -368,8 +372,12 @@ export function parseExactConflictChoice(request: PeerRequest): ExactConflictCho
   }
 }
 
+export function isAllowedConflictDirection(mode: SyncMode, direction: FileSyncDirection): boolean {
+  return !((direction === "push-local" && mode === "receive-only") || (direction === "pull-remote" && mode === "send-only"))
+}
+
 export function requireAllowedConflictDirection(mode: SyncMode, direction: FileSyncDirection): void {
-  if ((direction === "push-local" && mode === "receive-only") || (direction === "pull-remote" && mode === "send-only")) {
+  if (!isAllowedConflictDirection(mode, direction)) {
     throw new Error("That version conflicts with this folder's one-way direction.")
   }
 }

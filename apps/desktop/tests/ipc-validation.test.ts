@@ -357,8 +357,21 @@ describe("peer conflict parsing", () => {
     })
   })
 
+  test("keeps a well-formed text digest from a newer peer", () => {
+    expect(parsePeerConflictCopy({ present: true, size: 4, modifiedMs: 8, digest: DIGEST, textDigest: OTHER_DIGEST })).toEqual({
+      present: true,
+      size: 4,
+      modifiedMs: 8,
+      digest: DIGEST,
+      textDigest: OTHER_DIGEST,
+    })
+  })
+
   test("rejects present copies with invalid metadata", () => {
     expect(() => parsePeerConflictCopy({ present: true, size: 4, modifiedMs: 8, digest: "xyz" })).toThrow(
+      "The paired computer returned invalid conflict file metadata.",
+    )
+    expect(() => parsePeerConflictCopy({ present: true, size: 4, modifiedMs: 8, digest: DIGEST, textDigest: "xyz" })).toThrow(
       "The paired computer returned invalid conflict file metadata.",
     )
     expect(() => parsePeerConflictCopy({ present: "yes" })).toThrow(

@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
+  describeTextFile,
   describeTransferFile,
   isSourceFileUnavailable,
   readTransferFileChunk,
@@ -112,6 +113,31 @@ describe("bounded transfer file reads", () => {
     } finally {
       await rm(source, { recursive: true, force: true })
       await rm(destination, { recursive: true, force: true })
+    }
+  })
+
+  test("gives CRLF and LF copies of one text the same text digest from the transfer read", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-transfer-text-"))
+    // The CRLF straddles the read buffer, as it can in any large text file.
+    const prefix = "x".repeat(TRANSFER_CHUNK_BYTES - 1)
+    try {
+      await writeFile(path.join(root, "windows.txt"), `${prefix}\r\nlast line\r\n`)
+      await writeFile(path.join(root, "unix.txt"), `${prefix}\nlast line\n`)
+      await writeFile(path.join(root, "binary.bin"), Buffer.from([0x61, 0x0d, 0x0a, 0x00]))
+      const [windows, unix, binary, plain] = await Promise.all([
+        describeTextFile(root, "windows.txt"),
+        describeTextFile(root, "unix.txt"),
+        describeTextFile(root, "binary.bin"),
+        describeTransferFile(root, "windows.txt"),
+      ])
+      expect(windows.digest).not.toBe(unix.digest)
+      expect(windows.textDigest).toBe(unix.digest)
+      expect(unix.textDigest).toBe(unix.digest)
+      expect(windows.digest).toBe(plain.digest)
+      expect(binary.textDigest).toBeUndefined()
+      expect("textDigest" in plain).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
     }
   })
 })

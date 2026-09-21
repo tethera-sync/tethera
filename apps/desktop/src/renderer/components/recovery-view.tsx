@@ -588,7 +588,7 @@ function conflictLabel(conflict: RecoveryConflict): string {
   if (conflict.kind === "deletion-not-propagated") return "Missing on one computer"
   if (conflict.kind === "direction-blocked") return "Conflicts with the one-way direction"
   if (conflict.kind === "initial-merge") return "Different during the initial merge"
-  return "No verified common baseline"
+  return "Different on each computer"
 }
 
 function copyAllowed(copy: ConflictCopyInspection, side: "local" | "remote", mode: SyncMode): boolean {

@@ -116,6 +116,7 @@ import {
 } from "./initial-sync"
 import { appendActivity } from "./activity-log"
 import {
+  describeTextFile,
   describeTransferFile,
   FileChangedError,
   isSourceFileUnavailable,
@@ -177,6 +178,7 @@ import {
   parseResolveFileConflictInput,
   parseRevealPath,
   parseSettingUpdate,
+  isAllowedConflictDirection,
   requireAllowedConflictDirection,
   requireUnchangedInspectedCopies,
   validateConflictInput,
@@ -192,8 +194,11 @@ import {
   canSkipUnchangedCycle,
   conflictChoiceOperations,
   CONFLICT_CHOICE_DRAIN_LIMIT,
+  conflictCopiesKey,
   conflictKey,
   CONTINUOUS_FINGERPRINT_CAPABILITY,
+  isLineEndingCandidate,
+  selectConflictsToReport,
   describeTransferFailures,
   partitionConflictChoices,
   isUnchangedScanReply,
@@ -219,6 +224,7 @@ import {
   type TransferBatchResult,
   type TransferFailure,
 } from "./continuous-sync"
+import { lineEndingOnlyDirection } from "./line-endings"
 import { fingerprintObservation, isObservationFingerprint } from "./observation-fingerprint"
 import { listArchivedVersions } from "./archive-history"
 import { DigestCacheVerifier, EngineScanDigestCache } from "./digest-cache"
@@ -290,7 +296,16 @@ const continuousSyncBlocked = new Set<string>()
 const continuousSyncMonitors = new Map<string, FolderChangeMonitor>()
 const continuousSyncRetryTimers = new Map<string, NodeJS.Timeout>()
 const continuousSyncNotificationsInFlight = new Set<string>()
-const continuousConflictFingerprints = new Map<string, string>()
+/** Per folder, the open conflicts already announced in the activity log, by `conflictCopiesKey`. */
+const reportedConflicts = new Map<string, Set<string>>()
+/** Per folder, every conflict the previous report saw, so a line-ending candidate is held back only once. */
+const seenConflicts = new Map<string, Set<string>>()
+/**
+ * Per folder, conflicts whose exact copies the coordinator already compared for
+ * a line-ending-only difference. A changed copy has a new key and is compared
+ * again; a restart compares everything once more.
+ */
+const lineEndingChecks = new Map<string, Set<string>>()
 /** Per folder, the last reported set of files left out because their destination path is occupied. */
 const occupiedPathFingerprints = new Map<string, string>()
 const continuousLastErrors = new Map<string, string>()
@@ -1586,8 +1601,8 @@ function hydrateAuthoritativeMappings(records: MappingRecord[]): void {
   initialSyncOutcomes = Object.fromEntries(
     Object.entries(initialSyncOutcomes).filter(([folderId]) => mappingRecords.has(folderId)),
   )
-  for (const folderId of continuousConflictFingerprints.keys()) {
-    if (!mappingRecords.has(folderId)) continuousConflictFingerprints.delete(folderId)
+  for (const folderId of [...reportedConflicts.keys(), ...seenConflicts.keys(), ...lineEndingChecks.keys()]) {
+    if (!mappingRecords.has(folderId)) forgetConflictReports(folderId)
   }
   for (const folderId of occupiedPathFingerprints.keys()) {
     if (!mappingRecords.has(folderId)) occupiedPathFingerprints.delete(folderId)
@@ -2326,7 +2341,7 @@ function conflictDetail(conflict: FileSyncConflict): string {
   if (conflict.kind === "direction-blocked") {
     return "The detected change conflicts with this folder's one-way sync direction. Neither version was replaced."
   }
-  return "The computers did not have a verified common baseline for this path. Neither version was replaced."
+  return "Each computer has a different copy and there is no earlier synced version to show which one changed. Both copies were kept; choose one in Recovery."
 }
 
 function recoveryConflict(
@@ -2414,9 +2429,12 @@ async function describeConflictCopy(
   rootPath: string,
   relativePath: string,
   expectedDigest: string | undefined,
+  includeText = false,
 ): Promise<PeerConflictCopy> {
   try {
-    const descriptor = await describeTransferFile(rootPath, relativePath)
+    const descriptor = includeText
+      ? await describeTextFile(rootPath, relativePath)
+      : await describeTransferFile(rootPath, relativePath)
     if (!expectedDigest || descriptor.digest !== expectedDigest) {
       throw new Error("The file changed after this conflict was recorded. Refresh the conflict before choosing a version.")
     }
@@ -2719,21 +2737,135 @@ async function resolveNewestConflicts(): Promise<ResolveNewestConflictsResult> {
   return total
 }
 
-function recordContinuousConflicts(folder: FolderSummary, conflicts: FileSyncConflict[]): void {
-  const fingerprint = conflicts
-    .map((conflict) => `${conflict.path}\0${conflict.kind}\0${conflict.localDigest ?? ""}\0${conflict.remoteDigest ?? ""}`)
-    .sort()
-    .join("\n")
-  if (continuousConflictFingerprints.get(folder.id) === fingerprint) return
-  if (fingerprint) {
-    pushActivity("Sync conflict needs attention", `${folder.name}: ${conflictSummary(conflicts)}`, "warning", folder.id)
-    for (const conflict of conflicts.slice(0, 20)) {
-      pushActivity(`Conflict left untouched: ${conflict.path}`, conflictDetail(conflict), "warning", folder.id)
+/**
+ * The exact choice that settles a conflict whose copies hold the same text in
+ * different line endings, or undefined when they differ in any other way.
+ * Throws when either copy could not be compared right now.
+ */
+async function lineEndingChoice(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  conflict: FileSyncConflict,
+): Promise<ExactConflictChoice | undefined> {
+  return withConflictHashing(folder.id, async () => {
+    const local = await describeConflictCopy(folder.localPath, localFilePath(folder.id, conflict.path), conflict.localDigest, true)
+    // Binary on this computer, so there is nothing to ask the paired computer.
+    if (local.textDigest === undefined) return undefined
+    const remote = parsePeerConflictCopy(await requirePeerSessions().request<unknown>(peer.id, {
+      type: "continuous-sync-inspect-conflict",
+      folderId: folder.id,
+      path: conflict.path,
+      textDigest: true,
+    }, CONTINUOUS_SYNC_RPC_TIMEOUT_MS))
+    const { digest: localDigest, size: localSize } = local
+    const { digest: remoteDigest, size: remoteSize } = remote
+    if (
+      localDigest === undefined || localSize === undefined ||
+      remoteDigest === undefined || remoteSize === undefined ||
+      remoteDigest !== conflict.remoteDigest
+    ) return undefined
+    const direction = lineEndingOnlyDirection(
+      { digest: localDigest, textDigest: local.textDigest },
+      { digest: remoteDigest, textDigest: remote.textDigest },
+    )
+    if (!direction || !isAllowedConflictDirection(folder.mode, direction)) return undefined
+    return { direction, localDigest, localSize, remoteDigest, remoteSize }
+  })
+}
+
+/**
+ * Coordinator only: queues the LF copy of every open conflict whose two copies
+ * hold the same text and differ only in Windows and Unix line endings, and
+ * returns the durable state with those choices recorded. Each choice names
+ * both exact copies and runs through the ordinary archive-backed conflict path
+ * on a later cycle, so the replaced copy is kept in history.
+ *
+ * The kept content never rests on the paired computer's word: pulling needs
+ * its copy's digest to equal this computer's own text digest, which the
+ * transfer verifies, and pushing sends this computer's own copy.
+ */
+async function settleLineEndingConflicts(
+  folder: FolderSummary,
+  peer: DeviceSummary,
+  state: FileSyncState,
+): Promise<FileSyncState> {
+  const queuedPaths = new Set(state.operations.map((operation) => operation.path))
+  const openKeys = new Set(state.conflicts.map(conflictCopiesKey))
+  const checked = new Set([...(lineEndingChecks.get(folder.id) ?? [])].filter((key) => openKeys.has(key)))
+  lineEndingChecks.set(folder.id, checked)
+  const candidates = state.conflicts.filter((conflict) =>
+    isLineEndingCandidate(conflict) && !queuedPaths.has(conflict.path) && !checked.has(conflictCopiesKey(conflict)))
+  if (candidates.length === 0) return state
+  const previousAction = snapshot.folders.find((item) => item.id === folder.id)?.currentAction
+  updateFolder(folder.id, {
+    currentAction: `Checking ${candidates.length.toLocaleString("en-GB")} conflicting file${candidates.length === 1 ? "" : "s"} for line-ending-only differences…`,
+  })
+  broadcastSnapshot()
+  const settleable: Array<{ key: string; choice: ExactConflictChoice & { mappingId: string; path: string; requestedAt: string } }> = []
+  try {
+    for (const conflict of candidates) {
+      const current = snapshot.folders.find((item) => item.id === folder.id)
+      if (!current || current.paused || snapshot.paused || getPairedDevice(folder.remoteDeviceId)?.status !== "online") break
+      // A version the user is choosing right now takes precedence over this pass.
+      if (hasConflictResolutionInFlight(folder.id)) break
+      const key = conflictCopiesKey(conflict)
+      let choice: ExactConflictChoice | undefined
+      try {
+        choice = await lineEndingChoice(folder, peer, conflict)
+      } catch (error) {
+        if (isScanCancelled(error)) throw error
+        // Left unchecked, so a later cycle compares this conflict again.
+        console.warn(`[continuous-sync] unable to compare line endings for ${folder.id}`, error)
+        continue
+      }
+      if (choice) settleable.push({ key, choice: { mappingId: folder.id, path: conflict.path, ...choice, requestedAt: new Date().toISOString() } })
+      else checked.add(key)
     }
-    continuousConflictFingerprints.set(folder.id, fingerprint)
-  } else {
-    continuousConflictFingerprints.delete(folder.id)
+  } finally {
+    if (previousAction !== undefined) updateFolder(folder.id, { currentAction: previousAction })
   }
+  if (settleable.length === 0) return state
+  for (let start = 0; start < settleable.length; start += BULK_CONFLICT_BATCH_SIZE) {
+    const batch = settleable.slice(start, start + BULK_CONFLICT_BATCH_SIZE)
+    await engine.request<FileSyncState>("fileSync.resolveConflicts", { mappingId: folder.id, choices: batch.map(({ choice }) => choice) })
+    // Only a recorded choice counts as checked: a choice that later exhausts
+    // its retries must leave the conflict to the user, not be queued again.
+    for (const { key } of batch) checked.add(key)
+  }
+  const settled = settleable.length
+  pushActivity(
+    "Line-ending differences settled",
+    `${folder.name}: ${settled.toLocaleString("en-GB")} file${settled === 1 ? "" : "s"} had the same text on both computers and differed only in Windows (CRLF) and Unix (LF) line endings. Tethera is keeping the LF copy, which is how git stores text; each replaced copy is archived first.`,
+    "info",
+    folder.id,
+  )
+  // The queued choices are applied by the next cycle.
+  continuousSyncQueued.add(folder.id)
+  return engine.request<FileSyncState>("fileSync.getState", { id: folder.id })
+}
+
+/** Announces each conflict once, when it first needs the user; see `selectConflictsToReport`. */
+function recordContinuousConflicts(folder: FolderSummary, state: Pick<FileSyncState, "conflicts" | "operations">): void {
+  const { report, reported, seen } = selectConflictsToReport(
+    state,
+    reportedConflicts.get(folder.id) ?? new Set(),
+    seenConflicts.get(folder.id) ?? new Set(),
+    lineEndingChecks.get(folder.id) ?? new Set(),
+  )
+  reportedConflicts.set(folder.id, reported)
+  seenConflicts.set(folder.id, seen)
+  if (report.length === 0) return
+  pushActivity("Sync conflict needs attention", `${folder.name}: ${conflictSummary(report)}`, "warning", folder.id)
+  for (const conflict of report.slice(0, 20)) {
+    pushActivity(`Conflict left untouched: ${conflict.path}`, conflictDetail(conflict), "warning", folder.id)
+  }
+}
+
+/** Forgets the in-memory conflict bookkeeping of a folder that is no longer mapped. */
+function forgetConflictReports(folderId: string): void {
+  reportedConflicts.delete(folderId)
+  seenConflicts.delete(folderId)
+  lineEndingChecks.delete(folderId)
 }
 
 /** Reports files left out because their destination path is already used, once per distinct set. */
@@ -2765,7 +2897,7 @@ async function refreshContinuousSyncState(folderId: string): Promise<void> {
     const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
     applyFileSyncStateToFolder(folderId, state)
     const current = snapshot.folders.find((item) => item.id === folderId)
-    if (current) recordContinuousConflicts(current, state.conflicts)
+    if (current) recordContinuousConflicts(current, state)
     broadcastSnapshot()
   } catch (error) {
     console.warn(`[continuous-sync] unable to restore durable state for ${folderId}`, error)
@@ -2898,7 +3030,7 @@ async function refreshContinuousSyncMonitors(): Promise<void> {
     if (retry) clearTimeout(retry)
     continuousSyncRetryTimers.delete(folderId)
     if (!mappingRecords.has(folderId)) {
-      continuousConflictFingerprints.delete(folderId)
+      forgetConflictReports(folderId)
       occupiedPathFingerprints.delete(folderId)
     }
   }
@@ -3198,7 +3330,7 @@ async function runGenerationCycle(
     await retireInitialConflictProjection(folderId, result)
     if (result.conflicts.length > 0) {
       applyFileSyncStateToFolder(folderId, result)
-      recordContinuousConflicts(folder, result.conflicts)
+      recordContinuousConflicts(folder, result)
       broadcastSnapshot()
     }
 
@@ -3227,7 +3359,8 @@ async function runGenerationCycle(
       peerOperations,
     )
 
-    const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+    // Both computers now hold this cycle's conflicts, so each can be compared.
+    const state = await settleLineEndingConflicts(folder, peer, await engine.request<FileSyncState>("fileSync.getState", { id: folderId }))
     const completedAt = new Date().toISOString()
     if (result.operations.length === 0 && peerOperations.length === 0 && state.operations.length === 0) {
       quietReconciles.set(folderId, {
@@ -3250,7 +3383,7 @@ async function runGenerationCycle(
       )
     }
     reportQueuedTransferFailures(folder, failures)
-    recordContinuousConflicts(folder, state.conflicts)
+    recordContinuousConflicts(folder, state)
     return result
   } finally {
     if (incomingGenerationId) await releaseGeneration(engine, incomingGenerationId)
@@ -3304,11 +3437,13 @@ async function flushContinuousSync(folderId: string): Promise<void> {
   broadcastSnapshot()
   let reconciledState: ReconcileFilesResult | undefined
   try {
-    const durableBeforeReconcile = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
-    if (durableBeforeReconcile.recoveryIssues.length > 0) {
-      applyFileSyncStateToFolder(folderId, durableBeforeReconcile)
+    const durableState = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+    if (durableState.recoveryIssues.length > 0) {
+      applyFileSyncStateToFolder(folderId, durableState)
       throw new Error("A replacement recovery issue must be repaired before this folder can synchronize.")
     }
+    // Conflicts left from before a restart are compared before anything is scanned.
+    const durableBeforeReconcile = await settleLineEndingConflicts(folder, peer, durableState)
     const { runnable: runnableChoices, exhausted: exhaustedChoices } = partitionConflictChoices(
       conflictChoiceOperations(durableBeforeReconcile),
     )
@@ -3334,7 +3469,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
           folderId,
         )
       }
-      recordContinuousConflicts(folder, state.conflicts)
+      recordContinuousConflicts(folder, state)
       continuousSyncQueued.add(folderId)
       return
     }
@@ -3367,7 +3502,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       if (localUnchanged && peerReply.kind === "unchanged") {
         applyFileSyncStateToFolder(folderId, durableBeforeReconcile, new Date().toISOString())
         continuousLastErrors.delete(folderId)
-        recordContinuousConflicts(folder, durableBeforeReconcile.conflicts)
+        recordContinuousConflicts(folder, durableBeforeReconcile)
         return
       }
       if (peerReply.kind === "generation") knownPeerScan = peerReply.reply
@@ -3442,7 +3577,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
         folderId,
       )
       reportQueuedTransferFailures(folder, failures)
-      recordContinuousConflicts(folder, state.conflicts)
+      recordContinuousConflicts(folder, state)
       continuousSyncQueued.add(folderId)
       return
     }
@@ -3472,7 +3607,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
     await retireInitialConflictProjection(folderId, result)
     if (result.conflicts.length > 0) {
       applyFileSyncStateToFolder(folderId, result)
-      recordContinuousConflicts(folder, result.conflicts)
+      recordContinuousConflicts(folder, result)
       broadcastSnapshot()
     }
     const peerResult = await requirePeerSessions().request<unknown>(peer.id, observeRequest, CONTINUOUS_SYNC_RPC_TIMEOUT_MS, { chunked })
@@ -3486,7 +3621,8 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       peerOperations,
     )
 
-    const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
+    // Both computers now hold this cycle's conflicts, so each can be compared.
+    const state = await settleLineEndingConflicts(folder, peer, await engine.request<FileSyncState>("fileSync.getState", { id: folderId }))
     const completedAt = new Date().toISOString()
     if (result.operations.length === 0 && peerOperations.length === 0 && state.operations.length === 0) {
       quietReconciles.set(folderId, {
@@ -3510,7 +3646,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       )
     }
     reportQueuedTransferFailures(folder, failures)
-    recordContinuousConflicts(folder, state.conflicts)
+    recordContinuousConflicts(folder, state)
   } catch (error) {
     // A cancelled check was stopped deliberately — by shutdown, a settings
     // change, a pause, or a conflict resolution claiming the folder. Nothing
@@ -3535,7 +3671,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       return undefined
     })
     if (latestState) {
-      recordContinuousConflicts(folder, latestState.conflicts)
+      recordContinuousConflicts(folder, latestState)
       if (latestState.conflicts.length > 0 || latestState.recoveryIssues.length > 0) {
         applyFileSyncStateToFolder(folderId, latestState)
       } else {
@@ -5388,7 +5524,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
           const current = snapshot.folders.find((item) => item.id === folderId)
           if (current) {
             recordOccupiedPaths(current, state.occupiedPaths ?? [])
-            recordContinuousConflicts(current, state.conflicts)
+            recordContinuousConflicts(current, state)
           }
           broadcastSnapshot()
           return state
@@ -5455,11 +5591,13 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
     if (isManifestPathIgnored(relativePath, folder.ignorePatterns) || isTetheraStagingPath(relativePath)) {
       throw new Error("The requested conflict path is not eligible for synchronization.")
     }
+    // Older coordinators never ask for the text digest and never receive one.
+    const includeText = request.textDigest === true
     return withPeerFileOperation(context, folderId, () => withConflictHashing(folderId, async () => {
       const state = await engine.request<FileSyncState>("fileSync.getState", { id: folderId })
       const conflict = state.conflicts.find((candidate) => candidate.path === relativePath)
       if (!conflict) throw new Error("This file conflict no longer exists on the paired computer.")
-      return describeConflictCopy(folder.localPath, localFilePath(folder.id, relativePath), conflict.localDigest)
+      return describeConflictCopy(folder.localPath, localFilePath(folder.id, relativePath), conflict.localDigest, includeText)
     }))
   }
   if (request.type === "continuous-sync-resolve-conflict") {
@@ -5553,7 +5691,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
       await retireInitialConflictProjection(folderId, state)
       applyFileSyncStateToFolder(folderId, state, new Date().toISOString())
       const current = snapshot.folders.find((item) => item.id === folderId)
-      if (current) recordContinuousConflicts(current, state.conflicts)
+      if (current) recordContinuousConflicts(current, state)
       broadcastSnapshot()
       return state
     })
