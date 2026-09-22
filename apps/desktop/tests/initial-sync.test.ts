@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { FileChangedError } from "../src/main/file-transfer"
@@ -487,6 +487,53 @@ describe("writeFileChunksAtomic", () => {
       }())
       expect(await readFile(path.join(root, "nested/large.bin"))).toEqual(content)
       expect(await readdir(path.join(root, "nested"))).toEqual(["large.bin"])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("gives new and replacing copies the source modification time", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-chunk-test-"))
+    const archiveRoot = await mkdtemp(path.join(tmpdir(), "tethera-archive-test-"))
+    const sourceModifiedMs = Date.parse("2026-01-02T03:04:05.000Z")
+    const original = Buffer.from("local original")
+    const replacement = Buffer.from("remote edit")
+    try {
+      await writeFileChunksAtomic(root, "new.txt", replacement.length, sha256Hex(replacement), async function* () {
+        yield replacement
+      }(), { sourceModifiedMs })
+      expect((await stat(path.join(root, "new.txt"))).mtimeMs).toBe(sourceModifiedMs)
+
+      await writeFile(path.join(root, "notes.txt"), original)
+      await writeFileChunksAtomic(root, "notes.txt", replacement.length, sha256Hex(replacement), async function* () {
+        yield replacement
+      }(), {
+        sourceModifiedMs,
+        expectedDestinationDigest: sha256Hex(original),
+        expectedDestinationSize: original.length,
+        replacement: {
+          journalId: "replacement-mtime",
+          archiveRoot,
+          markArchived: async () => undefined,
+          markInstalled: async () => undefined,
+        },
+      })
+      expect(await readFile(path.join(root, "notes.txt"))).toEqual(replacement)
+      expect((await stat(path.join(root, "notes.txt"))).mtimeMs).toBe(sourceModifiedMs)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(archiveRoot, { recursive: true, force: true })
+    }
+  })
+
+  test("rejects an unrepresentable source modification time before creating a destination", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "tethera-chunk-test-"))
+    const content = Buffer.from("content")
+    try {
+      await expect(writeFileChunksAtomic(root, "file.txt", content.length, sha256Hex(content), async function* () {
+        yield content
+      }(), { sourceModifiedMs: 9e15 })).rejects.toThrow("modification time is invalid")
+      expect(await readdir(root)).toEqual([])
     } finally {
       await rm(root, { recursive: true, force: true })
     }

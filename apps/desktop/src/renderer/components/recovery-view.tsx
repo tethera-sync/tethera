@@ -269,7 +269,7 @@ export function RecoveryView({ snapshot }: { snapshot: AppSnapshot }) {
           <AlertDialogHeader>
             <AlertDialogTitle>Use the newest modified copy?</AlertDialogTitle>
             <AlertDialogDescription>
-              Tethera will verify both copies for every conflict, queue the copy with the later modified time, and archive the replaced copy during sync. Ties, unavailable files, changed files, and choices blocked by the folder direction stay unresolved. Keep both computers online; this may take a while.
+              Tethera will verify both copies for every conflict, queue the copy with the later modified time, and archive the replaced copy during sync. Ties, unavailable files, changed files, and choices blocked by the folder direction stay unresolved. A git checkout or pull marks old content as newly modified, so review code folders file by file instead. Keep both computers online; this may take a while.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

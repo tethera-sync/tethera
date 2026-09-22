@@ -6,6 +6,7 @@ import { fingerprintFolder, parsePeerManifest, scanFolder, type FileManifest } f
 import { fingerprintObservation } from "../src/main/observation-fingerprint"
 import {
   canSkipUnchangedCycle,
+  changeCycleRestMs,
   conflictChoiceOperations,
   conflictCopiesKey,
   conflictKey,
@@ -262,6 +263,13 @@ describe("describeInitialMergeOutcome", () => {
   })
 })
 
+test("a change-driven check rests three times as long as the last one took, for at most two minutes", () => {
+  expect(changeCycleRestMs(200)).toBe(600)
+  expect(changeCycleRestMs(20_000)).toBe(60_000)
+  expect(changeCycleRestMs(10 * 60_000)).toBe(2 * 60_000)
+  expect(changeCycleRestMs(-5)).toBe(0)
+})
+
 test("FolderChangeMonitor reports nested filesystem changes", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "tethera-watch-test-"))
   await mkdir(path.join(root, "nested"))
@@ -332,6 +340,61 @@ test("FolderChangeMonitor reports a watch-depth degradation instead of silently 
       expect(report.reason.kind).toBe("watch-depth-exceeded")
       expect(report.reason.message).toContain("watch limit")
     }
+  } finally {
+    monitor.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+async function waitForChange(read: () => number, after: number): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (read() <= after) {
+    if (Date.now() > deadline) throw new Error("watch event timed out")
+    await Bun.sleep(50)
+  }
+}
+
+test("FolderChangeMonitor per-directory watchers skip ignored paths and Tethera staging files", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "tethera-watch-filter-"))
+  let changes = 0
+  const monitor = new FolderChangeMonitor(root, ["*.log"], () => {
+    changes += 1
+  }, undefined, { recursive: false })
+  try {
+    await mkdir(path.join(root, "src"))
+    expect(await monitor.start()).toBe(false)
+    await writeFile(path.join(root, "src", "debug.log"), "ignored")
+    await writeFile(path.join(root, "src", ".notes.txt.tethera-tmp-0123456789abcdef0123456789abcdef"), "staging")
+    await Bun.sleep(1_500)
+    expect(changes).toBe(0)
+    await writeFile(path.join(root, "src", "notes.txt"), "changed")
+    await waitForChange(() => changes, 0)
+  } finally {
+    monitor.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("FolderChangeMonitor watches a folder created, or removed and created again, after it started", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "tethera-watch-added-"))
+  let changes = 0
+  const monitor = new FolderChangeMonitor(root, [], () => {
+    changes += 1
+  }, undefined, { recursive: false })
+  try {
+    expect(await monitor.start()).toBe(false)
+    await mkdir(path.join(root, "added", "deeper"), { recursive: true })
+    await waitForChange(() => changes, 0)
+    let seen = changes
+    await writeFile(path.join(root, "added", "deeper", "notes.txt"), "first")
+    await waitForChange(() => changes, seen)
+
+    await rm(path.join(root, "added"), { recursive: true })
+    await mkdir(path.join(root, "added", "deeper"), { recursive: true })
+    await Bun.sleep(1_500)
+    seen = changes
+    await writeFile(path.join(root, "added", "deeper", "notes.txt"), "second")
+    await waitForChange(() => changes, seen)
   } finally {
     monitor.close()
     await rm(root, { recursive: true, force: true })

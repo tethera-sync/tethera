@@ -202,6 +202,7 @@ import {
 } from "./ipc-validation"
 import {
   canSkipUnchangedCycle,
+  changeCycleRestMs,
   conflictChoiceOperations,
   CONFLICT_CHOICE_DRAIN_LIMIT,
   conflictCopiesKey,
@@ -305,6 +306,10 @@ const continuousSyncQueued = new Set<string>()
 const continuousSyncBlocked = new Set<string>()
 const continuousSyncMonitors = new Map<string, FolderChangeMonitor>()
 const continuousSyncRetryTimers = new Map<string, NodeJS.Timeout>()
+/** Folders whose next check must not wait out the change rest: a user action or unfinished queued copies asked for it. */
+const continuousSyncPrompt = new Set<string>()
+/** Per folder, when a check started only by file changes may next begin (see `changeCycleRestMs`). */
+const continuousSyncRestUntil = new Map<string, number>()
 const continuousSyncNotificationsInFlight = new Set<string>()
 /** Per folder, the open conflicts already announced in the activity log, by `conflictCopiesKey`. */
 const reportedConflicts = new Map<string, Set<string>>()
@@ -2948,8 +2953,23 @@ async function refreshContinuousSyncState(folderId: string): Promise<void> {
   }
 }
 
-function scheduleContinuousSync(folderId: string): void {
+/** `change` comes from a file watcher, directly or through the paired computer; anything else runs without waiting. */
+type ContinuousSyncTrigger = "change" | "request"
+
+function scheduleContinuousSync(folderId: string, trigger: ContinuousSyncTrigger = "request"): void {
   if (continuousSyncBlocked.has(folderId)) return
+  if (trigger === "change" && !continuousSyncPrompt.has(folderId)) {
+    const restMs = (continuousSyncRestUntil.get(folderId) ?? 0) - Date.now()
+    if (restMs > 0) {
+      continuousSyncQueued.add(folderId)
+      if (!continuousSyncInFlight.has(folderId)) {
+        scheduleContinuousSyncRetry(folderId, restMs, () => void flushContinuousSync(folderId))
+      }
+      return
+    }
+  } else if (trigger === "request") {
+    continuousSyncPrompt.add(folderId)
+  }
   const retry = continuousSyncRetryTimers.get(folderId)
   if (retry) clearTimeout(retry)
   continuousSyncRetryTimers.delete(folderId)
@@ -2973,7 +2993,7 @@ async function notifyContinuousSyncCoordinator(folderId: string): Promise<void> 
   const folder = snapshot.folders.find((item) => item.id === folderId)
   if (!record || !folder || continuousSyncBlocked.has(folderId)) return
   if (isLocalContinuousCoordinator(record)) {
-    scheduleContinuousSync(folderId)
+    scheduleContinuousSync(folderId, "change")
     return
   }
   if (continuousSyncNotificationsInFlight.has(folderId)) return
@@ -3473,6 +3493,8 @@ async function flushContinuousSync(folderId: string): Promise<void> {
 
   continuousCyclesInProgress += 1
   continuousSyncInFlight.add(folderId)
+  continuousSyncPrompt.delete(folderId)
+  const cycleStartedAt = performance.now()
   updateFolder(folderId, {
     status: "syncing",
     work: newFolderWork({ kind: "scanning", purpose: "changes" }),
@@ -3515,6 +3537,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       }
       recordContinuousConflicts(folder, state)
       continuousSyncQueued.add(folderId)
+      continuousSyncPrompt.add(folderId)
       return
     }
     if (exhaustedChoices.length > 0) {
@@ -3623,6 +3646,7 @@ async function flushContinuousSync(folderId: string): Promise<void> {
       reportQueuedTransferFailures(folder, failures)
       recordContinuousConflicts(folder, state)
       continuousSyncQueued.add(folderId)
+      continuousSyncPrompt.add(folderId)
       return
     }
 
@@ -3751,8 +3775,12 @@ async function flushContinuousSync(folderId: string): Promise<void> {
   } finally {
     continuousSyncInFlight.delete(folderId)
     continuousCyclesInProgress -= 1
+    continuousSyncRestUntil.set(folderId, Date.now() + changeCycleRestMs(performance.now() - cycleStartedAt))
     broadcastSnapshot()
-    if (continuousSyncQueued.has(folderId)) queueMicrotask(() => void flushContinuousSync(folderId))
+    if (continuousSyncQueued.has(folderId)) {
+      continuousSyncQueued.delete(folderId)
+      scheduleContinuousSync(folderId, "change")
+    }
   }
 }
 
@@ -3943,6 +3971,7 @@ async function pullPlannedFile(
         onChunk: onProgress,
         expectedDestinationDigest,
         expectedDestinationSize,
+        sourceModifiedMs: descriptor.modifiedMs,
         replacement: journalId
           ? {
               journalId,
@@ -5705,7 +5734,7 @@ async function handlePeerRequest(context: PeerRequestContext, request: PeerReque
   if (request.type === "continuous-sync-notify") {
     const folderId = typeof request.folderId === "string" ? request.folderId : ""
     requireContinuousSyncNotification(context, folderId)
-    scheduleContinuousSync(folderId)
+    scheduleContinuousSync(folderId, "change")
     return { queued: true }
   }
   if (request.type === "continuous-sync-observe") {

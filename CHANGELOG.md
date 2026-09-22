@@ -2,6 +2,9 @@
 
 All notable changes to this project, newest first.
 
+- 🐛 Keep each file's original modified time when Tethera copies it to the other computer. Copies used to look freshly edited, so "Newest wins" could pick an older copy that had only just been received over the one that was actually edited. Copies made by earlier versions keep the time they were copied, and a git checkout or pull also marks old content as new, so review code folders file by file.
+- ⚡ Stop very large folders that never stop changing from being checked back to back: a check started by file changes now waits three times as long as the previous check took (at most two minutes). Your own actions and unfinished queued copies still start a check straight away.
+- ⚡ Stop re-reading every folder on Linux whenever a file is created or renamed (every git command does this). Only a new, removed or moved folder is walked again, and changes to ignored files and Tethera's own temporary files no longer start a check.
 - ✨ Update the other computer from this one: each paired device now shows its Tethera version, and when it is out of date you can update it from its card and follow the download and restart there. Windows and AppImage installs finish on their own; Linux packages download and then ask for a password on that computer. Both computers need this version before one can update the other.
 - ✨ Settle conflicts that are only Windows-versus-Unix line endings automatically: when both computers hold the same text and one copy uses LF throughout, Tethera keeps that copy (the form git stores) and archives the other, instead of asking you about every file of a repository checked out on both systems. Both computers need the update.
 - 🎨 Announce each sync conflict once, when it first needs you, instead of re-listing the remaining conflicts every time some are resolved, and explain a conflict without a shared history in plain words.

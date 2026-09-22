@@ -1,5 +1,5 @@
 import type { FSWatcher } from "node:fs"
-import { opendir, realpath, stat, watch } from "./synced-fs"
+import { lstat, opendir, realpath, stat, watch } from "./synced-fs"
 import path from "node:path"
 import type { OverallStatus, SyncMode } from "../shared/contracts"
 import type { FileManifest } from "./folder-manifest"
@@ -199,6 +199,20 @@ export function shouldUseGenerations(
   chunkedFrames: boolean,
 ): boolean {
   return capabilities.has(SCAN_GENERATION_CAPABILITY) && chunkedFrames
+}
+
+const CHANGE_CYCLE_REST_FACTOR = 3
+const MAX_CHANGE_CYCLE_REST_MS = 2 * 60_000
+
+/**
+ * How long a check started only by file changes waits after the previous check
+ * finished. Scaling the rest with the check's own duration leaves a small
+ * folder responding within a second, while a huge folder that never stops
+ * changing (live git repositories, build output) spends at most about a
+ * quarter of its time checking instead of scanning back to back.
+ */
+export function changeCycleRestMs(previousCycleMs: number): number {
+  return Math.min(Math.max(0, previousCycleMs) * CHANGE_CYCLE_REST_FACTOR, MAX_CHANGE_CYCLE_REST_MS)
 }
 
 /** However quiet a folder looks, it is fully reconciled at least this often. */
@@ -525,6 +539,12 @@ export class FolderChangeMonitor {
   #debounce: NodeJS.Timeout | null = null
   #fallback: NodeJS.Timeout | null = null
   #stopped = false
+  /** Aborts every directory collection when the monitor closes. */
+  readonly #closed = new AbortController()
+  /** Set when the debounced change also needs every watched directory re-collected. */
+  #fullRefreshPending = false
+  /** Entries created, removed or moved since the last debounce, whose watch coverage must be updated. */
+  readonly #renamedEntries = new Set<string>()
   #refreshing: Promise<boolean> | null = null
   /** Cancels an in-flight directory collection when the monitor closes. */
   #collectionController: AbortController | null = null
@@ -572,6 +592,7 @@ export class FolderChangeMonitor {
 
   close(): void {
     this.#stopped = true
+    this.#closed.abort()
     this.#collectionController?.abort()
     this.#collectionController = null
     if (this.#debounce) clearTimeout(this.#debounce)
@@ -584,12 +605,17 @@ export class FolderChangeMonitor {
 
   #schedule(refreshDirectories: boolean): void {
     if (this.#stopped) return
+    // A later plain change must not cancel a full refresh an earlier event asked for.
+    this.#fullRefreshPending ||= refreshDirectories
     if (this.#debounce) clearTimeout(this.#debounce)
     this.#debounce = setTimeout(() => {
       this.#debounce = null
-      if (refreshDirectories && this.#recursive) {
+      const fullRefresh = this.#fullRefreshPending
+      this.#fullRefreshPending = false
+      if (fullRefresh && this.#recursive) {
         this.#restoreRecursiveWatcher()
-      } else if (refreshDirectories) {
+      } else if (fullRefresh) {
+        this.#renamedEntries.clear()
         void this.#refreshWatchers()
           // A refresh that completed without rejecting a directory genuinely
           // restores full coverage; reporting recovery when the same pass just
@@ -598,9 +624,64 @@ export class FolderChangeMonitor {
             if (!degraded) this.#reportRecovered()
           })
           .catch((error: unknown) => this.#reportRefreshFailure(error))
+      } else if (this.#renamedEntries.size > 0) {
+        // Watch a new folder before its check runs, so a write landing in it
+        // straight after the check started still raises its own event.
+        void this.#watchRenamedEntries()
+          .catch((error: unknown) => {
+            if (!this.#stopped) this.#reportRefreshFailure(error)
+          })
+          .finally(() => {
+            if (!this.#stopped) this.#onChange()
+          })
+        return
       }
       this.#onChange()
     }, CHANGE_DEBOUNCE_MS)
+  }
+
+  /**
+   * One directory watcher's event. Tethera's own staging files and ignored
+   * paths never need a check. A created, removed or moved entry only changes
+   * coverage below itself, so re-walking the whole tree for it (as happens for
+   * every git command, which renames its lock files into place) is avoided.
+   */
+  #onDirectoryEvent(directory: string, event: string, filename: string | null): void {
+    if (filename === null) {
+      this.#schedule(true)
+      return
+    }
+    const entry = path.join(directory, filename)
+    if (this.#isExcludedChange(path.relative(this.#rootPath, entry))) return
+    if (event === "rename") this.#renamedEntries.add(entry)
+    this.#schedule(false)
+  }
+
+  async #watchRenamedEntries(): Promise<void> {
+    // A full refresh already walking the tree would close watchers it did not see.
+    await this.#refreshing?.then(() => undefined, () => undefined)
+    const entries = [...this.#renamedEntries]
+    this.#renamedEntries.clear()
+    for (const entry of entries) {
+      if (this.#stopped) return
+      this.#unwatchSubtree(entry)
+      if (!(await isRealDirectory(entry))) continue
+      const relativeEntry = path.relative(this.#rootPath, entry).replaceAll("\\", "/")
+      const directories = await collectWatchDirectories(this.#rootPath, this.#ignorePatterns, this.#closed.signal, relativeEntry)
+      if (this.#stopped) return
+      this.#watchDirectories(directories)
+    }
+  }
+
+  /** Closes the watchers for a directory that was removed, moved or replaced, and for everything below it. */
+  #unwatchSubtree(directory: string): void {
+    if (!this.#watchers.has(directory)) return
+    const below = directory + path.sep
+    for (const [watched, watcher] of this.#watchers) {
+      if (watched !== directory && !watched.startsWith(below)) continue
+      watcher.close()
+      this.#watchers.delete(watched)
+    }
   }
 
   #reportDegraded(reason: WatchDegradationReason): void {
@@ -689,30 +770,7 @@ export class FolderChangeMonitor {
           this.#watchers.delete(directory)
         }
       }
-      for (const directory of directories) {
-        if (this.#stopped || controller.signal.aborted) return true
-        if (this.#watchers.has(directory)) continue
-        try {
-          const watcher = watch(directory, { persistent: false }, (event) => this.#schedule(event === "rename"))
-          watcher.on("error", () => {
-            watcher.close()
-            this.#watchers.delete(directory)
-            this.#schedule(false)
-          })
-          this.#watchers.set(directory, watcher)
-        } catch (error) {
-          // e.g. ENOSPC once the OS's native watch-descriptor limit is exhausted
-          // (common on large trees). The directory is left unwatched; report it
-          // rather than silently losing coverage of that subtree.
-          degraded = true
-          this.#reportDegraded({
-            kind: "watcher-rejected",
-            directory,
-            message: error instanceof Error ? error.message : String(error),
-          })
-          this.#schedule(false)
-        }
-      }
+      degraded = this.#watchDirectories(directories)
     } catch (error) {
       // A close() during collection aborts the walk; a stopped monitor swallows
       // it instead of reporting a refresh failure for a scan it no longer wants.
@@ -723,9 +781,59 @@ export class FolderChangeMonitor {
     }
     return degraded
   }
+
+  /** Watches every listed directory not already watched. Returns whether any was refused. */
+  #watchDirectories(directories: string[]): boolean {
+    let degraded = false
+    for (const directory of directories) {
+      if (this.#stopped) return degraded
+      if (this.#watchers.has(directory)) continue
+      try {
+        const watcher = watch(directory, { persistent: false }, (event, filename) => {
+          this.#onDirectoryEvent(directory, event, filename)
+        })
+        watcher.on("error", () => {
+          watcher.close()
+          this.#watchers.delete(directory)
+          this.#schedule(false)
+        })
+        this.#watchers.set(directory, watcher)
+      } catch (error) {
+        // e.g. ENOSPC once the OS's native watch-descriptor limit is exhausted
+        // (common on large trees). The directory is left unwatched; report it
+        // rather than silently losing coverage of that subtree.
+        degraded = true
+        this.#reportDegraded({
+          kind: "watcher-rejected",
+          directory,
+          message: error instanceof Error ? error.message : String(error),
+        })
+        this.#schedule(false)
+      }
+    }
+    return degraded
+  }
 }
 
-export async function collectWatchDirectories(rootPath: string, ignorePatterns: string[], signal?: AbortSignal | null): Promise<string[]> {
+async function isRealDirectory(entry: string): Promise<boolean> {
+  try {
+    const metadata = await lstat(entry)
+    return metadata.isDirectory() && !metadata.isSymbolicLink()
+  } catch (error) {
+    // The entry was removed or moved away again before it could be checked.
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT" || code === "ENOTDIR") return false
+    throw error
+  }
+}
+
+/** Lists the directories to watch under `startDirectory` (the whole root by default), skipping ignored and escaping ones. */
+export async function collectWatchDirectories(
+  rootPath: string,
+  ignorePatterns: string[],
+  signal?: AbortSignal | null,
+  startDirectory = "",
+): Promise<string[]> {
   const canonicalRoot = await realpath(rootPath)
   if (signal?.aborted) throw new Error("The watcher collection was cancelled.")
   const directories: string[] = []
@@ -757,6 +865,10 @@ export async function collectWatchDirectories(rootPath: string, ignorePatterns: 
     }
   }
 
-  await visit(rootPath, "", 0)
+  if (startDirectory === "") {
+    await visit(rootPath, "", 0)
+  } else if (!isTetheraStagingPath(startDirectory) && !isIgnored(`${startDirectory}/placeholder`)) {
+    await visit(path.join(rootPath, startDirectory), startDirectory, startDirectory.split("/").length)
+  }
   return directories
 }

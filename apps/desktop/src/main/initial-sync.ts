@@ -190,6 +190,12 @@ export interface AtomicChunkWriteOptions {
   expectedDestinationDigest?: string
   expectedDestinationSize?: number
   replacement?: DurableReplacementHooks
+  /**
+   * The source file's modification time, given to the copy before it is installed.
+   * Without it every copy would look freshly edited, and choosing the newest copy
+   * would prefer whichever computer last received a file over the one that edited it.
+   */
+  sourceModifiedMs?: number
 }
 
 export interface CoordinatedInitialMergeOptions {
@@ -357,7 +363,7 @@ export async function writeFileChunksAtomic(
   chunks: AsyncIterable<Buffer>,
   options: AtomicChunkWriteOptions = {},
 ): Promise<void> {
-  const { onChunk, expectedDestinationDigest, expectedDestinationSize, replacement } = options
+  const { onChunk, expectedDestinationDigest, expectedDestinationSize, replacement, sourceModifiedMs } = options
   if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) throw new Error("The transferred file size is invalid.")
   if (!isSha256HexDigest(expectedDigest)) throw new Error("The transferred file digest is invalid.")
   if (expectedDestinationDigest !== undefined && !isSha256HexDigest(expectedDestinationDigest)) {
@@ -368,6 +374,10 @@ export async function writeFileChunksAtomic(
   }
   if (expectedDestinationSize !== undefined && (!Number.isSafeInteger(expectedDestinationSize) || expectedDestinationSize < 0)) {
     throw new Error("The expected destination size is invalid.")
+  }
+  const sourceModifiedAt = sourceModifiedMs === undefined ? undefined : new Date(sourceModifiedMs)
+  if (sourceModifiedAt !== undefined && Number.isNaN(sourceModifiedAt.getTime())) {
+    throw new Error("The transferred file modification time is invalid.")
   }
   if (isTetheraStagingPath(relativePath)) throw new Error("Tethera staging paths are reserved and cannot be synchronized.")
   const destination = resolveWithinRoot(rootPath, relativePath)
@@ -409,6 +419,8 @@ export async function writeFileChunksAtomic(
     if (writtenBytes !== expectedSize || hash.digest("hex") !== expectedDigest) {
       throw new Error("The transferred file failed integrity verification.")
     }
+    // Set on the staged inode, so the installed link never shows the transfer time.
+    if (sourceModifiedAt !== undefined) await handle.utimes(new Date(), sourceModifiedAt)
     await handle.sync()
     await handle.close()
     await ensureContainedDestinationDirectory(rootPath, directory)
